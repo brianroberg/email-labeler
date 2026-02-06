@@ -13,6 +13,7 @@ import sys
 import tomllib
 from pathlib import Path
 
+import httpx
 from dotenv import load_dotenv
 
 from classifier import EmailClassifier, EmailMetadata, SenderType
@@ -129,12 +130,21 @@ async def run_daemon() -> None:
     )
     label_manager = LabelManager(proxy_client=proxy_client, config=config)
 
-    # Verify labels on startup
-    missing = await label_manager.verify_labels()
-    if missing:
-        log.error("Missing Gmail labels: %s", missing)
-        log.error("Create these labels manually in Gmail before running the daemon.")
-        sys.exit(1)
+    # Wait for api-proxy to become available, then verify labels
+    startup_backoff = 5
+    max_startup_backoff = 60
+    while True:
+        try:
+            missing = await label_manager.verify_labels()
+            if missing:
+                log.error("Missing Gmail labels: %s", missing)
+                log.error("Create these labels manually in Gmail before running the daemon.")
+                sys.exit(1)
+            break
+        except httpx.ConnectError:
+            log.warning("Cannot reach api-proxy at %s — retrying in %ds", proxy_client.proxy_url, startup_backoff)
+            await asyncio.sleep(startup_backoff)
+            startup_backoff = min(startup_backoff * 2, max_startup_backoff)
 
     log.info("All labels verified. Starting poll loop.")
 
@@ -178,10 +188,12 @@ async def run_daemon() -> None:
             # Reset backoff on success
             backoff = poll_interval
 
+        except httpx.ConnectError:
+            log.warning("Lost connection to api-proxy at %s — retrying in %ds", proxy_client.proxy_url, backoff)
+            backoff = min(backoff * 2, poll_interval * 10)
         except Exception:
             log.exception("Error in poll cycle")
             backoff = min(backoff * 2, poll_interval * 10)
-            log.info("Backing off for %ds", backoff)
 
         await asyncio.sleep(backoff)
 
