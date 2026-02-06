@@ -133,10 +133,21 @@ def config():
                 "user_template": "From: {sender}\nSubject: {subject}\nPreview: {snippet}",
             },
             "email_classification": {
-                "system": "Classify the email.",
+                "preamble": "Classify the email into one category:",
+                "postamble": "Think carefully.",
                 "user_template": "From: {sender}\nSubject: {subject}\nBody:\n{body}",
+                "categories": {
+                    "NEEDS_RESPONSE": "Requires a reply.",
+                    "FYI": "Informational, no action needed.",
+                    "LOW_PRIORITY": "Low importance.",
+                    "UNWANTED": "Spam or unwanted.",
+                },
             },
-        }
+        },
+        "vip_senders": {
+            "addresses": ["vip@example.com"],
+            "categories": ["NEEDS_RESPONSE", "FYI"],
+        },
     }
 
 
@@ -252,4 +263,102 @@ class TestClassifyPipeline:
         await classifier.classify(metadata, "Just wanted to share this article.")
 
         mock_cloud_llm.complete.assert_called_once()
+        mock_local_llm.complete.assert_called_once()
+
+
+# ── VIP sender tests ────────────────────────────────────────────────────
+
+
+@pytest.fixture
+def vip_metadata():
+    return EmailMetadata(
+        message_id="msg_vip",
+        sender="Important Person <vip@example.com>",
+        subject="Quick question",
+        snippet="Are you free tomorrow?",
+    )
+
+
+class TestVipSender:
+    async def test_vip_skips_cloud_llm(self, classifier, mock_cloud_llm, vip_metadata):
+        """VIP senders are classified as PERSON without an LLM call."""
+        sender_type, raw = await classifier.classify_sender(vip_metadata)
+
+        assert sender_type == SenderType.PERSON
+        assert raw == "VIP"
+        mock_cloud_llm.complete.assert_not_called()
+
+    async def test_non_vip_uses_cloud_llm(self, classifier, mock_cloud_llm, metadata):
+        """Non-VIP senders still go through the cloud LLM."""
+        mock_cloud_llm.complete.return_value = "PERSON"
+        await classifier.classify_sender(metadata)
+        mock_cloud_llm.complete.assert_called_once()
+
+    async def test_vip_case_insensitive(self, classifier, mock_cloud_llm):
+        """VIP lookup is case-insensitive."""
+        meta = EmailMetadata(
+            message_id="msg_vip2",
+            sender="VIP Person <VIP@Example.COM>",
+            subject="Hi",
+            snippet="Hello",
+        )
+        sender_type, raw = await classifier.classify_sender(meta)
+        assert sender_type == SenderType.PERSON
+        assert raw == "VIP"
+        mock_cloud_llm.complete.assert_not_called()
+
+    async def test_is_vip_checks_email_not_name(self, classifier, mock_cloud_llm):
+        """VIP check matches the email address, not the display name."""
+        meta = EmailMetadata(
+            message_id="msg_not_vip",
+            sender="vip@example.com <other@example.com>",
+            subject="Hi",
+            snippet="Hello",
+        )
+        mock_cloud_llm.complete.return_value = "PERSON"
+        await classifier.classify_sender(meta)
+        mock_cloud_llm.complete.assert_called_once()
+
+
+class TestVipClassification:
+    async def test_vip_gets_narrowed_prompt(self, classifier, mock_local_llm, vip_metadata):
+        """VIP emails get a prompt with only NEEDS_RESPONSE and FYI."""
+        mock_local_llm.complete.return_value = "FYI"
+        await classifier.classify_email(vip_metadata, "See you tomorrow.", SenderType.PERSON, vip=True)
+
+        system_prompt = mock_local_llm.complete.call_args.args[0]
+        assert "NEEDS_RESPONSE" in system_prompt
+        assert "FYI" in system_prompt
+        assert "LOW_PRIORITY" not in system_prompt
+        assert "UNWANTED" not in system_prompt
+
+    async def test_non_vip_gets_full_prompt(self, classifier, mock_local_llm, metadata):
+        """Non-VIP emails get the full prompt with all 4 categories."""
+        mock_local_llm.complete.return_value = "FYI"
+        await classifier.classify_email(metadata, "Project update.", SenderType.PERSON, vip=False)
+
+        system_prompt = mock_local_llm.complete.call_args.args[0]
+        assert "NEEDS_RESPONSE" in system_prompt
+        assert "FYI" in system_prompt
+        assert "LOW_PRIORITY" in system_prompt
+        assert "UNWANTED" in system_prompt
+
+    async def test_vip_clamps_unexpected_label(self, classifier, mock_local_llm, vip_metadata):
+        """If LLM returns LOW_PRIORITY for a VIP, it gets clamped to FYI."""
+        mock_local_llm.complete.return_value = "LOW_PRIORITY"
+        label, _ = await classifier.classify_email(
+            vip_metadata, "Newsletter FYI.", SenderType.PERSON, vip=True
+        )
+        assert label == EmailLabel.FYI
+
+    async def test_vip_full_pipeline(self, classifier, mock_cloud_llm, mock_local_llm, vip_metadata):
+        """Full pipeline: VIP skips sender LLM, uses narrowed prompt, routes to local LLM."""
+        mock_local_llm.complete.return_value = "NEEDS_RESPONSE"
+
+        result = await classifier.classify(vip_metadata, "Can you review this?")
+
+        assert result.sender_type == SenderType.PERSON
+        assert result.sender_type_raw == "VIP"
+        assert result.label == EmailLabel.NEEDS_RESPONSE
+        mock_cloud_llm.complete.assert_not_called()
         mock_local_llm.complete.assert_called_once()

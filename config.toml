@@ -50,19 +50,23 @@ user_template = """From: {sender}
 Subject: {subject}
 Preview: {snippet}"""
 
+[vip_senders]
+# Email addresses that are always classified as PERSON (skips sender LLM call)
+# and restricted to VIP-only categories (skips low-priority/unwanted).
+addresses = []
+categories = ["NEEDS_RESPONSE", "FYI"]
+
 [prompts.email_classification]
-system = """You are an email classifier. Based on the full email content, classify it into exactly one category:
-
-- NEEDS_RESPONSE: The email requires a reply or action from the recipient. Questions directed at you, meeting requests, invitations needing RSVP, requests for information.
-- FYI: The email is informational and worth reading but requires no action. Status updates from people, shared articles from contacts, announcements you should know about.
-- LOW_PRIORITY: The email has low importance. Marketing newsletters you subscribed to, routine automated notifications, social media digests, promotional offers you might occasionally want.
-- UNWANTED: The email is unwanted. Spam, unsolicited marketing, emails from senders you don't recognize with no value, phishing attempts, repeated promotional emails.
-
-Respond with ONLY one word: NEEDS_RESPONSE, FYI, LOW_PRIORITY, or UNWANTED
-
-Think about it carefully before answering. Use <think> tags to reason about the email, then give your final answer."""
+preamble = "You are an email classifier. Based on the full email content, classify it into exactly one category:"
+postamble = "Think about it carefully before answering. Use <think> tags to reason about the email, then give your final answer."
 
 user_template = """From: {sender}
 Subject: {subject}
 Body:
 {body}"""
+
+[prompts.email_classification.categories]
+NEEDS_RESPONSE = "The email requires a reply or action from the recipient. Questions directed at you, meeting requests, invitations needing RSVP, requests for information."
+FYI = "The email is informational and worth reading but requires no action. Status updates from people, shared articles from contacts, announcements you should know about."
+LOW_PRIORITY = "The email has low importance. Marketing newsletters you subscribed to, routine automated notifications, social media digests, promotional offers you might occasionally want."
+UNWANTED = "The email is unwanted. Spam, unsolicited marketing, emails from senders you don't recognize with no value, phishing attempts, repeated promotional emails."
