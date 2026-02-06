@@ -95,6 +95,9 @@ async def process_single_email(
         )
         return True
 
+    except httpx.ConnectError as exc:
+        log.warning("Connection error processing email %s: %s", msg_id, exc)
+        return False
     except Exception:
         log.exception("Error processing email %s", msg_id)
         return False
