@@ -2,6 +2,7 @@
 poll_interval_seconds = 60
 max_emails_per_cycle = 10
 gmail_query = "in:inbox -label:agent/processed"
+max_thread_chars = 50000
 healthcheck_file = "/tmp/healthcheck"
 
 [labels]
@@ -62,7 +63,7 @@ postamble = "Think about it carefully before answering. Use <think> tags to reas
 
 user_template = """From: {sender}
 Subject: {subject}
-Body:
+Thread transcript:
 {body}"""
 
 [prompts.email_classification.categories]

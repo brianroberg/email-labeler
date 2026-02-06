@@ -5,7 +5,7 @@ from unittest.mock import AsyncMock
 import pytest
 
 from classifier import EmailLabel, SenderType
-from labeler import LabelManager
+from labeler import LabelManager, _get_priority
 
 
 @pytest.fixture
@@ -86,9 +86,7 @@ class TestVerifyLabels:
         }
 
     async def test_no_labels_present(self, label_manager, mock_proxy):
-        mock_proxy.list_labels.return_value = {
-            "labels": [{"id": "INBOX", "name": "INBOX", "type": "system"}]
-        }
+        mock_proxy.list_labels.return_value = {"labels": [{"id": "INBOX", "name": "INBOX", "type": "system"}]}
         missing = await label_manager.verify_labels()
         assert len(missing) == 8
 
@@ -168,3 +166,84 @@ class TestApplyClassification:
         await label_manager.apply_classification("msg_001", EmailLabel.UNWANTED, SenderType.SERVICE)
 
         assert mock_proxy.modify_message.call_count == 1
+
+
+class TestPriorityOrder:
+    def test_priority_ordering(self):
+        assert _get_priority(EmailLabel.UNWANTED) < _get_priority(EmailLabel.LOW_PRIORITY)
+        assert _get_priority(EmailLabel.LOW_PRIORITY) < _get_priority(EmailLabel.FYI)
+        assert _get_priority(EmailLabel.FYI) < _get_priority(EmailLabel.NEEDS_RESPONSE)
+
+    def test_needs_response_highest(self):
+        assert _get_priority(EmailLabel.NEEDS_RESPONSE) == 3
+
+    def test_unwanted_lowest(self):
+        assert _get_priority(EmailLabel.UNWANTED) == 0
+
+
+class TestBatchApplyClassification:
+    async def test_applies_to_multiple_messages(self, label_manager, mock_proxy, all_labels_response):
+        mock_proxy.list_labels.return_value = all_labels_response
+        await label_manager.verify_labels()
+
+        mock_proxy.modify_message.return_value = {"id": "msg_001"}
+        await label_manager.apply_classification(
+            ["msg_001", "msg_002", "msg_003"], EmailLabel.NEEDS_RESPONSE, SenderType.PERSON
+        )
+
+        assert mock_proxy.modify_message.call_count == 3
+
+    async def test_single_string_still_works(self, label_manager, mock_proxy, all_labels_response):
+        """Backward compat: single string message_id still works."""
+        mock_proxy.list_labels.return_value = all_labels_response
+        await label_manager.verify_labels()
+
+        mock_proxy.modify_message.return_value = {"id": "msg_001"}
+        await label_manager.apply_classification("msg_001", EmailLabel.FYI, SenderType.PERSON)
+
+        mock_proxy.modify_message.assert_called_once()
+
+    async def test_batch_applies_correct_labels(self, label_manager, mock_proxy, all_labels_response):
+        mock_proxy.list_labels.return_value = all_labels_response
+        await label_manager.verify_labels()
+
+        mock_proxy.modify_message.return_value = {"id": "msg_001"}
+        await label_manager.apply_classification(
+            ["msg_001", "msg_002"], EmailLabel.LOW_PRIORITY, SenderType.SERVICE
+        )
+
+        # Both messages should get the same labels
+        for call in mock_proxy.modify_message.call_args_list:
+            kwargs = call.kwargs
+            assert "Label_3" in kwargs["add_label_ids"]  # low-priority
+            assert "Label_5" in kwargs["add_label_ids"]  # processed
+            assert "Label_8" in kwargs["add_label_ids"]  # non-personal
+            assert "INBOX" in kwargs["remove_label_ids"]
+
+
+class TestGetExistingPriority:
+    async def test_no_classification_labels(self, label_manager, mock_proxy, all_labels_response):
+        mock_proxy.list_labels.return_value = all_labels_response
+        await label_manager.verify_labels()
+
+        messages = [{"labelIds": ["INBOX", "UNREAD"]}]
+        assert label_manager.get_existing_priority(messages) is None
+
+    async def test_finds_existing_label(self, label_manager, mock_proxy, all_labels_response):
+        mock_proxy.list_labels.return_value = all_labels_response
+        await label_manager.verify_labels()
+
+        messages = [{"labelIds": ["INBOX", "Label_2", "Label_5"]}]  # Label_2 = fyi
+        priority = label_manager.get_existing_priority(messages)
+        assert priority == _get_priority(EmailLabel.FYI)
+
+    async def test_returns_highest_priority(self, label_manager, mock_proxy, all_labels_response):
+        mock_proxy.list_labels.return_value = all_labels_response
+        await label_manager.verify_labels()
+
+        messages = [
+            {"labelIds": ["Label_3"]},  # low-priority
+            {"labelIds": ["Label_1"]},  # needs-response
+        ]
+        priority = label_manager.get_existing_priority(messages)
+        assert priority == _get_priority(EmailLabel.NEEDS_RESPONSE)

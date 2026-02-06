@@ -21,16 +21,19 @@ PROXY_API_KEY = os.environ.get("PROXY_API_KEY", "")
 
 class ProxyAuthError(Exception):
     """Raised when proxy returns 401 Unauthorized."""
+
     pass
 
 
 class ProxyForbiddenError(Exception):
     """Raised when proxy returns 403 Forbidden (blocked operation or rejected confirmation)."""
+
     pass
 
 
 class ProxyError(Exception):
     """Raised for other proxy errors (5xx, connection errors, etc.)."""
+
     pass
 
 
@@ -43,7 +46,7 @@ class GmailProxyClient:
     proxy UI, so they use a longer timeout than read operations.
     """
 
-    READ_TIMEOUT = 30.0    # seconds — read-only operations (no approval needed)
+    READ_TIMEOUT = 30.0  # seconds — read-only operations (no approval needed)
     WRITE_TIMEOUT = 300.0  # seconds — write operations may block on human approval
 
     def __init__(self, proxy_url: Optional[str] = None, api_key: Optional[str] = None):
@@ -73,7 +76,7 @@ class GmailProxyClient:
         try:
             error_data = response.json()
             return error_data.get("message", default)
-        except (ValueError, KeyError):
+        except ValueError, KeyError:
             # Response is not valid JSON or doesn't have expected structure
             return default
 
@@ -158,6 +161,29 @@ class GmailProxyClient:
             The message resource.
         """
         url = f"{self.proxy_url}/gmail/v1/users/{user_id}/messages/{message_id}"
+        params = {"format": format}
+
+        async with httpx.AsyncClient(timeout=self.READ_TIMEOUT) as client:
+            response = await client.get(url, headers=self._get_headers(), params=params)
+            return self._handle_response(response)
+
+    async def get_thread(
+        self,
+        thread_id: str,
+        user_id: str = "me",
+        format: str = "full",
+    ) -> dict:
+        """Get a specific thread by ID.
+
+        Args:
+            thread_id: The ID of the thread to retrieve.
+            user_id: The user's email address or 'me' for authenticated user.
+            format: The format to return the thread in ('full', 'metadata', 'minimal').
+
+        Returns:
+            The thread resource with embedded messages.
+        """
+        url = f"{self.proxy_url}/gmail/v1/users/{user_id}/threads/{thread_id}"
         params = {"format": format}
 
         async with httpx.AsyncClient(timeout=self.READ_TIMEOUT) as client:

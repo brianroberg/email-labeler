@@ -16,6 +16,20 @@ _LABEL_CONFIG_KEY = {
 }
 
 
+# Priority ordering: higher index = higher priority. Never downgrade.
+_PRIORITY_ORDER = [
+    EmailLabel.UNWANTED,  # 0 — lowest
+    EmailLabel.LOW_PRIORITY,  # 1
+    EmailLabel.FYI,  # 2
+    EmailLabel.NEEDS_RESPONSE,  # 3 — highest
+]
+
+
+def _get_priority(label: EmailLabel) -> int:
+    """Get priority rank for a label (higher = more important)."""
+    return _PRIORITY_ORDER.index(label)
+
+
 class LabelManager:
     """Manages Gmail label verification and application."""
 
@@ -37,8 +51,14 @@ class LabelManager:
 
         required_names = set()
         for key in (
-            "needs_response", "fyi", "low_priority", "unwanted",
-            "processed", "would_have_deleted", "personal", "non_personal",
+            "needs_response",
+            "fyi",
+            "low_priority",
+            "unwanted",
+            "processed",
+            "would_have_deleted",
+            "personal",
+            "non_personal",
         ):
             name = self.labels_config[key]
             required_names.add(name)
@@ -53,22 +73,32 @@ class LabelManager:
         return missing
 
     async def apply_classification(
-        self, message_id: str, label: EmailLabel, sender_type: SenderType
+        self, message_ids: str | list[str], label: EmailLabel, sender_type: SenderType
     ) -> None:
-        """Apply classification label and action to a message.
+        """Apply classification label and action to message(s).
 
-        Applies in a single modify_message call:
+        Applies in one modify_message call per message:
         - The classification label (e.g., agent/needs-response)
         - The processed marker label (agent/processed)
         - The sender-path label (agent/personal or agent/non-personal)
         - Any extra labels (e.g., agent/would-have-deleted for unwanted)
         - Archive action (remove INBOX) if configured
 
+        Note: This method applies labels unconditionally. The caller is
+        responsible for checking priority (get_existing_priority) and
+        skipping downgrades before calling this method.
+
         Args:
-            message_id: Gmail message ID.
+            message_ids: Single message ID or list of message IDs in a thread.
             label: The classification result.
             sender_type: Whether the sender was classified as PERSON or SERVICE.
         """
+        # Normalize to list
+        if isinstance(message_ids, str):
+            ids = [message_ids]
+        else:
+            ids = list(message_ids)
+
         config_key = _LABEL_CONFIG_KEY[label]
         label_name = self.labels_config[config_key]
         processed_name = self.labels_config["processed"]
@@ -88,9 +118,37 @@ class LabelManager:
 
         # Determine action
         action = self.labels_config["actions"][config_key]
-        kwargs = {"message_id": message_id, "add_label_ids": add_label_ids}
+        remove_label_ids = ["INBOX"] if action == "archive" else []
 
-        if action == "archive":
-            kwargs["remove_label_ids"] = ["INBOX"]
+        # Apply to all messages
+        for msg_id in ids:
+            kwargs = {"message_id": msg_id, "add_label_ids": add_label_ids}
+            if remove_label_ids:
+                kwargs["remove_label_ids"] = remove_label_ids
+            await self.proxy.modify_message(**kwargs)
 
-        await self.proxy.modify_message(**kwargs)
+    def get_existing_priority(self, thread_messages: list[dict]) -> int | None:
+        """Check existing classification labels on thread messages.
+
+        Args:
+            thread_messages: List of Gmail message resources (must include labelIds).
+
+        Returns:
+            The highest existing priority rank, or None if no classification labels found.
+        """
+        # Build reverse lookup: label_id -> EmailLabel
+        id_to_label = {}
+        for label_enum, config_key in _LABEL_CONFIG_KEY.items():
+            label_name = self.labels_config[config_key]
+            if label_name in self.label_ids:
+                id_to_label[self.label_ids[label_name]] = label_enum
+
+        max_priority = None
+        for msg in thread_messages:
+            for label_id in msg.get("labelIds", []):
+                if label_id in id_to_label:
+                    priority = _get_priority(id_to_label[label_id])
+                    if max_priority is None or priority > max_priority:
+                        max_priority = priority
+
+        return max_priority
