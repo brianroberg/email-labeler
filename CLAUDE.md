@@ -59,7 +59,7 @@ Poll loop → find unprocessed emails
 
 - `PROXY_URL` — API proxy URL (default: `http://host.docker.internal:8000`)
 - `PROXY_API_KEY` — API proxy authentication key
-- `CLOUD_LLM_URL` — Cloud LLM endpoint (MiniMax)
+- `CLOUD_LLM_URL` — Cloud LLM endpoint (any OpenAI-compatible API)
 - `CLOUD_LLM_API_KEY` — Cloud LLM API key
 - `MLX_URL` — Local MLX LLM endpoint
 

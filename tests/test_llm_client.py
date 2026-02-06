@@ -13,7 +13,7 @@ def cloud_client():
     return LLMClient(
         base_url="https://api.cloud.example.com/v1/chat/completions",
         api_key="sk-test-key",
-        model="MiniMax-M1",
+        model="test-cloud-model",
         max_tokens=8096,
         temperature=0.2,
         timeout=60,
@@ -62,7 +62,7 @@ class TestComplete:
             assert call_kwargs.args[0] == "https://api.cloud.example.com/v1/chat/completions"
 
             body = call_kwargs.kwargs["json"]
-            assert body["model"] == "MiniMax-M1"
+            assert body["model"] == "test-cloud-model"
             assert body["max_tokens"] == 8096
             assert body["temperature"] == 0.2
             assert len(body["messages"]) == 2

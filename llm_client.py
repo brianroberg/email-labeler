@@ -1,6 +1,6 @@
 """LLM client abstraction for cloud and local endpoints.
 
-Supports any OpenAI-compatible chat completion API (MiniMax, MLX, etc.).
+Supports any OpenAI-compatible chat completion API.
 Handles thinking tag stripping for reasoning models.
 """
 

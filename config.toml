@@ -24,7 +24,7 @@ unwanted = "archive"
 unwanted = ["agent/would-have-deleted"]
 
 [llm.cloud]
-model = "MiniMax-M1"
+model = "deepseek/deepseek-v3.2"
 max_tokens = 8096
 temperature = 0.2
 timeout = 60

@@ -100,7 +100,7 @@ email-labeler/
 - Python 3.14+
 - [uv](https://docs.astral.sh/uv/) package manager
 - Access to an [api-proxy](../api-proxy) instance with a valid API key
-- A cloud LLM endpoint (MiniMax or any OpenAI-compatible API)
+- A cloud LLM endpoint (any OpenAI-compatible chat completion API)
 - A local MLX LLM endpoint for person email classification (optional but recommended)
 - All eight Gmail labels created manually (see [Label Setup](#label-setup))
 
@@ -124,9 +124,9 @@ Edit `.env` with your credentials:
 # Required: api-proxy authentication
 PROXY_API_KEY=aproxy_your_key_here
 
-# Required: Cloud LLM (MiniMax or any OpenAI-compatible endpoint)
-CLOUD_LLM_URL=https://api.minimaxi.chat/v1/chat/completions
-CLOUD_LLM_API_KEY=your_minimax_api_key_here
+# Required: Cloud LLM (any OpenAI-compatible chat completion endpoint)
+CLOUD_LLM_URL=https://your-llm-provider.com/v1/chat/completions
+CLOUD_LLM_API_KEY=your_api_key_here
 
 # Recommended: Local LLM (MLX/Qwen3 for person email privacy)
 MLX_URL=http://macbook:8080/v1/chat/completions
@@ -163,7 +163,7 @@ uv run python daemon.py
 ```
 
 The daemon will:
-1. Verify all six Gmail labels exist (exits if any are missing)
+1. Verify all eight Gmail labels exist (exits if any are missing)
 2. Enter the poll loop, querying Gmail every 60 seconds
 3. Classify and label each unprocessed email
 4. Write a healthcheck timestamp to `/tmp/healthcheck`
@@ -183,8 +183,8 @@ Required environment variables in `agent-stack/.env`:
 
 ```env
 EMAIL_LABELER_API_KEY=aproxy_your_key_here
-CLOUD_LLM_URL=https://api.minimaxi.chat/v1/chat/completions
-CLOUD_LLM_API_KEY=your_minimax_api_key_here
+CLOUD_LLM_URL=https://your-llm-provider.com/v1/chat/completions
+CLOUD_LLM_API_KEY=your_api_key_here
 MLX_URL=http://macbook:8080/v1/chat/completions
 TS_AUTHKEY=tskey-auth-...  # for Tailscale sidecar
 ```
@@ -251,9 +251,13 @@ healthcheck_file = "/tmp/healthcheck"            # Healthcheck timestamp path
 
 ### LLM settings
 
+The cloud LLM model is configured here, not in `.env`. The URL and API key come from
+`.env`, but the model name and inference parameters live in `config.toml` so they stay
+in version control.
+
 ```toml
 [llm.cloud]
-model = "MiniMax-M1"
+model = "deepseek/deepseek-v3.2"   # must match your provider's model ID
 max_tokens = 8096
 temperature = 0.2
 timeout = 60
@@ -285,6 +289,8 @@ The daemon is designed to run unattended and recover from transient failures:
 |---|---|---|---|
 | `PROXY_API_KEY` | Yes | — | API key for the api-proxy server |
 | `PROXY_URL` | No | `http://host.docker.internal:8000` | URL of the api-proxy server |
-| `CLOUD_LLM_URL` | Yes | — | Cloud LLM chat completion endpoint |
+| `CLOUD_LLM_URL` | Yes | — | Cloud LLM chat completion endpoint (any OpenAI-compatible API) |
 | `CLOUD_LLM_API_KEY` | Yes | — | API key for the cloud LLM |
 | `MLX_URL` | No | — | Local MLX LLM chat completion endpoint. If unset or unreachable, person emails are skipped. |
+
+Note: The cloud LLM **model name** is configured in `config.toml` under `[llm.cloud]`, not in `.env`. This keeps secrets (keys, URLs) in `.env` while operational parameters (model, temperature, prompts) stay in version-controlled `config.toml`.

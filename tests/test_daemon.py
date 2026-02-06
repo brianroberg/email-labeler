@@ -119,6 +119,11 @@ class TestProcessSingleEmail:
         )
 
         assert result is True
+        # Pre-computed sender_type should be passed to avoid duplicate LLM call
+        mock_classifier.classify.assert_called_once()
+        call_kwargs = mock_classifier.classify.call_args
+        assert call_kwargs[0][2] == SenderType.SERVICE  # sender_type arg
+        assert call_kwargs[0][3] == "SERVICE"  # sender_type_raw arg
         mock_label_manager.apply_classification.assert_called_once_with(
             "msg_001", EmailLabel.UNWANTED, SenderType.SERVICE
         )

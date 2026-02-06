@@ -128,13 +128,24 @@ class EmailClassifier:
         raw = await llm.complete(self.email_config["system"], user_content)
         return (parse_email_label(raw), raw)
 
-    async def classify(self, metadata: EmailMetadata, body: str) -> ClassificationResult:
-        """Full two-stage classification pipeline."""
-        sender_type, sender_raw = await self.classify_sender(metadata)
+    async def classify(
+        self,
+        metadata: EmailMetadata,
+        body: str,
+        sender_type: SenderType | None = None,
+        sender_type_raw: str | None = None,
+    ) -> ClassificationResult:
+        """Full two-stage classification pipeline.
+
+        If sender_type is provided, Stage 1 is skipped (avoids duplicate LLM calls
+        when the caller has already classified the sender).
+        """
+        if sender_type is None:
+            sender_type, sender_type_raw = await self.classify_sender(metadata)
         label, label_raw = await self.classify_email(metadata, body, sender_type)
         return ClassificationResult(
             sender_type=sender_type,
-            sender_type_raw=sender_raw,
+            sender_type_raw=sender_type_raw or "",
             label=label,
             label_raw=label_raw,
         )

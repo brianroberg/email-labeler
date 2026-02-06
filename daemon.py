@@ -75,12 +75,12 @@ async def process_single_email(
 
         if not mlx_available:
             # Check sender type first — if person, skip (privacy)
-            sender_type, _ = await classifier.classify_sender(metadata)
+            sender_type, sender_raw = await classifier.classify_sender(metadata)
             if sender_type == SenderType.PERSON:
                 log.info("Skipping person email %s (MLX unavailable): %s", msg_id, subject)
                 return False
-            # Service email — can proceed with cloud-only classification
-            result = await classifier.classify(metadata, body)
+            # Service email — pass pre-computed sender type to avoid duplicate LLM call
+            result = await classifier.classify(metadata, body, sender_type, sender_raw)
         else:
             result = await classifier.classify(metadata, body)
 
