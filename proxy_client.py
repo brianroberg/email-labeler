@@ -38,8 +38,13 @@ class GmailProxyClient:
     """Client for Gmail API operations through a proxy server.
 
     The proxy server handles Google OAuth authentication and provides
-    human-in-the-loop controls for sensitive operations.
+    human-in-the-loop controls for sensitive operations. Write operations
+    (modify, trash, untrash) may block until a human approves them in the
+    proxy UI, so they use a longer timeout than read operations.
     """
+
+    READ_TIMEOUT = 30.0    # seconds — read-only operations (no approval needed)
+    WRITE_TIMEOUT = 300.0  # seconds — write operations may block on human approval
 
     def __init__(self, proxy_url: Optional[str] = None, api_key: Optional[str] = None):
         """Initialize the proxy client.
@@ -132,7 +137,7 @@ class GmailProxyClient:
         if label_ids:
             params["labelIds"] = ",".join(label_ids)
 
-        async with httpx.AsyncClient(timeout=30.0) as client:
+        async with httpx.AsyncClient(timeout=self.READ_TIMEOUT) as client:
             response = await client.get(url, headers=self._get_headers(), params=params)
             return self._handle_response(response)
 
@@ -155,7 +160,7 @@ class GmailProxyClient:
         url = f"{self.proxy_url}/gmail/v1/users/{user_id}/messages/{message_id}"
         params = {"format": format}
 
-        async with httpx.AsyncClient(timeout=30.0) as client:
+        async with httpx.AsyncClient(timeout=self.READ_TIMEOUT) as client:
             response = await client.get(url, headers=self._get_headers(), params=params)
             return self._handle_response(response)
 
@@ -184,7 +189,7 @@ class GmailProxyClient:
         if remove_label_ids:
             body["removeLabelIds"] = remove_label_ids
 
-        async with httpx.AsyncClient(timeout=30.0) as client:
+        async with httpx.AsyncClient(timeout=self.WRITE_TIMEOUT) as client:
             response = await client.post(url, headers=self._get_headers(), json=body)
             return self._handle_response(response)
 
@@ -200,7 +205,7 @@ class GmailProxyClient:
         """
         url = f"{self.proxy_url}/gmail/v1/users/{user_id}/messages/{message_id}/trash"
 
-        async with httpx.AsyncClient(timeout=30.0) as client:
+        async with httpx.AsyncClient(timeout=self.WRITE_TIMEOUT) as client:
             response = await client.post(url, headers=self._get_headers())
             return self._handle_response(response)
 
@@ -216,7 +221,7 @@ class GmailProxyClient:
         """
         url = f"{self.proxy_url}/gmail/v1/users/{user_id}/messages/{message_id}/untrash"
 
-        async with httpx.AsyncClient(timeout=30.0) as client:
+        async with httpx.AsyncClient(timeout=self.WRITE_TIMEOUT) as client:
             response = await client.post(url, headers=self._get_headers())
             return self._handle_response(response)
 
@@ -231,7 +236,7 @@ class GmailProxyClient:
         """
         url = f"{self.proxy_url}/gmail/v1/users/{user_id}/labels"
 
-        async with httpx.AsyncClient(timeout=30.0) as client:
+        async with httpx.AsyncClient(timeout=self.READ_TIMEOUT) as client:
             response = await client.get(url, headers=self._get_headers())
             return self._handle_response(response)
 
@@ -247,7 +252,7 @@ class GmailProxyClient:
         """
         url = f"{self.proxy_url}/gmail/v1/users/{user_id}/labels/{label_id}"
 
-        async with httpx.AsyncClient(timeout=30.0) as client:
+        async with httpx.AsyncClient(timeout=self.READ_TIMEOUT) as client:
             response = await client.get(url, headers=self._get_headers())
             return self._handle_response(response)
 
