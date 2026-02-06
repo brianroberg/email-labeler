@@ -67,7 +67,7 @@ Thread transcript:
 {body}"""
 
 [prompts.email_classification.categories]
-NEEDS_RESPONSE = "The email requires a reply or action from the recipient. Questions directed at you, meeting requests, invitations needing RSVP, requests for information. Note: the statement, 'Let me know if you have any questions' (or similar) does not by itself constitute a requirement of a response."
+NEEDS_RESPONSE = "The email requires a reply or action from the recipient. Questions directed the recipient, meeting requests with the recipient, invitations needing RSVP by the recipient, requests for information from the recipient. Note: the statement, 'Let me know if you have any questions' (or similar) does not by itself constitute a need to respond."
 FYI = "The email is informational and worth reading but requires no action. Status updates from people, shared articles from contacts, announcements you should know about."
 LOW_PRIORITY = "The email has low importance. Marketing newsletters you subscribed to, routine automated notifications, social media digests, promotional offers you might occasionally want."
 UNWANTED = "The email is unwanted. Spam, unsolicited marketing, invitations to review services or products, offers to initiate new business relationships (i.e. cold emails), phishing attempts, repeated promotional emails."
