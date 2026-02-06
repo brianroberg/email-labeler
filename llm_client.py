@@ -56,8 +56,13 @@ class LLMClient:
             ],
         }
 
-        async with httpx.AsyncClient(timeout=self.timeout) as client:
-            response = await client.post(self.base_url, headers=headers, json=body)
+        try:
+            async with httpx.AsyncClient(timeout=self.timeout) as client:
+                response = await client.post(self.base_url, headers=headers, json=body)
+        except httpx.TimeoutException:
+            raise TimeoutError(
+                f"LLM request to {self.model} timed out after {self.timeout}s"
+            ) from None
 
         if response.status_code != 200:
             raise RuntimeError(f"LLM request failed with status {response.status_code}")

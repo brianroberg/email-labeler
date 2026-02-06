@@ -192,6 +192,9 @@ async def process_single_thread(
     except httpx.ConnectError as exc:
         log.warning("Connection error processing thread %s: %s", thread_id, exc)
         return False
+    except TimeoutError as exc:
+        log.warning("Timeout processing thread %s: %s", thread_id, exc)
+        return False
     except Exception:
         log.exception("Error processing thread %s", thread_id)
         return False
