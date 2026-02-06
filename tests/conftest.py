@@ -74,5 +74,7 @@ def sample_labels():
             {"id": "Label_4", "name": "agent/unwanted", "type": "user"},
             {"id": "Label_5", "name": "agent/processed", "type": "user"},
             {"id": "Label_6", "name": "agent/would-have-deleted", "type": "user"},
+            {"id": "Label_7", "name": "agent/personal", "type": "user"},
+            {"id": "Label_8", "name": "agent/non-personal", "type": "user"},
         ]
     }

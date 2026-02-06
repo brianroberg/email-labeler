@@ -69,7 +69,7 @@ class TestProcessSingleEmail:
         mock_proxy.get_message.assert_called_once_with("msg_001")
         mock_classifier.classify.assert_called_once()
         mock_label_manager.apply_classification.assert_called_once_with(
-            "msg_001", EmailLabel.LOW_PRIORITY
+            "msg_001", EmailLabel.LOW_PRIORITY, SenderType.SERVICE
         )
 
     async def test_person_email_processed_when_mlx_available(
@@ -120,7 +120,7 @@ class TestProcessSingleEmail:
 
         assert result is True
         mock_label_manager.apply_classification.assert_called_once_with(
-            "msg_001", EmailLabel.UNWANTED
+            "msg_001", EmailLabel.UNWANTED, SenderType.SERVICE
         )
 
     async def test_error_in_processing_returns_false(
@@ -153,7 +153,10 @@ class TestLoadConfig:
 
     def test_config_has_all_labels(self):
         config = load_config()
-        for key in ("needs_response", "fyi", "low_priority", "unwanted", "processed", "would_have_deleted"):
+        for key in (
+            "needs_response", "fyi", "low_priority", "unwanted",
+            "processed", "would_have_deleted", "personal", "non_personal",
+        ):
             assert key in config["labels"]
 
     def test_config_has_prompts(self):

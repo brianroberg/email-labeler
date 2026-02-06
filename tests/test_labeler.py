@@ -4,7 +4,7 @@ from unittest.mock import AsyncMock
 
 import pytest
 
-from classifier import EmailLabel
+from classifier import EmailLabel, SenderType
 from labeler import LabelManager
 
 
@@ -18,6 +18,8 @@ def config():
             "unwanted": "agent/unwanted",
             "processed": "agent/processed",
             "would_have_deleted": "agent/would-have-deleted",
+            "personal": "agent/personal",
+            "non_personal": "agent/non-personal",
             "actions": {
                 "needs_response": "inbox",
                 "fyi": "inbox",
@@ -43,6 +45,8 @@ def all_labels_response():
             {"id": "Label_4", "name": "agent/unwanted", "type": "user"},
             {"id": "Label_5", "name": "agent/processed", "type": "user"},
             {"id": "Label_6", "name": "agent/would-have-deleted", "type": "user"},
+            {"id": "Label_7", "name": "agent/personal", "type": "user"},
+            {"id": "Label_8", "name": "agent/non-personal", "type": "user"},
         ]
     }
 
@@ -77,6 +81,8 @@ class TestVerifyLabels:
             "agent/low-priority",
             "agent/unwanted",
             "agent/would-have-deleted",
+            "agent/personal",
+            "agent/non-personal",
         }
 
     async def test_no_labels_present(self, label_manager, mock_proxy):
@@ -84,7 +90,7 @@ class TestVerifyLabels:
             "labels": [{"id": "INBOX", "name": "INBOX", "type": "system"}]
         }
         missing = await label_manager.verify_labels()
-        assert len(missing) == 6
+        assert len(missing) == 8
 
     async def test_builds_label_id_map(self, label_manager, mock_proxy, all_labels_response):
         """verify_labels populates the internal label name -> ID mapping."""
@@ -101,12 +107,13 @@ class TestApplyClassification:
         await label_manager.verify_labels()
 
         mock_proxy.modify_message.return_value = {"id": "msg_001"}
-        await label_manager.apply_classification("msg_001", EmailLabel.NEEDS_RESPONSE)
+        await label_manager.apply_classification("msg_001", EmailLabel.NEEDS_RESPONSE, SenderType.PERSON)
 
         mock_proxy.modify_message.assert_called_once()
         call_kwargs = mock_proxy.modify_message.call_args.kwargs
         assert "Label_1" in call_kwargs["add_label_ids"]  # needs-response
         assert "Label_5" in call_kwargs["add_label_ids"]  # processed
+        assert "Label_7" in call_kwargs["add_label_ids"]  # personal
         assert "remove_label_ids" not in call_kwargs or "INBOX" not in call_kwargs.get("remove_label_ids", [])
 
     async def test_fyi_stays_in_inbox(self, label_manager, mock_proxy, all_labels_response):
@@ -114,11 +121,12 @@ class TestApplyClassification:
         await label_manager.verify_labels()
 
         mock_proxy.modify_message.return_value = {"id": "msg_001"}
-        await label_manager.apply_classification("msg_001", EmailLabel.FYI)
+        await label_manager.apply_classification("msg_001", EmailLabel.FYI, SenderType.PERSON)
 
         call_kwargs = mock_proxy.modify_message.call_args.kwargs
         assert "Label_2" in call_kwargs["add_label_ids"]  # fyi
         assert "Label_5" in call_kwargs["add_label_ids"]  # processed
+        assert "Label_7" in call_kwargs["add_label_ids"]  # personal
         assert "remove_label_ids" not in call_kwargs or "INBOX" not in call_kwargs.get("remove_label_ids", [])
 
     async def test_low_priority_gets_archived(self, label_manager, mock_proxy, all_labels_response):
@@ -126,11 +134,12 @@ class TestApplyClassification:
         await label_manager.verify_labels()
 
         mock_proxy.modify_message.return_value = {"id": "msg_001"}
-        await label_manager.apply_classification("msg_001", EmailLabel.LOW_PRIORITY)
+        await label_manager.apply_classification("msg_001", EmailLabel.LOW_PRIORITY, SenderType.SERVICE)
 
         call_kwargs = mock_proxy.modify_message.call_args.kwargs
         assert "Label_3" in call_kwargs["add_label_ids"]  # low-priority
         assert "Label_5" in call_kwargs["add_label_ids"]  # processed
+        assert "Label_8" in call_kwargs["add_label_ids"]  # non-personal
         assert "INBOX" in call_kwargs["remove_label_ids"]
 
     async def test_unwanted_gets_archived_and_extra_label(
@@ -140,13 +149,14 @@ class TestApplyClassification:
         await label_manager.verify_labels()
 
         mock_proxy.modify_message.return_value = {"id": "msg_001"}
-        await label_manager.apply_classification("msg_001", EmailLabel.UNWANTED)
+        await label_manager.apply_classification("msg_001", EmailLabel.UNWANTED, SenderType.SERVICE)
 
         call_kwargs = mock_proxy.modify_message.call_args.kwargs
         add_ids = call_kwargs["add_label_ids"]
         assert "Label_4" in add_ids  # unwanted
         assert "Label_5" in add_ids  # processed
         assert "Label_6" in add_ids  # would-have-deleted (extra)
+        assert "Label_8" in add_ids  # non-personal
         assert "INBOX" in call_kwargs["remove_label_ids"]
 
     async def test_single_modify_call(self, label_manager, mock_proxy, all_labels_response):
@@ -155,6 +165,6 @@ class TestApplyClassification:
         await label_manager.verify_labels()
 
         mock_proxy.modify_message.return_value = {"id": "msg_001"}
-        await label_manager.apply_classification("msg_001", EmailLabel.UNWANTED)
+        await label_manager.apply_classification("msg_001", EmailLabel.UNWANTED, SenderType.SERVICE)
 
         assert mock_proxy.modify_message.call_count == 1

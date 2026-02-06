@@ -27,11 +27,13 @@ The daemon classifies emails into four categories and applies the corresponding 
 | `agent/low-priority` | Routine notifications, newsletters | Archived |
 | `agent/unwanted` | Spam, unsolicited marketing | Archived |
 
-Two additional labels are used as markers:
+Additional labels are used as markers:
 
 | Label | Purpose |
 |---|---|
 | `agent/processed` | Applied to every classified email. Used by the poll query to skip already-processed messages. |
+| `agent/personal` | Applied when Stage 1 classified the sender as a real person. Indicates the email body was processed by the local LLM only. |
+| `agent/non-personal` | Applied when Stage 1 classified the sender as an automated service. Indicates the email body was processed by the cloud LLM. |
 | `agent/would-have-deleted` | Applied alongside `agent/unwanted`. Marks emails that the daemon would delete if it had permission, without actually deleting anything. |
 
 ## Architecture
@@ -100,7 +102,7 @@ email-labeler/
 - Access to an [api-proxy](../api-proxy) instance with a valid API key
 - A cloud LLM endpoint (MiniMax or any OpenAI-compatible API)
 - A local MLX LLM endpoint for person email classification (optional but recommended)
-- All six Gmail labels created manually (see [Label Setup](#label-setup))
+- All eight Gmail labels created manually (see [Label Setup](#label-setup))
 
 ## Setup
 
@@ -135,7 +137,7 @@ MLX_URL=http://macbook:8080/v1/chat/completions
 
 ### 3. Label Setup
 
-The api-proxy blocks programmatic label creation, so all six labels must be created manually in Gmail before the daemon starts.
+The api-proxy blocks programmatic label creation, so all eight labels must be created manually in Gmail before the daemon starts.
 
 In Gmail, go to **Settings > Labels > Create new label** and create each of these:
 
@@ -146,6 +148,8 @@ agent/low-priority
 agent/unwanted
 agent/processed
 agent/would-have-deleted
+agent/personal
+agent/non-personal
 ```
 
 Gmail will treat the `/` as a label hierarchy separator, nesting them under an `agent` parent. The daemon verifies all labels exist on startup and exits with an error if any are missing.

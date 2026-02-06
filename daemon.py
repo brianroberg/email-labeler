@@ -84,7 +84,7 @@ async def process_single_email(
         else:
             result = await classifier.classify(metadata, body)
 
-        await label_manager.apply_classification(msg_id, result.label)
+        await label_manager.apply_classification(msg_id, result.label, result.sender_type)
         log.info(
             "Classified %s: sender=%s label=%s — %s",
             msg_id,

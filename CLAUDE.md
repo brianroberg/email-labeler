@@ -51,6 +51,8 @@ Poll loop → find unprocessed emails
 - `agent/low-priority` — Archive
 - `agent/unwanted` — Archive + apply `agent/would-have-deleted`
 - `agent/processed` — Marker (always applied)
+- `agent/personal` — Sender classified as person (body processed locally)
+- `agent/non-personal` — Sender classified as service (body processed via cloud)
 - `agent/would-have-deleted` — Extra marker for unwanted
 
 ## Environment Variables

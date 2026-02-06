@@ -11,6 +11,8 @@ low_priority = "agent/low-priority"
 unwanted = "agent/unwanted"
 processed = "agent/processed"
 would_have_deleted = "agent/would-have-deleted"
+personal = "agent/personal"
+non_personal = "agent/non-personal"
 
 [labels.actions]
 needs_response = "inbox"

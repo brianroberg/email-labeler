@@ -4,7 +4,7 @@ Manages Gmail labels for the email classification system.
 All labels must be pre-created in Gmail (api-proxy blocks label creation).
 """
 
-from classifier import EmailLabel
+from classifier import EmailLabel, SenderType
 from proxy_client import GmailProxyClient
 
 # Mapping from EmailLabel enum to config key names
@@ -36,7 +36,10 @@ class LabelManager:
         gmail_labels = {label["name"]: label["id"] for label in response["labels"]}
 
         required_names = set()
-        for key in ("needs_response", "fyi", "low_priority", "unwanted", "processed", "would_have_deleted"):
+        for key in (
+            "needs_response", "fyi", "low_priority", "unwanted",
+            "processed", "would_have_deleted", "personal", "non_personal",
+        ):
             name = self.labels_config[key]
             required_names.add(name)
 
@@ -49,26 +52,33 @@ class LabelManager:
 
         return missing
 
-    async def apply_classification(self, message_id: str, label: EmailLabel) -> None:
+    async def apply_classification(
+        self, message_id: str, label: EmailLabel, sender_type: SenderType
+    ) -> None:
         """Apply classification label and action to a message.
 
         Applies in a single modify_message call:
         - The classification label (e.g., agent/needs-response)
         - The processed marker label (agent/processed)
+        - The sender-path label (agent/personal or agent/non-personal)
         - Any extra labels (e.g., agent/would-have-deleted for unwanted)
         - Archive action (remove INBOX) if configured
 
         Args:
             message_id: Gmail message ID.
             label: The classification result.
+            sender_type: Whether the sender was classified as PERSON or SERVICE.
         """
         config_key = _LABEL_CONFIG_KEY[label]
         label_name = self.labels_config[config_key]
         processed_name = self.labels_config["processed"]
+        path_key = "personal" if sender_type == SenderType.PERSON else "non_personal"
+        path_name = self.labels_config[path_key]
 
         add_label_ids = [
             self.label_ids[label_name],
             self.label_ids[processed_name],
+            self.label_ids[path_name],
         ]
 
         # Add extra labels (e.g., would-have-deleted for unwanted)
