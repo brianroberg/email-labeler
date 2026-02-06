@@ -6,6 +6,7 @@ Stage 2: Full body sent to local LLM (person) or cloud LLM (service) for classif
 Privacy invariant: Person email bodies NEVER leave the local network.
 """
 
+import os
 import re
 from dataclasses import dataclass
 from enum import Enum
@@ -98,7 +99,10 @@ class EmailClassifier:
         self.sender_config = config["prompts"]["sender_classification"]
         self.email_config = config["prompts"]["email_classification"]
         vip_config = config.get("vip_senders", {})
-        self.vip_addresses: set[str] = {addr.lower() for addr in vip_config.get("addresses", [])}
+        raw_addrs = os.environ.get("VIP_SENDERS", "")
+        self.vip_addresses: set[str] = {
+            addr.strip().lower() for addr in raw_addrs.split(",") if addr.strip()
+        }
         self.vip_categories: list[str] = vip_config.get("categories", ["NEEDS_RESPONSE", "FYI"])
 
     def _is_vip(self, metadata: EmailMetadata) -> bool:

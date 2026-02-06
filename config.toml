@@ -51,9 +51,9 @@ Subject: {subject}
 Preview: {snippet}"""
 
 [vip_senders]
-# Email addresses that are always classified as PERSON (skips sender LLM call)
+# VIP addresses come from VIP_SENDERS env var (comma-separated).
+# These are always classified as PERSON (skips sender LLM call)
 # and restricted to VIP-only categories (skips low-priority/unwanted).
-addresses = []
 categories = ["NEEDS_RESPONSE", "FYI"]
 
 [prompts.email_classification]

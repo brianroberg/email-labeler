@@ -177,5 +177,4 @@ class TestLoadConfig:
     def test_config_has_vip_senders(self):
         config = load_config()
         assert "vip_senders" in config
-        assert "addresses" in config["vip_senders"]
         assert "categories" in config["vip_senders"]

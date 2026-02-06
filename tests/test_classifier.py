@@ -1,6 +1,6 @@
 """Tests for email classifier — parsing functions and EmailClassifier class."""
 
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, patch
 
 import pytest
 
@@ -145,7 +145,6 @@ def config():
             },
         },
         "vip_senders": {
-            "addresses": ["vip@example.com"],
             "categories": ["NEEDS_RESPONSE", "FYI"],
         },
     }
@@ -163,11 +162,12 @@ def metadata():
 
 @pytest.fixture
 def classifier(mock_cloud_llm, mock_local_llm, config):
-    return EmailClassifier(
-        cloud_llm=mock_cloud_llm,
-        local_llm=mock_local_llm,
-        config=config,
-    )
+    with patch.dict("os.environ", {"VIP_SENDERS": "vip@example.com"}):
+        return EmailClassifier(
+            cloud_llm=mock_cloud_llm,
+            local_llm=mock_local_llm,
+            config=config,
+        )
 
 
 class TestClassifySender:
