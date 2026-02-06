@@ -30,7 +30,7 @@ temperature = 0.2
 timeout = 60
 
 [llm.local]
-model = "mlx-community/Qwen3-14B-4bit"
+model = "qwen/qwen3-32b"
 max_tokens = 8096
 temperature = 0.2
 timeout = 120
