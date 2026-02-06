@@ -17,6 +17,7 @@ import httpx
 from dotenv import load_dotenv
 
 from classifier import EmailClassifier, EmailLabel, SenderType, ThreadMetadata
+from config_utils import substitute_env_vars
 from gmail_utils import decode_body, get_header
 from labeler import LabelManager, _get_priority
 from llm_client import LLMClient
@@ -33,10 +34,15 @@ log = logging.getLogger("email-labeler")
 
 
 def load_config() -> dict:
-    """Load configuration from config.toml."""
+    """Load configuration from config.toml.
+
+    After parsing, any {env.VAR_NAME} placeholders in string values are
+    replaced with the corresponding environment variable (empty string if unset).
+    """
     config_path = Path(__file__).parent / "config.toml"
     with open(config_path, "rb") as f:
-        return tomllib.load(f)
+        config = tomllib.load(f)
+    return substitute_env_vars(config)
 
 
 def format_thread_transcript(messages: list[dict], max_chars: int) -> str:
