@@ -8,6 +8,8 @@ import re
 
 import httpx
 
+from retry import retry_with_backoff
+
 
 class LLMClient:
     """Client for OpenAI-compatible chat completion endpoints."""
@@ -56,9 +58,12 @@ class LLMClient:
             ],
         }
 
-        try:
+        async def _do_request() -> httpx.Response:
             async with httpx.AsyncClient(timeout=self.timeout) as client:
-                response = await client.post(self.base_url, headers=headers, json=body)
+                return await client.post(self.base_url, headers=headers, json=body)
+
+        try:
+            response = await retry_with_backoff(_do_request, f"LLM {self.model}")
         except httpx.TimeoutException:
             raise TimeoutError(
                 f"LLM request to {self.model} timed out after {self.timeout}s"

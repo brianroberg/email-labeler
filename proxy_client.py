@@ -11,6 +11,8 @@ from typing import Optional
 import httpx
 from dotenv import load_dotenv
 
+from retry import retry_with_backoff
+
 # Load environment variables from .env file
 load_dotenv()
 
@@ -140,9 +142,11 @@ class GmailProxyClient:
         if label_ids:
             params["labelIds"] = ",".join(label_ids)
 
-        async with httpx.AsyncClient(timeout=self.READ_TIMEOUT) as client:
-            response = await client.get(url, headers=self._get_headers(), params=params)
-            return self._handle_response(response)
+        async def _do_request() -> httpx.Response:
+            async with httpx.AsyncClient(timeout=self.READ_TIMEOUT) as client:
+                return await client.get(url, headers=self._get_headers(), params=params)
+
+        return self._handle_response(await retry_with_backoff(_do_request, "Gmail list_messages"))
 
     async def get_message(
         self,
@@ -163,9 +167,11 @@ class GmailProxyClient:
         url = f"{self.proxy_url}/gmail/v1/users/{user_id}/messages/{message_id}"
         params = {"format": format}
 
-        async with httpx.AsyncClient(timeout=self.READ_TIMEOUT) as client:
-            response = await client.get(url, headers=self._get_headers(), params=params)
-            return self._handle_response(response)
+        async def _do_request() -> httpx.Response:
+            async with httpx.AsyncClient(timeout=self.READ_TIMEOUT) as client:
+                return await client.get(url, headers=self._get_headers(), params=params)
+
+        return self._handle_response(await retry_with_backoff(_do_request, "Gmail get_message"))
 
     async def get_thread(
         self,
@@ -186,9 +192,11 @@ class GmailProxyClient:
         url = f"{self.proxy_url}/gmail/v1/users/{user_id}/threads/{thread_id}"
         params = {"format": format}
 
-        async with httpx.AsyncClient(timeout=self.READ_TIMEOUT) as client:
-            response = await client.get(url, headers=self._get_headers(), params=params)
-            return self._handle_response(response)
+        async def _do_request() -> httpx.Response:
+            async with httpx.AsyncClient(timeout=self.READ_TIMEOUT) as client:
+                return await client.get(url, headers=self._get_headers(), params=params)
+
+        return self._handle_response(await retry_with_backoff(_do_request, "Gmail get_thread"))
 
     async def modify_message(
         self,
@@ -215,9 +223,11 @@ class GmailProxyClient:
         if remove_label_ids:
             body["removeLabelIds"] = remove_label_ids
 
-        async with httpx.AsyncClient(timeout=self.WRITE_TIMEOUT) as client:
-            response = await client.post(url, headers=self._get_headers(), json=body)
-            return self._handle_response(response)
+        async def _do_request() -> httpx.Response:
+            async with httpx.AsyncClient(timeout=self.WRITE_TIMEOUT) as client:
+                return await client.post(url, headers=self._get_headers(), json=body)
+
+        return self._handle_response(await retry_with_backoff(_do_request, "Gmail modify_message"))
 
     async def trash_message(self, message_id: str, user_id: str = "me") -> dict:
         """Move a message to trash.
@@ -231,9 +241,11 @@ class GmailProxyClient:
         """
         url = f"{self.proxy_url}/gmail/v1/users/{user_id}/messages/{message_id}/trash"
 
-        async with httpx.AsyncClient(timeout=self.WRITE_TIMEOUT) as client:
-            response = await client.post(url, headers=self._get_headers())
-            return self._handle_response(response)
+        async def _do_request() -> httpx.Response:
+            async with httpx.AsyncClient(timeout=self.WRITE_TIMEOUT) as client:
+                return await client.post(url, headers=self._get_headers())
+
+        return self._handle_response(await retry_with_backoff(_do_request, "Gmail trash_message"))
 
     async def untrash_message(self, message_id: str, user_id: str = "me") -> dict:
         """Remove a message from trash.
@@ -247,9 +259,11 @@ class GmailProxyClient:
         """
         url = f"{self.proxy_url}/gmail/v1/users/{user_id}/messages/{message_id}/untrash"
 
-        async with httpx.AsyncClient(timeout=self.WRITE_TIMEOUT) as client:
-            response = await client.post(url, headers=self._get_headers())
-            return self._handle_response(response)
+        async def _do_request() -> httpx.Response:
+            async with httpx.AsyncClient(timeout=self.WRITE_TIMEOUT) as client:
+                return await client.post(url, headers=self._get_headers())
+
+        return self._handle_response(await retry_with_backoff(_do_request, "Gmail untrash_message"))
 
     async def list_labels(self, user_id: str = "me") -> dict:
         """List all labels in the user's mailbox.
@@ -262,9 +276,11 @@ class GmailProxyClient:
         """
         url = f"{self.proxy_url}/gmail/v1/users/{user_id}/labels"
 
-        async with httpx.AsyncClient(timeout=self.READ_TIMEOUT) as client:
-            response = await client.get(url, headers=self._get_headers())
-            return self._handle_response(response)
+        async def _do_request() -> httpx.Response:
+            async with httpx.AsyncClient(timeout=self.READ_TIMEOUT) as client:
+                return await client.get(url, headers=self._get_headers())
+
+        return self._handle_response(await retry_with_backoff(_do_request, "Gmail list_labels"))
 
     async def get_label(self, label_id: str, user_id: str = "me") -> dict:
         """Get a specific label by ID.
@@ -278,9 +294,11 @@ class GmailProxyClient:
         """
         url = f"{self.proxy_url}/gmail/v1/users/{user_id}/labels/{label_id}"
 
-        async with httpx.AsyncClient(timeout=self.READ_TIMEOUT) as client:
-            response = await client.get(url, headers=self._get_headers())
-            return self._handle_response(response)
+        async def _do_request() -> httpx.Response:
+            async with httpx.AsyncClient(timeout=self.READ_TIMEOUT) as client:
+                return await client.get(url, headers=self._get_headers())
+
+        return self._handle_response(await retry_with_backoff(_do_request, "Gmail get_label"))
 
 
 # Singleton instance for convenience
