@@ -7,8 +7,10 @@ from evals.report import (
     compute_confusion_matrix,
     compute_metrics,
     compute_precision_recall_f1,
+    print_comparison,
+    print_report,
 )
-from evals.schemas import PredictionResult
+from evals.schemas import PredictionResult, RunMeta
 
 
 def _make_result(
@@ -251,3 +253,155 @@ class TestComputeMetrics:
         metrics = compute_metrics(results)
         assert metrics["stage1"]["privacy_violations"] == 1
         assert abs(metrics["stage1"]["privacy_violation_rate"] - 1 / 3) < 0.001
+
+
+def _make_meta(**overrides) -> RunMeta:
+    defaults = {
+        "run_id": "abc12345-6789",
+        "timestamp": "2025-01-01T00:00:00",
+        "config_hash": "deadbeef",
+        "config_path": "config.toml",
+        "cloud_model": "test-cloud",
+        "local_model": "test-local",
+        "golden_set_path": "golden.jsonl",
+        "golden_set_count": 10,
+    }
+    defaults.update(overrides)
+    return RunMeta(**defaults)
+
+
+class TestPrintReportVerbose:
+    """Verify --verbose shows disagreements in single-run report."""
+
+    def test_verbose_shows_disagreement_section(self, capsys):
+        results = [
+            _make_result("person", "service", "fyi", "low_priority"),
+            _make_result("service", "service", "low_priority", "low_priority"),
+        ]
+        meta = _make_meta()
+        metrics = compute_metrics(results)
+        print_report(meta, metrics, verbose=True, results=results)
+        out = capsys.readouterr().out
+        assert "--- Disagreements ---" in out
+        assert "t_person_fyi" in out
+        assert "sender=person->service" in out
+        assert "label=fyi->low_priority" in out
+
+    def test_verbose_shows_none_when_all_correct(self, capsys):
+        results = [
+            _make_result("person", "person", "fyi", "fyi"),
+            _make_result("service", "service", "low_priority", "low_priority"),
+        ]
+        meta = _make_meta()
+        metrics = compute_metrics(results)
+        print_report(meta, metrics, verbose=True, results=results)
+        out = capsys.readouterr().out
+        assert "--- Disagreements ---" in out
+        assert "None!" in out
+
+    def test_no_verbose_omits_disagreements(self, capsys):
+        results = [
+            _make_result("person", "service", "fyi", "low_priority"),
+        ]
+        meta = _make_meta()
+        metrics = compute_metrics(results)
+        print_report(meta, metrics, verbose=False, results=results)
+        out = capsys.readouterr().out
+        assert "Disagreements" not in out
+
+    def test_verbose_flags_privacy_violation(self, capsys):
+        results = [
+            _make_result("person", "service", "fyi", "fyi"),
+        ]
+        meta = _make_meta()
+        metrics = compute_metrics(results)
+        print_report(meta, metrics, verbose=True, results=results)
+        out = capsys.readouterr().out
+        assert "[PRIVACY VIOLATION]" in out
+
+
+class TestPrintComparisonVerbose:
+    """Verify --verbose shows prediction differences in comparison report."""
+
+    def test_verbose_shows_sender_diff(self, capsys):
+        r1 = [PredictionResult(
+            thread_id="t1", expected_sender_type="person", expected_label="fyi",
+            predicted_sender_type="person", predicted_label="fyi",
+            sender_type_correct=True, label_correct=True,
+        )]
+        r2 = [PredictionResult(
+            thread_id="t1", expected_sender_type="person", expected_label="fyi",
+            predicted_sender_type="service", predicted_label="fyi",
+            sender_type_correct=False, label_correct=True,
+        )]
+        meta = _make_meta()
+        m1, m2 = compute_metrics(r1), compute_metrics(r2)
+        print_comparison(meta, m1, meta, m2, verbose=True, results1=r1, results2=r2)
+        out = capsys.readouterr().out
+        assert "--- Prediction Differences (A -> B) ---" in out
+        assert "sender: person->service" in out
+        assert "expected person" in out
+
+    def test_verbose_shows_label_diff(self, capsys):
+        r1 = [PredictionResult(
+            thread_id="t1", expected_sender_type="service", expected_label="fyi",
+            predicted_sender_type="service", predicted_label="fyi",
+            sender_type_correct=True, label_correct=True,
+        )]
+        r2 = [PredictionResult(
+            thread_id="t1", expected_sender_type="service", expected_label="fyi",
+            predicted_sender_type="service", predicted_label="low_priority",
+            sender_type_correct=True, label_correct=False,
+        )]
+        meta = _make_meta()
+        m1, m2 = compute_metrics(r1), compute_metrics(r2)
+        print_comparison(meta, m1, meta, m2, verbose=True, results1=r1, results2=r2)
+        out = capsys.readouterr().out
+        assert "label: fyi->low_priority" in out
+        assert "expected fyi" in out
+
+    def test_verbose_shows_none_when_identical(self, capsys):
+        r = [PredictionResult(
+            thread_id="t1", expected_sender_type="person", expected_label="fyi",
+            predicted_sender_type="person", predicted_label="fyi",
+            sender_type_correct=True, label_correct=True,
+        )]
+        meta = _make_meta()
+        m = compute_metrics(r)
+        print_comparison(meta, m, meta, m, verbose=True, results1=r, results2=r)
+        out = capsys.readouterr().out
+        assert "--- Prediction Differences (A -> B) ---" in out
+        assert "None!" in out
+
+    def test_no_verbose_omits_diffs(self, capsys):
+        r1 = [PredictionResult(
+            thread_id="t1", expected_sender_type="person", expected_label="fyi",
+            predicted_sender_type="person", predicted_label="fyi",
+            sender_type_correct=True, label_correct=True,
+        )]
+        r2 = [PredictionResult(
+            thread_id="t1", expected_sender_type="person", expected_label="fyi",
+            predicted_sender_type="service", predicted_label="low_priority",
+            sender_type_correct=False, label_correct=False,
+        )]
+        meta = _make_meta()
+        m1, m2 = compute_metrics(r1), compute_metrics(r2)
+        print_comparison(meta, m1, meta, m2, verbose=False, results1=r1, results2=r2)
+        out = capsys.readouterr().out
+        assert "Prediction Differences" not in out
+
+    def test_verbose_skips_error_results(self, capsys):
+        r1 = [PredictionResult(
+            thread_id="t1", expected_sender_type="person", expected_label="fyi",
+            predicted_sender_type="person", predicted_label="fyi",
+            sender_type_correct=True, label_correct=True,
+        )]
+        r2 = [PredictionResult(
+            thread_id="t1", expected_sender_type="person", expected_label="fyi",
+            error="timeout",
+        )]
+        meta = _make_meta()
+        m1, m2 = compute_metrics(r1), compute_metrics(r2)
+        print_comparison(meta, m1, meta, m2, verbose=True, results1=r1, results2=r2)
+        out = capsys.readouterr().out
+        assert "None!" in out

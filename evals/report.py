@@ -256,6 +256,9 @@ def print_report(meta: RunMeta, metrics: dict, verbose: bool = False,
 def print_comparison(
     meta1: RunMeta, metrics1: dict,
     meta2: RunMeta, metrics2: dict,
+    verbose: bool = False,
+    results1: list[PredictionResult] | None = None,
+    results2: list[PredictionResult] | None = None,
 ) -> None:
     """Print side-by-side comparison of two runs."""
     print(f"\n{'=' * 60}")
@@ -318,6 +321,30 @@ def print_comparison(
             format_pct(ca["accuracy"]), format_pct(cb["accuracy"]),
             delta(ca["accuracy"], cb["accuracy"]),
         ], widths))
+
+    if verbose and results1 and results2:
+        r2_by_id = {r.thread_id: r for r in results2}
+        diffs = []
+        for r1 in results1:
+            r2 = r2_by_id.get(r1.thread_id)
+            if r2 is None:
+                continue
+            if r1.error or r2.error:
+                continue
+            parts = []
+            if r1.predicted_sender_type != r2.predicted_sender_type:
+                parts.append(f"sender: {r1.predicted_sender_type}->{r2.predicted_sender_type}"
+                             f" (expected {r1.expected_sender_type})")
+            if r1.predicted_label != r2.predicted_label:
+                parts.append(f"label: {r1.predicted_label}->{r2.predicted_label}"
+                             f" (expected {r1.expected_label})")
+            if parts:
+                diffs.append((r1.thread_id, parts))
+        print("\n--- Prediction Differences (A -> B) ---")
+        if not diffs:
+            print("  None!")
+        for tid, parts in diffs:
+            print(f"  {tid}: {', '.join(parts)}")
 
     print()
 
@@ -404,7 +431,8 @@ def cli():
         meta2, pred2 = load_results(Path(args.compare[1]))
         metrics1 = compute_metrics(pred1)
         metrics2 = compute_metrics(pred2)
-        print_comparison(meta1, metrics1, meta2, metrics2)
+        print_comparison(meta1, metrics1, meta2, metrics2,
+                         verbose=args.verbose, results1=pred1, results2=pred2)
 
     elif args.results_dir:
         print_trend(Path(args.results_dir))
