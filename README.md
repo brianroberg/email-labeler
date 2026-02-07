@@ -274,8 +274,17 @@ uv run python -m evals.harvest --proxy-url http://localhost:8000 --label needs_r
 Interactive CLI for reviewing and correcting labels in the golden set. Saves atomically after each session.
 
 ```bash
-# Review all threads
+# Review all threads (blind mode by default)
 uv run python -m evals.review
+
+# Show existing labels while reviewing
+uv run python -m evals.review --show-labels
+
+# Review only sender classification (stage 1)
+uv run python -m evals.review --stage 1
+
+# Review only label classification (stage 2)
+uv run python -m evals.review --stage 2
 
 # Only review unreviewed threads
 uv run python -m evals.review --unreviewed-only
@@ -290,7 +299,8 @@ uv run python -m evals.review --start-at 5
 | Flag | Description |
 |---|---|
 | `--golden-set` | Path to golden set JSONL (default: `evals/golden_set.jsonl`) |
-| `--blind` | Blind mode: classify without seeing current labels |
+| `--show-labels` | Show existing labels (default is blind mode) |
+| `--stage` | Review only stage 1 (sender) or stage 2 (label) |
 | `--unreviewed-only` | Show only threads not yet reviewed |
 | `--filter-label` | Show only threads with this label |
 | `--start-at` | Start at thread index (0-based) |

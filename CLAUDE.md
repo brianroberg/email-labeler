@@ -65,6 +65,8 @@ Poll loop → find unprocessed emails
 
 ## Testing
 
+**Always run the full test suite before declaring any task complete.**
+
 ```bash
 uv run --extra dev pytest tests/ -v
 ```
