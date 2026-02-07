@@ -126,11 +126,17 @@ uv sync --extra dev
 
 ### 2. Create environment file
 
+If running as part of the `agent-stack` setup (recommended), symlink to the shared `.env` to avoid maintaining variables in two places:
+
+```bash
+ln -s ../agent-stack/.env .env
+```
+
+Otherwise, copy the example and fill in your values:
+
 ```bash
 cp .env.example .env
 ```
-
-Edit `.env` with your credentials:
 
 ```env
 # Required: api-proxy authentication
@@ -223,6 +229,12 @@ The `evals/` directory provides a 4-stage pipeline for measuring classification 
 
 ```
 harvest → review → run_eval → report
+```
+
+The eval tools run outside Docker and need access to the same environment variables as the daemon. If you haven't already, symlink to `agent-stack/.env`:
+
+```bash
+ln -s ../agent-stack/.env .env
 ```
 
 ### 1. Harvest — Build a golden set from production data
