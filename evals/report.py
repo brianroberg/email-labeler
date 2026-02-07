@@ -323,6 +323,9 @@ def print_comparison(
         ], widths))
 
     if verbose and results1 and results2:
+        compare_sender = meta1.stages != "stage2_only" and meta2.stages != "stage2_only"
+        compare_label = meta1.stages != "stage1_only" and meta2.stages != "stage1_only"
+
         r2_by_id = {r.thread_id: r for r in results2}
         diffs = []
         for r1 in results1:
@@ -332,15 +335,19 @@ def print_comparison(
             if r1.error or r2.error:
                 continue
             parts = []
-            if r1.predicted_sender_type != r2.predicted_sender_type:
+            if compare_sender and r1.predicted_sender_type != r2.predicted_sender_type:
                 parts.append(f"sender: {r1.predicted_sender_type}->{r2.predicted_sender_type}"
                              f" (expected {r1.expected_sender_type})")
-            if r1.predicted_label != r2.predicted_label:
+            if compare_label and r1.predicted_label != r2.predicted_label:
                 parts.append(f"label: {r1.predicted_label}->{r2.predicted_label}"
                              f" (expected {r1.expected_label})")
             if parts:
                 diffs.append((r1.thread_id, parts))
         print("\n--- Prediction Differences (A -> B) ---")
+        if not compare_sender:
+            print("  (sender differences omitted — not all runs include stage 1)")
+        if not compare_label:
+            print("  (label differences omitted — not all runs include stage 2)")
         if not diffs:
             print("  None!")
         for tid, parts in diffs:

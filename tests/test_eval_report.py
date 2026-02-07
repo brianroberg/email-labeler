@@ -405,3 +405,79 @@ class TestPrintComparisonVerbose:
         print_comparison(meta, m1, meta, m2, verbose=True, results1=r1, results2=r2)
         out = capsys.readouterr().out
         assert "None!" in out
+
+    def test_verbose_omits_sender_diffs_when_stage1_missing(self, capsys):
+        """When one run is stage2_only, sender diffs should be omitted with a warning."""
+        r1 = [PredictionResult(
+            thread_id="t1", expected_sender_type="person", expected_label="fyi",
+            predicted_sender_type="person", predicted_label="fyi",
+            sender_type_correct=True, label_correct=True,
+        )]
+        r2 = [PredictionResult(
+            thread_id="t1", expected_sender_type="person", expected_label="low_priority",
+            predicted_sender_type=None, predicted_label="low_priority",
+            label_correct=False,
+        )]
+        meta_full = _make_meta(stages="full")
+        meta_s2 = _make_meta(run_id="def67890", stages="stage2_only")
+        m1, m2 = compute_metrics(r1), compute_metrics(r2)
+        print_comparison(meta_full, m1, meta_s2, m2, verbose=True, results1=r1, results2=r2)
+        out = capsys.readouterr().out
+        assert "sender differences omitted" in out
+        assert "sender:" not in out
+        # Label diffs should still appear
+        assert "label: fyi->low_priority" in out
+
+    def test_verbose_omits_label_diffs_when_stage2_missing(self, capsys):
+        """When one run is stage1_only, label diffs should be omitted with a warning."""
+        r1 = [PredictionResult(
+            thread_id="t1", expected_sender_type="person", expected_label="fyi",
+            predicted_sender_type="person", predicted_label="fyi",
+            sender_type_correct=True, label_correct=True,
+        )]
+        r2 = [PredictionResult(
+            thread_id="t1", expected_sender_type="person", expected_label="fyi",
+            predicted_sender_type="service", predicted_label=None,
+            sender_type_correct=False,
+        )]
+        meta_full = _make_meta(stages="full")
+        meta_s1 = _make_meta(run_id="def67890", stages="stage1_only")
+        m1, m2 = compute_metrics(r1), compute_metrics(r2)
+        print_comparison(meta_full, m1, meta_s1, m2, verbose=True, results1=r1, results2=r2)
+        out = capsys.readouterr().out
+        assert "label differences omitted" in out
+        assert "label:" not in out
+        # Sender diffs should still appear
+        assert "sender: person->service" in out
+
+    def test_verbose_omits_both_when_stages_incompatible(self, capsys):
+        """stage1_only vs stage2_only: both warnings shown, no diffs."""
+        r1 = [PredictionResult(
+            thread_id="t1", expected_sender_type="person", expected_label="fyi",
+            predicted_sender_type="person", sender_type_correct=True,
+        )]
+        r2 = [PredictionResult(
+            thread_id="t1", expected_sender_type="person", expected_label="fyi",
+            predicted_label="low_priority", label_correct=False,
+        )]
+        meta_s1 = _make_meta(stages="stage1_only")
+        meta_s2 = _make_meta(run_id="def67890", stages="stage2_only")
+        m1, m2 = compute_metrics(r1), compute_metrics(r2)
+        print_comparison(meta_s1, m1, meta_s2, m2, verbose=True, results1=r1, results2=r2)
+        out = capsys.readouterr().out
+        assert "sender differences omitted" in out
+        assert "label differences omitted" in out
+        assert "None!" in out
+
+    def test_verbose_no_warning_when_both_full(self, capsys):
+        """Two full runs should show no omission warnings."""
+        r = [PredictionResult(
+            thread_id="t1", expected_sender_type="person", expected_label="fyi",
+            predicted_sender_type="person", predicted_label="fyi",
+            sender_type_correct=True, label_correct=True,
+        )]
+        meta = _make_meta(stages="full")
+        m = compute_metrics(r)
+        print_comparison(meta, m, meta, m, verbose=True, results1=r, results2=r)
+        out = capsys.readouterr().out
+        assert "omitted" not in out
