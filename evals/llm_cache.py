@@ -46,10 +46,10 @@ class CachedLLMClient:
 
     def _cache_key(self, system_prompt: str, user_content: str) -> str:
         """Compute cache key from LLM parameters and prompt content."""
-        extra = json.dumps(self.inner.extra_body, sort_keys=True)
-        raw = (
-            f"{self.inner.model}|{self.inner.temperature}|{self.inner.max_tokens}"
-            f"|{extra}|{system_prompt}|{user_content}"
+        raw = json.dumps(
+            [self.inner.model, self.inner.temperature, self.inner.max_tokens,
+             self.inner.extra_body, system_prompt, user_content],
+            sort_keys=True,
         )
         return hashlib.sha256(raw.encode()).hexdigest()
 

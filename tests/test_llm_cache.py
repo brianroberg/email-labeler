@@ -59,6 +59,19 @@ class TestCacheHitMiss:
         assert inner.complete.await_count == 2
         assert cached.misses == 2
 
+    async def test_pipe_in_prompt_does_not_collide(self, tmp_path: Path):
+        """Prompts that differ only by field boundary are distinct cache keys."""
+        inner = _make_inner()
+        inner.complete.side_effect = ["PERSON", "SERVICE"]
+        cached = CachedLLMClient(inner, tmp_path / "cache.jsonl")
+
+        r1 = await cached.complete("sys|A", "B")
+        r2 = await cached.complete("sys", "A|B")
+
+        assert r1 == "PERSON"
+        assert r2 == "SERVICE"
+        assert cached.misses == 2
+
     async def test_different_extra_body_are_different_keys(self, tmp_path: Path):
         """Toggling extra_body (e.g. enable_thinking) produces a cache miss."""
         cache_path = tmp_path / "cache.jsonl"
