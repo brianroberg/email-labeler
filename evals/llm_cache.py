@@ -1,6 +1,6 @@
 """Disk-backed LLM response cache for eval suite.
 
-Caches LLM responses keyed by (model, temperature, max_tokens, system_prompt, user_content).
+Caches LLM responses keyed by (model, temperature, max_tokens, extra_body, system_prompt, user_content).
 Cache is loaded into memory at startup and new entries are appended to disk on flush().
 """
 
@@ -46,9 +46,10 @@ class CachedLLMClient:
 
     def _cache_key(self, system_prompt: str, user_content: str) -> str:
         """Compute cache key from LLM parameters and prompt content."""
+        extra = json.dumps(self.inner.extra_body, sort_keys=True)
         raw = (
             f"{self.inner.model}|{self.inner.temperature}|{self.inner.max_tokens}"
-            f"|{system_prompt}|{user_content}"
+            f"|{extra}|{system_prompt}|{user_content}"
         )
         return hashlib.sha256(raw.encode()).hexdigest()
 

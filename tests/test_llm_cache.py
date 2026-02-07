@@ -10,12 +10,13 @@ from evals.llm_cache import CachedLLMClient
 from llm_client import LLMClient
 
 
-def _make_inner() -> LLMClient:
+def _make_inner(**overrides) -> LLMClient:
     """Create a mock LLMClient with typical attributes."""
     inner = AsyncMock(spec=LLMClient)
-    inner.model = "test-model"
-    inner.temperature = 0.2
-    inner.max_tokens = 1000
+    inner.model = overrides.get("model", "test-model")
+    inner.temperature = overrides.get("temperature", 0.2)
+    inner.max_tokens = overrides.get("max_tokens", 1000)
+    inner.extra_body = overrides.get("extra_body", {})
     return inner
 
 
@@ -57,6 +58,24 @@ class TestCacheHitMiss:
         assert r2 == "SERVICE"
         assert inner.complete.await_count == 2
         assert cached.misses == 2
+
+    async def test_different_extra_body_are_different_keys(self, tmp_path: Path):
+        """Toggling extra_body (e.g. enable_thinking) produces a cache miss."""
+        cache_path = tmp_path / "cache.jsonl"
+
+        thinking_on = _make_inner(extra_body={})
+        thinking_on.complete.return_value = "NEEDS_RESPONSE"
+        cached_on = CachedLLMClient(thinking_on, cache_path)
+        await cached_on.complete("sys", "usr")
+        cached_on.flush()
+
+        thinking_off = _make_inner(extra_body={"enable_thinking": False})
+        thinking_off.complete.return_value = "FYI"
+        cached_off = CachedLLMClient(thinking_off, cache_path)
+        result = await cached_off.complete("sys", "usr")
+
+        assert result == "FYI"
+        assert cached_off.misses == 1  # cache miss, not a hit from thinking_on
 
 
 class TestFlushAndReload:
