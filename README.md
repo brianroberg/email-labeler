@@ -237,6 +237,12 @@ The eval tools run outside Docker and need access to the same environment variab
 ln -s ../agent-stack/.env .env
 ```
 
+Since the symlinked `.env` may contain Docker-internal hostnames (e.g. `PROXY_URL=http://api-proxy:8000`), use `--proxy-url` to point at the proxy's host-accessible address:
+
+```bash
+uv run python -m evals.harvest --proxy-url http://localhost:8000 --max-threads 200
+```
+
 ### 1. Harvest — Build a golden set from production data
 
 Pulls threads already labeled by the daemon, infers ground truth from their Gmail labels, and exports to JSONL.
