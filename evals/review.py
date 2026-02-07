@@ -22,7 +22,6 @@ from gmail_utils import decode_body
 
 SENDER_TYPES = ["person", "service"]
 LABELS = ["needs_response", "fyi", "low_priority", "unwanted"]
-BODY_PREVIEW_CHARS = 500
 
 _SENDER_KEY_MAP = {"p": "person", "s": "service"}
 _LABEL_KEY_MAP = {"n": "needs_response", "f": "fyi", "l": "low_priority", "u": "unwanted"}
@@ -130,14 +129,11 @@ def display_thread(thread: GoldenThread, index: int, total: int, *, show_labels:
     if thread.notes:
         print(f"Notes:    {thread.notes}")
 
-    # Body preview
-    print("\n--- Body preview ---")
+    # Body
+    print("\n--- Body ---")
     for i, msg in enumerate(thread.messages):
         body = decode_body(msg.get("payload", {}))
-        preview = body[:BODY_PREVIEW_CHARS]
-        if len(body) > BODY_PREVIEW_CHARS:
-            preview += "..."
-        print(f"[Message {i + 1}] {preview}")
+        print(f"[Message {i + 1}] {body}")
 
     if show_labels:
         print("\nCurrent labels:")
