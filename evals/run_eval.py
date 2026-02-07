@@ -151,7 +151,15 @@ async def evaluate_single(
     except Exception as exc:
         result.error = str(exc)
 
-    result.duration_seconds = round(time.monotonic() - start, 3)
+    # Use actual LLM time when caching (0 for pure cache hits); wall time otherwise
+    cloud = classifier.cloud_llm
+    local = classifier.local_llm
+    if hasattr(cloud, "take_llm_seconds"):
+        result.duration_seconds = round(
+            cloud.take_llm_seconds() + local.take_llm_seconds(), 3
+        )
+    else:
+        result.duration_seconds = round(time.monotonic() - start, 3)
     return result
 
 

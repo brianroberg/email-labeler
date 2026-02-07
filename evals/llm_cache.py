@@ -6,6 +6,7 @@ Cache is loaded into memory at startup and new entries are appended to disk on f
 
 import hashlib
 import json
+import time
 from pathlib import Path
 
 from llm_client import LLMClient
@@ -25,6 +26,7 @@ class CachedLLMClient:
         self._pending: list[dict] = []  # new entries to flush to disk
         self.hits = 0
         self.misses = 0
+        self._llm_seconds = 0.0  # accumulated LLM call time (misses only)
         self._load()
 
     def _load(self) -> None:
@@ -59,7 +61,9 @@ class CachedLLMClient:
             return self._cache[key]
 
         self.misses += 1
+        start = time.monotonic()
         response = await self.inner.complete(system_prompt, user_content)
+        self._llm_seconds += time.monotonic() - start
 
         self._cache[key] = response
         self._pending.append({
@@ -68,6 +72,12 @@ class CachedLLMClient:
             "response": response,
         })
         return response
+
+    def take_llm_seconds(self) -> float:
+        """Return accumulated LLM call time and reset to zero."""
+        elapsed = self._llm_seconds
+        self._llm_seconds = 0.0
+        return elapsed
 
     async def is_available(self) -> bool:
         """Delegate to inner client."""

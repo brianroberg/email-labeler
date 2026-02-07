@@ -168,6 +168,32 @@ class TestErrorNotCached:
         assert not (tmp_path / "cache.jsonl").exists()
 
 
+class TestLlmSeconds:
+    async def test_miss_accumulates_time(self, tmp_path: Path):
+        inner = _make_inner()
+        inner.complete.return_value = "PERSON"
+        cached = CachedLLMClient(inner, tmp_path / "cache.jsonl")
+
+        await cached.complete("sys", "usr")
+
+        assert cached._llm_seconds > 0
+        elapsed = cached.take_llm_seconds()
+        assert elapsed > 0
+        assert cached._llm_seconds == 0.0  # reset after take
+
+    async def test_hit_does_not_accumulate_time(self, tmp_path: Path):
+        inner = _make_inner()
+        inner.complete.return_value = "PERSON"
+        cached = CachedLLMClient(inner, tmp_path / "cache.jsonl")
+
+        await cached.complete("sys", "usr")
+        cached.take_llm_seconds()  # drain
+
+        await cached.complete("sys", "usr")  # cache hit
+
+        assert cached.take_llm_seconds() == 0.0
+
+
 class TestIsAvailable:
     async def test_delegates_to_inner(self, tmp_path: Path):
         inner = _make_inner()
