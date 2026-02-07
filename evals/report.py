@@ -359,8 +359,11 @@ def print_comparison(
         compare_label = meta1.stages != "stage1_only" and meta2.stages != "stage1_only"
         ctx = golden_context or {}
 
+        regressions: list[tuple[str, list[str]]] = []   # A correct, B wrong
+        improvements: list[tuple[str, list[str]]] = []  # A wrong, B correct
+        other: list[tuple[str, list[str]]] = []         # both wrong, different
+
         r2_by_id = {r.thread_id: r for r in results2}
-        diffs = []
         for r1 in results1:
             r2 = r2_by_id.get(r1.thread_id)
             if r2 is None:
@@ -368,23 +371,49 @@ def print_comparison(
             if r1.error or r2.error:
                 continue
             parts = []
+            has_regression = False
+            has_improvement = False
             if compare_sender and r1.predicted_sender_type != r2.predicted_sender_type:
+                a_right = r1.predicted_sender_type == r1.expected_sender_type
+                b_right = r2.predicted_sender_type == r2.expected_sender_type
                 parts.append(f"sender: {r1.predicted_sender_type}->{r2.predicted_sender_type}"
                              f" (expected {r1.expected_sender_type})")
+                has_regression = has_regression or (a_right and not b_right)
+                has_improvement = has_improvement or (b_right and not a_right)
             if compare_label and r1.predicted_label != r2.predicted_label:
+                a_right = r1.predicted_label == r1.expected_label
+                b_right = r2.predicted_label == r2.expected_label
                 parts.append(f"label: {r1.predicted_label}->{r2.predicted_label}"
                              f" (expected {r1.expected_label})")
-            if parts:
-                diffs.append((r1.thread_id, parts))
+                has_regression = has_regression or (a_right and not b_right)
+                has_improvement = has_improvement or (b_right and not a_right)
+            if not parts:
+                continue
+            entry = (r1.thread_id, parts)
+            if has_regression and not has_improvement:
+                regressions.append(entry)
+            elif has_improvement and not has_regression:
+                improvements.append(entry)
+            else:
+                other.append(entry)
+
         print("\n--- Prediction Differences (A -> B) ---")
         if not compare_sender:
             print("  (sender differences omitted — not all runs include stage 1)")
         if not compare_label:
             print("  (label differences omitted — not all runs include stage 2)")
-        if not diffs:
+        if not regressions and not improvements and not other:
             print("  None!")
-        for tid, parts in diffs:
-            print(f"  {format_thread_label(tid, ctx)}: {', '.join(parts)}")
+        for section_label, entries in [
+            ("Regressions (A correct, B wrong)", regressions),
+            ("Improvements (A wrong, B correct)", improvements),
+            ("Other changes (both wrong)", other),
+        ]:
+            if not entries:
+                continue
+            print(f"\n  {section_label}:")
+            for tid, parts in entries:
+                print(f"    {format_thread_label(tid, ctx)}: {', '.join(parts)}")
 
     print()
 

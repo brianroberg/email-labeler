@@ -324,7 +324,8 @@ class TestPrintReportVerbose:
 class TestPrintComparisonVerbose:
     """Verify --verbose shows prediction differences in comparison report."""
 
-    def test_verbose_shows_sender_diff(self, capsys):
+    def test_regression_a_correct_b_wrong(self, capsys):
+        """A predicted correctly, B didn't → appears under Regressions."""
         r1 = [PredictionResult(
             thread_id="t1", expected_sender_type="person", expected_label="fyi",
             predicted_sender_type="person", predicted_label="fyi",
@@ -339,15 +340,36 @@ class TestPrintComparisonVerbose:
         m1, m2 = compute_metrics(r1), compute_metrics(r2)
         print_comparison(meta, m1, meta, m2, verbose=True, results1=r1, results2=r2)
         out = capsys.readouterr().out
-        assert "--- Prediction Differences (A -> B) ---" in out
+        assert "Regressions (A correct, B wrong)" in out
         assert "sender: person->service" in out
-        assert "expected person" in out
+        assert "Improvements" not in out
 
-    def test_verbose_shows_label_diff(self, capsys):
+    def test_improvement_a_wrong_b_correct(self, capsys):
+        """A predicted wrong, B got it right → appears under Improvements."""
         r1 = [PredictionResult(
+            thread_id="t1", expected_sender_type="service", expected_label="fyi",
+            predicted_sender_type="service", predicted_label="low_priority",
+            sender_type_correct=True, label_correct=False,
+        )]
+        r2 = [PredictionResult(
             thread_id="t1", expected_sender_type="service", expected_label="fyi",
             predicted_sender_type="service", predicted_label="fyi",
             sender_type_correct=True, label_correct=True,
+        )]
+        meta = _make_meta()
+        m1, m2 = compute_metrics(r1), compute_metrics(r2)
+        print_comparison(meta, m1, meta, m2, verbose=True, results1=r1, results2=r2)
+        out = capsys.readouterr().out
+        assert "Improvements (A wrong, B correct)" in out
+        assert "label: low_priority->fyi" in out
+        assert "Regressions" not in out
+
+    def test_other_changes_both_wrong(self, capsys):
+        """Both wrong with different predictions → appears under Other changes."""
+        r1 = [PredictionResult(
+            thread_id="t1", expected_sender_type="service", expected_label="fyi",
+            predicted_sender_type="service", predicted_label="unwanted",
+            sender_type_correct=True, label_correct=False,
         )]
         r2 = [PredictionResult(
             thread_id="t1", expected_sender_type="service", expected_label="fyi",
@@ -358,8 +380,33 @@ class TestPrintComparisonVerbose:
         m1, m2 = compute_metrics(r1), compute_metrics(r2)
         print_comparison(meta, m1, meta, m2, verbose=True, results1=r1, results2=r2)
         out = capsys.readouterr().out
-        assert "label: fyi->low_priority" in out
-        assert "expected fyi" in out
+        assert "Other changes (both wrong)" in out
+        assert "label: unwanted->low_priority" in out
+        assert "Regressions" not in out
+        assert "Improvements" not in out
+
+    def test_mixed_thread_regression_and_improvement(self, capsys):
+        """Thread with regression on one field and improvement on another → Other."""
+        r1 = [PredictionResult(
+            thread_id="t1", expected_sender_type="person", expected_label="fyi",
+            predicted_sender_type="person", predicted_label="low_priority",
+            sender_type_correct=True, label_correct=False,
+        )]
+        r2 = [PredictionResult(
+            thread_id="t1", expected_sender_type="person", expected_label="fyi",
+            predicted_sender_type="service", predicted_label="fyi",
+            sender_type_correct=False, label_correct=True,
+        )]
+        meta = _make_meta()
+        m1, m2 = compute_metrics(r1), compute_metrics(r2)
+        print_comparison(meta, m1, meta, m2, verbose=True, results1=r1, results2=r2)
+        out = capsys.readouterr().out
+        # Mixed: regression on sender, improvement on label → Other
+        assert "Other changes (both wrong)" in out
+        assert "sender: person->service" in out
+        assert "label: low_priority->fyi" in out
+        assert "Regressions (A correct, B wrong)" not in out
+        assert "Improvements (A wrong, B correct)" not in out
 
     def test_verbose_shows_none_when_identical(self, capsys):
         r = [PredictionResult(
@@ -415,7 +462,7 @@ class TestPrintComparisonVerbose:
             sender_type_correct=True, label_correct=True,
         )]
         r2 = [PredictionResult(
-            thread_id="t1", expected_sender_type="person", expected_label="low_priority",
+            thread_id="t1", expected_sender_type="person", expected_label="fyi",
             predicted_sender_type=None, predicted_label="low_priority",
             label_correct=False,
         )]
@@ -426,7 +473,8 @@ class TestPrintComparisonVerbose:
         out = capsys.readouterr().out
         assert "sender differences omitted" in out
         assert "sender:" not in out
-        # Label diffs should still appear
+        # Label diffs should still appear under Regressions (A had fyi correct, B got it wrong)
+        assert "Regressions" in out
         assert "label: fyi->low_priority" in out
 
     def test_verbose_omits_label_diffs_when_stage2_missing(self, capsys):
