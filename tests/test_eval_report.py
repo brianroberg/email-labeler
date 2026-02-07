@@ -7,10 +7,11 @@ from evals.report import (
     compute_confusion_matrix,
     compute_metrics,
     compute_precision_recall_f1,
+    format_thread_label,
     print_comparison,
     print_report,
 )
-from evals.schemas import PredictionResult, RunMeta
+from evals.schemas import GoldenThread, PredictionResult, RunMeta
 
 
 def _make_result(
@@ -481,3 +482,86 @@ class TestPrintComparisonVerbose:
         print_comparison(meta, m, meta, m, verbose=True, results1=r, results2=r)
         out = capsys.readouterr().out
         assert "omitted" not in out
+
+
+def _make_golden(thread_id: str, subject: str, senders: list[str]) -> GoldenThread:
+    return GoldenThread(
+        thread_id=thread_id,
+        messages=[],
+        senders=senders,
+        subject=subject,
+        snippet="",
+        expected_sender_type="person",
+        expected_label="fyi",
+    )
+
+
+class TestFormatThreadLabel:
+    def test_with_context(self):
+        ctx = {"t1": _make_golden("t1", "Meeting tomorrow", ["alice@example.com"])}
+        assert format_thread_label("t1", ctx) == "t1 (alice@example.com: Meeting tomorrow)"
+
+    def test_without_context(self):
+        assert format_thread_label("t1", {}) == "t1"
+
+    def test_long_subject_truncated(self):
+        ctx = {"t1": _make_golden("t1", "A" * 100, ["bob@test.com"])}
+        result = format_thread_label("t1", ctx, max_subject=20)
+        assert result == "t1 (bob@test.com: " + "A" * 20 + "...)"
+
+    def test_short_subject_not_truncated(self):
+        ctx = {"t1": _make_golden("t1", "Short", ["x@y.com"])}
+        result = format_thread_label("t1", ctx, max_subject=20)
+        assert "..." not in result
+
+    def test_no_senders_shows_unknown(self):
+        ctx = {"t1": _make_golden("t1", "No sender", [])}
+        assert "unknown" in format_thread_label("t1", ctx)
+
+
+class TestVerboseGoldenContext:
+    """Verify that golden set context appears in verbose output."""
+
+    def test_report_disagreements_show_subject(self, capsys):
+        results = [
+            _make_result("person", "service", "fyi", "low_priority"),
+        ]
+        ctx = {"t_person_fyi": _make_golden("t_person_fyi", "Lunch plans", ["friend@mail.com"])}
+        meta = _make_meta()
+        metrics = compute_metrics(results)
+        print_report(meta, metrics, verbose=True, results=results, golden_context=ctx)
+        out = capsys.readouterr().out
+        assert "Lunch plans" in out
+        assert "friend@mail.com" in out
+
+    def test_report_without_context_shows_plain_id(self, capsys):
+        results = [
+            _make_result("person", "service", "fyi", "low_priority"),
+        ]
+        meta = _make_meta()
+        metrics = compute_metrics(results)
+        print_report(meta, metrics, verbose=True, results=results, golden_context={})
+        out = capsys.readouterr().out
+        assert "t_person_fyi:" in out
+        # No parenthetical context
+        assert "t_person_fyi (" not in out
+
+    def test_comparison_diffs_show_subject(self, capsys):
+        r1 = [PredictionResult(
+            thread_id="t1", expected_sender_type="person", expected_label="fyi",
+            predicted_sender_type="person", predicted_label="fyi",
+            sender_type_correct=True, label_correct=True,
+        )]
+        r2 = [PredictionResult(
+            thread_id="t1", expected_sender_type="person", expected_label="fyi",
+            predicted_sender_type="service", predicted_label="fyi",
+            sender_type_correct=False, label_correct=True,
+        )]
+        ctx = {"t1": _make_golden("t1", "Project update", ["coworker@corp.com"])}
+        meta = _make_meta()
+        m1, m2 = compute_metrics(r1), compute_metrics(r2)
+        print_comparison(meta, m1, meta, m2, verbose=True, results1=r1, results2=r2,
+                         golden_context=ctx)
+        out = capsys.readouterr().out
+        assert "Project update" in out
+        assert "coworker@corp.com" in out

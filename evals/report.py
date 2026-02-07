@@ -13,10 +13,39 @@ import json
 import sys
 from pathlib import Path
 
-from evals.schemas import PredictionResult, RunMeta
+from evals.schemas import GoldenThread, PredictionResult, RunMeta
 
 SENDER_TYPES = ["person", "service"]
 LABEL_CLASSES = ["needs_response", "fyi", "low_priority", "unwanted"]
+
+
+def load_golden_context(meta: RunMeta) -> dict[str, GoldenThread]:
+    """Try to load golden set from meta's recorded path. Returns empty dict on failure."""
+    path = Path(meta.golden_set_path)
+    if not path.exists():
+        return {}
+    try:
+        context: dict[str, GoldenThread] = {}
+        with open(path) as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                gt = GoldenThread.from_dict(json.loads(line))
+                context[gt.thread_id] = gt
+        return context
+    except Exception:
+        return {}
+
+
+def format_thread_label(thread_id: str, context: dict[str, GoldenThread], max_subject: int = 60) -> str:
+    """Format a thread ID with subject/sender context if available."""
+    gt = context.get(thread_id)
+    if gt is None:
+        return thread_id
+    subject = gt.subject[:max_subject] + "..." if len(gt.subject) > max_subject else gt.subject
+    sender = gt.senders[0] if gt.senders else "unknown"
+    return f"{thread_id} ({sender}: {subject})"
 
 
 def load_results(path: Path) -> tuple[RunMeta, list[PredictionResult]]:
@@ -195,7 +224,8 @@ def format_per_class_table(prf: dict[str, dict[str, float]], classes: list[str])
 
 
 def print_report(meta: RunMeta, metrics: dict, verbose: bool = False,
-                 results: list[PredictionResult] | None = None) -> None:
+                 results: list[PredictionResult] | None = None,
+                 golden_context: dict[str, GoldenThread] | None = None) -> None:
     """Print formatted report to stdout."""
     print(f"\n{'=' * 60}")
     print(f"Evaluation Report: {meta.run_id[:8]}")
@@ -236,12 +266,13 @@ def print_report(meta: RunMeta, metrics: dict, verbose: bool = False,
 
     if verbose and results:
         print("\n--- Disagreements ---")
+        ctx = golden_context or {}
         disagreements = [r for r in results if r.error is None
                          and (r.sender_type_correct is False or r.label_correct is False)]
         if not disagreements:
             print("  None!")
         for r in disagreements:
-            parts = [f"  {r.thread_id}:"]
+            parts = [f"  {format_thread_label(r.thread_id, ctx)}:"]
             if r.sender_type_correct is False:
                 parts.append(f"sender={r.expected_sender_type}->{r.predicted_sender_type}")
             if r.label_correct is False:
@@ -259,6 +290,7 @@ def print_comparison(
     verbose: bool = False,
     results1: list[PredictionResult] | None = None,
     results2: list[PredictionResult] | None = None,
+    golden_context: dict[str, GoldenThread] | None = None,
 ) -> None:
     """Print side-by-side comparison of two runs."""
     print(f"\n{'=' * 60}")
@@ -325,6 +357,7 @@ def print_comparison(
     if verbose and results1 and results2:
         compare_sender = meta1.stages != "stage2_only" and meta2.stages != "stage2_only"
         compare_label = meta1.stages != "stage1_only" and meta2.stages != "stage1_only"
+        ctx = golden_context or {}
 
         r2_by_id = {r.thread_id: r for r in results2}
         diffs = []
@@ -351,7 +384,7 @@ def print_comparison(
         if not diffs:
             print("  None!")
         for tid, parts in diffs:
-            print(f"  {tid}: {', '.join(parts)}")
+            print(f"  {format_thread_label(tid, ctx)}: {', '.join(parts)}")
 
     print()
 
@@ -431,15 +464,19 @@ def cli():
         if args.format == "json":
             report_as_json(meta, metrics)
         else:
-            print_report(meta, metrics, verbose=args.verbose, results=predictions)
+            ctx = load_golden_context(meta) if args.verbose else {}
+            print_report(meta, metrics, verbose=args.verbose, results=predictions,
+                         golden_context=ctx)
 
     elif args.compare:
         meta1, pred1 = load_results(Path(args.compare[0]))
         meta2, pred2 = load_results(Path(args.compare[1]))
         metrics1 = compute_metrics(pred1)
         metrics2 = compute_metrics(pred2)
+        ctx = load_golden_context(meta1) if args.verbose else {}
         print_comparison(meta1, metrics1, meta2, metrics2,
-                         verbose=args.verbose, results1=pred1, results2=pred2)
+                         verbose=args.verbose, results1=pred1, results2=pred2,
+                         golden_context=ctx)
 
     elif args.results_dir:
         print_trend(Path(args.results_dir))
