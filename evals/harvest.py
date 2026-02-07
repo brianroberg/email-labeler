@@ -239,7 +239,7 @@ def write_golden_set(threads: list[GoldenThread], output_path: Path, append: boo
 
 async def main(args: argparse.Namespace) -> None:
     config = load_eval_config(args.config)
-    proxy = GmailProxyClient()
+    proxy = GmailProxyClient(proxy_url=args.proxy_url)
 
     threads = await harvest_threads(
         proxy=proxy,
@@ -274,6 +274,7 @@ def cli():
     parser.add_argument("--label", choices=["needs_response", "fyi", "low_priority", "unwanted"],
                         help="Filter by classification label")
     parser.add_argument("--config", help="Path to config.toml (default: ./config.toml)")
+    parser.add_argument("--proxy-url", help="API proxy URL (overrides PROXY_URL env var)")
     args = parser.parse_args()
     asyncio.run(main(args))
 

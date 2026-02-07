@@ -261,6 +261,7 @@ uv run python -m evals.harvest --output evals/golden_set.jsonl --label needs_res
 | `--sender-type` | Filter: `person` or `service` |
 | `--label` | Filter: `needs_response`, `fyi`, `low_priority`, `unwanted` |
 | `--config` | Path to config.toml (default: `./config.toml`) |
+| `--proxy-url` | API proxy URL (overrides `PROXY_URL` env var) |
 
 ### 2. Review — Manually verify ground truth labels
 
