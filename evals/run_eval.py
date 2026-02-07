@@ -20,9 +20,12 @@ import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 
+import httpx
+
 from classifier import EmailClassifier, SenderType, ThreadMetadata
 from config_utils import substitute_env_vars
 from daemon import format_thread_transcript
+from evals import format_network_error
 from evals.schemas import GoldenThread, PredictionResult, RunMeta
 from gmail_utils import get_header
 from llm_client import LLMClient
@@ -140,6 +143,8 @@ async def evaluate_single(
                 golden.expected_sender_type == "person" and result.predicted_sender_type == "service"
             )
 
+    except (httpx.ConnectError, httpx.TimeoutException) as exc:
+        result.error = format_network_error(exc, "LLM endpoint")
     except Exception as exc:
         result.error = str(exc)
 

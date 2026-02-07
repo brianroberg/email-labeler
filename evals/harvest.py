@@ -16,10 +16,17 @@ import tomllib
 from datetime import datetime, timezone
 from pathlib import Path
 
+import httpx
+
 from config_utils import substitute_env_vars
+from evals import format_network_error
 from evals.schemas import GoldenThread
 from gmail_utils import get_header
-from proxy_client import GmailProxyClient
+from proxy_client import GmailProxyClient, ProxyAuthError, ProxyError, ProxyForbiddenError
+
+_NETWORK_ERRORS = (
+    httpx.ConnectError, httpx.TimeoutException, ProxyAuthError, ProxyForbiddenError, ProxyError,
+)
 
 # Label name -> (field, value) for ground truth inference
 _SENDER_TYPE_LABELS = {
@@ -127,15 +134,23 @@ async def harvest_threads(
     now = datetime.now(timezone.utc).isoformat()
 
     # Build label ID -> name map
-    labels_response = await proxy.list_labels()
+    try:
+        labels_response = await proxy.list_labels()
+    except _NETWORK_ERRORS as exc:
+        print(f"Error: {format_network_error(exc, 'api-proxy')}", file=sys.stderr)
+        sys.exit(1)
     label_id_to_name = {lbl["id"]: lbl["name"] for lbl in labels_response["labels"]}
 
     # Fetch message stubs with agent/processed label
     processed_label = labels_config["processed"]
-    response = await proxy.list_messages(
-        q=f"label:{processed_label}",
-        max_results=max_threads * 3,  # Over-fetch since we group by thread
-    )
+    try:
+        response = await proxy.list_messages(
+            q=f"label:{processed_label}",
+            max_results=max_threads * 3,  # Over-fetch since we group by thread
+        )
+    except _NETWORK_ERRORS as exc:
+        print(f"Error: {format_network_error(exc, 'api-proxy')}", file=sys.stderr)
+        sys.exit(1)
     msg_stubs = response.get("messages", [])
 
     if not msg_stubs:
@@ -204,8 +219,11 @@ async def harvest_threads(
             if (i + 1) % 10 == 0:
                 print(f"  Processed {i + 1}/{min(len(thread_ids), max_threads)} threads...", file=sys.stderr)
 
+        except _NETWORK_ERRORS as exc:
+            print(f"  Error fetching thread {tid}: {format_network_error(exc, 'api-proxy')}",
+                  file=sys.stderr)
         except Exception as exc:
-            print(f"  Error fetching thread {tid}: {exc}", file=sys.stderr)
+            print(f"  Error processing thread {tid}: {exc}", file=sys.stderr)
 
     print(f"Harvested {len(results)} threads", file=sys.stderr)
     return results
