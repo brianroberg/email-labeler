@@ -168,6 +168,11 @@ def test_collapse_whitespace_reduces_excess_newlines():
     assert collapse_whitespace("Line 1\n\n\n\n\nLine 2") == "Line 1\n\nLine 2"
 
 
+def test_collapse_whitespace_reduces_whitespace_only_lines():
+    """Lines containing only spaces (e.g. from stripped HTML tags) should collapse."""
+    assert collapse_whitespace("Line 1\n \n \n \n \nLine 2") == "Line 1\n\nLine 2"
+
+
 def test_collapse_whitespace_strips_line_edges():
     assert collapse_whitespace("  Line 1  \n  Line 2  ") == "Line 1\nLine 2"
 

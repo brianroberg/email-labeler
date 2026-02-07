@@ -75,8 +75,8 @@ def strip_invisible_chars(text: str) -> str:
 def collapse_whitespace(text: str) -> str:
     """Normalize whitespace: collapse runs of spaces/tabs and excess blank lines."""
     text = re.sub(r"[ \t]{2,}", " ", text)
-    text = re.sub(r"\n{3,}", "\n\n", text)
     text = "\n".join(line.strip() for line in text.splitlines())
+    text = re.sub(r"\n{3,}", "\n\n", text)
     return text.strip()
 
 
