@@ -1,11 +1,13 @@
 """Interactive CLI to review and correct golden set labels.
 
 Usage:
-    python -m evals.review
+    python -m evals.review                    # blind mode (default)
+    python -m evals.review --show-labels      # see existing labels
+    python -m evals.review --stage 1          # review sender type only
+    python -m evals.review --stage 2          # review label only
     python -m evals.review --unreviewed-only
     python -m evals.review --filter-label needs_response
     python -m evals.review --start-at 5
-    python -m evals.review --blind
 """
 
 import argparse
@@ -116,7 +118,9 @@ def _prompt_notes() -> str:
 # Display
 # ---------------------------------------------------------------------------
 
-def display_thread(thread: GoldenThread, index: int, total: int, *, show_labels: bool = True) -> None:
+def display_thread(
+    thread: GoldenThread, index: int, total: int, *, show_labels: bool = True, stage: int | None = None
+) -> None:
     """Display a thread for review."""
     print(f"\n{'=' * 60}")
     print(f"Thread {index + 1}/{total}  (id: {thread.thread_id})")
@@ -137,32 +141,42 @@ def display_thread(thread: GoldenThread, index: int, total: int, *, show_labels:
 
     if show_labels:
         print("\nCurrent labels:")
-        print(f"  Sender type: {thread.expected_sender_type}")
-        print(f"  Label:       {thread.expected_label}")
+        if stage != 2:
+            print(f"  Sender type: {thread.expected_sender_type}")
+        if stage != 1:
+            print(f"  Label:       {thread.expected_label}")
 
 
 # ---------------------------------------------------------------------------
 # Normal review mode (one thread at a time)
 # ---------------------------------------------------------------------------
 
-def review_thread_normal(thread: GoldenThread, index: int, total: int) -> str:
+def review_thread_normal(thread: GoldenThread, index: int, total: int, *, stage: int | None = None) -> str:
     """Normal review: show labels, prompt for action.
+
+    When *stage* is ``1``, only show/allow editing sender type.
+    When *stage* is ``2``, only show/allow editing label.
 
     Returns ``"advance"``, ``"quit"``, or ``"stay"`` (re-show thread).
     """
-    display_thread(thread, index, total, show_labels=True)
+    display_thread(thread, index, total, show_labels=True, stage=stage)
+
+    # Build action menu based on which stages are being reviewed
+    actions: list[tuple[str, str]] = [("", "confirm")]
+    if stage != 2:
+        actions.append(("s", "sender"))
+    if stage != 1:
+        actions.append(("l", "label"))
+    actions.extend([("n", "notes"), ("x", "skip"), ("q", "quit")])
 
     while True:
-        key = prompt_hotkey_menu(
-            "Actions:",
-            [("", "confirm"), ("s", "sender"), ("l", "label"), ("n", "notes"), ("x", "skip"), ("q", "quit")],
-        )
+        key = prompt_hotkey_menu("Actions:", actions)
 
         if key == "" or key == "y":
             thread.reviewed = True
             return "advance"
 
-        if key == "s":
+        if key == "s" and stage != 2:
             new_type = _prompt_sender_type()
             if new_type:
                 thread.expected_sender_type = new_type
@@ -171,7 +185,7 @@ def review_thread_normal(thread: GoldenThread, index: int, total: int) -> str:
                 return "advance"
             continue  # cancelled — re-show menu
 
-        if key == "l":
+        if key == "l" and stage != 1:
             new_label = _prompt_label()
             if new_label:
                 thread.expected_label = new_label
@@ -201,50 +215,62 @@ def review_thread_normal(thread: GoldenThread, index: int, total: int) -> str:
 # Blind review mode
 # ---------------------------------------------------------------------------
 
-def review_thread_blind(thread: GoldenThread, index: int, total: int) -> str:
+def review_thread_blind(thread: GoldenThread, index: int, total: int, *, stage: int | None = None) -> str:
     """Blind review: hide labels, prompt sender type then label.
+
+    When *stage* is ``1``, only prompt for sender type.
+    When *stage* is ``2``, only prompt for label.
 
     Returns ``"advance"``, ``"quit"``, or ``"stay"``.
     """
     display_thread(thread, index, total, show_labels=False)
 
     # Step 1: sender type
-    while True:
-        key = prompt_hotkey_menu(
-            "Sender type:",
-            [("p", "person"), ("s", "service"), ("n", "notes"), ("x", "skip"), ("q", "quit")],
-        )
-        if key in _SENDER_KEY_MAP:
-            thread.expected_sender_type = _SENDER_KEY_MAP[key]
-            print(f"  -> {thread.expected_sender_type}")
-            break
-        if key == "n":
-            thread.notes = _prompt_notes()
-            print("  -> Notes saved.")
-            continue
-        if key == "x":
-            thread.skipped = True
-            thread.reviewed = True
-            print("  -> Thread marked as skipped.")
-            return "advance"
-        if key == "q":
-            return "quit"
-        print(f"  Invalid key: {key!r}")
+    if stage != 2:
+        while True:
+            key = prompt_hotkey_menu(
+                "Sender type:",
+                [("p", "person"), ("s", "service"), ("n", "notes"), ("x", "skip"), ("q", "quit")],
+            )
+            if key in _SENDER_KEY_MAP:
+                thread.expected_sender_type = _SENDER_KEY_MAP[key]
+                print(f"  -> {thread.expected_sender_type}")
+                break
+            if key == "n":
+                thread.notes = _prompt_notes()
+                print("  -> Notes saved.")
+                continue
+            if key == "x":
+                thread.skipped = True
+                thread.reviewed = True
+                print("  -> Thread marked as skipped.")
+                return "advance"
+            if key == "q":
+                return "quit"
+            print(f"  Invalid key: {key!r}")
 
     # Step 2: label
-    while True:
-        key = prompt_hotkey_menu(
-            "Label:",
-            [("n", "needs_response"), ("f", "fyi"), ("l", "low_priority"), ("u", "unwanted"), ("q", "quit")],
-        )
-        if key in _LABEL_KEY_MAP:
-            thread.expected_label = _LABEL_KEY_MAP[key]
-            thread.reviewed = True
-            print(f"  -> Classified as {thread.expected_sender_type} / {thread.expected_label}")
-            return "advance"
-        if key == "q":
-            return "quit"
-        print(f"  Invalid key: {key!r}")
+    if stage != 1:
+        while True:
+            key = prompt_hotkey_menu(
+                "Label:",
+                [
+                    ("n", "needs_response"), ("f", "fyi"),
+                    ("l", "low_priority"), ("u", "unwanted"), ("q", "quit"),
+                ],
+            )
+            if key in _LABEL_KEY_MAP:
+                thread.expected_label = _LABEL_KEY_MAP[key]
+                thread.reviewed = True
+                print(f"  -> Classified as {thread.expected_sender_type} / {thread.expected_label}")
+                return "advance"
+            if key == "q":
+                return "quit"
+            print(f"  Invalid key: {key!r}")
+
+    # stage==1 only: mark reviewed after sender type
+    thread.reviewed = True
+    return "advance"
 
 
 # ---------------------------------------------------------------------------
@@ -252,7 +278,7 @@ def review_thread_blind(thread: GoldenThread, index: int, total: int) -> str:
 # ---------------------------------------------------------------------------
 
 def review_loop(
-    threads: list[GoldenThread], *, start_at: int = 0, blind: bool = False
+    threads: list[GoldenThread], *, start_at: int = 0, blind: bool = False, stage: int | None = None
 ) -> None:
     """Main interactive review loop.  Does NOT save — caller is responsible."""
     review_fn = review_thread_blind if blind else review_thread_normal
@@ -260,7 +286,7 @@ def review_loop(
     i = start_at
 
     while i < total:
-        result = review_fn(threads[i], i, total)
+        result = review_fn(threads[i], i, total, stage=stage)
         if result == "quit":
             break
         if result == "advance":
@@ -275,7 +301,13 @@ def review_loop(
 def cli():
     parser = argparse.ArgumentParser(description="Review and correct golden set labels")
     parser.add_argument("--golden-set", default="evals/golden_set.jsonl", help="Path to golden set JSONL")
-    parser.add_argument("--blind", action="store_true", help="Blind mode: classify without seeing labels")
+    parser.add_argument(
+        "--show-labels", action="store_true", help="Show existing labels (default is blind mode)",
+    )
+    parser.add_argument(
+        "--stage", type=int, choices=[1, 2], default=None,
+        help="Review only stage 1 (sender) or stage 2 (label)",
+    )
     parser.add_argument("--unreviewed-only", action="store_true", help="Show only unreviewed threads")
     parser.add_argument("--filter-label", choices=LABELS, help="Show only threads with this label")
     parser.add_argument("--start-at", type=int, default=0, help="Start at thread index (0-based)")
@@ -306,7 +338,7 @@ def cli():
         sys.exit(0)
 
     # Review, then save
-    review_loop(threads, start_at=args.start_at, blind=args.blind)
+    review_loop(threads, start_at=args.start_at, blind=not args.show_labels, stage=args.stage)
 
     if filtered:
         # Merge changes from filtered subset back into the full set
