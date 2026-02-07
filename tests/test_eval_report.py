@@ -1,0 +1,253 @@
+"""Tests for evals.report — metric computation with hand-crafted result lists."""
+
+from evals.report import (
+    LABEL_CLASSES,
+    SENDER_TYPES,
+    compute_accuracy,
+    compute_confusion_matrix,
+    compute_metrics,
+    compute_precision_recall_f1,
+)
+from evals.schemas import PredictionResult
+
+
+def _make_result(
+    expected_st: str, predicted_st: str | None,
+    expected_lb: str, predicted_lb: str | None,
+    error: str | None = None,
+) -> PredictionResult:
+    """Helper to build a PredictionResult with correctness flags set."""
+    st_correct = None
+    lb_correct = None
+    privacy_violation = False
+
+    if predicted_st is not None and error is None:
+        st_correct = expected_st == predicted_st
+        privacy_violation = expected_st == "person" and predicted_st == "service"
+    if predicted_lb is not None and error is None:
+        lb_correct = expected_lb == predicted_lb
+
+    return PredictionResult(
+        thread_id=f"t_{expected_st}_{expected_lb}",
+        expected_sender_type=expected_st,
+        expected_label=expected_lb,
+        predicted_sender_type=predicted_st,
+        predicted_label=predicted_lb,
+        sender_type_correct=st_correct,
+        label_correct=lb_correct,
+        privacy_violation=privacy_violation,
+        error=error,
+    )
+
+
+class TestComputeAccuracy:
+    def test_all_correct(self):
+        results = [
+            _make_result("person", "person", "fyi", "fyi"),
+            _make_result("service", "service", "low_priority", "low_priority"),
+        ]
+        assert compute_accuracy(results, "sender_type_correct") == 1.0
+        assert compute_accuracy(results, "label_correct") == 1.0
+
+    def test_half_correct(self):
+        results = [
+            _make_result("person", "person", "fyi", "fyi"),
+            _make_result("person", "service", "fyi", "low_priority"),
+        ]
+        assert compute_accuracy(results, "sender_type_correct") == 0.5
+        assert compute_accuracy(results, "label_correct") == 0.5
+
+    def test_none_correct(self):
+        results = [
+            _make_result("person", "service", "fyi", "low_priority"),
+        ]
+        assert compute_accuracy(results, "sender_type_correct") == 0.0
+
+    def test_skips_none_values(self):
+        """Results with None correctness fields should be excluded."""
+        results = [
+            _make_result("person", "person", "fyi", "fyi"),
+            _make_result("service", None, "low_priority", None, error="timeout"),
+        ]
+        # Error result has sender_type_correct=None, should be skipped
+        assert compute_accuracy(results, "sender_type_correct") == 1.0
+
+    def test_empty_list(self):
+        assert compute_accuracy([], "sender_type_correct") is None
+
+
+class TestConfusionMatrix:
+    def test_perfect_sender_classification(self):
+        results = [
+            _make_result("person", "person", "fyi", "fyi"),
+            _make_result("person", "person", "needs_response", "needs_response"),
+            _make_result("service", "service", "low_priority", "low_priority"),
+        ]
+        matrix = compute_confusion_matrix(results, "expected_sender_type", "predicted_sender_type",
+                                          SENDER_TYPES)
+        assert matrix["person"]["person"] == 2
+        assert matrix["person"]["service"] == 0
+        assert matrix["service"]["service"] == 1
+        assert matrix["service"]["person"] == 0
+
+    def test_sender_misclassifications(self):
+        results = [
+            _make_result("person", "person", "fyi", "fyi"),      # TP for person
+            _make_result("person", "service", "fyi", "fyi"),     # FN for person (privacy violation)
+            _make_result("service", "service", "low_priority", "low_priority"),  # TN for person
+            _make_result("service", "person", "low_priority", "low_priority"),   # FP for person
+        ]
+        matrix = compute_confusion_matrix(results, "expected_sender_type", "predicted_sender_type",
+                                          SENDER_TYPES)
+        assert matrix["person"]["person"] == 1   # TP
+        assert matrix["person"]["service"] == 1  # FN (privacy violation!)
+        assert matrix["service"]["service"] == 1 # TN
+        assert matrix["service"]["person"] == 1  # FP
+
+    def test_label_confusion_matrix(self):
+        results = [
+            _make_result("service", "service", "needs_response", "needs_response"),
+            _make_result("service", "service", "fyi", "fyi"),
+            _make_result("service", "service", "low_priority", "unwanted"),  # Misclassified
+            _make_result("service", "service", "unwanted", "unwanted"),
+        ]
+        matrix = compute_confusion_matrix(results, "expected_label", "predicted_label", LABEL_CLASSES)
+        assert matrix["needs_response"]["needs_response"] == 1
+        assert matrix["fyi"]["fyi"] == 1
+        assert matrix["low_priority"]["unwanted"] == 1  # Misclassification
+        assert matrix["low_priority"]["low_priority"] == 0
+        assert matrix["unwanted"]["unwanted"] == 1
+
+
+class TestPrecisionRecallF1:
+    def test_perfect_binary(self):
+        """Perfect classification should give 1.0 for all metrics."""
+        matrix = {
+            "person": {"person": 5, "service": 0},
+            "service": {"person": 0, "service": 5},
+        }
+        prf = compute_precision_recall_f1(matrix, SENDER_TYPES)
+        assert prf["person"]["precision"] == 1.0
+        assert prf["person"]["recall"] == 1.0
+        assert prf["person"]["f1"] == 1.0
+        assert prf["service"]["precision"] == 1.0
+        assert prf["service"]["recall"] == 1.0
+        assert prf["service"]["f1"] == 1.0
+
+    def test_known_values(self):
+        """Hand-computed precision/recall/F1.
+
+        Person: TP=3, FP=1, FN=2  -> P=3/4=0.75, R=3/5=0.60, F1=2*0.75*0.60/1.35=0.6667
+        Service: TP=4, FP=2, FN=1 -> P=4/6=0.6667, R=4/5=0.80, F1=2*0.6667*0.80/1.4667=0.7273
+        """
+        matrix = {
+            "person":  {"person": 3, "service": 2},  # 3 TP, 2 FN
+            "service": {"person": 1, "service": 4},   # 4 TP, 1 FN; person FP=1
+        }
+        prf = compute_precision_recall_f1(matrix, SENDER_TYPES)
+
+        assert abs(prf["person"]["precision"] - 0.75) < 0.001
+        assert abs(prf["person"]["recall"] - 0.60) < 0.001
+        assert abs(prf["person"]["f1"] - 2 * 0.75 * 0.60 / (0.75 + 0.60)) < 0.001
+
+        assert abs(prf["service"]["precision"] - 4 / 6) < 0.001
+        assert abs(prf["service"]["recall"] - 0.80) < 0.001
+
+    def test_zero_support_class(self):
+        """Class with no true positives or predictions should get 0.0."""
+        matrix = {
+            "needs_response": {"needs_response": 0, "fyi": 0, "low_priority": 0, "unwanted": 0},
+            "fyi": {"needs_response": 0, "fyi": 5, "low_priority": 0, "unwanted": 0},
+            "low_priority": {"needs_response": 0, "fyi": 0, "low_priority": 3, "unwanted": 0},
+            "unwanted": {"needs_response": 0, "fyi": 0, "low_priority": 0, "unwanted": 2},
+        }
+        prf = compute_precision_recall_f1(matrix, LABEL_CLASSES)
+        assert prf["needs_response"]["precision"] == 0.0
+        assert prf["needs_response"]["recall"] == 0.0
+        assert prf["needs_response"]["f1"] == 0.0
+        assert prf["fyi"]["precision"] == 1.0
+        assert prf["fyi"]["recall"] == 1.0
+
+
+class TestComputeMetrics:
+    def test_full_pipeline_metrics(self):
+        """Test complete metrics computation with a mix of correct/incorrect results."""
+        results = [
+            # Correct: person + needs_response
+            _make_result("person", "person", "needs_response", "needs_response"),
+            # Correct: service + low_priority
+            _make_result("service", "service", "low_priority", "low_priority"),
+            # Wrong sender type (privacy violation), right label
+            _make_result("person", "service", "fyi", "fyi"),
+            # Right sender type, wrong label
+            _make_result("service", "service", "unwanted", "low_priority"),
+        ]
+        metrics = compute_metrics(results)
+
+        assert metrics["total"] == 4
+        assert metrics["errors"] == 0
+        assert metrics["valid"] == 4
+
+        # Stage 1: 3/4 correct (one person->service)
+        assert metrics["stage1"]["count"] == 4
+        assert metrics["stage1"]["accuracy"] == 0.75
+        assert metrics["stage1"]["privacy_violations"] == 1
+        assert metrics["stage1"]["privacy_violation_rate"] == 0.25
+
+        # Stage 2: 3/4 correct (one unwanted->low_priority)
+        assert metrics["stage2"]["count"] == 4
+        assert metrics["stage2"]["accuracy"] == 0.75
+
+        # Combined: only 2/4 have both stages correct
+        assert metrics["combined"]["count"] == 4
+        assert metrics["combined"]["accuracy"] == 0.5
+
+    def test_with_errors(self):
+        results = [
+            _make_result("person", "person", "fyi", "fyi"),
+            _make_result("service", None, "low_priority", None, error="timeout"),
+        ]
+        metrics = compute_metrics(results)
+        assert metrics["total"] == 2
+        assert metrics["errors"] == 1
+        assert metrics["valid"] == 1
+
+    def test_stage1_only(self):
+        """Results with only sender_type predictions (stage1_only mode)."""
+        results = [
+            PredictionResult(
+                thread_id="t1", expected_sender_type="person", expected_label="fyi",
+                predicted_sender_type="person", sender_type_correct=True,
+            ),
+            PredictionResult(
+                thread_id="t2", expected_sender_type="service", expected_label="low_priority",
+                predicted_sender_type="service", sender_type_correct=True,
+            ),
+        ]
+        metrics = compute_metrics(results)
+        assert "stage1" in metrics
+        assert metrics["stage1"]["accuracy"] == 1.0
+        assert "stage2" not in metrics  # No label predictions
+        assert "combined" not in metrics
+
+    def test_empty_results(self):
+        metrics = compute_metrics([])
+        assert metrics["total"] == 0
+        assert metrics["errors"] == 0
+        assert "stage1" not in metrics
+        assert "stage2" not in metrics
+        assert "combined" not in metrics
+
+    def test_privacy_violation_tracking(self):
+        """Privacy violations should be tracked independently of accuracy."""
+        results = [
+            # Person correctly classified as person
+            _make_result("person", "person", "fyi", "fyi"),
+            # Person misclassified as service (PRIVACY VIOLATION)
+            _make_result("person", "service", "needs_response", "needs_response"),
+            # Service classified as person (harmless, just inefficient)
+            _make_result("service", "person", "low_priority", "low_priority"),
+        ]
+        metrics = compute_metrics(results)
+        assert metrics["stage1"]["privacy_violations"] == 1
+        assert abs(metrics["stage1"]["privacy_violation_rate"] - 1 / 3) < 0.001

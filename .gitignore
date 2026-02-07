@@ -21,3 +21,7 @@ htmlcov/
 .idea/
 *.swp
 *.swo
+
+# Classification quality data (contains email content, keep local)
+evals/golden_set.jsonl
+evals/results/*.jsonl

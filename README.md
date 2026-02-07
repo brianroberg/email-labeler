@@ -77,22 +77,34 @@ Additional labels are used as markers:
 
 ```
 email-labeler/
-├── daemon.py          Main entry point: polling loop and orchestration
-├── classifier.py      Two-tier classification logic and LLM output parsing
-├── labeler.py         Gmail label verification and application
-├── llm_client.py      LLM abstraction for cloud and local endpoints
-├── proxy_client.py    Gmail API proxy client (shared with email-agent)
-├── gmail_utils.py     Email header and body parsing (shared with email-agent)
-├── config.toml        Label definitions, prompts, and operational parameters
-├── pyproject.toml     Python project metadata and dependencies
-├── Dockerfile         Container image definition
-├── .env.example       Environment variable template
+├── daemon.py           Main entry point: polling loop and orchestration
+├── classifier.py       Two-tier classification logic and LLM output parsing
+├── labeler.py          Gmail label verification and application
+├── llm_client.py       LLM abstraction for cloud and local endpoints
+├── proxy_client.py     Gmail API proxy client (shared with email-agent)
+├── gmail_utils.py      Email header and body parsing (shared with email-agent)
+├── config_utils.py     Config loading and env var substitution
+├── config.toml         Label definitions, prompts, and operational parameters
+├── pyproject.toml      Python project metadata and dependencies
+├── Dockerfile          Container image definition
+├── .env.example        Environment variable template
+├── evals/              Classification evaluation suite
+│   ├── schemas.py      Dataclasses: GoldenThread, PredictionResult, RunMeta
+│   ├── harvest.py      Pull processed threads → golden set JSONL
+│   ├── review.py       Interactive CLI for label review and correction
+│   ├── run_eval.py     Replay golden set through real classifier
+│   ├── report.py       Metrics: accuracy, confusion matrix, P/R/F1, privacy
+│   └── results/        Timestamped result files from evaluation runs
 └── tests/
-    ├── conftest.py        Shared fixtures and sample Gmail data
-    ├── test_llm_client.py LLM client tests (13 tests)
-    ├── test_classifier.py Classifier tests (35 tests)
-    ├── test_labeler.py    Label manager tests (9 tests)
-    └── test_daemon.py     Daemon orchestration tests (9 tests)
+    ├── conftest.py          Shared fixtures and sample Gmail data
+    ├── test_llm_client.py   LLM client tests
+    ├── test_classifier.py   Classifier tests
+    ├── test_labeler.py      Label manager tests
+    ├── test_daemon.py       Daemon orchestration tests
+    ├── test_config_utils.py Config loading tests
+    ├── test_eval_schemas.py Golden set and result serialization tests
+    ├── test_eval_harvest.py Ground truth inference and deduplication tests
+    └── test_eval_report.py  Metrics computation and report formatting tests
 ```
 
 ## Prerequisites
@@ -205,6 +217,164 @@ Check container health with:
 docker inspect --format='{{.State.Health.Status}}' agent-stack-email-labeler-1
 ```
 
+## Evaluation Suite
+
+The `evals/` directory provides a 4-stage pipeline for measuring classification accuracy:
+
+```
+harvest → review → run_eval → report
+```
+
+### 1. Harvest — Build a golden set from production data
+
+Pulls threads already labeled by the daemon, infers ground truth from their Gmail labels, and exports to JSONL.
+
+```bash
+# Harvest up to 200 processed threads
+uv run python -m evals.harvest --output evals/golden_set.jsonl --max-threads 200
+
+# Append new threads (deduplicates automatically)
+uv run python -m evals.harvest --output evals/golden_set.jsonl --append
+
+# Filter by sender type or label
+uv run python -m evals.harvest --output evals/golden_set.jsonl --sender-type person
+uv run python -m evals.harvest --output evals/golden_set.jsonl --label needs_response
+```
+
+| Flag | Description |
+|---|---|
+| `--output` | Output JSONL path (default: `evals/golden_set.jsonl`) |
+| `--max-threads` | Max threads to fetch (default: `200`) |
+| `--append` | Append to existing file, deduplicating by thread ID |
+| `--sender-type` | Filter: `person` or `service` |
+| `--label` | Filter: `needs_response`, `fyi`, `low_priority`, `unwanted` |
+| `--config` | Path to config.toml (default: `./config.toml`) |
+
+### 2. Review — Manually verify ground truth labels
+
+Interactive CLI for reviewing and correcting labels in the golden set. Saves atomically after each session.
+
+```bash
+# Review all threads
+uv run python -m evals.review
+
+# Only review unreviewed threads
+uv run python -m evals.review --unreviewed-only
+
+# Filter to a specific label
+uv run python -m evals.review --filter-label needs_response
+
+# Resume from thread index 5
+uv run python -m evals.review --start-at 5
+```
+
+| Flag | Description |
+|---|---|
+| `--golden-set` | Path to golden set JSONL (default: `evals/golden_set.jsonl`) |
+| `--unreviewed-only` | Show only threads not yet reviewed |
+| `--filter-label` | Show only threads with this label |
+| `--start-at` | Start at thread index (0-based) |
+
+### 3. Run — Replay golden set through the classifier
+
+Sends each golden thread through the real `EmailClassifier` with live LLM endpoints. Results are written to timestamped JSONL files in `evals/results/`.
+
+```bash
+# Full evaluation (both stages)
+uv run python -m evals.run_eval
+
+# Evaluate only Stage 1 (sender classification)
+uv run python -m evals.run_eval --stages stage1_only
+
+# Evaluate only Stage 2 (uses expected sender type as input)
+uv run python -m evals.run_eval --stages stage2_only
+
+# Use alternate config and tag the run
+uv run python -m evals.run_eval --config config_v2.toml --tag new-prompts
+
+# Only evaluate reviewed threads, with higher parallelism
+uv run python -m evals.run_eval --reviewed-only --parallelism 5
+
+# Dry run — show what would be evaluated
+uv run python -m evals.run_eval --dry-run
+```
+
+| Flag | Description |
+|---|---|
+| `--golden-set` | Path to golden set JSONL (default: `evals/golden_set.jsonl`) |
+| `--config` | Path to config.toml (default: `./config.toml`) |
+| `--output-dir` | Output directory for results (default: `evals/results/`) |
+| `--stages` | `full`, `stage1_only`, or `stage2_only` (default: `full`) |
+| `--parallelism` | Concurrent evaluations (default: `3`) |
+| `--reviewed-only` | Only evaluate threads marked as reviewed |
+| `--dry-run` | Show what would be evaluated without calling LLMs |
+| `--tag` | Tag for the results filename (e.g. `new-prompts`) |
+
+### 4. Report — Compute metrics and compare runs
+
+Generates accuracy, confusion matrix, per-class precision/recall/F1, and privacy violation reports.
+
+```bash
+# Single run report
+uv run python -m evals.report --results evals/results/run.jsonl
+
+# Verbose — show per-thread disagreements
+uv run python -m evals.report --results evals/results/run.jsonl --verbose
+
+# JSON output for programmatic use
+uv run python -m evals.report --results evals/results/run.jsonl --format json
+
+# Compare two runs side by side
+uv run python -m evals.report --compare evals/results/run_a.jsonl evals/results/run_b.jsonl
+
+# Trend view across all runs
+uv run python -m evals.report --results-dir evals/results/
+```
+
+| Flag | Description |
+|---|---|
+| `--results` | Path to a single results JSONL file |
+| `--compare` | Two result file paths for side-by-side comparison |
+| `--results-dir` | Directory of results for trend view |
+| `--verbose` | Show per-thread disagreements |
+| `--format` | `table` (default) or `json` |
+
+### Typical Workflows
+
+**Prompt A/B test:**
+
+```bash
+# Run baseline
+uv run python -m evals.run_eval --tag baseline
+# Edit prompts in config.toml, then re-run
+uv run python -m evals.run_eval --tag new-prompts
+# Compare
+uv run python -m evals.report --compare evals/results/*baseline*.jsonl evals/results/*new-prompts*.jsonl
+```
+
+**Model swap:**
+
+```bash
+# Run with current model
+uv run python -m evals.run_eval --tag deepseek-v3
+# Change [llm.cloud] model in config.toml, then re-run
+uv run python -m evals.run_eval --config config_v2.toml --tag gpt-4o
+# Compare
+uv run python -m evals.report --compare evals/results/*deepseek*.jsonl evals/results/*gpt-4o*.jsonl
+```
+
+**Ongoing monitoring:**
+
+```bash
+# Periodically harvest new production data
+uv run python -m evals.harvest --append
+# Review new threads
+uv run python -m evals.review --unreviewed-only
+# Re-evaluate and check trends
+uv run python -m evals.run_eval --reviewed-only --tag weekly
+uv run python -m evals.report --results-dir evals/results/
+```
+
 ## Testing
 
 All tests use mocks and require no external services.
@@ -222,12 +392,16 @@ uv run --extra dev pytest tests/
 
 ### Test coverage by module
 
-| Test file | Module | Tests | What's covered |
-|---|---|---|---|
-| `test_llm_client.py` | `llm_client.py` | 13 | Request format, auth headers, `<think>` tag stripping, error handling, availability checks |
-| `test_classifier.py` | `classifier.py` | 35 | `parse_sender` formats, `parse_sender_type` edge cases and defaults, `parse_email_label` edge cases and defaults, cloud/local routing, full pipeline |
-| `test_labeler.py` | `labeler.py` | 9 | Label verification (all present, partial, none), label ID mapping, inbox/archive actions, extra labels for unwanted, single API call per email |
-| `test_daemon.py` | `daemon.py` | 9 | Service email path, person email path, MLX-unavailable skip, error isolation, config loading |
+| Test file | Module | What's covered |
+|---|---|---|
+| `test_llm_client.py` | `llm_client.py` | Request format, auth headers, `<think>` tag stripping, error handling, availability checks |
+| `test_classifier.py` | `classifier.py` | `parse_sender` formats, `parse_sender_type` edge cases and defaults, `parse_email_label` edge cases and defaults, cloud/local routing, full pipeline |
+| `test_labeler.py` | `labeler.py` | Label verification (all present, partial, none), label ID mapping, inbox/archive actions, extra labels for unwanted, single API call per email |
+| `test_daemon.py` | `daemon.py` | Service email path, person email path, MLX-unavailable skip, error isolation, config loading |
+| `test_config_utils.py` | `config_utils.py` | Config loading, `{env.VAR}` substitution |
+| `test_eval_schemas.py` | `evals/schemas.py` | GoldenThread/PredictionResult/RunMeta serialization round-trips |
+| `test_eval_harvest.py` | `evals/harvest.py` | Ground truth inference from labels, deduplication |
+| `test_eval_report.py` | `evals/report.py` | Confusion matrix, precision/recall/F1, accuracy, privacy violation metrics |
 
 ### Linting
 
