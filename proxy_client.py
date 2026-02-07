@@ -16,7 +16,7 @@ load_dotenv()
 
 # Proxy configuration
 PROXY_URL = os.environ.get("PROXY_URL", "http://host.docker.internal:8000")
-PROXY_API_KEY = os.environ.get("PROXY_API_KEY", "")
+PROXY_API_KEY = os.environ.get("PROXY_API_KEY") or os.environ.get("EMAIL_LABELER_API_KEY", "")
 
 
 class ProxyAuthError(Exception):
