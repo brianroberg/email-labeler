@@ -10,6 +10,7 @@ from classifier import (
     EmailLabel,
     EmailMetadata,
     SenderType,
+    ThreadMetadata,
     parse_email_label,
     parse_sender,
     parse_sender_type,
@@ -205,9 +206,7 @@ class TestClassifyEmail:
 
     async def test_service_routes_to_cloud_llm(self, classifier, mock_cloud_llm, metadata):
         mock_cloud_llm.complete.return_value = "LOW_PRIORITY"
-        label, raw = await classifier.classify_email(
-            metadata, "Your order has shipped!", SenderType.SERVICE
-        )
+        label, raw = await classifier.classify_email(metadata, "Your order has shipped!", SenderType.SERVICE)
 
         assert label == EmailLabel.LOW_PRIORITY
         mock_cloud_llm.complete.assert_called_once()
@@ -253,9 +252,7 @@ class TestClassifyPipeline:
         assert mock_cloud_llm.complete.call_count == 2
         mock_local_llm.complete.assert_not_called()
 
-    async def test_person_uses_cloud_then_local(
-        self, classifier, mock_cloud_llm, mock_local_llm, metadata
-    ):
+    async def test_person_uses_cloud_then_local(self, classifier, mock_cloud_llm, mock_local_llm, metadata):
         """Person emails use cloud for sender type, local for email classification."""
         mock_cloud_llm.complete.return_value = "PERSON"
         mock_local_llm.complete.return_value = "FYI"
@@ -357,6 +354,115 @@ class TestVipClassification:
 
         result = await classifier.classify(vip_metadata, "Can you review this?")
 
+        assert result.sender_type == SenderType.PERSON
+        assert result.sender_type_raw == "VIP"
+        assert result.label == EmailLabel.NEEDS_RESPONSE
+        mock_cloud_llm.complete.assert_not_called()
+        mock_local_llm.complete.assert_called_once()
+
+
+# ── Thread metadata fixtures ─────────────────────────────────────────────
+
+
+@pytest.fixture
+def thread_metadata():
+    return ThreadMetadata(
+        thread_id="thread_001",
+        senders=["John Doe <john@example.com>", "Amazon <noreply@amazon.com>"],
+        subject="Re: Meeting tomorrow",
+        snippet="Hey, can we meet tomorrow?",
+    )
+
+
+@pytest.fixture
+def vip_thread_metadata():
+    return ThreadMetadata(
+        thread_id="thread_vip",
+        senders=["Other Person <other@example.com>", "Important Person <vip@example.com>"],
+        subject="Quick question",
+        snippet="Are you free tomorrow?",
+    )
+
+
+@pytest.fixture
+def service_only_thread_metadata():
+    return ThreadMetadata(
+        thread_id="thread_svc",
+        senders=["Amazon <noreply@amazon.com>", "FedEx <tracking@fedex.com>"],
+        subject="Your order has shipped",
+        snippet="Track your package...",
+    )
+
+
+# ── Thread sender classification tests ───────────────────────────────────
+
+
+class TestThreadSenderClassification:
+    async def test_vip_in_thread_shortcircuits(self, classifier, mock_cloud_llm, vip_thread_metadata):
+        """If any sender in thread is VIP, return PERSON/VIP without LLM calls."""
+        sender_type, raw = await classifier.classify_sender(vip_thread_metadata)
+        assert sender_type == SenderType.PERSON
+        assert raw == "VIP"
+        mock_cloud_llm.complete.assert_not_called()
+
+    async def test_person_in_thread_shortcircuits(self, classifier, mock_cloud_llm, thread_metadata):
+        """Short-circuit on first PERSON sender."""
+        mock_cloud_llm.complete.return_value = "PERSON"
+        sender_type, raw = await classifier.classify_sender(thread_metadata)
+        assert sender_type == SenderType.PERSON
+        # Should only call LLM once (short-circuit after PERSON)
+        assert mock_cloud_llm.complete.call_count == 1
+
+    async def test_all_service_senders(self, classifier, mock_cloud_llm, service_only_thread_metadata):
+        """All SERVICE senders -> SERVICE."""
+        mock_cloud_llm.complete.return_value = "SERVICE"
+        sender_type, raw = await classifier.classify_sender(service_only_thread_metadata)
+        assert sender_type == SenderType.SERVICE
+        # Should call LLM for each unique sender
+        assert mock_cloud_llm.complete.call_count == 2
+
+    async def test_person_after_service_found(self, classifier, mock_cloud_llm, thread_metadata):
+        """First sender SERVICE, second sender PERSON -> short-circuit PERSON."""
+        mock_cloud_llm.complete.side_effect = ["SERVICE", "PERSON"]
+        sender_type, raw = await classifier.classify_sender(thread_metadata)
+        assert sender_type == SenderType.PERSON
+        assert mock_cloud_llm.complete.call_count == 2
+
+
+# ── Thread classify_email tests ──────────────────────────────────────────
+
+
+class TestThreadClassifyEmail:
+    async def test_thread_uses_first_sender_in_template(self, classifier, mock_local_llm, thread_metadata):
+        """Thread classification uses first sender in user template."""
+        mock_local_llm.complete.return_value = "NEEDS_RESPONSE"
+        await classifier.classify_email(thread_metadata, "Thread transcript here...", SenderType.PERSON)
+        call_args = mock_local_llm.complete.call_args
+        user_content = call_args.args[1]
+        assert "John Doe <john@example.com>" in user_content
+        assert "Thread transcript here..." in user_content
+
+
+# ── Thread VIP classification tests ──────────────────────────────────────
+
+
+class TestThreadVipClassification:
+    async def test_vip_thread_narrowed_prompt(self, classifier, mock_local_llm, vip_thread_metadata):
+        """VIP thread gets narrowed categories."""
+        mock_local_llm.complete.return_value = "NEEDS_RESPONSE"
+        await classifier.classify_email(vip_thread_metadata, "Thread text", SenderType.PERSON, vip=True)
+        system_prompt = mock_local_llm.complete.call_args.args[0]
+        assert "NEEDS_RESPONSE" in system_prompt
+        assert "FYI" in system_prompt
+        assert "LOW_PRIORITY" not in system_prompt
+        assert "UNWANTED" not in system_prompt
+
+    async def test_vip_thread_full_pipeline(
+        self, classifier, mock_cloud_llm, mock_local_llm, vip_thread_metadata
+    ):
+        """Full pipeline: VIP thread skips sender LLM, narrowed prompt, local LLM."""
+        mock_local_llm.complete.return_value = "NEEDS_RESPONSE"
+        result = await classifier.classify(vip_thread_metadata, "Thread text")
         assert result.sender_type == SenderType.PERSON
         assert result.sender_type_raw == "VIP"
         assert result.label == EmailLabel.NEEDS_RESPONSE

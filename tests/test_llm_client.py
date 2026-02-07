@@ -28,7 +28,7 @@ def local_client():
         model="mlx-community/Qwen3-14B-4bit",
         max_tokens=8096,
         temperature=0.2,
-        timeout=120,
+        timeout=180,
     )
 
 
@@ -174,6 +174,17 @@ class TestComplete:
             mock_client_cls.return_value.__aexit__ = AsyncMock(return_value=False)
 
             with pytest.raises(httpx.ConnectError):
+                await cloud_client.complete("sys", "user")
+
+    async def test_raises_timeout_error_on_timeout(self, cloud_client):
+        """Timeout exceptions are converted to TimeoutError with helpful message."""
+        with patch("llm_client.httpx.AsyncClient") as mock_client_cls:
+            mock_client = AsyncMock()
+            mock_client.post.side_effect = httpx.ReadTimeout("timed out")
+            mock_client_cls.return_value.__aenter__ = AsyncMock(return_value=mock_client)
+            mock_client_cls.return_value.__aexit__ = AsyncMock(return_value=False)
+
+            with pytest.raises(TimeoutError, match="timed out after 60s"):
                 await cloud_client.complete("sys", "user")
 
     async def test_uses_configured_timeout(self, cloud_client):

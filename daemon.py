@@ -16,9 +16,10 @@ from pathlib import Path
 import httpx
 from dotenv import load_dotenv
 
-from classifier import EmailClassifier, EmailMetadata, SenderType
+from classifier import EmailClassifier, EmailLabel, SenderType, ThreadMetadata
+from config_utils import substitute_env_vars
 from gmail_utils import decode_body, get_header
-from labeler import LabelManager
+from labeler import LabelManager, _get_priority
 from llm_client import LLMClient
 from proxy_client import GmailProxyClient
 
@@ -33,62 +34,161 @@ log = logging.getLogger("email-labeler")
 
 
 def load_config() -> dict:
-    """Load configuration from config.toml."""
+    """Load configuration from config.toml.
+
+    After parsing, any {env.VAR_NAME} placeholders in string values are
+    replaced with the corresponding environment variable (empty string if unset).
+    """
     config_path = Path(__file__).parent / "config.toml"
     with open(config_path, "rb") as f:
-        return tomllib.load(f)
+        config = tomllib.load(f)
+    return substitute_env_vars(config)
 
 
-async def process_single_email(
-    msg_id: str,
+def format_thread_transcript(messages: list[dict], max_chars: int) -> str:
+    """Format Gmail messages into a chronological thread transcript.
+
+    Messages should be pre-sorted by internalDate (chronological).
+    If the transcript exceeds max_chars, the oldest messages are dropped
+    and a truncation notice is prepended.
+
+    Args:
+        messages: List of Gmail message resources (with payload.headers and payload.body).
+        max_chars: Maximum character limit for the transcript.
+
+    Returns:
+        Formatted transcript string.
+    """
+    parts = []
+    for msg in messages:
+        headers = msg["payload"]["headers"]
+        sender = get_header(headers, "From")
+        date = get_header(headers, "Date")
+        body = decode_body(msg["payload"])
+
+        part = f"--- Message from {sender} on {date} ---\n{body}"
+        parts.append(part)
+
+    full = "\n\n".join(parts)
+    if len(full) <= max_chars:
+        return full
+
+    # Truncate from the oldest messages first
+    while len(parts) > 1:
+        parts.pop(0)
+        candidate = "[Earlier messages truncated]\n\n" + "\n\n".join(parts)
+        if len(candidate) <= max_chars:
+            return candidate
+
+    # Single message still too long — hard truncate
+    return parts[0][:max_chars]
+
+
+async def process_single_thread(
+    thread_id: str,
+    msg_ids: list[str],
     proxy_client: GmailProxyClient,
     classifier: EmailClassifier,
     label_manager: LabelManager,
     mlx_available: bool,
+    max_thread_chars: int,
 ) -> bool:
-    """Process a single email through the classification pipeline.
+    """Process a single thread through the classification pipeline.
+
+    Fetches the full thread, formats all messages into a transcript,
+    classifies once, and applies labels to all messages in the thread.
+
+    Enforces no-downgrade rule: if the thread already has a classification
+    with equal or higher priority, it is skipped.
 
     Args:
-        msg_id: Gmail message ID.
+        thread_id: Gmail thread ID.
+        msg_ids: List of message IDs in the thread (from list_messages stubs).
         proxy_client: Gmail proxy client.
         classifier: Email classifier instance.
         label_manager: Label manager instance.
         mlx_available: Whether the local MLX LLM is available.
+        max_thread_chars: Maximum characters for thread transcript.
 
     Returns:
-        True if the email was successfully classified and labeled,
+        True if the thread was successfully classified and labeled,
         False if skipped or errored.
     """
     try:
-        message = await proxy_client.get_message(msg_id)
-        headers = message["payload"]["headers"]
-        sender = get_header(headers, "From")
-        subject = get_header(headers, "Subject")
-        snippet = message.get("snippet", "")
-        body = decode_body(message["payload"])
+        # Fetch full thread (all messages in one API call)
+        thread_data = await proxy_client.get_thread(thread_id)
+        messages = thread_data.get("messages", [])
+        if not messages:
+            log.warning("Thread %s has no messages, skipping", thread_id)
+            return False
 
-        metadata = EmailMetadata(
-            message_id=msg_id,
-            sender=sender,
+        # Sort chronologically
+        messages.sort(key=lambda m: int(m.get("internalDate", "0")))
+
+        # Check priority — skip if already classified at max priority
+        existing_priority = label_manager.get_existing_priority(messages)
+        if existing_priority is not None and existing_priority >= _get_priority(EmailLabel.NEEDS_RESPONSE):
+            log.info("Thread %s already at max priority, skipping", thread_id)
+            return False
+
+        # Collect all message IDs (thread may have more messages than query returned)
+        all_msg_ids = [msg["id"] for msg in messages]
+
+        # Extract unique senders (preserve order)
+        senders = []
+        seen = set()
+        for msg in messages:
+            headers = msg["payload"]["headers"]
+            sender = get_header(headers, "From")
+            if sender and sender not in seen:
+                senders.append(sender)
+                seen.add(sender)
+
+        if not senders:
+            log.warning("Thread %s has no valid senders, skipping", thread_id)
+            return False
+
+        first_headers = messages[0]["payload"]["headers"]
+        subject = get_header(first_headers, "Subject")
+        snippet = messages[-1].get("snippet", "")  # latest message snippet
+
+        metadata = ThreadMetadata(
+            thread_id=thread_id,
+            senders=senders,
             subject=subject,
             snippet=snippet,
         )
 
+        # Format thread transcript
+        transcript = format_thread_transcript(messages, max_thread_chars)
+
+        # Classify
         if not mlx_available:
-            # Check sender type first — if person, skip (privacy)
             sender_type, sender_raw = await classifier.classify_sender(metadata)
             if sender_type == SenderType.PERSON:
-                log.info("Skipping person email %s (MLX unavailable): %s", msg_id, subject)
+                log.info("Skipping person thread %s (MLX unavailable): %s", thread_id, subject)
                 return False
-            # Service email — pass pre-computed sender type to avoid duplicate LLM call
-            result = await classifier.classify(metadata, body, sender_type, sender_raw)
+            result = await classifier.classify(metadata, transcript, sender_type, sender_raw)
         else:
-            result = await classifier.classify(metadata, body)
+            result = await classifier.classify(metadata, transcript)
 
-        await label_manager.apply_classification(msg_id, result.label, result.sender_type)
+        # Enforce no-downgrade
+        new_priority = _get_priority(result.label)
+        if existing_priority is not None and existing_priority >= new_priority:
+            log.info(
+                "Thread %s: existing priority %d >= new %d, skipping downgrade",
+                thread_id,
+                existing_priority,
+                new_priority,
+            )
+            return False
+
+        # Apply labels to ALL messages in thread
+        await label_manager.apply_classification(all_msg_ids, result.label, result.sender_type)
         log.info(
-            "Classified %s: sender=%s label=%s — %s",
-            msg_id,
+            "Classified thread %s (%d msgs): sender=%s label=%s — %s",
+            thread_id,
+            len(all_msg_ids),
             result.sender_type.value,
             result.label.value,
             subject,
@@ -96,10 +196,13 @@ async def process_single_email(
         return True
 
     except httpx.ConnectError as exc:
-        log.warning("Connection error processing email %s: %s", msg_id, exc)
+        log.warning("Connection error processing thread %s: %s", thread_id, exc)
+        return False
+    except TimeoutError as exc:
+        log.warning("Timeout processing thread %s: %s", thread_id, exc)
         return False
     except Exception:
-        log.exception("Error processing email %s", msg_id)
+        log.exception("Error processing thread %s", thread_id)
         return False
 
 
@@ -145,7 +248,11 @@ async def run_daemon() -> None:
                 sys.exit(1)
             break
         except httpx.ConnectError:
-            log.warning("Cannot reach api-proxy at %s — retrying in %ds", proxy_client.proxy_url, startup_backoff)
+            log.warning(
+                "Cannot reach api-proxy at %s — retrying in %ds",
+                proxy_client.proxy_url,
+                startup_backoff,
+            )
             await asyncio.sleep(startup_backoff)
             startup_backoff = min(startup_backoff * 2, max_startup_backoff)
 
@@ -168,22 +275,34 @@ async def run_daemon() -> None:
             messages = response.get("messages", [])
 
             if messages:
-                log.info("Found %d unprocessed email(s)", len(messages))
+                log.info("Found %d unprocessed message(s)", len(messages))
 
-            processed = 0
+            # Group messages by threadId
+            threads: dict[str, list[str]] = {}
             for msg_stub in messages:
-                success = await process_single_email(
-                    msg_stub["id"],
+                tid = msg_stub.get("threadId", msg_stub["id"])
+                threads.setdefault(tid, []).append(msg_stub["id"])
+
+            if threads:
+                log.info("Grouped into %d thread(s)", len(threads))
+
+            max_thread_chars = daemon_config.get("max_thread_chars", 50000)
+            processed = 0
+            for tid, msg_ids in threads.items():
+                success = await process_single_thread(
+                    tid,
+                    msg_ids,
                     proxy_client,
                     classifier,
                     label_manager,
                     mlx_available,
+                    max_thread_chars,
                 )
                 if success:
                     processed += 1
 
-            if messages:
-                log.info("Processed %d/%d emails", processed, len(messages))
+            if threads:
+                log.info("Processed %d/%d threads", processed, len(threads))
 
             # Update healthcheck
             healthcheck_file.write_text(str(asyncio.get_event_loop().time()))
@@ -192,7 +311,11 @@ async def run_daemon() -> None:
             backoff = poll_interval
 
         except httpx.ConnectError:
-            log.warning("Lost connection to api-proxy at %s — retrying in %ds", proxy_client.proxy_url, backoff)
+            log.warning(
+                "Lost connection to api-proxy at %s — retrying in %ds",
+                proxy_client.proxy_url,
+                backoff,
+            )
             backoff = min(backoff * 2, poll_interval * 10)
         except Exception:
             log.exception("Error in poll cycle")
