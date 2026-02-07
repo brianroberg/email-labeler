@@ -312,8 +312,8 @@ uv run python -m evals.run_eval --stages stage2_only
 # Use alternate config and tag the run
 uv run python -m evals.run_eval --config config_v2.toml --tag new-prompts
 
-# Only evaluate reviewed threads, with higher parallelism
-uv run python -m evals.run_eval --reviewed-only --parallelism 5
+# Include unreviewed threads (default is reviewed-only)
+uv run python -m evals.run_eval --include-unreviewed
 
 # Dry run — show what would be evaluated
 uv run python -m evals.run_eval --dry-run
@@ -326,7 +326,7 @@ uv run python -m evals.run_eval --dry-run
 | `--output-dir` | Output directory for results (default: `evals/results/`) |
 | `--stages` | `full`, `stage1_only`, or `stage2_only` (default: `full`) |
 | `--parallelism` | Concurrent evaluations (default: `3`) |
-| `--reviewed-only` | Only evaluate threads marked as reviewed |
+| `--include-unreviewed` | Also evaluate threads not yet reviewed (default: reviewed only) |
 | `--dry-run` | Show what would be evaluated without calling LLMs |
 | `--tag` | Tag for the results filename (e.g. `new-prompts`) |
 
@@ -391,7 +391,7 @@ uv run python -m evals.harvest --proxy-url http://localhost:8000 --append
 # Review new threads
 uv run python -m evals.review --unreviewed-only
 # Re-evaluate and check trends
-uv run python -m evals.run_eval --reviewed-only --tag weekly
+uv run python -m evals.run_eval --tag weekly
 uv run python -m evals.report --results-dir evals/results/
 ```
 

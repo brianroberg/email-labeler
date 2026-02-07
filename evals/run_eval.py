@@ -4,7 +4,7 @@ Usage:
     python -m evals.run_eval
     python -m evals.run_eval --golden-set evals/golden_set.jsonl --stages full
     python -m evals.run_eval --config config_v2.toml --tag new-prompts
-    python -m evals.run_eval --stages stage1_only --reviewed-only
+    python -m evals.run_eval --stages stage1_only --include-unreviewed
     python -m evals.run_eval --dry-run
 """
 
@@ -222,7 +222,7 @@ async def main(args: argparse.Namespace) -> None:
 
     # Load golden set
     golden_path = Path(args.golden_set)
-    golden_set = load_golden_set(golden_path, reviewed_only=args.reviewed_only)
+    golden_set = load_golden_set(golden_path, reviewed_only=not args.include_unreviewed)
     if not golden_set:
         print("No threads to evaluate.", file=sys.stderr)
         sys.exit(1)
@@ -315,7 +315,8 @@ def cli():
     parser.add_argument("--stages", choices=VALID_STAGES, default="full",
                         help="Which stages to evaluate")
     parser.add_argument("--parallelism", type=int, default=3, help="Concurrent evaluations")
-    parser.add_argument("--reviewed-only", action="store_true", help="Only evaluate reviewed threads")
+    parser.add_argument("--include-unreviewed", action="store_true",
+                        help="Also evaluate threads not yet reviewed (default: reviewed only)")
     parser.add_argument("--dry-run", action="store_true", help="Show what would be evaluated")
     parser.add_argument("--tag", help="Tag for the results file name")
     args = parser.parse_args()
