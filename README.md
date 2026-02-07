@@ -249,14 +249,14 @@ Pulls threads already labeled by the daemon, infers ground truth from their Gmai
 
 ```bash
 # Harvest up to 200 processed threads
-uv run python -m evals.harvest --output evals/golden_set.jsonl --max-threads 200
+uv run python -m evals.harvest --proxy-url http://localhost:8000 --max-threads 200
 
 # Append new threads (deduplicates automatically)
-uv run python -m evals.harvest --output evals/golden_set.jsonl --append
+uv run python -m evals.harvest --proxy-url http://localhost:8000 --append
 
 # Filter by sender type or label
-uv run python -m evals.harvest --output evals/golden_set.jsonl --sender-type person
-uv run python -m evals.harvest --output evals/golden_set.jsonl --label needs_response
+uv run python -m evals.harvest --proxy-url http://localhost:8000 --sender-type person
+uv run python -m evals.harvest --proxy-url http://localhost:8000 --label needs_response
 ```
 
 | Flag | Description |
@@ -386,7 +386,7 @@ uv run python -m evals.report --compare evals/results/*deepseek*.jsonl evals/res
 
 ```bash
 # Periodically harvest new production data
-uv run python -m evals.harvest --append
+uv run python -m evals.harvest --proxy-url http://localhost:8000 --append
 # Review new threads
 uv run python -m evals.review --unreviewed-only
 # Re-evaluate and check trends
