@@ -6,12 +6,15 @@ Stage 2: Full body sent to local LLM (person) or cloud LLM (service) for classif
 Privacy invariant: Person email bodies NEVER leave the local network.
 """
 
+import logging
 import os
 import re
 from dataclasses import dataclass
 from enum import Enum
 
 from llm_client import LLMClient
+
+log = logging.getLogger(__name__)
 
 
 class SenderType(Enum):
@@ -76,28 +79,48 @@ def parse_sender(from_header: str) -> tuple[str, str]:
     return ("", from_header.strip())
 
 
+_SENDER_TYPE_VALID = {"PERSON", "SERVICE"}
+
+
 def parse_sender_type(raw_llm_output: str) -> SenderType:
     """Parse LLM output into SenderType. Defaults to SERVICE (safe)."""
     cleaned = raw_llm_output.strip().upper()
     if cleaned.startswith("PERSON"):
-        return SenderType.PERSON
-    if cleaned.startswith("SERVICE"):
-        return SenderType.SERVICE
-    return SenderType.SERVICE
+        result = SenderType.PERSON
+    elif cleaned.startswith("SERVICE"):
+        result = SenderType.SERVICE
+    else:
+        result = SenderType.SERVICE
+    if cleaned not in _SENDER_TYPE_VALID:
+        log.warning(
+            "Unexpected sender type output (interpreting as %s): %.40s",
+            result.name, raw_llm_output.strip(),
+        )
+    return result
+
+
+_EMAIL_LABEL_VALID = {"NEEDS_RESPONSE", "FYI", "LOW_PRIORITY", "UNWANTED"}
 
 
 def parse_email_label(raw_llm_output: str) -> EmailLabel:
     """Parse LLM output into EmailLabel. Defaults to LOW_PRIORITY (safe)."""
     cleaned = raw_llm_output.strip().upper()
     if cleaned.startswith("NEEDS_RESPONSE"):
-        return EmailLabel.NEEDS_RESPONSE
-    if cleaned.startswith("FYI"):
-        return EmailLabel.FYI
-    if cleaned.startswith("LOW_PRIORITY"):
-        return EmailLabel.LOW_PRIORITY
-    if cleaned.startswith("UNWANTED"):
-        return EmailLabel.UNWANTED
-    return EmailLabel.LOW_PRIORITY
+        result = EmailLabel.NEEDS_RESPONSE
+    elif cleaned.startswith("FYI"):
+        result = EmailLabel.FYI
+    elif cleaned.startswith("LOW_PRIORITY"):
+        result = EmailLabel.LOW_PRIORITY
+    elif cleaned.startswith("UNWANTED"):
+        result = EmailLabel.UNWANTED
+    else:
+        result = EmailLabel.LOW_PRIORITY
+    if cleaned not in _EMAIL_LABEL_VALID:
+        log.warning(
+            "Unexpected email label output (interpreting as %s): %.40s",
+            result.name, raw_llm_output.strip(),
+        )
+    return result
 
 
 class EmailClassifier:

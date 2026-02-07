@@ -79,6 +79,31 @@ class TestParseSenderType:
     def test_garbage_defaults_to_service(self):
         assert parse_sender_type("asdfghjkl") == SenderType.SERVICE
 
+    def test_no_warning_on_exact_match(self, caplog):
+        with caplog.at_level("WARNING", logger="classifier"):
+            parse_sender_type("PERSON")
+        assert caplog.records == []
+
+    def test_warns_on_trailing_text(self, caplog):
+        with caplog.at_level("WARNING", logger="classifier"):
+            parse_sender_type("PERSON. The sender is a real person.")
+        assert len(caplog.records) == 1
+        assert "interpreting as PERSON" in caplog.records[0].message
+
+    def test_warns_on_unrecognized_output(self, caplog):
+        with caplog.at_level("WARNING", logger="classifier"):
+            parse_sender_type("I think this is a human")
+        assert len(caplog.records) == 1
+        assert "interpreting as SERVICE" in caplog.records[0].message
+        assert "I think this is a human" in caplog.records[0].message
+
+    def test_warning_truncates_long_output(self, caplog):
+        long_output = "PERSON" + " extra commentary" * 20
+        with caplog.at_level("WARNING", logger="classifier"):
+            parse_sender_type(long_output)
+        assert len(caplog.records) == 1
+        assert len(caplog.records[0].message) < len(long_output)
+
 
 class TestParseEmailLabel:
     def test_needs_response(self):
@@ -110,6 +135,24 @@ class TestParseEmailLabel:
 
     def test_empty_defaults_to_low_priority(self):
         assert parse_email_label("") == EmailLabel.LOW_PRIORITY
+
+    def test_no_warning_on_exact_match(self, caplog):
+        with caplog.at_level("WARNING", logger="classifier"):
+            parse_email_label("NEEDS_RESPONSE")
+        assert caplog.records == []
+
+    def test_warns_on_trailing_text(self, caplog):
+        with caplog.at_level("WARNING", logger="classifier"):
+            parse_email_label("LOW_PRIORITY. This is a newsletter.")
+        assert len(caplog.records) == 1
+        assert "interpreting as LOW_PRIORITY" in caplog.records[0].message
+
+    def test_warns_on_unrecognized_output(self, caplog):
+        with caplog.at_level("WARNING", logger="classifier"):
+            parse_email_label("IMPORTANT")
+        assert len(caplog.records) == 1
+        assert "interpreting as LOW_PRIORITY" in caplog.records[0].message
+        assert "IMPORTANT" in caplog.records[0].message
 
 
 # ── EmailClassifier class tests ──────────────────────────────────────────
