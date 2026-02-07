@@ -21,6 +21,7 @@ class GoldenThread:
     harvested_at: str = ""  # ISO 8601
     reviewed: bool = False
     notes: str = ""
+    skipped: bool = False
 
     def to_dict(self) -> dict:
         return {
@@ -35,6 +36,7 @@ class GoldenThread:
             "harvested_at": self.harvested_at,
             "reviewed": self.reviewed,
             "notes": self.notes,
+            "skipped": self.skipped,
         }
 
     @classmethod
@@ -51,6 +53,7 @@ class GoldenThread:
             harvested_at=d.get("harvested_at", ""),
             reviewed=d.get("reviewed", False),
             notes=d.get("notes", ""),
+            skipped=d.get("skipped", False),
         )
 
 

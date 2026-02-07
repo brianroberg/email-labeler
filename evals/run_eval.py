@@ -41,6 +41,8 @@ def load_golden_set(path: Path, reviewed_only: bool = False) -> list[GoldenThrea
             line = line.strip()
             if line:
                 gt = GoldenThread.from_dict(json.loads(line))
+                if gt.skipped:
+                    continue
                 if reviewed_only and not gt.reviewed:
                     continue
                 threads.append(gt)

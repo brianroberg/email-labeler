@@ -290,6 +290,7 @@ uv run python -m evals.review --start-at 5
 | Flag | Description |
 |---|---|
 | `--golden-set` | Path to golden set JSONL (default: `evals/golden_set.jsonl`) |
+| `--blind` | Blind mode: classify without seeing current labels |
 | `--unreviewed-only` | Show only threads not yet reviewed |
 | `--filter-label` | Show only threads with this label |
 | `--start-at` | Start at thread index (0-based) |
