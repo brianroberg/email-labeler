@@ -329,6 +329,7 @@ uv run python -m evals.run_eval --dry-run
 | `--include-unreviewed` | Also evaluate threads not yet reviewed (default: reviewed only) |
 | `--dry-run` | Show what would be evaluated without calling LLMs |
 | `--tag` | Tag for the results filename (e.g. `new-prompts`) |
+| `--no-cache` | Disable LLM response cache (default: cache enabled) |
 
 ### 4. Report — Compute metrics and compare runs
 

@@ -26,6 +26,7 @@ from classifier import EmailClassifier, SenderType, ThreadMetadata
 from config_utils import substitute_env_vars
 from daemon import format_thread_transcript
 from evals import format_network_error
+from evals.llm_cache import CachedLLMClient
 from evals.schemas import GoldenThread, PredictionResult, RunMeta
 from gmail_utils import get_header
 from llm_client import LLMClient
@@ -236,8 +237,8 @@ async def main(args: argparse.Namespace) -> None:
                   file=sys.stderr)
         return
 
-    # Build classifier (same as daemon.run_daemon())
-    cloud_llm = LLMClient(
+    # Build LLM clients (same as daemon.run_daemon())
+    cloud_llm_base = LLMClient(
         base_url=os.environ.get("CLOUD_LLM_URL", ""),
         api_key=os.environ.get("CLOUD_LLM_API_KEY", ""),
         model=config["llm"]["cloud"]["model"],
@@ -245,7 +246,7 @@ async def main(args: argparse.Namespace) -> None:
         temperature=config["llm"]["cloud"]["temperature"],
         timeout=config["llm"]["cloud"]["timeout"],
     )
-    local_llm = LLMClient(
+    local_llm_base = LLMClient(
         base_url=os.environ.get("MLX_URL", ""),
         api_key="",
         model=config["llm"]["local"]["model"],
@@ -253,58 +254,83 @@ async def main(args: argparse.Namespace) -> None:
         temperature=config["llm"]["local"]["temperature"],
         timeout=config["llm"]["local"]["timeout"],
     )
+
+    # Wrap with cache unless --no-cache
+    if args.no_cache:
+        cloud_llm = cloud_llm_base
+        local_llm = local_llm_base
+    else:
+        cache_path = Path(__file__).parent / "cache" / "llm_cache.jsonl"
+        cloud_llm = CachedLLMClient(cloud_llm_base, cache_path)
+        local_llm = CachedLLMClient(local_llm_base, cache_path)
+
     classifier = EmailClassifier(cloud_llm=cloud_llm, local_llm=local_llm, config=config)
 
     max_thread_chars = config.get("daemon", {}).get("max_thread_chars", 50000)
 
-    # Run evaluation
-    print(f"Running evaluation (stages={args.stages}, parallelism={args.parallelism})...", file=sys.stderr)
-    results = await run_evaluation(
-        golden_set=golden_set,
-        classifier=classifier,
-        stages=args.stages,
-        max_thread_chars=max_thread_chars,
-        parallelism=args.parallelism,
-    )
+    # Run evaluation — flush cache even if something fails after evaluation
+    try:
+        print(f"Running evaluation (stages={args.stages}, parallelism={args.parallelism})...",
+              file=sys.stderr)
+        results = await run_evaluation(
+            golden_set=golden_set,
+            classifier=classifier,
+            stages=args.stages,
+            max_thread_chars=max_thread_chars,
+            parallelism=args.parallelism,
+        )
 
-    # Build run metadata
-    config_bytes = json.dumps(config, sort_keys=True).encode()
-    run_id = uuid.uuid4().hex
-    meta = RunMeta(
-        run_id=run_id,
-        timestamp=datetime.now(timezone.utc).isoformat(),
-        config_hash=hashlib.sha256(config_bytes).hexdigest()[:16],
-        config_path=str(config_path),
-        cloud_model=config["llm"]["cloud"]["model"],
-        local_model=config["llm"]["local"]["model"],
-        golden_set_path=str(golden_path),
-        golden_set_count=len(golden_set),
-        stages=args.stages,
-        parallelism=args.parallelism,
-        tag=args.tag or "",
-    )
+        # Build run metadata
+        config_bytes = json.dumps(config, sort_keys=True).encode()
+        run_id = uuid.uuid4().hex
+        meta = RunMeta(
+            run_id=run_id,
+            timestamp=datetime.now(timezone.utc).isoformat(),
+            config_hash=hashlib.sha256(config_bytes).hexdigest()[:16],
+            config_path=str(config_path),
+            cloud_model=config["llm"]["cloud"]["model"],
+            local_model=config["llm"]["local"]["model"],
+            golden_set_path=str(golden_path),
+            golden_set_count=len(golden_set),
+            stages=args.stages,
+            parallelism=args.parallelism,
+            tag=args.tag or "",
+        )
 
-    # Write results
-    output_dir = Path(args.output_dir)
-    output_path = build_output_path(output_dir, args.stages, args.tag or "", run_id)
-    write_results(output_path, meta, results)
+        # Write results
+        output_dir = Path(args.output_dir)
+        output_path = build_output_path(output_dir, args.stages, args.tag or "", run_id)
+        write_results(output_path, meta, results)
 
-    # Summary
-    errors = sum(1 for r in results if r.error)
-    st_correct = sum(1 for r in results if r.sender_type_correct is True)
-    st_total = sum(1 for r in results if r.sender_type_correct is not None)
-    lb_correct = sum(1 for r in results if r.label_correct is True)
-    lb_total = sum(1 for r in results if r.label_correct is not None)
-    violations = sum(1 for r in results if r.privacy_violation)
+        # Summary
+        errors = sum(1 for r in results if r.error)
+        st_correct = sum(1 for r in results if r.sender_type_correct is True)
+        st_total = sum(1 for r in results if r.sender_type_correct is not None)
+        lb_correct = sum(1 for r in results if r.label_correct is True)
+        lb_total = sum(1 for r in results if r.label_correct is not None)
+        violations = sum(1 for r in results if r.privacy_violation)
 
-    print(f"\nResults written to {output_path}", file=sys.stderr)
-    print(f"  Threads: {len(results)} ({errors} errors)", file=sys.stderr)
-    if st_total:
-        print(f"  Stage 1 accuracy: {st_correct}/{st_total} ({st_correct / st_total:.1%})", file=sys.stderr)
-    if lb_total:
-        print(f"  Stage 2 accuracy: {lb_correct}/{lb_total} ({lb_correct / lb_total:.1%})", file=sys.stderr)
-    if violations:
-        print(f"  Privacy violations: {violations}", file=sys.stderr)
+        print(f"\nResults written to {output_path}", file=sys.stderr)
+        print(f"  Threads: {len(results)} ({errors} errors)", file=sys.stderr)
+        if st_total:
+            pct = st_correct / st_total
+            print(f"  Stage 1 accuracy: {st_correct}/{st_total} ({pct:.1%})", file=sys.stderr)
+        if lb_total:
+            pct = lb_correct / lb_total
+            print(f"  Stage 2 accuracy: {lb_correct}/{lb_total} ({pct:.1%})", file=sys.stderr)
+        if violations:
+            print(f"  Privacy violations: {violations}", file=sys.stderr)
+        if not args.no_cache:
+            total_hits = cloud_llm.hits + local_llm.hits
+            total_misses = cloud_llm.misses + local_llm.misses
+            total_calls = total_hits + total_misses
+            if total_calls:
+                rate = total_hits / total_calls
+                print(f"  Cache: {total_hits}/{total_calls} hits ({rate:.1%})", file=sys.stderr)
+    finally:
+        if not args.no_cache:
+            cloud_llm.flush()
+            local_llm.flush()
 
 
 def cli():
@@ -319,6 +345,7 @@ def cli():
                         help="Also evaluate threads not yet reviewed (default: reviewed only)")
     parser.add_argument("--dry-run", action="store_true", help="Show what would be evaluated")
     parser.add_argument("--tag", help="Tag for the results file name")
+    parser.add_argument("--no-cache", action="store_true", help="Disable LLM response cache")
     args = parser.parse_args()
 
     if args.stages not in VALID_STAGES:
