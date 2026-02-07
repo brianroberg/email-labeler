@@ -22,6 +22,7 @@ class LLMClient:
         max_tokens: int = 8096,
         temperature: float = 0.2,
         timeout: int = 60,
+        extra_body: dict | None = None,
     ):
         self.base_url = base_url
         self.api_key = api_key
@@ -29,6 +30,7 @@ class LLMClient:
         self.max_tokens = max_tokens
         self.temperature = temperature
         self.timeout = timeout
+        self.extra_body = extra_body or {}
 
     async def complete(self, system_prompt: str, user_content: str) -> str:
         """Send a chat completion request and return the stripped response.
@@ -56,6 +58,7 @@ class LLMClient:
                 {"role": "system", "content": system_prompt},
                 {"role": "user", "content": user_content},
             ],
+            **self.extra_body,
         }
 
         async def _do_request() -> httpx.Response:
@@ -93,6 +96,7 @@ class LLMClient:
                 "max_tokens": 1,
                 "temperature": 0,
                 "messages": [{"role": "user", "content": "ping"}],
+                **self.extra_body,
             }
 
             async with httpx.AsyncClient(timeout=10) as client:

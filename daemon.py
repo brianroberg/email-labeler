@@ -219,6 +219,7 @@ async def run_daemon() -> None:
         max_tokens=config["llm"]["cloud"]["max_tokens"],
         temperature=config["llm"]["cloud"]["temperature"],
         timeout=config["llm"]["cloud"]["timeout"],
+        extra_body=config["llm"]["cloud"].get("extra_body"),
     )
     local_llm = LLMClient(
         base_url=os.environ.get("MLX_URL", ""),
@@ -227,6 +228,7 @@ async def run_daemon() -> None:
         max_tokens=config["llm"]["local"]["max_tokens"],
         temperature=config["llm"]["local"]["temperature"],
         timeout=config["llm"]["local"]["timeout"],
+        extra_body=config["llm"]["local"].get("extra_body"),
     )
 
     classifier = EmailClassifier(

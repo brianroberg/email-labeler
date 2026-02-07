@@ -250,3 +250,92 @@ class TestIsAvailable:
             mock_client_cls.return_value.__aexit__ = AsyncMock(return_value=False)
 
             assert await local_client.is_available() is False
+
+
+class TestExtraBody:
+    async def test_extra_body_merged_into_request(self):
+        """Extra body fields are merged into the API request."""
+        client = LLMClient(
+            base_url="http://localhost:8080/v1/chat/completions",
+            api_key="",
+            model="qwen3",
+            extra_body={"enable_thinking": False},
+        )
+        mock_response = _mock_response(json_data={
+            "choices": [{"message": {"content": "SERVICE"}}]
+        })
+
+        with patch("llm_client.httpx.AsyncClient") as mock_client_cls:
+            mock_client = AsyncMock()
+            mock_client.post.return_value = mock_response
+            mock_client_cls.return_value.__aenter__ = AsyncMock(return_value=mock_client)
+            mock_client_cls.return_value.__aexit__ = AsyncMock(return_value=False)
+
+            await client.complete("sys", "user")
+
+            body = mock_client.post.call_args.kwargs["json"]
+            assert body["enable_thinking"] is False
+            assert body["model"] == "qwen3"
+
+    async def test_nested_extra_body(self):
+        """Nested extra body (e.g. chat_template_kwargs) is preserved."""
+        client = LLMClient(
+            base_url="http://localhost:8080/v1/chat/completions",
+            api_key="",
+            model="qwen3",
+            extra_body={"chat_template_kwargs": {"enable_thinking": False}},
+        )
+        mock_response = _mock_response(json_data={
+            "choices": [{"message": {"content": "PERSON"}}]
+        })
+
+        with patch("llm_client.httpx.AsyncClient") as mock_client_cls:
+            mock_client = AsyncMock()
+            mock_client.post.return_value = mock_response
+            mock_client_cls.return_value.__aenter__ = AsyncMock(return_value=mock_client)
+            mock_client_cls.return_value.__aexit__ = AsyncMock(return_value=False)
+
+            await client.complete("sys", "user")
+
+            body = mock_client.post.call_args.kwargs["json"]
+            assert body["chat_template_kwargs"] == {"enable_thinking": False}
+
+    async def test_no_extra_body_by_default(self, cloud_client):
+        """Without extra_body, request contains only standard fields."""
+        mock_response = _mock_response(json_data={
+            "choices": [{"message": {"content": "SERVICE"}}]
+        })
+
+        with patch("llm_client.httpx.AsyncClient") as mock_client_cls:
+            mock_client = AsyncMock()
+            mock_client.post.return_value = mock_response
+            mock_client_cls.return_value.__aenter__ = AsyncMock(return_value=mock_client)
+            mock_client_cls.return_value.__aexit__ = AsyncMock(return_value=False)
+
+            await cloud_client.complete("sys", "user")
+
+            body = mock_client.post.call_args.kwargs["json"]
+            assert set(body.keys()) == {"model", "max_tokens", "temperature", "messages"}
+
+    async def test_extra_body_in_availability_check(self):
+        """Extra body fields are included in is_available ping."""
+        client = LLMClient(
+            base_url="http://localhost:8080/v1/chat/completions",
+            api_key="",
+            model="qwen3",
+            extra_body={"enable_thinking": False},
+        )
+        mock_response = _mock_response(json_data={
+            "choices": [{"message": {"content": "ok"}}]
+        })
+
+        with patch("llm_client.httpx.AsyncClient") as mock_client_cls:
+            mock_client = AsyncMock()
+            mock_client.post.return_value = mock_response
+            mock_client_cls.return_value.__aenter__ = AsyncMock(return_value=mock_client)
+            mock_client_cls.return_value.__aexit__ = AsyncMock(return_value=False)
+
+            await client.is_available()
+
+            body = mock_client.post.call_args.kwargs["json"]
+            assert body["enable_thinking"] is False

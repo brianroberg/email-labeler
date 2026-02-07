@@ -474,6 +474,34 @@ temperature = 0.2
 timeout = 120       # Local LLM gets more time (runs on consumer hardware)
 ```
 
+### Extra request body fields
+
+Each `[llm.*]` section supports an optional `extra_body` table. Any key-value pairs defined here are merged into every API request body sent to that endpoint. This is useful for provider-specific parameters that aren't part of the standard OpenAI chat completion format.
+
+**Disabling thinking for reasoning models** — Models like Qwen3, DeepSeek-R1, and GLM-4.5 generate chain-of-thought reasoning in `<think>` tags before answering. While the daemon already strips these tags from responses, you can disable thinking entirely to save tokens and reduce latency.
+
+For providers that accept a top-level `enable_thinking` flag (Novita.ai, many OpenAI-compatible APIs):
+
+```toml
+[llm.local.extra_body]
+enable_thinking = false
+```
+
+For LM Studio with models that use `chat_template_kwargs` (e.g. Qwen3):
+
+```toml
+[llm.local.extra_body.chat_template_kwargs]
+enable_thinking = false
+```
+
+You can put any provider-specific fields in `extra_body` — it is not limited to thinking controls. For example:
+
+```toml
+[llm.cloud.extra_body]
+top_p = 0.9
+frequency_penalty = 0.5
+```
+
 ### Prompt templates
 
 The `[prompts.sender_classification]` and `[prompts.email_classification]` sections contain the system prompts and user message templates used for each classification stage. Templates use Python format strings with `{sender}`, `{subject}`, `{snippet}`, and `{body}` placeholders.
