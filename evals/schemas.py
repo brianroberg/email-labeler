@@ -124,6 +124,17 @@ class RunMeta:
     stages: str = "full"  # "full" / "stage1_only" / "stage2_only"
     parallelism: int = 1
     tag: str = ""
+    # Cache key parameters (per-LLM)
+    cloud_temperature: float = 0.0
+    cloud_max_tokens: int = 0
+    cloud_extra_body: dict | None = None
+    local_temperature: float = 0.0
+    local_max_tokens: int = 0
+    local_extra_body: dict | None = None
+    # System prompts (constant across a run, deterministic from config)
+    sender_system_prompt: str = ""
+    email_system_prompt: str = ""
+    vip_email_system_prompt: str = ""
 
     def to_dict(self) -> dict:
         return {
@@ -139,6 +150,15 @@ class RunMeta:
             "stages": self.stages,
             "parallelism": self.parallelism,
             "tag": self.tag,
+            "cloud_temperature": self.cloud_temperature,
+            "cloud_max_tokens": self.cloud_max_tokens,
+            "cloud_extra_body": self.cloud_extra_body,
+            "local_temperature": self.local_temperature,
+            "local_max_tokens": self.local_max_tokens,
+            "local_extra_body": self.local_extra_body,
+            "sender_system_prompt": self.sender_system_prompt,
+            "email_system_prompt": self.email_system_prompt,
+            "vip_email_system_prompt": self.vip_email_system_prompt,
         }
 
     @classmethod
@@ -155,4 +175,13 @@ class RunMeta:
             stages=d.get("stages", "full"),
             parallelism=d.get("parallelism", 1),
             tag=d.get("tag", ""),
+            cloud_temperature=d.get("cloud_temperature", 0.0),
+            cloud_max_tokens=d.get("cloud_max_tokens", 0),
+            cloud_extra_body=d.get("cloud_extra_body"),
+            local_temperature=d.get("local_temperature", 0.0),
+            local_max_tokens=d.get("local_max_tokens", 0),
+            local_extra_body=d.get("local_extra_body"),
+            sender_system_prompt=d.get("sender_system_prompt", ""),
+            email_system_prompt=d.get("email_system_prompt", ""),
+            vip_email_system_prompt=d.get("vip_email_system_prompt", ""),
         )

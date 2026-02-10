@@ -155,6 +155,15 @@ class TestRunMeta:
             stages="full",
             parallelism=3,
             tag="baseline",
+            cloud_temperature=0.2,
+            cloud_max_tokens=8096,
+            cloud_extra_body={"top_p": 0.9},
+            local_temperature=0.3,
+            local_max_tokens=4096,
+            local_extra_body=None,
+            sender_system_prompt="Classify as PERSON or SERVICE",
+            email_system_prompt="Classify the email",
+            vip_email_system_prompt="Classify VIP email",
         )
         d = meta.to_dict()
         assert d["type"] == "run_meta"
@@ -168,6 +177,15 @@ class TestRunMeta:
         assert restored.stages == "full"
         assert restored.parallelism == 3
         assert restored.tag == "baseline"
+        assert restored.cloud_temperature == 0.2
+        assert restored.cloud_max_tokens == 8096
+        assert restored.cloud_extra_body == {"top_p": 0.9}
+        assert restored.local_temperature == 0.3
+        assert restored.local_max_tokens == 4096
+        assert restored.local_extra_body is None
+        assert restored.sender_system_prompt == "Classify as PERSON or SERVICE"
+        assert restored.email_system_prompt == "Classify the email"
+        assert restored.vip_email_system_prompt == "Classify VIP email"
 
     def test_defaults(self):
         d = {
@@ -184,6 +202,15 @@ class TestRunMeta:
         assert meta.stages == "full"
         assert meta.parallelism == 1
         assert meta.tag == ""
+        assert meta.cloud_temperature == 0.0
+        assert meta.cloud_max_tokens == 0
+        assert meta.cloud_extra_body is None
+        assert meta.local_temperature == 0.0
+        assert meta.local_max_tokens == 0
+        assert meta.local_extra_body is None
+        assert meta.sender_system_prompt == ""
+        assert meta.email_system_prompt == ""
+        assert meta.vip_email_system_prompt == ""
 
     def test_round_trip_via_json(self):
         meta = RunMeta(
@@ -198,9 +225,27 @@ class TestRunMeta:
             stages="stage1_only",
             parallelism=5,
             tag="experiment-1",
+            cloud_temperature=0.5,
+            cloud_max_tokens=2048,
+            cloud_extra_body={"enable_thinking": False},
+            local_temperature=0.1,
+            local_max_tokens=1024,
+            local_extra_body={"chat_template_kwargs": {"enable_thinking": False}},
+            sender_system_prompt="sender prompt",
+            email_system_prompt="email prompt",
+            vip_email_system_prompt="vip prompt",
         )
         json_str = json.dumps(meta.to_dict())
         restored = RunMeta.from_dict(json.loads(json_str))
         assert restored.stages == "stage1_only"
         assert restored.parallelism == 5
         assert restored.tag == "experiment-1"
+        assert restored.cloud_temperature == 0.5
+        assert restored.cloud_max_tokens == 2048
+        assert restored.cloud_extra_body == {"enable_thinking": False}
+        assert restored.local_temperature == 0.1
+        assert restored.local_max_tokens == 1024
+        assert restored.local_extra_body == {"chat_template_kwargs": {"enable_thinking": False}}
+        assert restored.sender_system_prompt == "sender prompt"
+        assert restored.email_system_prompt == "email prompt"
+        assert restored.vip_email_system_prompt == "vip prompt"

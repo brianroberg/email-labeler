@@ -296,18 +296,31 @@ async def main(args: argparse.Namespace) -> None:
         # Build run metadata
         config_bytes = json.dumps(config, sort_keys=True).encode()
         run_id = uuid.uuid4().hex
+        cloud_cfg = config["llm"]["cloud"]
+        local_cfg = config["llm"]["local"]
+        all_categories = list(config["prompts"]["email_classification"]["categories"].keys())
+        vip_categories = config.get("vip_senders", {}).get("categories", ["NEEDS_RESPONSE", "FYI"])
         meta = RunMeta(
             run_id=run_id,
             timestamp=datetime.now(timezone.utc).isoformat(),
             config_hash=hashlib.sha256(config_bytes).hexdigest()[:16],
             config_path=str(config_path),
-            cloud_model=config["llm"]["cloud"]["model"],
-            local_model=config["llm"]["local"]["model"],
+            cloud_model=cloud_cfg["model"],
+            local_model=local_cfg["model"],
             golden_set_path=str(golden_path),
             golden_set_count=len(golden_set),
             stages=args.stages,
             parallelism=args.parallelism,
             tag=args.tag or "",
+            cloud_temperature=cloud_cfg["temperature"],
+            cloud_max_tokens=cloud_cfg["max_tokens"],
+            cloud_extra_body=cloud_cfg.get("extra_body"),
+            local_temperature=local_cfg["temperature"],
+            local_max_tokens=local_cfg["max_tokens"],
+            local_extra_body=local_cfg.get("extra_body"),
+            sender_system_prompt=classifier.sender_config["system"],
+            email_system_prompt=classifier._build_email_prompt(all_categories),
+            vip_email_system_prompt=classifier._build_email_prompt(vip_categories),
         )
 
         # Write results
