@@ -232,6 +232,9 @@ async def main(args: argparse.Namespace) -> None:
     # Load golden set
     golden_path = Path(args.golden_set)
     golden_set = load_golden_set(golden_path, reviewed_only=not args.include_unreviewed)
+    if args.sender_type:
+        golden_set = [g for g in golden_set if g.expected_sender_type == args.sender_type]
+
     if not golden_set:
         print("No threads to evaluate.", file=sys.stderr)
         sys.exit(1)
@@ -356,6 +359,8 @@ def cli():
     parser.add_argument("--dry-run", action="store_true", help="Show what would be evaluated")
     parser.add_argument("--tag", help="Tag for the results file name")
     parser.add_argument("--no-cache", action="store_true", help="Disable LLM response cache")
+    parser.add_argument("--sender-type", choices=("person", "service"),
+                        help="Only evaluate threads with this expected sender type")
     args = parser.parse_args()
 
     if args.stages not in VALID_STAGES:

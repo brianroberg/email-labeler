@@ -340,6 +340,7 @@ uv run python -m evals.run_eval --dry-run
 | `--dry-run` | Show what would be evaluated without calling LLMs |
 | `--tag` | Tag for the results filename (e.g. `new-prompts`) |
 | `--no-cache` | Disable LLM response cache (default: cache enabled) |
+| `--sender-type` | Only evaluate threads with this expected sender type (`person` or `service`) |
 
 ### 4. Report — Compute metrics and compare runs
 
