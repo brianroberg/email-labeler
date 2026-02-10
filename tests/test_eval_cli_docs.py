@@ -11,7 +11,7 @@ from unittest.mock import patch
 # Flags that argparse adds automatically and don't need README docs
 _ARGPARSE_BUILTINS = {"-h", "--help"}
 
-README_PATH = Path(__file__).parent.parent / "README.md"
+README_PATH = Path(__file__).parent.parent / "evals" / "README.md"
 
 # Map: module import path -> section heading text in README
 _CLI_MODULES = {
