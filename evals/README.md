@@ -97,6 +97,9 @@ uv run python -m evals.run_eval --stages stage2_only
 # Use alternate config and tag the run
 uv run python -m evals.run_eval --config config_v2.toml --tag new-prompts
 
+# Override a single setting without editing config.toml
+uv run python -m evals.run_eval --local-model qwen/qwen3-14b --tag qwen3-14b
+
 # Include unreviewed threads (default is reviewed-only)
 uv run python -m evals.run_eval --include-unreviewed
 
@@ -116,6 +119,12 @@ uv run python -m evals.run_eval --dry-run
 | `--tag` | Tag for the results filename (e.g. `new-prompts`) |
 | `--no-cache` | Disable LLM response cache (default: cache enabled) |
 | `--sender-type` | Only evaluate threads with this expected sender type (`person` or `service`) |
+| `--cloud-model` | Override cloud LLM model name from config |
+| `--local-model` | Override local LLM model name from config |
+| `--cloud-temperature` | Override cloud LLM temperature (alias: `--cloud-temp`) |
+| `--local-temperature` | Override local LLM temperature (alias: `--local-temp`) |
+| `--cloud-max-tokens` | Override cloud LLM max tokens from config |
+| `--local-max-tokens` | Override local LLM max tokens from config |
 
 ### 4. Report — Compute metrics and compare runs
 

@@ -229,6 +229,18 @@ async def main(args: argparse.Namespace) -> None:
         config = tomllib.load(f)
     config = substitute_env_vars(config)
 
+    # Apply CLI overrides to config (CLI always wins over config file)
+    _overrides = {
+        "cloud": {"model": args.cloud_model, "temperature": args.cloud_temperature,
+                  "max_tokens": args.cloud_max_tokens},
+        "local": {"model": args.local_model, "temperature": args.local_temperature,
+                  "max_tokens": args.local_max_tokens},
+    }
+    for section, fields in _overrides.items():
+        for key, value in fields.items():
+            if value is not None:
+                config["llm"][section][key] = value
+
     # Load golden set
     golden_path = Path(args.golden_set)
     golden_set = load_golden_set(golden_path, reviewed_only=not args.include_unreviewed)
@@ -374,6 +386,15 @@ def cli():
     parser.add_argument("--no-cache", action="store_true", help="Disable LLM response cache")
     parser.add_argument("--sender-type", choices=("person", "service"),
                         help="Only evaluate threads with this expected sender type")
+    # Config overrides (CLI always wins over config file)
+    parser.add_argument("--cloud-model", help="Override cloud LLM model name")
+    parser.add_argument("--local-model", help="Override local LLM model name")
+    parser.add_argument("--cloud-temperature", "--cloud-temp", type=float, dest="cloud_temperature",
+                        help="Override cloud LLM temperature")
+    parser.add_argument("--local-temperature", "--local-temp", type=float, dest="local_temperature",
+                        help="Override local LLM temperature")
+    parser.add_argument("--cloud-max-tokens", type=int, help="Override cloud LLM max tokens")
+    parser.add_argument("--local-max-tokens", type=int, help="Override local LLM max tokens")
     args = parser.parse_args()
 
     if args.stages not in VALID_STAGES:
