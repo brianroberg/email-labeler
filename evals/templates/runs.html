@@ -1,0 +1,75 @@
+{% extends "base.html" %}
+{% block title %}Runs — Eval Suite{% endblock %}
+{% block content %}
+<h2>Evaluation Runs</h2>
+
+<form method="get" class="filter-form">
+    <div class="grid">
+        <label>
+            Cloud Model
+            <select name="cloud_model">
+                <option value="">All</option>
+                {% for m in options.cloud_models %}
+                <option value="{{ m }}" {% if filters.cloud_model == m %}selected{% endif %}>{{ m }}</option>
+                {% endfor %}
+            </select>
+        </label>
+        <label>
+            Local Model
+            <select name="local_model">
+                <option value="">All</option>
+                {% for m in options.local_models %}
+                <option value="{{ m }}" {% if filters.local_model == m %}selected{% endif %}>{{ m }}</option>
+                {% endfor %}
+            </select>
+        </label>
+        <label>
+            Stages
+            <select name="stages">
+                <option value="">All</option>
+                {% for s in options.stages %}
+                <option value="{{ s }}" {% if filters.stages == s %}selected{% endif %}>{{ s }}</option>
+                {% endfor %}
+            </select>
+        </label>
+        <label>
+            Tag
+            <input type="text" name="tag" value="{{ filters.tag }}" placeholder="Search tags...">
+        </label>
+    </div>
+    <button type="submit" style="width: auto;">Filter</button>
+</form>
+
+{% if runs %}
+<figure>
+<table>
+    <thead>
+        <tr>
+            <th>Run ID</th>
+            <th>Timestamp</th>
+            <th>Stages</th>
+            <th>Cloud Model</th>
+            <th>Local Model</th>
+            <th>Tag</th>
+            <th>Threads</th>
+        </tr>
+    </thead>
+    <tbody>
+        {% for path, meta in runs %}
+        <tr>
+            <td><a href="/run/{{ meta.run_id[:8] }}" class="mono">{{ meta.run_id[:8] }}</a></td>
+            <td>{{ meta.timestamp[:19] }}</td>
+            <td>{{ meta.stages }}</td>
+            <td><small>{{ meta.cloud_model }}</small></td>
+            <td><small>{{ meta.local_model }}</small></td>
+            <td>{{ meta.tag or "—" }}</td>
+            <td>{{ meta.golden_set_count }}</td>
+        </tr>
+        {% endfor %}
+    </tbody>
+</table>
+</figure>
+{% else %}
+<p>No runs found{% if filters.cloud_model or filters.local_model or filters.stages or filters.tag %} matching filters{% endif %}.</p>
+{% endif %}
+{% endblock %}

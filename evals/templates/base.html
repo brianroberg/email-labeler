@@ -1,0 +1,48 @@
+<!DOCTYPE html>
+<html lang="en" data-theme="light">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>{% block title %}Eval Suite{% endblock %}</title>
+    <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@picocss/pico@2/css/pico.min.css">
+    <style>
+        :root { --pico-font-size: 15px; }
+        nav { margin-bottom: 0; }
+        .badge {
+            display: inline-block; padding: 0.15rem 0.5rem; border-radius: 4px;
+            font-size: 0.8rem; font-weight: 600;
+        }
+        .badge-ok { background: #d4edda; color: #155724; }
+        .badge-err { background: #f8d7da; color: #721c24; }
+        .badge-warn { background: #fff3cd; color: #856404; }
+        table { font-size: 0.9rem; }
+        .mono { font-family: monospace; font-size: 0.85rem; }
+        details > summary { cursor: pointer; font-weight: 600; }
+        pre.cot {
+            white-space: pre-wrap; word-break: break-word;
+            max-height: 400px; overflow-y: auto; font-size: 0.8rem;
+            background: var(--pico-code-background-color);
+            padding: 0.75rem; border-radius: 4px;
+        }
+        .delta-pos { color: #155724; font-weight: 600; }
+        .delta-neg { color: #721c24; font-weight: 600; }
+        .filter-form { margin-bottom: 1.5rem; }
+        .filter-form .grid { align-items: end; }
+        .metric-section { margin: 1.5rem 0; }
+        .metric-section h4 { margin-bottom: 0.5rem; }
+    </style>
+</head>
+<body>
+    <nav class="container-fluid">
+        <ul><li><a href="/"><strong>Eval Suite</strong></a></li></ul>
+        <ul>
+            <li><a href="/">Runs</a></li>
+            <li><a href="/compare">Compare</a></li>
+            <li><a href="/logout">Logout</a></li>
+        </ul>
+    </nav>
+    <main class="container">
+        {% block content %}{% endblock %}
+    </main>
+</body>
+</html>

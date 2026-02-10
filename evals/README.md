@@ -155,6 +155,40 @@ uv run python -m evals.report --results-dir evals/results/
 | `--verbose` | Show per-thread disagreements |
 | `--format` | `table` (default) or `json` |
 
+### 5. Web UI — Interactive reporting and comparison
+
+Launch a local web server to browse runs, view metrics, compare results, and inspect chain-of-thought reasoning.
+
+```bash
+# Set auth secret (required unless you want no auth)
+export EVAL_WEB_SECRET="your-secret-here"
+
+# Launch web UI
+uv run python -m evals.run_web
+
+# Custom port
+uv run python -m evals.run_web --port 8080
+```
+
+Navigate to `http://localhost:5000` in your browser. Features:
+
+- **Run list**: Filter by model, stages, tag. Click any run to view details.
+- **Run detail**: Metrics, confusion matrices, per-class P/R/F1, per-thread results with duration and chain-of-thought.
+- **Compare**: Select a baseline run and one or more comparison runs to see side-by-side accuracy deltas.
+
+| Flag | Description |
+|---|---|
+| `--host` | Host to bind to (default: `127.0.0.1`) |
+| `--port` | Port to bind to (default: `5000`) |
+
+## Chain-of-Thought Capture
+
+When running evaluations with the LLM cache enabled (the default), chain-of-thought content from `<think>...</think>` blocks is automatically captured and stored in sidecar files alongside results.
+
+**Sidecar format:** `evals/results/<run>.cot.jsonl` — one JSON line per thread with `stage1_thinking` and `stage2_thinking` fields.
+
+Chain-of-thought is viewable in the web UI on the run detail page.
+
 ## LLM Response Cache
 
 The eval suite includes a disk-backed LLM response cache that avoids redundant LLM calls across repeated evaluation runs. This is especially useful during prompt A/B testing or model swaps — once a thread has been evaluated with a given configuration, re-running produces instant results from cache.

@@ -110,6 +110,34 @@ class PredictionResult:
 
 
 @dataclass
+class ThinkingEntry:
+    """Chain-of-thought content for one thread in an eval run.
+
+    Stored in sidecar .cot.jsonl files alongside main results.
+    """
+
+    thread_id: str
+    stage1_thinking: str = ""
+    stage2_thinking: str = ""
+
+    def to_dict(self) -> dict:
+        return {
+            "type": "thinking",
+            "thread_id": self.thread_id,
+            "stage1_thinking": self.stage1_thinking,
+            "stage2_thinking": self.stage2_thinking,
+        }
+
+    @classmethod
+    def from_dict(cls, d: dict) -> "ThinkingEntry":
+        return cls(
+            thread_id=d["thread_id"],
+            stage1_thinking=d.get("stage1_thinking", ""),
+            stage2_thinking=d.get("stage2_thinking", ""),
+        )
+
+
+@dataclass
 class RunMeta:
     """Metadata for an evaluation run (first line of results JSONL)."""
 

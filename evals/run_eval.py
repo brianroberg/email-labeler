@@ -27,7 +27,7 @@ from config_utils import substitute_env_vars
 from daemon import format_thread_transcript
 from evals import format_network_error
 from evals.llm_cache import CachedLLMClient
-from evals.schemas import GoldenThread, PredictionResult, RunMeta
+from evals.schemas import GoldenThread, PredictionResult, RunMeta, ThinkingEntry
 from gmail_utils import get_header
 from llm_client import LLMClient
 
@@ -92,7 +92,7 @@ async def evaluate_single(
     classifier: EmailClassifier,
     stages: str,
     max_thread_chars: int,
-) -> PredictionResult:
+) -> tuple[PredictionResult, ThinkingEntry]:
     """Evaluate a single golden thread.
 
     Args:
@@ -102,16 +102,25 @@ async def evaluate_single(
         max_thread_chars: Max chars for thread transcript.
 
     Returns:
-        PredictionResult with predictions and correctness flags.
+        Tuple of (PredictionResult, ThinkingEntry).
     """
     result = PredictionResult(
         thread_id=golden.thread_id,
         expected_sender_type=golden.expected_sender_type,
         expected_label=golden.expected_label,
     )
+    thinking = ThinkingEntry(thread_id=golden.thread_id)
 
     metadata = reconstruct_thread_metadata(golden)
     transcript = reconstruct_transcript(golden, max_thread_chars)
+
+    cloud = classifier.cloud_llm
+    local = classifier.local_llm
+
+    # Drain any leftover thinking from previous calls
+    if hasattr(cloud, "take_thinking"):
+        cloud.take_thinking()
+        local.take_thinking()
 
     start = time.monotonic()
     try:
@@ -123,6 +132,8 @@ async def evaluate_single(
             result.privacy_violation = (
                 golden.expected_sender_type == "person" and result.predicted_sender_type == "service"
             )
+            if hasattr(cloud, "take_thinking"):
+                thinking.stage1_thinking = cloud.take_thinking()
 
         elif stages == "stage2_only":
             # Use expected sender type as input (skip Stage 1)
@@ -133,13 +144,27 @@ async def evaluate_single(
             result.predicted_label_raw = label_raw
             result.sender_type_correct = True  # By definition
             result.label_correct = result.predicted_label == golden.expected_label
+            if hasattr(cloud, "take_thinking"):
+                thinking.stage2_thinking = cloud.take_thinking() + local.take_thinking()
 
         else:  # full
-            classification = await classifier.classify(metadata, transcript)
-            result.predicted_sender_type = classification.sender_type.value
-            result.predicted_sender_type_raw = classification.sender_type_raw
-            result.predicted_label = classification.label.value
-            result.predicted_label_raw = classification.label_raw
+            # Stage 1 first, harvest thinking before stage 2
+            sender_type, sender_raw = await classifier.classify_sender(metadata)
+            if hasattr(cloud, "take_thinking"):
+                thinking.stage1_thinking = cloud.take_thinking()
+
+            # Stage 2
+            vip = classifier._is_vip(metadata)
+            label, label_raw = await classifier.classify_email(
+                metadata, transcript, sender_type, vip=vip,
+            )
+            if hasattr(cloud, "take_thinking"):
+                thinking.stage2_thinking = cloud.take_thinking() + local.take_thinking()
+
+            result.predicted_sender_type = sender_type.value
+            result.predicted_sender_type_raw = sender_raw
+            result.predicted_label = label.value
+            result.predicted_label_raw = label_raw
             result.sender_type_correct = result.predicted_sender_type == golden.expected_sender_type
             result.label_correct = result.predicted_label == golden.expected_label
             result.privacy_violation = (
@@ -152,15 +177,13 @@ async def evaluate_single(
         result.error = str(exc)
 
     # Use actual LLM time when caching (0 for pure cache hits); wall time otherwise
-    cloud = classifier.cloud_llm
-    local = classifier.local_llm
     if hasattr(cloud, "take_llm_seconds"):
         result.duration_seconds = round(
             cloud.take_llm_seconds() + local.take_llm_seconds(), 3
         )
     else:
         result.duration_seconds = round(time.monotonic() - start, 3)
-    return result
+    return result, thinking
 
 
 async def run_evaluation(
@@ -169,7 +192,7 @@ async def run_evaluation(
     stages: str,
     max_thread_chars: int,
     parallelism: int = 1,
-) -> list[PredictionResult]:
+) -> tuple[list[PredictionResult], list[ThinkingEntry]]:
     """Run evaluation across all golden threads.
 
     Args:
@@ -180,22 +203,25 @@ async def run_evaluation(
         parallelism: Number of concurrent evaluations.
 
     Returns:
-        List of PredictionResult objects.
+        Tuple of (predictions, thinking_entries).
     """
     semaphore = asyncio.Semaphore(parallelism)
-    results: list[PredictionResult] = []
     total = len(golden_set)
 
-    async def eval_with_semaphore(golden: GoldenThread, idx: int) -> PredictionResult:
+    async def eval_with_semaphore(
+        golden: GoldenThread, idx: int,
+    ) -> tuple[PredictionResult, ThinkingEntry]:
         async with semaphore:
-            r = await evaluate_single(golden, classifier, stages, max_thread_chars)
+            r, t = await evaluate_single(golden, classifier, stages, max_thread_chars)
             status = "error" if r.error else "ok"
             print(f"  [{idx + 1}/{total}] {golden.thread_id[:12]}... {status}", file=sys.stderr)
-            return r
+            return r, t
 
     tasks = [eval_with_semaphore(gt, i) for i, gt in enumerate(golden_set)]
-    results = await asyncio.gather(*tasks)
-    return list(results)
+    pairs = await asyncio.gather(*tasks)
+    results = [p[0] for p in pairs]
+    thinking = [p[1] for p in pairs]
+    return results, thinking
 
 
 def build_output_path(output_dir: Path, stages: str, tag: str, run_id: str) -> Path:
@@ -220,6 +246,23 @@ def write_results(
         f.write(json.dumps(meta.to_dict()) + "\n")
         for r in results:
             f.write(json.dumps(r.to_dict()) + "\n")
+
+
+def write_thinking_sidecar(
+    results_path: Path,
+    thinking_entries: list[ThinkingEntry],
+) -> None:
+    """Write chain-of-thought content to sidecar .cot.jsonl file.
+
+    Only writes entries that have at least one non-empty thinking field.
+    """
+    entries = [t for t in thinking_entries if t.stage1_thinking or t.stage2_thinking]
+    if not entries:
+        return
+    sidecar_path = results_path.with_suffix(".cot.jsonl")
+    with open(sidecar_path, "w") as f:
+        for entry in entries:
+            f.write(json.dumps(entry.to_dict()) + "\n")
 
 
 async def main(args: argparse.Namespace) -> None:
@@ -297,7 +340,7 @@ async def main(args: argparse.Namespace) -> None:
     try:
         print(f"Running evaluation (stages={args.stages}, parallelism={args.parallelism})...",
               file=sys.stderr)
-        results = await run_evaluation(
+        results, thinking_entries = await run_evaluation(
             golden_set=golden_set,
             classifier=classifier,
             stages=args.stages,
@@ -335,10 +378,11 @@ async def main(args: argparse.Namespace) -> None:
             vip_email_system_prompt=classifier._build_email_prompt(vip_categories),
         )
 
-        # Write results
+        # Write results + thinking sidecar
         output_dir = Path(args.output_dir)
         output_path = build_output_path(output_dir, args.stages, args.tag or "", run_id)
         write_results(output_path, meta, results)
+        write_thinking_sidecar(output_path, thinking_entries)
 
         # Summary
         errors = sum(1 for r in results if r.error)

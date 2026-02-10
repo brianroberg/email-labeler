@@ -4,6 +4,7 @@ Caches LLM responses keyed by (model, temperature, max_tokens, extra_body, syste
 Cache is loaded into memory at startup and new entries are appended to disk on flush().
 """
 
+import asyncio
 import hashlib
 import json
 import time
@@ -22,11 +23,12 @@ class CachedLLMClient:
     def __init__(self, inner: LLMClient, cache_path: Path):
         self.inner = inner
         self.cache_path = cache_path
-        self._cache: dict[str, str] = {}  # key -> response
+        self._cache: dict[str, tuple[str, str]] = {}  # key -> (response, thinking)
         self._pending: list[dict] = []  # new entries to flush to disk
         self.hits = 0
         self.misses = 0
         self._llm_seconds = 0.0  # accumulated LLM call time (misses only)
+        self._thinking_buffers: dict[int, list[str]] = {}  # per-task thinking buffers
         self._load()
 
     def _load(self) -> None:
@@ -40,7 +42,10 @@ class CachedLLMClient:
                     continue
                 try:
                     entry = json.loads(line)
-                    self._cache[entry["key"]] = entry["response"]
+                    self._cache[entry["key"]] = (
+                        entry["response"],
+                        entry.get("thinking", ""),
+                    )
                 except (json.JSONDecodeError, KeyError):
                     continue  # skip corrupt entries
 
@@ -53,26 +58,50 @@ class CachedLLMClient:
         )
         return hashlib.sha256(raw.encode()).hexdigest()
 
+    def _task_key(self) -> int:
+        """Return a key for the current asyncio task (0 when not inside a task)."""
+        task = asyncio.current_task()
+        return id(task) if task else 0
+
     async def complete(self, system_prompt: str, user_content: str) -> str:
         """Return cached response on hit, otherwise call inner LLM and cache the result."""
         key = self._cache_key(system_prompt, user_content)
+        tk = self._task_key()
 
         if key in self._cache:
             self.hits += 1
-            return self._cache[key]
+            response, thinking = self._cache[key]
+            if thinking:
+                self._thinking_buffers.setdefault(tk, []).append(thinking)
+            return response
 
         self.misses += 1
         start = time.monotonic()
-        response = await self.inner.complete(system_prompt, user_content)
+        response, thinking = await self.inner.complete(
+            system_prompt, user_content, include_thinking=True,
+        )
         self._llm_seconds += time.monotonic() - start
 
-        self._cache[key] = response
+        if thinking:
+            self._thinking_buffers.setdefault(tk, []).append(thinking)
+
+        self._cache[key] = (response, thinking)
         self._pending.append({
             "key": key,
             "model": self.inner.model,
             "response": response,
+            "thinking": thinking,
         })
         return response
+
+    def take_thinking(self) -> str:
+        """Return accumulated thinking content for the current task and reset its buffer.
+
+        Uses asyncio.current_task() to isolate thinking per concurrent task,
+        preventing cross-contamination when parallelism > 1.
+        """
+        buf = self._thinking_buffers.pop(self._task_key(), [])
+        return "\n\n".join(t for t in buf if t)
 
     def take_llm_seconds(self) -> float:
         """Return accumulated LLM call time and reset to zero."""

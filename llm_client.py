@@ -32,15 +32,19 @@ class LLMClient:
         self.timeout = timeout
         self.extra_body = extra_body or {}
 
-    async def complete(self, system_prompt: str, user_content: str) -> str:
+    async def complete(
+        self, system_prompt: str, user_content: str, include_thinking: bool = False,
+    ) -> str | tuple[str, str]:
         """Send a chat completion request and return the stripped response.
 
         Args:
             system_prompt: System message for the LLM.
             user_content: User message content.
+            include_thinking: If True, return (stripped, thinking) tuple.
 
         Returns:
-            The LLM response with thinking tags stripped.
+            If include_thinking is False: stripped response string.
+            If include_thinking is True: (stripped_response, thinking_content) tuple.
 
         Raises:
             RuntimeError: If the LLM returns a non-200 response.
@@ -76,6 +80,8 @@ class LLMClient:
             raise RuntimeError(f"LLM request failed with status {response.status_code}")
 
         content = response.json()["choices"][0]["message"]["content"]
+        if include_thinking:
+            return self._strip_thinking(content), self._extract_thinking(content)
         return self._strip_thinking(content)
 
     async def is_available(self) -> bool:
@@ -105,6 +111,12 @@ class LLMClient:
             return response.status_code == 200
         except (httpx.ConnectError, httpx.TimeoutException):
             return False
+
+    @staticmethod
+    def _extract_thinking(content: str) -> str:
+        """Extract all <think>...</think> blocks, joined with double newline."""
+        matches = re.findall(r"<think>(.*?)</think>", content, flags=re.DOTALL)
+        return "\n\n".join(m.strip() for m in matches)
 
     @staticmethod
     def _strip_thinking(content: str) -> str:
