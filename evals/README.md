@@ -12,6 +12,8 @@ The eval tools run outside Docker and need access to the same environment variab
 ln -s ../agent-stack/.env .env
 ```
 
+**Stop the daemon before running evals** if your local MLX server only supports one model at a time. The daemon and eval runner may request different models (e.g. `qwen/qwen3-32b` vs `qwen3-14b` via `--local-model`), causing the server to swap models mid-request and return errors. This is especially important when using `--local-model` to test a model that differs from `config.toml`.
+
 Since the symlinked `.env` may contain Docker-internal hostnames (e.g. `PROXY_URL=http://api-proxy:8000`), use `--proxy-url` to point at the proxy's host-accessible address:
 
 ```bash
