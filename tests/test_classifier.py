@@ -70,6 +70,15 @@ class TestParseSenderType:
     def test_with_trailing_text(self):
         assert parse_sender_type("PERSON. The sender is a real person.") == SenderType.PERSON
 
+    def test_last_line_fallback_person(self):
+        assert parse_sender_type("The sender is a human\n\nPERSON") == SenderType.PERSON
+
+    def test_last_line_fallback_service(self):
+        assert parse_sender_type("This is a newsletter from a company\n\nSERVICE") == SenderType.SERVICE
+
+    def test_last_line_fallback_with_trailing_text(self):
+        assert parse_sender_type("Some preamble\nSERVICE. Clearly automated.") == SenderType.SERVICE
+
     def test_unknown_defaults_to_service(self):
         assert parse_sender_type("UNKNOWN") == SenderType.SERVICE
 
@@ -78,6 +87,9 @@ class TestParseSenderType:
 
     def test_garbage_defaults_to_service(self):
         assert parse_sender_type("asdfghjkl") == SenderType.SERVICE
+
+    def test_garbage_last_line_defaults_to_service(self):
+        assert parse_sender_type("some preamble\nstill garbage") == SenderType.SERVICE
 
     def test_no_warning_on_exact_match(self, caplog):
         with caplog.at_level("WARNING", logger="classifier"):
@@ -130,11 +142,20 @@ class TestParseEmailLabel:
     def test_with_trailing_text(self):
         assert parse_email_label("LOW_PRIORITY. This is a newsletter.") == EmailLabel.LOW_PRIORITY
 
+    def test_last_line_fallback_unwanted(self):
+        assert parse_email_label("This is spam\n\nUNWANTED") == EmailLabel.UNWANTED
+
+    def test_last_line_fallback_needs_response(self):
+        assert parse_email_label("Looks important\nNEEDS_RESPONSE") == EmailLabel.NEEDS_RESPONSE
+
     def test_unknown_defaults_to_low_priority(self):
         assert parse_email_label("SOMETHING_ELSE") == EmailLabel.LOW_PRIORITY
 
     def test_empty_defaults_to_low_priority(self):
         assert parse_email_label("") == EmailLabel.LOW_PRIORITY
+
+    def test_garbage_last_line_defaults_to_low_priority(self):
+        assert parse_email_label("some preamble\nstill garbage") == EmailLabel.LOW_PRIORITY
 
     def test_no_warning_on_exact_match(self, caplog):
         with caplog.at_level("WARNING", logger="classifier"):

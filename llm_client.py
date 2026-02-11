@@ -112,14 +112,18 @@ class LLMClient:
         except (httpx.ConnectError, httpx.TimeoutException):
             return False
 
+    # Matches <think>...</think> and <<think>>...</<think>> (DeepSeek variant)
+    _THINK_PATTERN = re.compile(r"<<?think>>?.*?</<?think>>?", flags=re.DOTALL)
+    _THINK_EXTRACT = re.compile(r"<<?think>>?(.*?)</<?think>>?", flags=re.DOTALL)
+
     @staticmethod
     def _extract_thinking(content: str) -> str:
-        """Extract all <think>...</think> blocks, joined with double newline."""
-        matches = re.findall(r"<think>(.*?)</think>", content, flags=re.DOTALL)
+        """Extract all think blocks (handles <think> and <<think>> variants)."""
+        matches = LLMClient._THINK_EXTRACT.findall(content)
         return "\n\n".join(m.strip() for m in matches)
 
     @staticmethod
     def _strip_thinking(content: str) -> str:
-        """Remove <think>...</think> blocks from LLM output."""
-        stripped = re.sub(r"<think>.*?</think>", "", content, flags=re.DOTALL)
+        """Remove think blocks from LLM output (handles <think> and <<think>> variants)."""
+        stripped = LLMClient._THINK_PATTERN.sub("", content)
         return stripped.strip()

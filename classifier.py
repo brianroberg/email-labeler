@@ -82,14 +82,28 @@ def parse_sender(from_header: str) -> tuple[str, str]:
 _SENDER_TYPE_VALID = {"PERSON", "SERVICE"}
 
 
+def _match_sender_type(text: str) -> SenderType | None:
+    """Return SenderType if text starts with a known keyword, else None."""
+    if text.startswith("PERSON"):
+        return SenderType.PERSON
+    if text.startswith("SERVICE"):
+        return SenderType.SERVICE
+    return None
+
+
 def parse_sender_type(raw_llm_output: str) -> SenderType:
-    """Parse LLM output into SenderType. Defaults to SERVICE (safe)."""
+    """Parse LLM output into SenderType. Defaults to SERVICE (safe).
+
+    Checks the full output first, then falls back to the last non-empty line
+    to handle models that emit preamble text before their final answer.
+    """
     cleaned = raw_llm_output.strip().upper()
-    if cleaned.startswith("PERSON"):
-        result = SenderType.PERSON
-    elif cleaned.startswith("SERVICE"):
-        result = SenderType.SERVICE
-    else:
+    result = _match_sender_type(cleaned)
+    if result is None:
+        # Fall back to last non-empty line (where models put their final answer)
+        last_line = cleaned.rsplit("\n", 1)[-1].strip()
+        result = _match_sender_type(last_line)
+    if result is None:
         result = SenderType.SERVICE
     if cleaned not in _SENDER_TYPE_VALID:
         log.warning(
@@ -102,18 +116,31 @@ def parse_sender_type(raw_llm_output: str) -> SenderType:
 _EMAIL_LABEL_VALID = {"NEEDS_RESPONSE", "FYI", "LOW_PRIORITY", "UNWANTED"}
 
 
+def _match_email_label(text: str) -> EmailLabel | None:
+    """Return EmailLabel if text starts with a known keyword, else None."""
+    if text.startswith("NEEDS_RESPONSE"):
+        return EmailLabel.NEEDS_RESPONSE
+    if text.startswith("FYI"):
+        return EmailLabel.FYI
+    if text.startswith("LOW_PRIORITY"):
+        return EmailLabel.LOW_PRIORITY
+    if text.startswith("UNWANTED"):
+        return EmailLabel.UNWANTED
+    return None
+
+
 def parse_email_label(raw_llm_output: str) -> EmailLabel:
-    """Parse LLM output into EmailLabel. Defaults to LOW_PRIORITY (safe)."""
+    """Parse LLM output into EmailLabel. Defaults to LOW_PRIORITY (safe).
+
+    Checks the full output first, then falls back to the last non-empty line
+    to handle models that emit preamble text before their final answer.
+    """
     cleaned = raw_llm_output.strip().upper()
-    if cleaned.startswith("NEEDS_RESPONSE"):
-        result = EmailLabel.NEEDS_RESPONSE
-    elif cleaned.startswith("FYI"):
-        result = EmailLabel.FYI
-    elif cleaned.startswith("LOW_PRIORITY"):
-        result = EmailLabel.LOW_PRIORITY
-    elif cleaned.startswith("UNWANTED"):
-        result = EmailLabel.UNWANTED
-    else:
+    result = _match_email_label(cleaned)
+    if result is None:
+        last_line = cleaned.rsplit("\n", 1)[-1].strip()
+        result = _match_email_label(last_line)
+    if result is None:
         result = EmailLabel.LOW_PRIORITY
     if cleaned not in _EMAIL_LABEL_VALID:
         log.warning(
