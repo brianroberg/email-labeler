@@ -105,7 +105,6 @@ def parse_sender_type(raw_llm_output: str) -> SenderType:
         result = _match_sender_type(last_line)
     if result is None:
         result = SenderType.SERVICE
-    if cleaned not in _SENDER_TYPE_VALID:
         log.warning(
             "Unexpected sender type output (interpreting as %s): %.40s",
             result.name, raw_llm_output.strip(),
@@ -142,7 +141,6 @@ def parse_email_label(raw_llm_output: str) -> EmailLabel:
         result = _match_email_label(last_line)
     if result is None:
         result = EmailLabel.LOW_PRIORITY
-    if cleaned not in _EMAIL_LABEL_VALID:
         log.warning(
             "Unexpected email label output (interpreting as %s): %.40s",
             result.name, raw_llm_output.strip(),

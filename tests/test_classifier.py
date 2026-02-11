@@ -96,11 +96,15 @@ class TestParseSenderType:
             parse_sender_type("PERSON")
         assert caplog.records == []
 
-    def test_warns_on_trailing_text(self, caplog):
+    def test_no_warning_on_trailing_text(self, caplog):
         with caplog.at_level("WARNING", logger="classifier"):
             parse_sender_type("PERSON. The sender is a real person.")
-        assert len(caplog.records) == 1
-        assert "interpreting as PERSON" in caplog.records[0].message
+        assert caplog.records == []
+
+    def test_no_warning_on_last_line_fallback(self, caplog):
+        with caplog.at_level("WARNING", logger="classifier"):
+            parse_sender_type("The sender is a human\n\nPERSON")
+        assert caplog.records == []
 
     def test_warns_on_unrecognized_output(self, caplog):
         with caplog.at_level("WARNING", logger="classifier"):
@@ -108,13 +112,6 @@ class TestParseSenderType:
         assert len(caplog.records) == 1
         assert "interpreting as SERVICE" in caplog.records[0].message
         assert "I think this is a human" in caplog.records[0].message
-
-    def test_warning_truncates_long_output(self, caplog):
-        long_output = "PERSON" + " extra commentary" * 20
-        with caplog.at_level("WARNING", logger="classifier"):
-            parse_sender_type(long_output)
-        assert len(caplog.records) == 1
-        assert len(caplog.records[0].message) < len(long_output)
 
 
 class TestParseEmailLabel:
@@ -162,11 +159,15 @@ class TestParseEmailLabel:
             parse_email_label("NEEDS_RESPONSE")
         assert caplog.records == []
 
-    def test_warns_on_trailing_text(self, caplog):
+    def test_no_warning_on_trailing_text(self, caplog):
         with caplog.at_level("WARNING", logger="classifier"):
             parse_email_label("LOW_PRIORITY. This is a newsletter.")
-        assert len(caplog.records) == 1
-        assert "interpreting as LOW_PRIORITY" in caplog.records[0].message
+        assert caplog.records == []
+
+    def test_no_warning_on_last_line_fallback(self, caplog):
+        with caplog.at_level("WARNING", logger="classifier"):
+            parse_email_label("This is spam\n\nUNWANTED")
+        assert caplog.records == []
 
     def test_warns_on_unrecognized_output(self, caplog):
         with caplog.at_level("WARNING", logger="classifier"):
