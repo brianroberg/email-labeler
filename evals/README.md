@@ -48,7 +48,7 @@ uv run python -m evals.harvest --proxy-url http://localhost:8000 --label needs_r
 
 ### 2. Review — Manually verify ground truth labels
 
-Interactive CLI for reviewing and correcting labels in the golden set. Saves atomically after each session.
+Interactive CLI for reviewing and correcting labels in the golden set. Saves atomically after each session. Press `z` at any prompt to undo the last classification and go back — undo works as a stack, so pressing it repeatedly walks back through previous decisions.
 
 ```bash
 # Review all threads (blind mode by default)

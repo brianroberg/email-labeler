@@ -28,6 +28,22 @@ LABELS = ["needs_response", "fyi", "low_priority", "unwanted"]
 _SENDER_KEY_MAP = {"p": "person", "s": "service"}
 _LABEL_KEY_MAP = {"n": "needs_response", "f": "fyi", "l": "low_priority", "u": "unwanted"}
 
+# Mutable fields that get snapshotted for undo
+_SNAPSHOT_FIELDS = ("expected_sender_type", "expected_label", "reviewed", "notes", "skipped")
+
+
+def _capture_snapshot(thread: GoldenThread, index: int) -> dict:
+    """Capture mutable fields before a mutation so they can be restored."""
+    return {"index": index, **{f: getattr(thread, f) for f in _SNAPSHOT_FIELDS}}
+
+
+def _restore_snapshot(threads: list[GoldenThread], snapshot: dict) -> int:
+    """Restore a thread from *snapshot* and return the index to revisit."""
+    thread = threads[snapshot["index"]]
+    for f in _SNAPSHOT_FIELDS:
+        setattr(thread, f, snapshot[f])
+    return snapshot["index"]
+
 
 def load_golden_set(path: Path) -> list[GoldenThread]:
     """Load golden set from JSONL file."""
@@ -151,13 +167,15 @@ def display_thread(
 # Normal review mode (one thread at a time)
 # ---------------------------------------------------------------------------
 
-def review_thread_normal(thread: GoldenThread, index: int, total: int, *, stage: int | None = None) -> str:
+def review_thread_normal(
+    thread: GoldenThread, index: int, total: int, *, stage: int | None = None, undo_stack: list | None = None,
+) -> str:
     """Normal review: show labels, prompt for action.
 
     When *stage* is ``1``, only show/allow editing sender type.
     When *stage* is ``2``, only show/allow editing label.
 
-    Returns ``"advance"``, ``"quit"``, or ``"stay"`` (re-show thread).
+    Returns ``"advance"``, ``"quit"``, ``"back"``, or ``"stay"``.
     """
     display_thread(thread, index, total, show_labels=True, stage=stage)
 
@@ -167,18 +185,22 @@ def review_thread_normal(thread: GoldenThread, index: int, total: int, *, stage:
         actions.append(("s", "sender"))
     if stage != 1:
         actions.append(("l", "label"))
-    actions.extend([("n", "notes"), ("x", "skip"), ("q", "quit")])
+    actions.extend([("n", "notes"), ("z", "undo"), ("x", "skip"), ("q", "quit")])
 
     while True:
         key = prompt_hotkey_menu("Actions:", actions)
 
         if key == "" or key == "y":
+            if undo_stack is not None:
+                undo_stack.append(_capture_snapshot(thread, index))
             thread.reviewed = True
             return "advance"
 
         if key == "s" and stage != 2:
             new_type = _prompt_sender_type()
             if new_type:
+                if undo_stack is not None:
+                    undo_stack.append(_capture_snapshot(thread, index))
                 thread.expected_sender_type = new_type
                 print(f"  -> Sender type set to: {new_type}")
                 thread.reviewed = True
@@ -188,6 +210,8 @@ def review_thread_normal(thread: GoldenThread, index: int, total: int, *, stage:
         if key == "l" and stage != 1:
             new_label = _prompt_label()
             if new_label:
+                if undo_stack is not None:
+                    undo_stack.append(_capture_snapshot(thread, index))
                 thread.expected_label = new_label
                 print(f"  -> Label set to: {new_label}")
                 thread.reviewed = True
@@ -199,7 +223,12 @@ def review_thread_normal(thread: GoldenThread, index: int, total: int, *, stage:
             print("  -> Notes saved. (Thread not yet confirmed — press Enter to confirm)")
             continue  # re-show action menu (thread already displayed)
 
+        if key == "z":
+            return "back"
+
         if key == "x":
+            if undo_stack is not None:
+                undo_stack.append(_capture_snapshot(thread, index))
             thread.skipped = True
             thread.reviewed = True
             print("  -> Thread marked as skipped.")
@@ -215,13 +244,15 @@ def review_thread_normal(thread: GoldenThread, index: int, total: int, *, stage:
 # Blind review mode
 # ---------------------------------------------------------------------------
 
-def review_thread_blind(thread: GoldenThread, index: int, total: int, *, stage: int | None = None) -> str:
+def review_thread_blind(
+    thread: GoldenThread, index: int, total: int, *, stage: int | None = None, undo_stack: list | None = None,
+) -> str:
     """Blind review: hide labels, prompt sender type then label.
 
     When *stage* is ``1``, only prompt for sender type.
     When *stage* is ``2``, only prompt for label.
 
-    Returns ``"advance"``, ``"quit"``, or ``"stay"``.
+    Returns ``"advance"``, ``"quit"``, ``"back"``, or ``"stay"``.
     """
     display_thread(thread, index, total, show_labels=False)
 
@@ -230,17 +261,26 @@ def review_thread_blind(thread: GoldenThread, index: int, total: int, *, stage: 
         while True:
             key = prompt_hotkey_menu(
                 "Sender type:",
-                [("p", "person"), ("s", "service"), ("n", "notes"), ("x", "skip"), ("q", "quit")],
+                [
+                    ("p", "person"), ("s", "service"), ("z", "undo"),
+                    ("n", "notes"), ("x", "skip"), ("q", "quit"),
+                ],
             )
             if key in _SENDER_KEY_MAP:
+                if undo_stack is not None:
+                    undo_stack.append(_capture_snapshot(thread, index))
                 thread.expected_sender_type = _SENDER_KEY_MAP[key]
                 print(f"  -> {thread.expected_sender_type}")
                 break
+            if key == "z":
+                return "back"
             if key == "n":
                 thread.notes = _prompt_notes()
                 print("  -> Notes saved.")
                 continue
             if key == "x":
+                if undo_stack is not None:
+                    undo_stack.append(_capture_snapshot(thread, index))
                 thread.skipped = True
                 thread.reviewed = True
                 print("  -> Thread marked as skipped.")
@@ -256,19 +296,24 @@ def review_thread_blind(thread: GoldenThread, index: int, total: int, *, stage: 
                 "Label:",
                 [
                     ("n", "needs_response"), ("f", "fyi"),
-                    ("l", "low_priority"), ("u", "unwanted"), ("q", "quit"),
+                    ("l", "low_priority"), ("u", "unwanted"), ("z", "undo"), ("q", "quit"),
                 ],
             )
             if key in _LABEL_KEY_MAP:
+                if undo_stack is not None:
+                    undo_stack.append(_capture_snapshot(thread, index))
                 thread.expected_label = _LABEL_KEY_MAP[key]
                 thread.reviewed = True
                 print(f"  -> Classified as {thread.expected_sender_type} / {thread.expected_label}")
                 return "advance"
+            if key == "z":
+                return "back"
             if key == "q":
                 return "quit"
             print(f"  Invalid key: {key!r}")
 
     # stage==1 only: mark reviewed after sender type
+    # (snapshot already captured before the sender type mutation above)
     thread.reviewed = True
     return "advance"
 
@@ -282,15 +327,22 @@ def review_loop(
 ) -> None:
     """Main interactive review loop.  Does NOT save — caller is responsible."""
     review_fn = review_thread_blind if blind else review_thread_normal
+    undo_stack: list[dict] = []
     total = len(threads)
     i = start_at
 
     while i < total:
-        result = review_fn(threads[i], i, total, stage=stage)
+        result = review_fn(threads[i], i, total, stage=stage, undo_stack=undo_stack)
         if result == "quit":
             break
         if result == "advance":
             i += 1
+        elif result == "back":
+            if not undo_stack:
+                print("  Nothing to undo.")
+            else:
+                i = _restore_snapshot(threads, undo_stack.pop())
+                print(f"  <- Undone. Back to thread {i + 1}/{total}.")
         # "stay" → loop again on the same thread
 
 
