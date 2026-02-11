@@ -224,6 +224,31 @@ class TestCorruptCacheFile:
         assert cached.take_thinking() == ""  # No thinking in old entries
 
 
+    async def test_old_cache_with_unstripped_double_bracket_think(self, tmp_path: Path):
+        """Cache entries with <<think>> blocks in response are normalized on load."""
+        cache_path = tmp_path / "cache.jsonl"
+        inner = _make_inner()
+        valid_key = CachedLLMClient(inner, cache_path)._cache_key("sys", "usr")
+        cache_path.write_text(
+            json.dumps({
+                "key": valid_key,
+                "model": "test-model",
+                "response": "preamble\n<<think>>\nreasoning here\n</<think>>\nSERVICE",
+                "thinking": "",
+            }) + "\n"
+        )
+
+        cached = CachedLLMClient(inner, cache_path)
+        result = await cached.complete("sys", "usr")
+
+        assert "<<think>>" not in result
+        assert "reasoning here" not in result
+        assert "SERVICE" in result
+        assert cached.hits == 1
+        # Thinking should be recovered from the response
+        assert "reasoning here" in cached.take_thinking()
+
+
 class TestErrorNotCached:
     async def test_llm_error_is_not_cached(self, tmp_path: Path):
         inner = _make_inner()

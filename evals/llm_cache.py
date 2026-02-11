@@ -42,10 +42,14 @@ class CachedLLMClient:
                     continue
                 try:
                     entry = json.loads(line)
-                    self._cache[entry["key"]] = (
-                        entry["response"],
-                        entry.get("thinking", ""),
-                    )
+                    response = entry["response"]
+                    thinking = entry.get("thinking", "")
+                    # Normalize old entries that may contain unstripped think tags
+                    extra_thinking = LLMClient._extract_thinking(response)
+                    response = LLMClient._strip_thinking(response)
+                    if extra_thinking and not thinking:
+                        thinking = extra_thinking
+                    self._cache[entry["key"]] = (response, thinking)
                 except (json.JSONDecodeError, KeyError):
                     continue  # skip corrupt entries
 
