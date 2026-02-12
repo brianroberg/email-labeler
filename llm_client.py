@@ -85,8 +85,12 @@ class LLMClient:
             ) from None
 
         if response.status_code != 200:
-            body = response.text[:500]
-            raise RuntimeError(f"LLM request failed with status {response.status_code}: {body}")
+            prompt_chars = len(system_prompt) + len(user_content)
+            resp_body = response.text[:500]
+            raise RuntimeError(
+                f"LLM request failed with status {response.status_code} "
+                f"(prompt ~{prompt_chars // 4} tokens, {prompt_chars} chars): {resp_body}"
+            )
 
         msg = response.json()["choices"][0]["message"]
         content = msg["content"]

@@ -219,6 +219,9 @@ async def process_single_thread(
     except TimeoutError as exc:
         log.warning("Timeout processing thread %s: %s", thread_id, exc)
         return False
+    except RuntimeError as exc:
+        log.error("Thread %s: %s", thread_id, exc)
+        return False
     except Exception:
         log.exception("Error processing thread %s", thread_id)
         return False
