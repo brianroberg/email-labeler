@@ -38,7 +38,6 @@ _CLASSIFICATION_LABELS = {
     "needs_response": "needs_response",
     "fyi": "fyi",
     "low_priority": "low_priority",
-    "unwanted": "unwanted",
 }
 
 
@@ -64,7 +63,7 @@ def infer_ground_truth(
 
     Returns:
         (sender_type, label) tuple. sender_type is "person"/"service"/""
-        and label is "needs_response"/"fyi"/"low_priority"/"unwanted"/"".
+        and label is "needs_response"/"fyi"/"low_priority"/"".
     """
     # Build reverse map: label_name -> config_key
     name_to_config_key = {}
@@ -271,7 +270,7 @@ def cli():
     parser.add_argument("--max-threads", type=int, default=200, help="Max threads to fetch")
     parser.add_argument("--append", action="store_true", help="Append to existing file (deduplicates)")
     parser.add_argument("--sender-type", choices=["person", "service"], help="Filter by sender type")
-    parser.add_argument("--label", choices=["needs_response", "fyi", "low_priority", "unwanted"],
+    parser.add_argument("--label", choices=["needs_response", "fyi", "low_priority"],
                         help="Filter by classification label")
     parser.add_argument("--config", help="Path to config.toml (default: ./config.toml)")
     parser.add_argument("--proxy-url", help="API proxy URL (overrides PROXY_URL env var)")

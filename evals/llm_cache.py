@@ -67,7 +67,9 @@ class CachedLLMClient:
         task = asyncio.current_task()
         return id(task) if task else 0
 
-    async def complete(self, system_prompt: str, user_content: str) -> str:
+    async def complete(
+        self, system_prompt: str, user_content: str, include_thinking: bool = False,
+    ) -> str | tuple[str, str]:
         """Return cached response on hit, otherwise call inner LLM and cache the result."""
         key = self._cache_key(system_prompt, user_content)
         tk = self._task_key()
@@ -77,6 +79,8 @@ class CachedLLMClient:
             response, thinking = self._cache[key]
             if thinking:
                 self._thinking_buffers.setdefault(tk, []).append(thinking)
+            if include_thinking:
+                return response, thinking
             return response
 
         self.misses += 1
@@ -96,6 +100,8 @@ class CachedLLMClient:
             "response": response,
             "thinking": thinking,
         })
+        if include_thinking:
+            return response, thinking
         return response
 
     def take_thinking(self) -> str:

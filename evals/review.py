@@ -23,10 +23,10 @@ from evals.schemas import GoldenThread
 from gmail_utils import decode_body
 
 SENDER_TYPES = ["person", "service"]
-LABELS = ["needs_response", "fyi", "low_priority", "unwanted"]
+LABELS = ["needs_response", "fyi", "low_priority"]
 
 _SENDER_KEY_MAP = {"p": "person", "s": "service"}
-_LABEL_KEY_MAP = {"n": "needs_response", "f": "fyi", "l": "low_priority", "u": "unwanted"}
+_LABEL_KEY_MAP = {"n": "needs_response", "f": "fyi", "l": "low_priority"}
 
 # Mutable fields that get snapshotted for undo
 _SNAPSHOT_FIELDS = ("expected_sender_type", "expected_label", "reviewed", "notes", "skipped")
@@ -117,7 +117,7 @@ def _prompt_sender_type() -> str | None:
 def _prompt_label() -> str | None:
     """Hotkey sub-menu for label. Returns value or None on cancel."""
     key = prompt_hotkey_menu(
-        "Select label:", [("n", "needs_response"), ("f", "fyi"), ("l", "low_priority"), ("u", "unwanted")]
+        "Select label:", [("n", "needs_response"), ("f", "fyi"), ("l", "low_priority")]
     )
     return _LABEL_KEY_MAP.get(key)
 
@@ -296,7 +296,7 @@ def review_thread_blind(
                 "Label:",
                 [
                     ("n", "needs_response"), ("f", "fyi"),
-                    ("l", "low_priority"), ("u", "unwanted"), ("z", "undo"), ("q", "quit"),
+                    ("l", "low_priority"), ("z", "undo"), ("q", "quit"),
                 ],
             )
             if key in _LABEL_KEY_MAP:

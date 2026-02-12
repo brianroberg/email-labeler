@@ -26,7 +26,6 @@ class EmailLabel(Enum):
     NEEDS_RESPONSE = "needs_response"
     FYI = "fyi"
     LOW_PRIORITY = "low_priority"
-    UNWANTED = "unwanted"
 
 
 @dataclass
@@ -53,6 +52,8 @@ class ClassificationResult:
     sender_type_raw: str
     label: EmailLabel
     label_raw: str
+    sender_cot: str = ""  # Raw Stage 1 CoT (with think tags)
+    label_cot: str = ""  # Raw Stage 2 CoT (with think tags)
 
 
 def parse_sender(from_header: str) -> tuple[str, str]:
@@ -112,7 +113,7 @@ def parse_sender_type(raw_llm_output: str) -> SenderType:
     return result
 
 
-_EMAIL_LABEL_VALID = {"NEEDS_RESPONSE", "FYI", "LOW_PRIORITY", "UNWANTED"}
+_EMAIL_LABEL_VALID = {"NEEDS_RESPONSE", "FYI", "LOW_PRIORITY"}
 
 
 def _match_email_label(text: str) -> EmailLabel | None:
@@ -124,7 +125,7 @@ def _match_email_label(text: str) -> EmailLabel | None:
     if text.startswith("LOW_PRIORITY"):
         return EmailLabel.LOW_PRIORITY
     if text.startswith("UNWANTED"):
-        return EmailLabel.UNWANTED
+        return EmailLabel.LOW_PRIORITY  # backward compat: UNWANTED merged into LOW_PRIORITY
     return None
 
 
@@ -184,58 +185,72 @@ class EmailClassifier:
         lines.append(self.email_config["postamble"])
         return "\n".join(lines)
 
-    async def classify_sender(self, metadata: EmailMetadata | ThreadMetadata) -> tuple[SenderType, str]:
+    async def classify_sender(
+        self, metadata: EmailMetadata | ThreadMetadata,
+    ) -> tuple[SenderType, str, str]:
         """Stage 1: Classify sender(s) as PERSON or SERVICE.
 
         For ThreadMetadata: checks all unique senders. Short-circuits on VIP
         (free, no LLM call) then on first PERSON from LLM.
         Only metadata (sender, subject, snippet) is sent — never the body.
+
+        Returns:
+            (sender_type, raw_output, cot) where cot is the chain-of-thought reasoning.
         """
         # Single sender (EmailMetadata)
         if isinstance(metadata, EmailMetadata):
             if self._is_vip(metadata):
-                return (SenderType.PERSON, "VIP")
+                return (SenderType.PERSON, "VIP", "")
             user_content = self.sender_config["user_template"].format(
                 sender=metadata.sender,
                 subject=metadata.subject,
                 snippet=metadata.snippet,
             )
-            raw = await self.cloud_llm.complete(self.sender_config["system"], user_content)
-            return (parse_sender_type(raw), raw)
+            raw, cot = await self.cloud_llm.complete(
+                self.sender_config["system"], user_content, include_thinking=True,
+            )
+            return (parse_sender_type(raw), raw, cot)
 
         # Multiple senders (ThreadMetadata) — check VIP first (free)
         if self._is_vip(metadata):
-            return (SenderType.PERSON, "VIP")
+            return (SenderType.PERSON, "VIP", "")
 
         # LLM-classify each unique sender, short-circuit on first PERSON
+        last_raw, last_cot = "SERVICE", ""
         for sender in metadata.senders:
             user_content = self.sender_config["user_template"].format(
                 sender=sender,
                 subject=metadata.subject,
                 snippet=metadata.snippet,
             )
-            raw = await self.cloud_llm.complete(self.sender_config["system"], user_content)
+            raw, cot = await self.cloud_llm.complete(
+                self.sender_config["system"], user_content, include_thinking=True,
+            )
+            last_raw, last_cot = raw, cot
             if parse_sender_type(raw) == SenderType.PERSON:
-                return (SenderType.PERSON, raw)
+                return (SenderType.PERSON, raw, cot)
 
-        return (SenderType.SERVICE, "SERVICE")
+        return (SenderType.SERVICE, last_raw, last_cot)
 
     async def classify_email(
         self, metadata: EmailMetadata | ThreadMetadata, body: str, sender_type: SenderType, vip: bool = False
-    ) -> tuple[EmailLabel, str]:
+    ) -> tuple[EmailLabel, str, str]:
         """Stage 2: Classify email content. Routes based on sender type.
 
         Person emails -> local LLM (privacy preserved)
         Service emails -> cloud LLM
         VIP emails use a narrowed prompt with fewer categories.
+
+        Returns:
+            (label, raw_output, cot) where cot is the chain-of-thought reasoning.
         """
         llm = self.local_llm if sender_type == SenderType.PERSON else self.cloud_llm
         category_names = self.vip_categories if vip else list(self.email_config["categories"].keys())
         system_prompt = self._build_email_prompt(category_names)
 
-        # For threads, use first sender in template; full transcript has all senders
+        # For threads, include all senders; for single messages, use the one sender
         if isinstance(metadata, ThreadMetadata):
-            sender = metadata.senders[0] if metadata.senders else ""
+            sender = ", ".join(metadata.senders) if metadata.senders else ""
         else:
             sender = metadata.sender
 
@@ -244,12 +259,12 @@ class EmailClassifier:
             subject=metadata.subject,
             body=body,
         )
-        raw = await llm.complete(system_prompt, user_content)
+        raw, cot = await llm.complete(system_prompt, user_content, include_thinking=True)
         label = parse_email_label(raw)
         # Safety net: clamp VIP results to allowed categories
         if vip and label.name not in category_names:
             label = EmailLabel.FYI
-        return (label, raw)
+        return (label, raw, cot)
 
     async def classify(
         self,
@@ -264,12 +279,15 @@ class EmailClassifier:
         when the caller has already classified the sender).
         """
         vip = self._is_vip(metadata)
+        sender_cot = ""
         if sender_type is None:
-            sender_type, sender_type_raw = await self.classify_sender(metadata)
-        label, label_raw = await self.classify_email(metadata, body, sender_type, vip=vip)
+            sender_type, sender_type_raw, sender_cot = await self.classify_sender(metadata)
+        label, label_raw, label_cot = await self.classify_email(metadata, body, sender_type, vip=vip)
         return ClassificationResult(
             sender_type=sender_type,
             sender_type_raw=sender_type_raw or "",
             label=label,
             label_raw=label_raw,
+            sender_cot=sender_cot,
+            label_cot=label_cot,
         )

@@ -111,15 +111,14 @@ class TestConfusionMatrix:
         results = [
             _make_result("service", "service", "needs_response", "needs_response"),
             _make_result("service", "service", "fyi", "fyi"),
-            _make_result("service", "service", "low_priority", "unwanted"),  # Misclassified
-            _make_result("service", "service", "unwanted", "unwanted"),
+            _make_result("service", "service", "low_priority", "fyi"),  # Misclassified
+            _make_result("service", "service", "low_priority", "low_priority"),
         ]
         matrix = compute_confusion_matrix(results, "expected_label", "predicted_label", LABEL_CLASSES)
         assert matrix["needs_response"]["needs_response"] == 1
         assert matrix["fyi"]["fyi"] == 1
-        assert matrix["low_priority"]["unwanted"] == 1  # Misclassification
-        assert matrix["low_priority"]["low_priority"] == 0
-        assert matrix["unwanted"]["unwanted"] == 1
+        assert matrix["low_priority"]["fyi"] == 1  # Misclassification
+        assert matrix["low_priority"]["low_priority"] == 1
 
 
 class TestPrecisionRecallF1:
@@ -159,10 +158,9 @@ class TestPrecisionRecallF1:
     def test_zero_support_class(self):
         """Class with no true positives or predictions should get 0.0."""
         matrix = {
-            "needs_response": {"needs_response": 0, "fyi": 0, "low_priority": 0, "unwanted": 0},
-            "fyi": {"needs_response": 0, "fyi": 5, "low_priority": 0, "unwanted": 0},
-            "low_priority": {"needs_response": 0, "fyi": 0, "low_priority": 3, "unwanted": 0},
-            "unwanted": {"needs_response": 0, "fyi": 0, "low_priority": 0, "unwanted": 2},
+            "needs_response": {"needs_response": 0, "fyi": 0, "low_priority": 0},
+            "fyi": {"needs_response": 0, "fyi": 5, "low_priority": 0},
+            "low_priority": {"needs_response": 0, "fyi": 0, "low_priority": 3},
         }
         prf = compute_precision_recall_f1(matrix, LABEL_CLASSES)
         assert prf["needs_response"]["precision"] == 0.0
@@ -183,7 +181,7 @@ class TestComputeMetrics:
             # Wrong sender type (privacy violation), right label
             _make_result("person", "service", "fyi", "fyi"),
             # Right sender type, wrong label
-            _make_result("service", "service", "unwanted", "low_priority"),
+            _make_result("service", "service", "needs_response", "low_priority"),
         ]
         metrics = compute_metrics(results)
 
@@ -197,7 +195,7 @@ class TestComputeMetrics:
         assert metrics["stage1"]["privacy_violations"] == 1
         assert metrics["stage1"]["privacy_violation_rate"] == 0.25
 
-        # Stage 2: 3/4 correct (one unwanted->low_priority)
+        # Stage 2: 3/4 correct (one needs_response->low_priority)
         assert metrics["stage2"]["count"] == 4
         assert metrics["stage2"]["accuracy"] == 0.75
 
@@ -368,7 +366,7 @@ class TestPrintComparisonVerbose:
         """Both wrong with different predictions → appears under Other changes."""
         r1 = [PredictionResult(
             thread_id="t1", expected_sender_type="service", expected_label="fyi",
-            predicted_sender_type="service", predicted_label="unwanted",
+            predicted_sender_type="service", predicted_label="needs_response",
             sender_type_correct=True, label_correct=False,
         )]
         r2 = [PredictionResult(
@@ -381,7 +379,7 @@ class TestPrintComparisonVerbose:
         print_comparison(meta, m1, meta, m2, verbose=True, results1=r1, results2=r2)
         out = capsys.readouterr().out
         assert "Other changes (both wrong)" in out
-        assert "label: unwanted->low_priority" in out
+        assert "label: needs_response->low_priority" in out
         assert "Regressions" not in out
         assert "Improvements" not in out
 

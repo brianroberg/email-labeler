@@ -10,9 +10,7 @@ LABELS_CONFIG = {
     "needs_response": "agent/needs-response",
     "fyi": "agent/fyi",
     "low_priority": "agent/low-priority",
-    "unwanted": "agent/unwanted",
     "processed": "agent/processed",
-    "would_have_deleted": "agent/would-have-deleted",
     "personal": "agent/personal",
     "non_personal": "agent/non-personal",
 }
@@ -22,18 +20,16 @@ LABEL_ID_TO_NAME = {
     "Label_1": "agent/needs-response",
     "Label_2": "agent/fyi",
     "Label_3": "agent/low-priority",
-    "Label_4": "agent/unwanted",
-    "Label_5": "agent/processed",
-    "Label_6": "agent/would-have-deleted",
-    "Label_7": "agent/personal",
-    "Label_8": "agent/non-personal",
+    "Label_4": "agent/processed",
+    "Label_5": "agent/personal",
+    "Label_6": "agent/non-personal",
 }
 
 
 class TestInferGroundTruth:
     def test_person_needs_response(self):
         messages = [
-            {"labelIds": ["INBOX", "Label_7", "Label_1", "Label_5"]},
+            {"labelIds": ["INBOX", "Label_5", "Label_1", "Label_4"]},
         ]
         sender_type, label = infer_ground_truth(messages, LABEL_ID_TO_NAME, LABELS_CONFIG)
         assert sender_type == "person"
@@ -41,23 +37,15 @@ class TestInferGroundTruth:
 
     def test_service_low_priority(self):
         messages = [
-            {"labelIds": ["Label_8", "Label_3", "Label_5"]},
+            {"labelIds": ["Label_6", "Label_3", "Label_4"]},
         ]
         sender_type, label = infer_ground_truth(messages, LABEL_ID_TO_NAME, LABELS_CONFIG)
         assert sender_type == "service"
         assert label == "low_priority"
 
-    def test_service_unwanted(self):
-        messages = [
-            {"labelIds": ["Label_8", "Label_4", "Label_5", "Label_6"]},
-        ]
-        sender_type, label = infer_ground_truth(messages, LABEL_ID_TO_NAME, LABELS_CONFIG)
-        assert sender_type == "service"
-        assert label == "unwanted"
-
     def test_person_fyi(self):
         messages = [
-            {"labelIds": ["Label_7", "Label_2", "Label_5"]},
+            {"labelIds": ["Label_5", "Label_2", "Label_4"]},
         ]
         sender_type, label = infer_ground_truth(messages, LABEL_ID_TO_NAME, LABELS_CONFIG)
         assert sender_type == "person"
@@ -67,8 +55,8 @@ class TestInferGroundTruth:
         """Labels on any message in the thread should be picked up."""
         messages = [
             {"labelIds": ["INBOX"]},
-            {"labelIds": ["Label_7"]},  # personal on second message
-            {"labelIds": ["Label_1", "Label_5"]},  # needs_response on third
+            {"labelIds": ["Label_5"]},  # personal on second message
+            {"labelIds": ["Label_1", "Label_4"]},  # needs_response on third
         ]
         sender_type, label = infer_ground_truth(messages, LABEL_ID_TO_NAME, LABELS_CONFIG)
         assert sender_type == "person"
@@ -77,7 +65,7 @@ class TestInferGroundTruth:
     def test_missing_sender_type(self):
         """Missing sender type label should return empty string."""
         messages = [
-            {"labelIds": ["Label_1", "Label_5"]},  # Has label but no personal/non_personal
+            {"labelIds": ["Label_1", "Label_4"]},  # Has label but no personal/non_personal
         ]
         sender_type, label = infer_ground_truth(messages, LABEL_ID_TO_NAME, LABELS_CONFIG)
         assert sender_type == ""
@@ -86,7 +74,7 @@ class TestInferGroundTruth:
     def test_missing_classification_label(self):
         """Missing classification label should return empty string."""
         messages = [
-            {"labelIds": ["Label_7", "Label_5"]},  # Has personal but no classification
+            {"labelIds": ["Label_5", "Label_4"]},  # Has personal but no classification
         ]
         sender_type, label = infer_ground_truth(messages, LABEL_ID_TO_NAME, LABELS_CONFIG)
         assert sender_type == "person"

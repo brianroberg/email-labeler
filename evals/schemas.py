@@ -16,7 +16,7 @@ class GoldenThread:
     subject: str
     snippet: str
     expected_sender_type: str  # "person" or "service"
-    expected_label: str  # "needs_response" / "fyi" / "low_priority" / "unwanted"
+    expected_label: str  # "needs_response" / "fyi" / "low_priority"
     source: str = "harvested"  # "harvested" or "manual"
     harvested_at: str = ""  # ISO 8601
     reviewed: bool = False

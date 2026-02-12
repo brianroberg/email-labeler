@@ -28,7 +28,7 @@ def mock_classifier():
         label=EmailLabel.NEEDS_RESPONSE,
         label_raw="NEEDS_RESPONSE",
     )
-    classifier.classify_sender.return_value = (SenderType.PERSON, "PERSON")
+    classifier.classify_sender.return_value = (SenderType.PERSON, "PERSON", "")
     return classifier
 
 
@@ -147,7 +147,7 @@ class TestProcessSingleThread:
         self, mock_proxy, mock_classifier, mock_label_manager, mock_thread_response
     ):
         mock_proxy.get_thread.return_value = mock_thread_response
-        mock_classifier.classify_sender.return_value = (SenderType.PERSON, "PERSON")
+        mock_classifier.classify_sender.return_value = (SenderType.PERSON, "PERSON", "")
 
         result = await process_single_thread(
             "thread_001",
@@ -238,12 +238,12 @@ class TestProcessSingleThread:
     ):
         """Service threads still processed even when MLX is down."""
         mock_proxy.get_thread.return_value = mock_thread_response
-        mock_classifier.classify_sender.return_value = (SenderType.SERVICE, "SERVICE")
+        mock_classifier.classify_sender.return_value = (SenderType.SERVICE, "SERVICE", "")
         mock_classifier.classify.return_value = ClassificationResult(
             sender_type=SenderType.SERVICE,
             sender_type_raw="SERVICE",
-            label=EmailLabel.UNWANTED,
-            label_raw="UNWANTED",
+            label=EmailLabel.LOW_PRIORITY,
+            label_raw="LOW_PRIORITY",
         )
 
         result = await process_single_thread(
@@ -282,9 +282,7 @@ class TestLoadConfig:
             "needs_response",
             "fyi",
             "low_priority",
-            "unwanted",
             "processed",
-            "would_have_deleted",
             "personal",
             "non_personal",
         ):

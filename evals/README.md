@@ -42,7 +42,7 @@ uv run python -m evals.harvest --proxy-url http://localhost:8000 --label needs_r
 | `--max-threads` | Max threads to fetch (default: `200`) |
 | `--append` | Append to existing file, deduplicating by thread ID |
 | `--sender-type` | Filter: `person` or `service` |
-| `--label` | Filter: `needs_response`, `fyi`, `low_priority`, `unwanted` |
+| `--label` | Filter: `needs_response`, `fyi`, `low_priority` |
 | `--config` | Path to config.toml (default: `./config.toml`) |
 | `--proxy-url` | API proxy URL (overrides `PROXY_URL` env var) |
 

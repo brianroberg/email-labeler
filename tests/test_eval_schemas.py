@@ -101,7 +101,7 @@ class TestPredictionResult:
         pr = PredictionResult(
             thread_id="t_err",
             expected_sender_type="service",
-            expected_label="unwanted",
+            expected_label="low_priority",
             error="Connection refused",
         )
         d = pr.to_dict()

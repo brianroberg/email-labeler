@@ -16,7 +16,7 @@ from pathlib import Path
 from evals.schemas import GoldenThread, PredictionResult, RunMeta
 
 SENDER_TYPES = ["person", "service"]
-LABEL_CLASSES = ["needs_response", "fyi", "low_priority", "unwanted"]
+LABEL_CLASSES = ["needs_response", "fyi", "low_priority"]
 
 
 def load_golden_context(meta: RunMeta) -> dict[str, GoldenThread]:

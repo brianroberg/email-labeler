@@ -24,8 +24,7 @@ The daemon classifies emails into four categories and applies the corresponding 
 |---|---|---|
 | `agent/needs-response` | Requires a reply or action from you | Stays in inbox |
 | `agent/fyi` | Worth reading, no action needed | Stays in inbox |
-| `agent/low-priority` | Routine notifications, newsletters | Archived |
-| `agent/unwanted` | Spam, unsolicited marketing | Archived |
+| `agent/low-priority` | Routine notifications, newsletters, spam, unwanted | Archived |
 
 Additional labels are used as markers:
 
@@ -34,7 +33,6 @@ Additional labels are used as markers:
 | `agent/processed` | Applied to every classified email. Used by the poll query to skip already-processed messages. |
 | `agent/personal` | Applied when Stage 1 classified the sender as a real person. Indicates the email body was processed by the local LLM only. |
 | `agent/non-personal` | Applied when Stage 1 classified the sender as an automated service. Indicates the email body was processed by the cloud LLM. |
-| `agent/would-have-deleted` | Applied alongside `agent/unwanted`. Marks emails that the daemon would delete if it had permission, without actually deleting anything. |
 
 ## Architecture
 
@@ -155,7 +153,7 @@ MLX_URL=http://macbook:8080/v1/chat/completions
 
 ### 3. Label Setup
 
-The api-proxy blocks programmatic label creation, so all eight labels must be created manually in Gmail before the daemon starts.
+The api-proxy blocks programmatic label creation, so all labels must be created manually in Gmail before the daemon starts.
 
 In Gmail, go to **Settings > Labels > Create new label** and create each of these:
 
@@ -163,9 +161,7 @@ In Gmail, go to **Settings > Labels > Create new label** and create each of thes
 agent/needs-response
 agent/fyi
 agent/low-priority
-agent/unwanted
 agent/processed
-agent/would-have-deleted
 agent/personal
 agent/non-personal
 ```
@@ -250,7 +246,7 @@ uv run --extra dev pytest tests/
 |---|---|---|
 | `test_llm_client.py` | `llm_client.py` | Request format, auth headers, `<think>` tag stripping, error handling, availability checks |
 | `test_classifier.py` | `classifier.py` | `parse_sender` formats, `parse_sender_type` edge cases and defaults, `parse_email_label` edge cases and defaults, cloud/local routing, full pipeline |
-| `test_labeler.py` | `labeler.py` | Label verification (all present, partial, none), label ID mapping, inbox/archive actions, extra labels for unwanted, single API call per email |
+| `test_labeler.py` | `labeler.py` | Label verification (all present, partial, none), label ID mapping, inbox/archive actions, single API call per email |
 | `test_daemon.py` | `daemon.py` | Service email path, person email path, MLX-unavailable skip, error isolation, config loading |
 | `test_config_utils.py` | `config_utils.py` | Config loading, `{env.VAR}` substitution |
 | `test_eval_schemas.py` | `evals/schemas.py` | GoldenThread/PredictionResult/RunMeta serialization round-trips |
@@ -336,7 +332,7 @@ The daemon is designed to run unattended and recover from transient failures:
 - **Exponential backoff**: If a poll cycle fails, the sleep interval doubles (up to 10x the base interval), then resets on the next successful cycle.
 - **Per-email error isolation**: If one email fails to classify, the error is logged and the loop continues with the next email.
 - **MLX graceful degradation**: If the local MLX server is unreachable, person emails are skipped (retried next cycle) while service emails continue to be classified via the cloud LLM.
-- **Safe defaults**: If the LLM returns an unrecognizable sender type, it defaults to SERVICE (body goes to cloud, safe for non-person content). If the LLM returns an unrecognizable classification, it defaults to LOW_PRIORITY (archived but not marked as unwanted).
+- **Safe defaults**: If the LLM returns an unrecognizable sender type, it defaults to SERVICE (body goes to cloud, safe for non-person content). If the LLM returns an unrecognizable classification, it defaults to LOW_PRIORITY (archived).
 - **Startup validation**: The daemon verifies all required Gmail labels exist before entering the poll loop, preventing silent misclassification from misconfigured labels.
 
 ## Environment Variables

@@ -125,41 +125,36 @@ async def evaluate_single(
     start = time.monotonic()
     try:
         if stages == "stage1_only":
-            sender_type, sender_raw = await classifier.classify_sender(metadata)
+            sender_type, sender_raw, sender_cot = await classifier.classify_sender(metadata)
             result.predicted_sender_type = sender_type.value
             result.predicted_sender_type_raw = sender_raw
             result.sender_type_correct = result.predicted_sender_type == golden.expected_sender_type
             result.privacy_violation = (
                 golden.expected_sender_type == "person" and result.predicted_sender_type == "service"
             )
-            if hasattr(cloud, "take_thinking"):
-                thinking.stage1_thinking = cloud.take_thinking()
+            thinking.stage1_thinking = sender_cot
 
         elif stages == "stage2_only":
             # Use expected sender type as input (skip Stage 1)
             sender_type = SenderType(golden.expected_sender_type)
-            label, label_raw = await classifier.classify_email(metadata, transcript, sender_type)
+            label, label_raw, label_cot = await classifier.classify_email(metadata, transcript, sender_type)
             result.predicted_sender_type = golden.expected_sender_type  # Passed through
             result.predicted_label = label.value
             result.predicted_label_raw = label_raw
             result.sender_type_correct = True  # By definition
             result.label_correct = result.predicted_label == golden.expected_label
-            if hasattr(cloud, "take_thinking"):
-                thinking.stage2_thinking = cloud.take_thinking() + local.take_thinking()
+            thinking.stage2_thinking = label_cot
 
         else:  # full
-            # Stage 1 first, harvest thinking before stage 2
-            sender_type, sender_raw = await classifier.classify_sender(metadata)
-            if hasattr(cloud, "take_thinking"):
-                thinking.stage1_thinking = cloud.take_thinking()
+            sender_type, sender_raw, sender_cot = await classifier.classify_sender(metadata)
+            thinking.stage1_thinking = sender_cot
 
             # Stage 2
             vip = classifier._is_vip(metadata)
-            label, label_raw = await classifier.classify_email(
+            label, label_raw, label_cot = await classifier.classify_email(
                 metadata, transcript, sender_type, vip=vip,
             )
-            if hasattr(cloud, "take_thinking"):
-                thinking.stage2_thinking = cloud.take_thinking() + local.take_thinking()
+            thinking.stage2_thinking = label_cot
 
             result.predicted_sender_type = sender_type.value
             result.predicted_sender_type_raw = sender_raw
