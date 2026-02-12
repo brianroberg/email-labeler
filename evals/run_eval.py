@@ -284,6 +284,8 @@ async def main(args: argparse.Namespace) -> None:
     golden_set = load_golden_set(golden_path, reviewed_only=not args.include_unreviewed)
     if args.sender_type:
         golden_set = [g for g in golden_set if g.expected_sender_type == args.sender_type]
+    if args.max_threads:
+        golden_set = golden_set[:args.max_threads]
 
     if not golden_set:
         print("No threads to evaluate.", file=sys.stderr)
@@ -425,6 +427,7 @@ def cli():
     parser.add_argument("--no-cache", action="store_true", help="Disable LLM response cache")
     parser.add_argument("--sender-type", choices=("person", "service"),
                         help="Only evaluate threads with this expected sender type")
+    parser.add_argument("--max-threads", type=int, help="Max threads to evaluate")
     # Config overrides (CLI always wins over config file)
     parser.add_argument("--cloud-model", help="Override cloud LLM model name")
     parser.add_argument("--local-model", help="Override local LLM model name")

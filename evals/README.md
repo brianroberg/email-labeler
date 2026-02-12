@@ -107,6 +107,9 @@ uv run python -m evals.run_eval --include-unreviewed
 
 # Dry run — show what would be evaluated
 uv run python -m evals.run_eval --dry-run
+
+# Evaluate only the first 10 threads
+uv run python -m evals.run_eval --max-threads 10
 ```
 
 | Flag | Description |
@@ -121,6 +124,7 @@ uv run python -m evals.run_eval --dry-run
 | `--tag` | Tag for the results filename (e.g. `new-prompts`) |
 | `--no-cache` | Disable LLM response cache (default: cache enabled) |
 | `--sender-type` | Only evaluate threads with this expected sender type (`person` or `service`) |
+| `--max-threads` | Max threads to evaluate (default: all) |
 | `--cloud-model` | Override cloud LLM model name from config |
 | `--local-model` | Override local LLM model name from config |
 | `--cloud-temperature` | Override cloud LLM temperature (alias: `--cloud-temp`) |
