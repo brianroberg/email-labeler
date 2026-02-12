@@ -32,15 +32,19 @@ class LLMClient:
         self.timeout = timeout
         self.extra_body = extra_body or {}
 
-    async def complete(self, system_prompt: str, user_content: str) -> str:
+    async def complete(
+        self, system_prompt: str, user_content: str, include_thinking: bool = False,
+    ) -> str | tuple[str, str]:
         """Send a chat completion request and return the stripped response.
 
         Args:
             system_prompt: System message for the LLM.
             user_content: User message content.
+            include_thinking: If True, return (stripped, thinking) tuple.
 
         Returns:
-            The LLM response with thinking tags stripped.
+            If include_thinking is False: stripped response string.
+            If include_thinking is True: (stripped_response, thinking_content) tuple.
 
         Raises:
             RuntimeError: If the LLM returns a non-200 response.
@@ -76,6 +80,8 @@ class LLMClient:
             raise RuntimeError(f"LLM request failed with status {response.status_code}")
 
         content = response.json()["choices"][0]["message"]["content"]
+        if include_thinking:
+            return self._strip_thinking(content), self._extract_thinking(content)
         return self._strip_thinking(content)
 
     async def is_available(self) -> bool:
@@ -106,8 +112,18 @@ class LLMClient:
         except (httpx.ConnectError, httpx.TimeoutException):
             return False
 
+    # Matches <think>...</think> and <<think>>...</<think>> (DeepSeek variant)
+    _THINK_PATTERN = re.compile(r"<<?think>>?.*?</<?think>>?", flags=re.DOTALL)
+    _THINK_EXTRACT = re.compile(r"<<?think>>?(.*?)</<?think>>?", flags=re.DOTALL)
+
+    @staticmethod
+    def _extract_thinking(content: str) -> str:
+        """Extract all think blocks (handles <think> and <<think>> variants)."""
+        matches = LLMClient._THINK_EXTRACT.findall(content)
+        return "\n\n".join(m.strip() for m in matches)
+
     @staticmethod
     def _strip_thinking(content: str) -> str:
-        """Remove <think>...</think> blocks from LLM output."""
-        stripped = re.sub(r"<think>.*?</think>", "", content, flags=re.DOTALL)
+        """Remove think blocks from LLM output (handles <think> and <<think>> variants)."""
+        stripped = LLMClient._THINK_PATTERN.sub("", content)
         return stripped.strip()

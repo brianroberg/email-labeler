@@ -12,6 +12,8 @@ The eval tools run outside Docker and need access to the same environment variab
 ln -s ../agent-stack/.env .env
 ```
 
+**Stop the daemon before running evals** if your local MLX server only supports one model at a time. The daemon and eval runner may request different models (e.g. `qwen/qwen3-32b` vs `qwen3-14b` via `--local-model`), causing the server to swap models mid-request and return errors. This is especially important when using `--local-model` to test a model that differs from `config.toml`.
+
 Since the symlinked `.env` may contain Docker-internal hostnames (e.g. `PROXY_URL=http://api-proxy:8000`), use `--proxy-url` to point at the proxy's host-accessible address:
 
 ```bash
@@ -46,7 +48,7 @@ uv run python -m evals.harvest --proxy-url http://localhost:8000 --label needs_r
 
 ### 2. Review — Manually verify ground truth labels
 
-Interactive CLI for reviewing and correcting labels in the golden set. Saves atomically after each session.
+Interactive CLI for reviewing and correcting labels in the golden set. Saves atomically after each session. Press `z` at any prompt to undo the last classification and go back — undo works as a stack, so pressing it repeatedly walks back through previous decisions.
 
 ```bash
 # Review all threads (blind mode by default)
@@ -154,6 +156,40 @@ uv run python -m evals.report --results-dir evals/results/
 | `--results-dir` | Directory of results for trend view |
 | `--verbose` | Show per-thread disagreements |
 | `--format` | `table` (default) or `json` |
+
+### 5. Web UI — Interactive reporting and comparison
+
+Launch a local web server to browse runs, view metrics, compare results, and inspect chain-of-thought reasoning.
+
+```bash
+# Set auth secret (required unless you want no auth)
+export EVAL_WEB_SECRET="your-secret-here"
+
+# Launch web UI
+uv run python -m evals.run_web
+
+# Custom port
+uv run python -m evals.run_web --port 8080
+```
+
+Navigate to `http://localhost:5000` in your browser. Features:
+
+- **Run list**: Filter by model, stages, tag. Click any run to view details.
+- **Run detail**: Metrics, confusion matrices, per-class P/R/F1, per-thread results with duration and chain-of-thought.
+- **Compare**: Select a baseline run and one or more comparison runs to see side-by-side accuracy deltas.
+
+| Flag | Description |
+|---|---|
+| `--host` | Host to bind to (default: `127.0.0.1`) |
+| `--port` | Port to bind to (default: `5000`) |
+
+## Chain-of-Thought Capture
+
+When running evaluations with the LLM cache enabled (the default), chain-of-thought content from `<think>...</think>` blocks is automatically captured and stored in sidecar files alongside results.
+
+**Sidecar format:** `evals/results/<run>.cot.jsonl` — one JSON line per thread with `stage1_thinking` and `stage2_thinking` fields.
+
+Chain-of-thought is viewable in the web UI on the run detail page.
 
 ## LLM Response Cache
 

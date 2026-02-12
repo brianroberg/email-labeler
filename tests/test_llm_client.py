@@ -121,6 +121,41 @@ class TestComplete:
             result = await cloud_client.complete("sys", "user")
             assert result == "SERVICE"
 
+    async def test_strips_double_bracket_think_tags(self, cloud_client):
+        """Verify <<think>>...</<think>> tags (DeepSeek variant) are stripped."""
+        mock_response = _mock_response(json_data={
+            "choices": [{"message": {"content":
+                "The sender is a company\n\n<<think>>\nreasoning here\n</<think>>\n\nSERVICE"}}]
+        })
+
+        with patch("llm_client.httpx.AsyncClient") as mock_client_cls:
+            mock_client = AsyncMock()
+            mock_client.post.return_value = mock_response
+            mock_client_cls.return_value.__aenter__ = AsyncMock(return_value=mock_client)
+            mock_client_cls.return_value.__aexit__ = AsyncMock(return_value=False)
+
+            result = await cloud_client.complete("sys", "user")
+            assert "SERVICE" in result
+            assert "<<think>>" not in result
+            assert "reasoning here" not in result
+
+    async def test_extracts_double_bracket_thinking(self, cloud_client):
+        """Verify <<think>> content is captured in include_thinking mode."""
+        mock_response = _mock_response(json_data={
+            "choices": [{"message": {"content":
+                "preamble\n<<think>>\ndeep reasoning\n</<think>>\nSERVICE"}}]
+        })
+
+        with patch("llm_client.httpx.AsyncClient") as mock_client_cls:
+            mock_client = AsyncMock()
+            mock_client.post.return_value = mock_response
+            mock_client_cls.return_value.__aenter__ = AsyncMock(return_value=mock_client)
+            mock_client_cls.return_value.__aexit__ = AsyncMock(return_value=False)
+
+            response, thinking = await cloud_client.complete("sys", "user", include_thinking=True)
+            assert response == "preamble\n\nSERVICE"
+            assert "deep reasoning" in thinking
+
     async def test_strips_multiple_think_tags(self, cloud_client):
         """Verify multiple think blocks are stripped."""
         mock_response = _mock_response(json_data={
