@@ -32,6 +32,10 @@ class LLMClient:
         self.timeout = timeout
         self.extra_body = extra_body or {}
 
+    def _is_glm_model(self) -> bool:
+        """Check if model uses GLM-style reasoning_content instead of inline think tags."""
+        return "glm" in self.model.lower()
+
     async def complete(
         self, system_prompt: str, user_content: str, include_thinking: bool = False,
     ) -> str | tuple[str, str]:
@@ -65,6 +69,10 @@ class LLMClient:
             **self.extra_body,
         }
 
+        # GLM models require explicit thinking enablement in request
+        if include_thinking and self._is_glm_model():
+            body["thinking"] = {"type": "enabled"}
+
         async def _do_request() -> httpx.Response:
             async with httpx.AsyncClient(timeout=self.timeout) as client:
                 return await client.post(self.base_url, headers=headers, json=body)
@@ -79,9 +87,17 @@ class LLMClient:
         if response.status_code != 200:
             raise RuntimeError(f"LLM request failed with status {response.status_code}")
 
-        content = response.json()["choices"][0]["message"]["content"]
+        msg = response.json()["choices"][0]["message"]
+        content = msg["content"]
+
         if include_thinking:
-            return self._strip_thinking(content), self._extract_thinking(content)
+            # GLM models return reasoning in a separate field
+            if self._is_glm_model() and msg.get("reasoning_content"):
+                thinking = msg["reasoning_content"]
+            else:
+                # DeepSeek/Qwen models use inline <think> tags
+                thinking = self._extract_thinking(content)
+            return self._strip_thinking(content), thinking
         return self._strip_thinking(content)
 
     async def is_available(self) -> bool:
