@@ -12,16 +12,14 @@ _LABEL_CONFIG_KEY = {
     EmailLabel.NEEDS_RESPONSE: "needs_response",
     EmailLabel.FYI: "fyi",
     EmailLabel.LOW_PRIORITY: "low_priority",
-    EmailLabel.UNWANTED: "unwanted",
 }
 
 
 # Priority ordering: higher index = higher priority. Never downgrade.
 _PRIORITY_ORDER = [
-    EmailLabel.UNWANTED,  # 0 — lowest
-    EmailLabel.LOW_PRIORITY,  # 1
-    EmailLabel.FYI,  # 2
-    EmailLabel.NEEDS_RESPONSE,  # 3 — highest
+    EmailLabel.LOW_PRIORITY,  # 0 — lowest
+    EmailLabel.FYI,  # 1
+    EmailLabel.NEEDS_RESPONSE,  # 2 — highest
 ]
 
 
@@ -54,9 +52,7 @@ class LabelManager:
             "needs_response",
             "fyi",
             "low_priority",
-            "unwanted",
             "processed",
-            "would_have_deleted",
             "personal",
             "non_personal",
         ):
@@ -81,7 +77,7 @@ class LabelManager:
         - The classification label (e.g., agent/needs-response)
         - The processed marker label (agent/processed)
         - The sender-path label (agent/personal or agent/non-personal)
-        - Any extra labels (e.g., agent/would-have-deleted for unwanted)
+        - Any extra labels (if configured)
         - Archive action (remove INBOX) if configured
 
         Note: This method applies labels unconditionally. The caller is
@@ -111,7 +107,7 @@ class LabelManager:
             self.label_ids[path_name],
         ]
 
-        # Add extra labels (e.g., would-have-deleted for unwanted)
+        # Add extra labels (if configured)
         extra_label_names = self.labels_config.get("extra_labels", {}).get(config_key, [])
         for extra_name in extra_label_names:
             add_label_ids.append(self.label_ids[extra_name])

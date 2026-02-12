@@ -24,8 +24,7 @@ The daemon classifies emails into four categories and applies the corresponding 
 |---|---|---|
 | `agent/needs-response` | Requires a reply or action from you | Stays in inbox |
 | `agent/fyi` | Worth reading, no action needed | Stays in inbox |
-| `agent/low-priority` | Routine notifications, newsletters | Archived |
-| `agent/unwanted` | Spam, unsolicited marketing | Archived |
+| `agent/low-priority` | Routine notifications, newsletters, spam, unwanted | Archived |
 
 Additional labels are used as markers:
 
@@ -34,7 +33,6 @@ Additional labels are used as markers:
 | `agent/processed` | Applied to every classified email. Used by the poll query to skip already-processed messages. |
 | `agent/personal` | Applied when Stage 1 classified the sender as a real person. Indicates the email body was processed by the local LLM only. |
 | `agent/non-personal` | Applied when Stage 1 classified the sender as an automated service. Indicates the email body was processed by the cloud LLM. |
-| `agent/would-have-deleted` | Applied alongside `agent/unwanted`. Marks emails that the daemon would delete if it had permission, without actually deleting anything. |
 
 ## Architecture
 
@@ -77,22 +75,34 @@ Additional labels are used as markers:
 
 ```
 email-labeler/
-├── daemon.py          Main entry point: polling loop and orchestration
-├── classifier.py      Two-tier classification logic and LLM output parsing
-├── labeler.py         Gmail label verification and application
-├── llm_client.py      LLM abstraction for cloud and local endpoints
-├── proxy_client.py    Gmail API proxy client (shared with email-agent)
-├── gmail_utils.py     Email header and body parsing (shared with email-agent)
-├── config.toml        Label definitions, prompts, and operational parameters
-├── pyproject.toml     Python project metadata and dependencies
-├── Dockerfile         Container image definition
-├── .env.example       Environment variable template
+├── daemon.py           Main entry point: polling loop and orchestration
+├── classifier.py       Two-tier classification logic and LLM output parsing
+├── labeler.py          Gmail label verification and application
+├── llm_client.py       LLM abstraction for cloud and local endpoints
+├── proxy_client.py     Gmail API proxy client (shared with email-agent)
+├── gmail_utils.py      Email header and body parsing (shared with email-agent)
+├── config_utils.py     Config loading and env var substitution
+├── config.toml         Label definitions, prompts, and operational parameters
+├── pyproject.toml      Python project metadata and dependencies
+├── Dockerfile          Container image definition
+├── .env.example        Environment variable template
+├── evals/              Classification evaluation suite
+│   ├── schemas.py      Dataclasses: GoldenThread, PredictionResult, RunMeta
+│   ├── harvest.py      Pull processed threads → golden set JSONL
+│   ├── review.py       Interactive CLI for label review and correction
+│   ├── run_eval.py     Replay golden set through real classifier
+│   ├── report.py       Metrics: accuracy, confusion matrix, P/R/F1, privacy
+│   └── results/        Timestamped result files from evaluation runs
 └── tests/
-    ├── conftest.py        Shared fixtures and sample Gmail data
-    ├── test_llm_client.py LLM client tests (13 tests)
-    ├── test_classifier.py Classifier tests (35 tests)
-    ├── test_labeler.py    Label manager tests (9 tests)
-    └── test_daemon.py     Daemon orchestration tests (9 tests)
+    ├── conftest.py          Shared fixtures and sample Gmail data
+    ├── test_llm_client.py   LLM client tests
+    ├── test_classifier.py   Classifier tests
+    ├── test_labeler.py      Label manager tests
+    ├── test_daemon.py       Daemon orchestration tests
+    ├── test_config_utils.py Config loading tests
+    ├── test_eval_schemas.py Golden set and result serialization tests
+    ├── test_eval_harvest.py Ground truth inference and deduplication tests
+    └── test_eval_report.py  Metrics computation and report formatting tests
 ```
 
 ## Prerequisites
@@ -114,11 +124,17 @@ uv sync --extra dev
 
 ### 2. Create environment file
 
+If running as part of the `agent-stack` setup (recommended), symlink to the shared `.env` to avoid maintaining variables in two places:
+
+```bash
+ln -s ../agent-stack/.env .env
+```
+
+Otherwise, copy the example and fill in your values:
+
 ```bash
 cp .env.example .env
 ```
-
-Edit `.env` with your credentials:
 
 ```env
 # Required: api-proxy authentication
@@ -137,7 +153,7 @@ MLX_URL=http://macbook:8080/v1/chat/completions
 
 ### 3. Label Setup
 
-The api-proxy blocks programmatic label creation, so all eight labels must be created manually in Gmail before the daemon starts.
+The api-proxy blocks programmatic label creation, so all labels must be created manually in Gmail before the daemon starts.
 
 In Gmail, go to **Settings > Labels > Create new label** and create each of these:
 
@@ -145,9 +161,7 @@ In Gmail, go to **Settings > Labels > Create new label** and create each of thes
 agent/needs-response
 agent/fyi
 agent/low-priority
-agent/unwanted
 agent/processed
-agent/would-have-deleted
 agent/personal
 agent/non-personal
 ```
@@ -205,6 +219,12 @@ Check container health with:
 docker inspect --format='{{.State.Health.Status}}' agent-stack-email-labeler-1
 ```
 
+## Evaluation Suite
+
+The `evals/` directory provides a 4-stage pipeline (`harvest → review → run_eval → report`) for measuring classification accuracy against a golden set of human-reviewed threads. It includes an LLM response cache for fast re-runs and supports prompt A/B testing, model comparison, and ongoing monitoring workflows.
+
+See [`evals/README.md`](evals/README.md) for full documentation and CLI reference.
+
 ## Testing
 
 All tests use mocks and require no external services.
@@ -222,12 +242,16 @@ uv run --extra dev pytest tests/
 
 ### Test coverage by module
 
-| Test file | Module | Tests | What's covered |
-|---|---|---|---|
-| `test_llm_client.py` | `llm_client.py` | 13 | Request format, auth headers, `<think>` tag stripping, error handling, availability checks |
-| `test_classifier.py` | `classifier.py` | 35 | `parse_sender` formats, `parse_sender_type` edge cases and defaults, `parse_email_label` edge cases and defaults, cloud/local routing, full pipeline |
-| `test_labeler.py` | `labeler.py` | 9 | Label verification (all present, partial, none), label ID mapping, inbox/archive actions, extra labels for unwanted, single API call per email |
-| `test_daemon.py` | `daemon.py` | 9 | Service email path, person email path, MLX-unavailable skip, error isolation, config loading |
+| Test file | Module | What's covered |
+|---|---|---|
+| `test_llm_client.py` | `llm_client.py` | Request format, auth headers, `<think>` tag stripping, error handling, availability checks |
+| `test_classifier.py` | `classifier.py` | `parse_sender` formats, `parse_sender_type` edge cases and defaults, `parse_email_label` edge cases and defaults, cloud/local routing, full pipeline |
+| `test_labeler.py` | `labeler.py` | Label verification (all present, partial, none), label ID mapping, inbox/archive actions, single API call per email |
+| `test_daemon.py` | `daemon.py` | Service email path, person email path, MLX-unavailable skip, error isolation, config loading |
+| `test_config_utils.py` | `config_utils.py` | Config loading, `{env.VAR}` substitution |
+| `test_eval_schemas.py` | `evals/schemas.py` | GoldenThread/PredictionResult/RunMeta serialization round-trips |
+| `test_eval_harvest.py` | `evals/harvest.py` | Ground truth inference from labels, deduplication |
+| `test_eval_report.py` | `evals/report.py` | Confusion matrix, precision/recall/F1, accuracy, privacy violation metrics |
 
 ### Linting
 
@@ -269,6 +293,34 @@ temperature = 0.2
 timeout = 120       # Local LLM gets more time (runs on consumer hardware)
 ```
 
+### Extra request body fields
+
+Each `[llm.*]` section supports an optional `extra_body` table. Any key-value pairs defined here are merged into every API request body sent to that endpoint. This is useful for provider-specific parameters that aren't part of the standard OpenAI chat completion format.
+
+**Disabling thinking for reasoning models** — Models like Qwen3, DeepSeek-R1, and GLM-4.5 generate chain-of-thought reasoning in `<think>` tags before answering. While the daemon already strips these tags from responses, you can disable thinking entirely to save tokens and reduce latency.
+
+For providers that accept a top-level `enable_thinking` flag (Novita.ai, many OpenAI-compatible APIs):
+
+```toml
+[llm.local.extra_body]
+enable_thinking = false
+```
+
+For LM Studio with models that use `chat_template_kwargs` (e.g. Qwen3):
+
+```toml
+[llm.local.extra_body.chat_template_kwargs]
+enable_thinking = false
+```
+
+You can put any provider-specific fields in `extra_body` — it is not limited to thinking controls. For example:
+
+```toml
+[llm.cloud.extra_body]
+top_p = 0.9
+frequency_penalty = 0.5
+```
+
 ### Prompt templates
 
 The `[prompts.sender_classification]` and `[prompts.email_classification]` sections contain the system prompts and user message templates used for each classification stage. Templates use Python format strings with `{sender}`, `{subject}`, `{snippet}`, and `{body}` placeholders.
@@ -280,7 +332,7 @@ The daemon is designed to run unattended and recover from transient failures:
 - **Exponential backoff**: If a poll cycle fails, the sleep interval doubles (up to 10x the base interval), then resets on the next successful cycle.
 - **Per-email error isolation**: If one email fails to classify, the error is logged and the loop continues with the next email.
 - **MLX graceful degradation**: If the local MLX server is unreachable, person emails are skipped (retried next cycle) while service emails continue to be classified via the cloud LLM.
-- **Safe defaults**: If the LLM returns an unrecognizable sender type, it defaults to SERVICE (body goes to cloud, safe for non-person content). If the LLM returns an unrecognizable classification, it defaults to LOW_PRIORITY (archived but not marked as unwanted).
+- **Safe defaults**: If the LLM returns an unrecognizable sender type, it defaults to SERVICE (body goes to cloud, safe for non-person content). If the LLM returns an unrecognizable classification, it defaults to LOW_PRIORITY (archived).
 - **Startup validation**: The daemon verifies all required Gmail labels exist before entering the poll loop, preventing silent misclassification from misconfigured labels.
 
 ## Environment Variables

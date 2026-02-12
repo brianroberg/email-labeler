@@ -9,9 +9,7 @@ healthcheck_file = "/tmp/healthcheck"
 needs_response = "agent/needs-response"
 fyi = "agent/fyi"
 low_priority = "agent/low-priority"
-unwanted = "agent/unwanted"
 processed = "agent/processed"
-would_have_deleted = "agent/would-have-deleted"
 personal = "agent/personal"
 non_personal = "agent/non-personal"
 
@@ -19,10 +17,6 @@ non_personal = "agent/non-personal"
 needs_response = "inbox"
 fyi = "inbox"
 low_priority = "archive"
-unwanted = "archive"
-
-[labels.extra_labels]
-unwanted = ["agent/would-have-deleted"]
 
 [llm.cloud]
 model = "deepseek/deepseek-v3.2"
@@ -35,6 +29,10 @@ model = "qwen/qwen3-32b"
 max_tokens = 8096
 temperature = 0.2
 timeout = 180
+# Optional: extra fields merged into every API request body.
+# See README for examples (e.g. disabling thinking for reasoning models).
+# [llm.local.extra_body]
+# enable_thinking = false
 
 [prompts.sender_classification]
 system = """You are an email classifier. Your job is to determine whether an email is from a real person or from an automated service/company.
@@ -54,12 +52,27 @@ Preview: {snippet}"""
 [vip_senders]
 # VIP addresses come from VIP_SENDERS env var (comma-separated).
 # These are always classified as PERSON (skips sender LLM call)
-# and restricted to VIP-only categories (skips low-priority/unwanted).
+# and restricted to VIP-only categories (skips low-priority).
 categories = ["NEEDS_RESPONSE", "FYI"]
 
 [prompts.email_classification]
-preamble = "You are an email classifier. Based on the full email content, classify it into exactly one category:"
-postamble = "Think about it carefully before answering. Use <think> tags to reason about the email, then give your final answer."
+preamble = """You are an email classifier. Based on the full email content, classify it into exactly one of three categories.
+
+Use this decision process:
+1. Does this email require {env.USER_NAME} to respond, take action, or make a decision? If yes → NEEDS_RESPONSE
+2. Is this email worth reading for awareness, even though no action is required? If yes → FYI
+3. Otherwise → LOW_PRIORITY
+
+Important: Unsolicited outreach from unfamiliar senders — including sales pitches, partnership proposals, cold introductions, and requests to "hop on a call" from people {env.USER_NAME} does not know — is LOW_PRIORITY, even if it contains a question or call to action.
+
+Categories:"""
+
+postamble = """Think step by step before answering. Use <think> tags to reason about the email:
+1. Who is this from? Is this someone {env.USER_NAME} likely knows or works with?
+2. Is there a specific action or response needed from {env.USER_NAME}?
+3. If no action is needed, is the content worth reading for situational awareness?
+
+Then give your final answer: NEEDS_RESPONSE, FYI, or LOW_PRIORITY"""
 
 user_template = """From: {sender}
 Subject: {subject}
@@ -67,7 +80,6 @@ Thread transcript:
 {body}"""
 
 [prompts.email_classification.categories]
-NEEDS_RESPONSE = "The email requires a reply or action from {env.USER_NAME}. Questions directed at {env.USER_NAME}, meeting requests with {env.USER_NAME}, invitations needing RSVP by {env.USER_NAME}, requests for information from {env.USER_NAME}. Note: the statement, 'Let me know if you have any questions' (or similar) does not by itself constitute a need to respond."
-FYI = "The email is informational and worth reading but requires no action. Status updates from people, shared articles from contacts, announcements you should know about."
-LOW_PRIORITY = "The email has low importance. Marketing newsletters you subscribed to, routine automated notifications, social media digests, promotional offers you might occasionally want."
-UNWANTED = "The email is unwanted. Spam, unsolicited marketing, invitations to review services or products, offers to initiate new business relationships (i.e. cold emails), phishing attempts, repeated promotional emails."
+NEEDS_RESPONSE = "The email requires a reply, decision, or action from {env.USER_NAME}. Examples: direct questions from colleagues or contacts, meeting requests, invitations needing RSVP, requests for information or approval. Note: 'Let me know if you have any questions' (or similar) does not by itself require a response. Cold emails and sales pitches do NOT qualify, even if they ask a question."
+FYI = "The email is informational and worth reading but requires no action. Examples: status updates from colleagues, team announcements, shared articles from contacts, policy updates, organizational news, event recaps, forwarded information relevant to {env.USER_NAME}'s work."
+LOW_PRIORITY = "The email has low importance or is unwanted. Examples: marketing newsletters, automated notifications, social media digests, promotional offers, spam, unsolicited sales or partnership pitches, cold outreach, phishing attempts, subscription digests. Anything that does not need to be read."

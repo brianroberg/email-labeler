@@ -8,6 +8,8 @@ import re
 
 import httpx
 
+from retry import retry_with_backoff
+
 
 class LLMClient:
     """Client for OpenAI-compatible chat completion endpoints."""
@@ -20,6 +22,7 @@ class LLMClient:
         max_tokens: int = 8096,
         temperature: float = 0.2,
         timeout: int = 60,
+        extra_body: dict | None = None,
     ):
         self.base_url = base_url
         self.api_key = api_key
@@ -27,16 +30,25 @@ class LLMClient:
         self.max_tokens = max_tokens
         self.temperature = temperature
         self.timeout = timeout
+        self.extra_body = extra_body or {}
 
-    async def complete(self, system_prompt: str, user_content: str) -> str:
+    def _is_glm_model(self) -> bool:
+        """Check if model uses GLM-style reasoning_content instead of inline think tags."""
+        return "glm" in self.model.lower()
+
+    async def complete(
+        self, system_prompt: str, user_content: str, include_thinking: bool = False,
+    ) -> str | tuple[str, str]:
         """Send a chat completion request and return the stripped response.
 
         Args:
             system_prompt: System message for the LLM.
             user_content: User message content.
+            include_thinking: If True, return (stripped, thinking) tuple.
 
         Returns:
-            The LLM response with thinking tags stripped.
+            If include_thinking is False: stripped response string.
+            If include_thinking is True: (stripped_response, thinking_content) tuple.
 
         Raises:
             RuntimeError: If the LLM returns a non-200 response.
@@ -54,11 +66,19 @@ class LLMClient:
                 {"role": "system", "content": system_prompt},
                 {"role": "user", "content": user_content},
             ],
+            **self.extra_body,
         }
 
-        try:
+        # GLM models require explicit thinking enablement in request
+        if include_thinking and self._is_glm_model():
+            body["thinking"] = {"type": "enabled"}
+
+        async def _do_request() -> httpx.Response:
             async with httpx.AsyncClient(timeout=self.timeout) as client:
-                response = await client.post(self.base_url, headers=headers, json=body)
+                return await client.post(self.base_url, headers=headers, json=body)
+
+        try:
+            response = await retry_with_backoff(_do_request, f"LLM {self.model}")
         except httpx.TimeoutException:
             raise TimeoutError(
                 f"LLM request to {self.model} timed out after {self.timeout}s"
@@ -67,7 +87,17 @@ class LLMClient:
         if response.status_code != 200:
             raise RuntimeError(f"LLM request failed with status {response.status_code}")
 
-        content = response.json()["choices"][0]["message"]["content"]
+        msg = response.json()["choices"][0]["message"]
+        content = msg["content"]
+
+        if include_thinking:
+            # GLM models return reasoning in a separate field
+            if self._is_glm_model() and msg.get("reasoning_content"):
+                thinking = msg["reasoning_content"]
+            else:
+                # DeepSeek/Qwen models use inline <think> tags
+                thinking = self._extract_thinking(content)
+            return self._strip_thinking(content), thinking
         return self._strip_thinking(content)
 
     async def is_available(self) -> bool:
@@ -88,6 +118,7 @@ class LLMClient:
                 "max_tokens": 1,
                 "temperature": 0,
                 "messages": [{"role": "user", "content": "ping"}],
+                **self.extra_body,
             }
 
             async with httpx.AsyncClient(timeout=10) as client:
@@ -97,8 +128,18 @@ class LLMClient:
         except (httpx.ConnectError, httpx.TimeoutException):
             return False
 
+    # Matches <think>...</think> and <<think>>...</<think>> (DeepSeek variant)
+    _THINK_PATTERN = re.compile(r"<<?think>>?.*?</<?think>>?", flags=re.DOTALL)
+    _THINK_EXTRACT = re.compile(r"<<?think>>?(.*?)</<?think>>?", flags=re.DOTALL)
+
+    @staticmethod
+    def _extract_thinking(content: str) -> str:
+        """Extract all think blocks (handles <think> and <<think>> variants)."""
+        matches = LLMClient._THINK_EXTRACT.findall(content)
+        return "\n\n".join(m.strip() for m in matches)
+
     @staticmethod
     def _strip_thinking(content: str) -> str:
-        """Remove <think>...</think> blocks from LLM output."""
-        stripped = re.sub(r"<think>.*?</think>", "", content, flags=re.DOTALL)
+        """Remove think blocks from LLM output (handles <think> and <<think>> variants)."""
+        stripped = LLMClient._THINK_PATTERN.sub("", content)
         return stripped.strip()

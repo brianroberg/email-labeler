@@ -1,0 +1,157 @@
+{% extends "base.html" %}
+{% block title %}Compare — Eval Suite{% endblock %}
+{% block content %}
+<h2>Compare Runs</h2>
+
+{# --- Selection Form --- #}
+<form method="get" class="filter-form">
+    <div class="grid">
+        <label>
+            Baseline
+            <select name="baseline" required>
+                <option value="">Select baseline...</option>
+                {% for path, meta in runs %}
+                <option value="{{ meta.run_id[:8] }}"
+                    {% if data and data.baseline_meta.run_id[:8] == meta.run_id[:8] %}selected{% endif %}>
+                    {{ meta.run_id[:8] }} — {{ meta.tag or meta.cloud_model }} ({{ meta.timestamp[:10] }})
+                </option>
+                {% endfor %}
+            </select>
+        </label>
+    </div>
+
+    <label>Compare against (select one or more):</label>
+    <div style="max-height: 200px; overflow-y: auto; border: 1px solid var(--pico-muted-border-color); border-radius: 4px; padding: 0.5rem; margin-bottom: 1rem;">
+    {% for path, meta in runs %}
+        <label style="margin-bottom: 0.25rem; display: block;">
+            <input type="checkbox" name="compare" value="{{ meta.run_id[:8] }}"
+                {% if data and meta.run_id[:8] in data.comparisons | map(attribute='meta') | map(attribute='run_id') | map('truncate', 8, True, '') | list %}checked{% endif %}>
+            <span class="mono">{{ meta.run_id[:8] }}</span> — {{ meta.tag or meta.cloud_model }} ({{ meta.timestamp[:10] }})
+        </label>
+    {% endfor %}
+    </div>
+
+    <button type="submit" style="width: auto;">Compare</button>
+</form>
+
+{% if error is defined and error %}
+<p style="color: var(--pico-del-color);">{{ error }}</p>
+{% endif %}
+
+{# --- Comparison Results --- #}
+{% if data %}
+<section class="metric-section">
+    <h4>Baseline: <span class="mono">{{ data.baseline_meta.run_id[:8] }}</span>
+        ({{ data.baseline_meta.tag or data.baseline_meta.cloud_model }})</h4>
+
+    <figure>
+    <table>
+        <thead>
+            <tr>
+                <th>Metric</th>
+                <th>Baseline</th>
+                {% for comp in data.comparisons %}
+                <th>
+                    <a href="/run/{{ comp.meta.run_id[:8] }}" class="mono">{{ comp.meta.run_id[:8] }}</a>
+                    <br><small>{{ comp.meta.tag or comp.meta.cloud_model }}</small>
+                </th>
+                {% endfor %}
+            </tr>
+        </thead>
+        <tbody>
+            {# Stage 1 #}
+            {% if data.baseline_metrics.stage1 is defined %}
+            <tr>
+                <th>Stage 1 Accuracy</th>
+                <td>{{ data.baseline_metrics.stage1.accuracy | pct }}</td>
+                {% for comp in data.comparisons %}
+                <td>
+                    {% if comp.metrics.stage1 is defined %}
+                    {{ comp.metrics.stage1.accuracy | pct }}
+                    {% if comp.deltas.stage1 is defined and comp.deltas.stage1.accuracy is not none %}
+                    <br><small class="{% if comp.deltas.stage1.accuracy > 0 %}delta-pos{% elif comp.deltas.stage1.accuracy < 0 %}delta-neg{% endif %}">
+                        {{ "%+.1f"|format(comp.deltas.stage1.accuracy * 100) }}pp
+                    </small>
+                    {% endif %}
+                    {% else %}N/A{% endif %}
+                </td>
+                {% endfor %}
+            </tr>
+            <tr>
+                <th>Privacy Violations</th>
+                <td>{{ data.baseline_metrics.stage1.privacy_violations }}</td>
+                {% for comp in data.comparisons %}
+                <td>
+                    {% if comp.metrics.stage1 is defined %}
+                    {{ comp.metrics.stage1.privacy_violations }}
+                    {% if comp.deltas.stage1 is defined and comp.deltas.stage1.privacy_violations is defined %}
+                    <br><small class="{% if comp.deltas.stage1.privacy_violations > 0 %}delta-neg{% elif comp.deltas.stage1.privacy_violations < 0 %}delta-pos{% endif %}">
+                        {{ "%+d"|format(comp.deltas.stage1.privacy_violations) }}
+                    </small>
+                    {% endif %}
+                    {% else %}N/A{% endif %}
+                </td>
+                {% endfor %}
+            </tr>
+            {% endif %}
+
+            {# Stage 2 #}
+            {% if data.baseline_metrics.stage2 is defined %}
+            <tr>
+                <th>Stage 2 Accuracy</th>
+                <td>{{ data.baseline_metrics.stage2.accuracy | pct }}</td>
+                {% for comp in data.comparisons %}
+                <td>
+                    {% if comp.metrics.stage2 is defined %}
+                    {{ comp.metrics.stage2.accuracy | pct }}
+                    {% if comp.deltas.stage2 is defined and comp.deltas.stage2.accuracy is not none %}
+                    <br><small class="{% if comp.deltas.stage2.accuracy > 0 %}delta-pos{% elif comp.deltas.stage2.accuracy < 0 %}delta-neg{% endif %}">
+                        {{ "%+.1f"|format(comp.deltas.stage2.accuracy * 100) }}pp
+                    </small>
+                    {% endif %}
+                    {% else %}N/A{% endif %}
+                </td>
+                {% endfor %}
+            </tr>
+            {# Per-class F1 #}
+            {% for cls in LABEL_CLASSES %}
+            <tr>
+                <td style="padding-left: 2rem;">{{ cls }} F1</td>
+                <td>{{ data.baseline_metrics.stage2.per_class[cls].f1 | pct }}</td>
+                {% for comp in data.comparisons %}
+                <td>
+                    {% if comp.metrics.stage2 is defined %}
+                    {{ comp.metrics.stage2.per_class[cls].f1 | pct }}
+                    {% else %}N/A{% endif %}
+                </td>
+                {% endfor %}
+            </tr>
+            {% endfor %}
+            {% endif %}
+
+            {# Combined #}
+            {% if data.baseline_metrics.combined is defined %}
+            <tr>
+                <th>E2E Accuracy</th>
+                <td>{{ data.baseline_metrics.combined.accuracy | pct }}</td>
+                {% for comp in data.comparisons %}
+                <td>
+                    {% if comp.metrics.combined is defined %}
+                    {{ comp.metrics.combined.accuracy | pct }}
+                    {% if comp.deltas.combined is defined and comp.deltas.combined.accuracy is not none %}
+                    <br><small class="{% if comp.deltas.combined.accuracy > 0 %}delta-pos{% elif comp.deltas.combined.accuracy < 0 %}delta-neg{% endif %}">
+                        {{ "%+.1f"|format(comp.deltas.combined.accuracy * 100) }}pp
+                    </small>
+                    {% endif %}
+                    {% else %}N/A{% endif %}
+                </td>
+                {% endfor %}
+            </tr>
+            {% endif %}
+        </tbody>
+    </table>
+    </figure>
+</section>
+{% endif %}
+
+{% endblock %}

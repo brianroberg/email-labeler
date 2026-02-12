@@ -70,6 +70,15 @@ class TestParseSenderType:
     def test_with_trailing_text(self):
         assert parse_sender_type("PERSON. The sender is a real person.") == SenderType.PERSON
 
+    def test_last_line_fallback_person(self):
+        assert parse_sender_type("The sender is a human\n\nPERSON") == SenderType.PERSON
+
+    def test_last_line_fallback_service(self):
+        assert parse_sender_type("This is a newsletter from a company\n\nSERVICE") == SenderType.SERVICE
+
+    def test_last_line_fallback_with_trailing_text(self):
+        assert parse_sender_type("Some preamble\nSERVICE. Clearly automated.") == SenderType.SERVICE
+
     def test_unknown_defaults_to_service(self):
         assert parse_sender_type("UNKNOWN") == SenderType.SERVICE
 
@@ -78,6 +87,31 @@ class TestParseSenderType:
 
     def test_garbage_defaults_to_service(self):
         assert parse_sender_type("asdfghjkl") == SenderType.SERVICE
+
+    def test_garbage_last_line_defaults_to_service(self):
+        assert parse_sender_type("some preamble\nstill garbage") == SenderType.SERVICE
+
+    def test_no_warning_on_exact_match(self, caplog):
+        with caplog.at_level("WARNING", logger="classifier"):
+            parse_sender_type("PERSON")
+        assert caplog.records == []
+
+    def test_no_warning_on_trailing_text(self, caplog):
+        with caplog.at_level("WARNING", logger="classifier"):
+            parse_sender_type("PERSON. The sender is a real person.")
+        assert caplog.records == []
+
+    def test_no_warning_on_last_line_fallback(self, caplog):
+        with caplog.at_level("WARNING", logger="classifier"):
+            parse_sender_type("The sender is a human\n\nPERSON")
+        assert caplog.records == []
+
+    def test_warns_on_unrecognized_output(self, caplog):
+        with caplog.at_level("WARNING", logger="classifier"):
+            parse_sender_type("I think this is a human")
+        assert len(caplog.records) == 1
+        assert "interpreting as SERVICE" in caplog.records[0].message
+        assert "I think this is a human" in caplog.records[0].message
 
 
 class TestParseEmailLabel:
@@ -90,8 +124,9 @@ class TestParseEmailLabel:
     def test_low_priority(self):
         assert parse_email_label("LOW_PRIORITY") == EmailLabel.LOW_PRIORITY
 
-    def test_unwanted(self):
-        assert parse_email_label("UNWANTED") == EmailLabel.UNWANTED
+    def test_unwanted_maps_to_low_priority(self):
+        """Backward compat: UNWANTED maps to LOW_PRIORITY after category merge."""
+        assert parse_email_label("UNWANTED") == EmailLabel.LOW_PRIORITY
 
     def test_lowercase(self):
         assert parse_email_label("needs_response") == EmailLabel.NEEDS_RESPONSE
@@ -100,16 +135,48 @@ class TestParseEmailLabel:
         assert parse_email_label("Fyi") == EmailLabel.FYI
 
     def test_with_whitespace(self):
-        assert parse_email_label("  UNWANTED  ") == EmailLabel.UNWANTED
+        assert parse_email_label("  LOW_PRIORITY  ") == EmailLabel.LOW_PRIORITY
 
     def test_with_trailing_text(self):
         assert parse_email_label("LOW_PRIORITY. This is a newsletter.") == EmailLabel.LOW_PRIORITY
+
+    def test_last_line_fallback_unwanted_maps_to_low_priority(self):
+        """Backward compat: UNWANTED on last line maps to LOW_PRIORITY."""
+        assert parse_email_label("This is spam\n\nUNWANTED") == EmailLabel.LOW_PRIORITY
+
+    def test_last_line_fallback_needs_response(self):
+        assert parse_email_label("Looks important\nNEEDS_RESPONSE") == EmailLabel.NEEDS_RESPONSE
 
     def test_unknown_defaults_to_low_priority(self):
         assert parse_email_label("SOMETHING_ELSE") == EmailLabel.LOW_PRIORITY
 
     def test_empty_defaults_to_low_priority(self):
         assert parse_email_label("") == EmailLabel.LOW_PRIORITY
+
+    def test_garbage_last_line_defaults_to_low_priority(self):
+        assert parse_email_label("some preamble\nstill garbage") == EmailLabel.LOW_PRIORITY
+
+    def test_no_warning_on_exact_match(self, caplog):
+        with caplog.at_level("WARNING", logger="classifier"):
+            parse_email_label("NEEDS_RESPONSE")
+        assert caplog.records == []
+
+    def test_no_warning_on_trailing_text(self, caplog):
+        with caplog.at_level("WARNING", logger="classifier"):
+            parse_email_label("LOW_PRIORITY. This is a newsletter.")
+        assert caplog.records == []
+
+    def test_no_warning_on_last_line_fallback(self, caplog):
+        with caplog.at_level("WARNING", logger="classifier"):
+            parse_email_label("This is spam\n\nLOW_PRIORITY")
+        assert caplog.records == []
+
+    def test_warns_on_unrecognized_output(self, caplog):
+        with caplog.at_level("WARNING", logger="classifier"):
+            parse_email_label("IMPORTANT")
+        assert len(caplog.records) == 1
+        assert "interpreting as LOW_PRIORITY" in caplog.records[0].message
+        assert "IMPORTANT" in caplog.records[0].message
 
 
 # ── EmailClassifier class tests ──────────────────────────────────────────
@@ -140,8 +207,7 @@ def config():
                 "categories": {
                     "NEEDS_RESPONSE": "Requires a reply.",
                     "FYI": "Informational, no action needed.",
-                    "LOW_PRIORITY": "Low importance.",
-                    "UNWANTED": "Spam or unwanted.",
+                    "LOW_PRIORITY": "Low importance or unwanted.",
                 },
             },
         },
@@ -173,8 +239,8 @@ def classifier(mock_cloud_llm, mock_local_llm, config):
 
 class TestClassifySender:
     async def test_routes_to_cloud_llm(self, classifier, mock_cloud_llm, metadata):
-        mock_cloud_llm.complete.return_value = "PERSON"
-        sender_type, raw = await classifier.classify_sender(metadata)
+        mock_cloud_llm.complete.return_value = ("PERSON", "thinking about sender")
+        sender_type, raw, cot = await classifier.classify_sender(metadata)
 
         assert sender_type == SenderType.PERSON
         mock_cloud_llm.complete.assert_called_once()
@@ -184,20 +250,25 @@ class TestClassifySender:
         assert "Meeting tomorrow" in call_args.args[1]
 
     async def test_returns_service_for_automated(self, classifier, mock_cloud_llm, metadata):
-        mock_cloud_llm.complete.return_value = "SERVICE"
-        sender_type, raw = await classifier.classify_sender(metadata)
+        mock_cloud_llm.complete.return_value = ("SERVICE", "")
+        sender_type, raw, cot = await classifier.classify_sender(metadata)
         assert sender_type == SenderType.SERVICE
 
     async def test_returns_raw_llm_output(self, classifier, mock_cloud_llm, metadata):
-        mock_cloud_llm.complete.return_value = "PERSON"
-        _, raw = await classifier.classify_sender(metadata)
+        mock_cloud_llm.complete.return_value = ("PERSON", "reasoning here")
+        _, raw, cot = await classifier.classify_sender(metadata)
         assert raw == "PERSON"
+
+    async def test_returns_cot(self, classifier, mock_cloud_llm, metadata):
+        mock_cloud_llm.complete.return_value = ("PERSON", "The sender appears to be a real person")
+        _, _, cot = await classifier.classify_sender(metadata)
+        assert cot == "The sender appears to be a real person"
 
 
 class TestClassifyEmail:
     async def test_person_routes_to_local_llm(self, classifier, mock_local_llm, metadata):
-        mock_local_llm.complete.return_value = "NEEDS_RESPONSE"
-        label, raw = await classifier.classify_email(
+        mock_local_llm.complete.return_value = ("NEEDS_RESPONSE", "reasoning")
+        label, raw, cot = await classifier.classify_email(
             metadata, "Hey, can we meet tomorrow?", SenderType.PERSON
         )
 
@@ -205,25 +276,32 @@ class TestClassifyEmail:
         mock_local_llm.complete.assert_called_once()
 
     async def test_service_routes_to_cloud_llm(self, classifier, mock_cloud_llm, metadata):
-        mock_cloud_llm.complete.return_value = "LOW_PRIORITY"
-        label, raw = await classifier.classify_email(metadata, "Your order has shipped!", SenderType.SERVICE)
+        mock_cloud_llm.complete.return_value = ("LOW_PRIORITY", "")
+        label, raw, cot = await classifier.classify_email(
+            metadata, "Your order has shipped!", SenderType.SERVICE,
+        )
 
         assert label == EmailLabel.LOW_PRIORITY
         mock_cloud_llm.complete.assert_called_once()
 
     async def test_formats_body_in_prompt(self, classifier, mock_local_llm, metadata):
-        mock_local_llm.complete.return_value = "FYI"
+        mock_local_llm.complete.return_value = ("FYI", "")
         body_text = "Here's the project update."
         await classifier.classify_email(metadata, body_text, SenderType.PERSON)
 
         call_args = mock_local_llm.complete.call_args
         assert body_text in call_args.args[1]
 
+    async def test_returns_cot(self, classifier, mock_local_llm, metadata):
+        mock_local_llm.complete.return_value = ("NEEDS_RESPONSE", "This email asks a direct question")
+        _, _, cot = await classifier.classify_email(metadata, "Can we meet?", SenderType.PERSON)
+        assert cot == "This email asks a direct question"
+
 
 class TestClassifyPipeline:
     async def test_full_person_pipeline(self, classifier, mock_cloud_llm, mock_local_llm, metadata):
-        mock_cloud_llm.complete.return_value = "PERSON"
-        mock_local_llm.complete.return_value = "NEEDS_RESPONSE"
+        mock_cloud_llm.complete.return_value = ("PERSON", "sender reasoning")
+        mock_local_llm.complete.return_value = ("NEEDS_RESPONSE", "label reasoning")
 
         result = await classifier.classify(metadata, "Can we discuss the proposal?")
 
@@ -232,9 +310,11 @@ class TestClassifyPipeline:
         assert result.label == EmailLabel.NEEDS_RESPONSE
         assert result.sender_type_raw == "PERSON"
         assert result.label_raw == "NEEDS_RESPONSE"
+        assert result.sender_cot == "sender reasoning"
+        assert result.label_cot == "label reasoning"
 
     async def test_full_service_pipeline(self, classifier, mock_cloud_llm, metadata):
-        mock_cloud_llm.complete.side_effect = ["SERVICE", "LOW_PRIORITY"]
+        mock_cloud_llm.complete.side_effect = [("SERVICE", ""), ("LOW_PRIORITY", "")]
 
         result = await classifier.classify(metadata, "Your order has shipped!")
 
@@ -245,7 +325,7 @@ class TestClassifyPipeline:
         self, classifier, mock_cloud_llm, mock_local_llm, metadata
     ):
         """Service emails use cloud LLM for both sender classification and email classification."""
-        mock_cloud_llm.complete.side_effect = ["SERVICE", "UNWANTED"]
+        mock_cloud_llm.complete.side_effect = [("SERVICE", ""), ("LOW_PRIORITY", "")]
 
         await classifier.classify(metadata, "Buy now!")
 
@@ -254,13 +334,22 @@ class TestClassifyPipeline:
 
     async def test_person_uses_cloud_then_local(self, classifier, mock_cloud_llm, mock_local_llm, metadata):
         """Person emails use cloud for sender type, local for email classification."""
-        mock_cloud_llm.complete.return_value = "PERSON"
-        mock_local_llm.complete.return_value = "FYI"
+        mock_cloud_llm.complete.return_value = ("PERSON", "")
+        mock_local_llm.complete.return_value = ("FYI", "")
 
         await classifier.classify(metadata, "Just wanted to share this article.")
 
         mock_cloud_llm.complete.assert_called_once()
         mock_local_llm.complete.assert_called_once()
+
+    async def test_skipped_stage1_has_empty_sender_cot(self, classifier, mock_cloud_llm, metadata):
+        """When sender_type is pre-provided, sender_cot should be empty."""
+        mock_cloud_llm.complete.return_value = ("LOW_PRIORITY", "label cot")
+
+        result = await classifier.classify(metadata, "Newsletter", SenderType.SERVICE, "SERVICE")
+
+        assert result.sender_cot == ""
+        assert result.label_cot == "label cot"
 
 
 # ── VIP sender tests ────────────────────────────────────────────────────
@@ -279,15 +368,16 @@ def vip_metadata():
 class TestVipSender:
     async def test_vip_skips_cloud_llm(self, classifier, mock_cloud_llm, vip_metadata):
         """VIP senders are classified as PERSON without an LLM call."""
-        sender_type, raw = await classifier.classify_sender(vip_metadata)
+        sender_type, raw, cot = await classifier.classify_sender(vip_metadata)
 
         assert sender_type == SenderType.PERSON
         assert raw == "VIP"
+        assert cot == ""
         mock_cloud_llm.complete.assert_not_called()
 
     async def test_non_vip_uses_cloud_llm(self, classifier, mock_cloud_llm, metadata):
         """Non-VIP senders still go through the cloud LLM."""
-        mock_cloud_llm.complete.return_value = "PERSON"
+        mock_cloud_llm.complete.return_value = ("PERSON", "")
         await classifier.classify_sender(metadata)
         mock_cloud_llm.complete.assert_called_once()
 
@@ -299,7 +389,7 @@ class TestVipSender:
             subject="Hi",
             snippet="Hello",
         )
-        sender_type, raw = await classifier.classify_sender(meta)
+        sender_type, raw, cot = await classifier.classify_sender(meta)
         assert sender_type == SenderType.PERSON
         assert raw == "VIP"
         mock_cloud_llm.complete.assert_not_called()
@@ -312,7 +402,7 @@ class TestVipSender:
             subject="Hi",
             snippet="Hello",
         )
-        mock_cloud_llm.complete.return_value = "PERSON"
+        mock_cloud_llm.complete.return_value = ("PERSON", "")
         await classifier.classify_sender(meta)
         mock_cloud_llm.complete.assert_called_once()
 
@@ -320,43 +410,43 @@ class TestVipSender:
 class TestVipClassification:
     async def test_vip_gets_narrowed_prompt(self, classifier, mock_local_llm, vip_metadata):
         """VIP emails get a prompt with only NEEDS_RESPONSE and FYI."""
-        mock_local_llm.complete.return_value = "FYI"
+        mock_local_llm.complete.return_value = ("FYI", "")
         await classifier.classify_email(vip_metadata, "See you tomorrow.", SenderType.PERSON, vip=True)
 
         system_prompt = mock_local_llm.complete.call_args.args[0]
         assert "NEEDS_RESPONSE" in system_prompt
         assert "FYI" in system_prompt
         assert "LOW_PRIORITY" not in system_prompt
-        assert "UNWANTED" not in system_prompt
 
     async def test_non_vip_gets_full_prompt(self, classifier, mock_local_llm, metadata):
-        """Non-VIP emails get the full prompt with all 4 categories."""
-        mock_local_llm.complete.return_value = "FYI"
+        """Non-VIP emails get the full prompt with all 3 categories."""
+        mock_local_llm.complete.return_value = ("FYI", "")
         await classifier.classify_email(metadata, "Project update.", SenderType.PERSON, vip=False)
 
         system_prompt = mock_local_llm.complete.call_args.args[0]
         assert "NEEDS_RESPONSE" in system_prompt
         assert "FYI" in system_prompt
         assert "LOW_PRIORITY" in system_prompt
-        assert "UNWANTED" in system_prompt
 
     async def test_vip_clamps_unexpected_label(self, classifier, mock_local_llm, vip_metadata):
         """If LLM returns LOW_PRIORITY for a VIP, it gets clamped to FYI."""
-        mock_local_llm.complete.return_value = "LOW_PRIORITY"
-        label, _ = await classifier.classify_email(
+        mock_local_llm.complete.return_value = ("LOW_PRIORITY", "")
+        label, _, _ = await classifier.classify_email(
             vip_metadata, "Newsletter FYI.", SenderType.PERSON, vip=True
         )
         assert label == EmailLabel.FYI
 
     async def test_vip_full_pipeline(self, classifier, mock_cloud_llm, mock_local_llm, vip_metadata):
         """Full pipeline: VIP skips sender LLM, uses narrowed prompt, routes to local LLM."""
-        mock_local_llm.complete.return_value = "NEEDS_RESPONSE"
+        mock_local_llm.complete.return_value = ("NEEDS_RESPONSE", "reasoning")
 
         result = await classifier.classify(vip_metadata, "Can you review this?")
 
         assert result.sender_type == SenderType.PERSON
         assert result.sender_type_raw == "VIP"
         assert result.label == EmailLabel.NEEDS_RESPONSE
+        assert result.sender_cot == ""  # VIP skips LLM for sender
+        assert result.label_cot == "reasoning"
         mock_cloud_llm.complete.assert_not_called()
         mock_local_llm.complete.assert_called_once()
 
@@ -400,32 +490,36 @@ def service_only_thread_metadata():
 class TestThreadSenderClassification:
     async def test_vip_in_thread_shortcircuits(self, classifier, mock_cloud_llm, vip_thread_metadata):
         """If any sender in thread is VIP, return PERSON/VIP without LLM calls."""
-        sender_type, raw = await classifier.classify_sender(vip_thread_metadata)
+        sender_type, raw, cot = await classifier.classify_sender(vip_thread_metadata)
         assert sender_type == SenderType.PERSON
         assert raw == "VIP"
+        assert cot == ""
         mock_cloud_llm.complete.assert_not_called()
 
     async def test_person_in_thread_shortcircuits(self, classifier, mock_cloud_llm, thread_metadata):
         """Short-circuit on first PERSON sender."""
-        mock_cloud_llm.complete.return_value = "PERSON"
-        sender_type, raw = await classifier.classify_sender(thread_metadata)
+        mock_cloud_llm.complete.return_value = ("PERSON", "person reasoning")
+        sender_type, raw, cot = await classifier.classify_sender(thread_metadata)
         assert sender_type == SenderType.PERSON
+        assert cot == "person reasoning"
         # Should only call LLM once (short-circuit after PERSON)
         assert mock_cloud_llm.complete.call_count == 1
 
     async def test_all_service_senders(self, classifier, mock_cloud_llm, service_only_thread_metadata):
         """All SERVICE senders -> SERVICE."""
-        mock_cloud_llm.complete.return_value = "SERVICE"
-        sender_type, raw = await classifier.classify_sender(service_only_thread_metadata)
+        mock_cloud_llm.complete.return_value = ("SERVICE", "")
+        sender_type, raw, cot = await classifier.classify_sender(service_only_thread_metadata)
         assert sender_type == SenderType.SERVICE
+        assert cot == ""  # All SERVICE, no CoT from short-circuit
         # Should call LLM for each unique sender
         assert mock_cloud_llm.complete.call_count == 2
 
     async def test_person_after_service_found(self, classifier, mock_cloud_llm, thread_metadata):
         """First sender SERVICE, second sender PERSON -> short-circuit PERSON."""
-        mock_cloud_llm.complete.side_effect = ["SERVICE", "PERSON"]
-        sender_type, raw = await classifier.classify_sender(thread_metadata)
+        mock_cloud_llm.complete.side_effect = [("SERVICE", ""), ("PERSON", "second sender cot")]
+        sender_type, raw, cot = await classifier.classify_sender(thread_metadata)
         assert sender_type == SenderType.PERSON
+        assert cot == "second sender cot"
         assert mock_cloud_llm.complete.call_count == 2
 
 
@@ -433,14 +527,30 @@ class TestThreadSenderClassification:
 
 
 class TestThreadClassifyEmail:
-    async def test_thread_uses_first_sender_in_template(self, classifier, mock_local_llm, thread_metadata):
-        """Thread classification uses first sender in user template."""
-        mock_local_llm.complete.return_value = "NEEDS_RESPONSE"
+    async def test_thread_uses_all_senders_in_template(self, classifier, mock_local_llm, thread_metadata):
+        """Thread classification includes all senders in user template."""
+        mock_local_llm.complete.return_value = ("NEEDS_RESPONSE", "")
         await classifier.classify_email(thread_metadata, "Thread transcript here...", SenderType.PERSON)
         call_args = mock_local_llm.complete.call_args
         user_content = call_args.args[1]
         assert "John Doe <john@example.com>" in user_content
+        assert "Amazon <noreply@amazon.com>" in user_content
         assert "Thread transcript here..." in user_content
+
+    async def test_single_sender_thread(self, classifier, mock_local_llm):
+        """Thread with one sender just shows that sender."""
+        single_sender_meta = ThreadMetadata(
+            thread_id="thread_single",
+            senders=["Solo Sender <solo@example.com>"],
+            subject="Single sender thread",
+            snippet="Just me here",
+        )
+        mock_local_llm.complete.return_value = ("FYI", "")
+        await classifier.classify_email(single_sender_meta, "Body text", SenderType.PERSON)
+        user_content = mock_local_llm.complete.call_args.args[1]
+        assert "Solo Sender <solo@example.com>" in user_content
+        # No comma when only one sender
+        assert ", " not in user_content.split("\n")[0]
 
 
 # ── Thread VIP classification tests ──────────────────────────────────────
@@ -449,19 +559,18 @@ class TestThreadClassifyEmail:
 class TestThreadVipClassification:
     async def test_vip_thread_narrowed_prompt(self, classifier, mock_local_llm, vip_thread_metadata):
         """VIP thread gets narrowed categories."""
-        mock_local_llm.complete.return_value = "NEEDS_RESPONSE"
+        mock_local_llm.complete.return_value = ("NEEDS_RESPONSE", "")
         await classifier.classify_email(vip_thread_metadata, "Thread text", SenderType.PERSON, vip=True)
         system_prompt = mock_local_llm.complete.call_args.args[0]
         assert "NEEDS_RESPONSE" in system_prompt
         assert "FYI" in system_prompt
         assert "LOW_PRIORITY" not in system_prompt
-        assert "UNWANTED" not in system_prompt
 
     async def test_vip_thread_full_pipeline(
         self, classifier, mock_cloud_llm, mock_local_llm, vip_thread_metadata
     ):
         """Full pipeline: VIP thread skips sender LLM, narrowed prompt, local LLM."""
-        mock_local_llm.complete.return_value = "NEEDS_RESPONSE"
+        mock_local_llm.complete.return_value = ("NEEDS_RESPONSE", "")
         result = await classifier.classify(vip_thread_metadata, "Thread text")
         assert result.sender_type == SenderType.PERSON
         assert result.sender_type_raw == "VIP"

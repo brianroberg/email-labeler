@@ -71,10 +71,8 @@ def sample_labels():
             {"id": "Label_1", "name": "agent/needs-response", "type": "user"},
             {"id": "Label_2", "name": "agent/fyi", "type": "user"},
             {"id": "Label_3", "name": "agent/low-priority", "type": "user"},
-            {"id": "Label_4", "name": "agent/unwanted", "type": "user"},
-            {"id": "Label_5", "name": "agent/processed", "type": "user"},
-            {"id": "Label_6", "name": "agent/would-have-deleted", "type": "user"},
-            {"id": "Label_7", "name": "agent/personal", "type": "user"},
-            {"id": "Label_8", "name": "agent/non-personal", "type": "user"},
+            {"id": "Label_4", "name": "agent/processed", "type": "user"},
+            {"id": "Label_5", "name": "agent/personal", "type": "user"},
+            {"id": "Label_6", "name": "agent/non-personal", "type": "user"},
         ]
     }

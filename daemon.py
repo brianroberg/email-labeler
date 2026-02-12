@@ -164,7 +164,7 @@ async def process_single_thread(
 
         # Classify
         if not mlx_available:
-            sender_type, sender_raw = await classifier.classify_sender(metadata)
+            sender_type, sender_raw, _ = await classifier.classify_sender(metadata)
             if sender_type == SenderType.PERSON:
                 log.info("Skipping person thread %s (MLX unavailable): %s", thread_id, subject)
                 return False
@@ -193,6 +193,8 @@ async def process_single_thread(
             result.label.value,
             subject,
         )
+        log.debug("Thread %s CoT — sender: %s", thread_id, result.sender_cot)
+        log.debug("Thread %s CoT — label: %s", thread_id, result.label_cot)
         return True
 
     except httpx.ConnectError as exc:
@@ -219,6 +221,7 @@ async def run_daemon() -> None:
         max_tokens=config["llm"]["cloud"]["max_tokens"],
         temperature=config["llm"]["cloud"]["temperature"],
         timeout=config["llm"]["cloud"]["timeout"],
+        extra_body=config["llm"]["cloud"].get("extra_body"),
     )
     local_llm = LLMClient(
         base_url=os.environ.get("MLX_URL", ""),
@@ -227,6 +230,7 @@ async def run_daemon() -> None:
         max_tokens=config["llm"]["local"]["max_tokens"],
         temperature=config["llm"]["local"]["temperature"],
         timeout=config["llm"]["local"]["timeout"],
+        extra_body=config["llm"]["local"].get("extra_body"),
     )
 
     classifier = EmailClassifier(

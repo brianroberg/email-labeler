@@ -1,0 +1,210 @@
+{% extends "base.html" %}
+{% block title %}Run {{ meta.run_id[:8] }} — Eval Suite{% endblock %}
+{% block content %}
+<h2>Run <span class="mono">{{ meta.run_id[:8] }}</span></h2>
+
+<section class="metric-section">
+    <h4>Metadata</h4>
+    <figure>
+    <table>
+        <tbody>
+            <tr><th style="width:160px">Timestamp</th><td>{{ meta.timestamp }}</td></tr>
+            <tr><th>Cloud Model</th><td>{{ meta.cloud_model }} (temp={{ meta.cloud_temperature }}, max_tokens={{ meta.cloud_max_tokens }})</td></tr>
+            <tr><th>Local Model</th><td>{{ meta.local_model }} (temp={{ meta.local_temperature }}, max_tokens={{ meta.local_max_tokens }})</td></tr>
+            <tr><th>Stages</th><td>{{ meta.stages }}</td></tr>
+            <tr><th>Config</th><td class="mono">{{ meta.config_path }} ({{ meta.config_hash }})</td></tr>
+            <tr><th>Golden Set</th><td>{{ meta.golden_set_count }} threads</td></tr>
+            <tr><th>Avg Duration</th><td>{{ avg_duration | duration }}</td></tr>
+            {% if meta.tag %}<tr><th>Tag</th><td>{{ meta.tag }}</td></tr>{% endif %}
+            {% if meta.cloud_extra_body %}<tr><th>Cloud extra_body</th><td class="mono">{{ meta.cloud_extra_body }}</td></tr>{% endif %}
+            {% if meta.local_extra_body %}<tr><th>Local extra_body</th><td class="mono">{{ meta.local_extra_body }}</td></tr>{% endif %}
+        </tbody>
+    </table>
+    </figure>
+</section>
+
+{# --- Stage 1 Metrics --- #}
+{% if metrics.stage1 is defined %}
+<section class="metric-section">
+    <h4>Stage 1: Sender Classification</h4>
+    <p>
+        <strong>Accuracy:</strong> {{ metrics.stage1.accuracy | pct }}
+        ({{ metrics.stage1.count }} threads)
+        &nbsp;|&nbsp;
+        <strong>Privacy Violations:</strong> {{ metrics.stage1.privacy_violations }}
+        ({{ metrics.stage1.privacy_violation_rate | pct }})
+    </p>
+    <details>
+        <summary>Confusion Matrix</summary>
+        <figure>
+        <table>
+            <thead><tr><th></th>{% for c in SENDER_TYPES %}<th>{{ c }}</th>{% endfor %}</tr></thead>
+            <tbody>
+            {% for exp in SENDER_TYPES %}
+            <tr>
+                <th>{{ exp }}</th>
+                {% for pred in SENDER_TYPES %}
+                <td>{{ metrics.stage1.confusion_matrix[exp][pred] }}</td>
+                {% endfor %}
+            </tr>
+            {% endfor %}
+            </tbody>
+        </table>
+        </figure>
+    </details>
+    <details>
+        <summary>Per-Class P / R / F1</summary>
+        <figure>
+        <table>
+            <thead><tr><th>Class</th><th>Precision</th><th>Recall</th><th>F1</th></tr></thead>
+            <tbody>
+            {% for cls in SENDER_TYPES %}
+            <tr>
+                <td>{{ cls }}</td>
+                <td>{{ metrics.stage1.per_class[cls].precision | pct }}</td>
+                <td>{{ metrics.stage1.per_class[cls].recall | pct }}</td>
+                <td>{{ metrics.stage1.per_class[cls].f1 | pct }}</td>
+            </tr>
+            {% endfor %}
+            </tbody>
+        </table>
+        </figure>
+    </details>
+</section>
+{% endif %}
+
+{# --- Stage 2 Metrics --- #}
+{% if metrics.stage2 is defined %}
+<section class="metric-section">
+    <h4>Stage 2: Label Classification</h4>
+    <p>
+        <strong>Accuracy:</strong> {{ metrics.stage2.accuracy | pct }}
+        ({{ metrics.stage2.count }} threads)
+    </p>
+    <details>
+        <summary>Confusion Matrix</summary>
+        <figure>
+        <table>
+            <thead><tr><th></th>{% for c in LABEL_CLASSES %}<th>{{ c }}</th>{% endfor %}</tr></thead>
+            <tbody>
+            {% for exp in LABEL_CLASSES %}
+            <tr>
+                <th>{{ exp }}</th>
+                {% for pred in LABEL_CLASSES %}
+                <td>{{ metrics.stage2.confusion_matrix[exp][pred] }}</td>
+                {% endfor %}
+            </tr>
+            {% endfor %}
+            </tbody>
+        </table>
+        </figure>
+    </details>
+    <details>
+        <summary>Per-Class P / R / F1</summary>
+        <figure>
+        <table>
+            <thead><tr><th>Class</th><th>Precision</th><th>Recall</th><th>F1</th></tr></thead>
+            <tbody>
+            {% for cls in LABEL_CLASSES %}
+            <tr>
+                <td>{{ cls }}</td>
+                <td>{{ metrics.stage2.per_class[cls].precision | pct }}</td>
+                <td>{{ metrics.stage2.per_class[cls].recall | pct }}</td>
+                <td>{{ metrics.stage2.per_class[cls].f1 | pct }}</td>
+            </tr>
+            {% endfor %}
+            </tbody>
+        </table>
+        </figure>
+    </details>
+</section>
+{% endif %}
+
+{# --- Combined --- #}
+{% if metrics.combined is defined %}
+<section class="metric-section">
+    <h4>Combined (End-to-End)</h4>
+    <p><strong>Accuracy:</strong> {{ metrics.combined.accuracy | pct }} ({{ metrics.combined.count }} threads)</p>
+</section>
+{% endif %}
+
+{# --- Per-Thread Results --- #}
+<section class="metric-section">
+    <h4>Per-Thread Results</h4>
+    <figure>
+    <table>
+        <thead>
+            <tr>
+                <th>Thread</th>
+                <th>Expected</th>
+                <th>Predicted</th>
+                <th>Duration</th>
+                <th>Status</th>
+                <th>CoT</th>
+            </tr>
+        </thead>
+        <tbody>
+        {% for row in rows %}
+        <tr>
+            <td><small>{{ row.label }}</small></td>
+            <td>{{ row.pred.expected_sender_type }} / {{ row.pred.expected_label }}</td>
+            <td>
+                {{ row.pred.predicted_sender_type or "—" }} / {{ row.pred.predicted_label or "—" }}
+                {% if row.pred.error %}<br><small style="color:var(--pico-del-color)">{{ row.pred.error }}</small>{% endif %}
+            </td>
+            <td class="mono">{{ row.pred.duration_seconds | duration }}</td>
+            <td>
+                {% if row.pred.error %}
+                <span class="badge badge-err">error</span>
+                {% elif row.pred.privacy_violation %}
+                <span class="badge badge-warn">privacy</span>
+                {% elif row.correct %}
+                <span class="badge badge-ok">ok</span>
+                {% else %}
+                <span class="badge badge-err">wrong</span>
+                {% endif %}
+            </td>
+            <td>
+                {% if row.cot and (row.cot.stage1_thinking or row.cot.stage2_thinking) %}
+                <details>
+                    <summary>view</summary>
+                    {% if row.cot.stage1_thinking %}
+                    <strong>Stage 1</strong>
+                    <pre class="cot">{{ row.cot.stage1_thinking }}</pre>
+                    {% endif %}
+                    {% if row.cot.stage2_thinking %}
+                    <strong>Stage 2</strong>
+                    <pre class="cot">{{ row.cot.stage2_thinking }}</pre>
+                    {% endif %}
+                </details>
+                {% else %}
+                —
+                {% endif %}
+            </td>
+        </tr>
+        {% endfor %}
+        </tbody>
+    </table>
+    </figure>
+</section>
+
+{# --- System Prompts (collapsible) --- #}
+<section class="metric-section">
+    <details>
+        <summary>System Prompts</summary>
+        {% if meta.sender_system_prompt %}
+        <h5>Sender Classification</h5>
+        <pre class="cot">{{ meta.sender_system_prompt }}</pre>
+        {% endif %}
+        {% if meta.email_system_prompt %}
+        <h5>Email Classification</h5>
+        <pre class="cot">{{ meta.email_system_prompt }}</pre>
+        {% endif %}
+        {% if meta.vip_email_system_prompt %}
+        <h5>VIP Email Classification</h5>
+        <pre class="cot">{{ meta.vip_email_system_prompt }}</pre>
+        {% endif %}
+    </details>
+</section>
+
+{% endblock %}
