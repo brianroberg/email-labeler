@@ -85,7 +85,8 @@ class LLMClient:
             ) from None
 
         if response.status_code != 200:
-            raise RuntimeError(f"LLM request failed with status {response.status_code}")
+            body = response.text[:500]
+            raise RuntimeError(f"LLM request failed with status {response.status_code}: {body}")
 
         msg = response.json()["choices"][0]["message"]
         content = msg["content"]
