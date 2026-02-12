@@ -3,6 +3,8 @@ poll_interval_seconds = 60
 max_emails_per_cycle = 10
 gmail_query = "in:inbox -label:agent/processed"
 max_thread_chars = 50000
+cloud_parallel = 2
+local_parallel = 1
 healthcheck_file = "/tmp/healthcheck"
 
 [labels]
@@ -19,15 +21,15 @@ fyi = "inbox"
 low_priority = "archive"
 
 [llm.cloud]
-model = "deepseek/deepseek-v3.2"
-max_tokens = 8096
-temperature = 0.2
+model = "zai-org/glm-5"
+max_tokens = 1024
+temperature = 0
 timeout = 60
 
 [llm.local]
-model = "qwen/qwen3-32b"
-max_tokens = 8096
-temperature = 0.2
+model = "qwen3-coder-30b-a3b-instruct-mlx"
+max_tokens = 1024
+temperature = 0
 timeout = 180
 # Optional: extra fields merged into every API request body.
 # See README for examples (e.g. disabling thinking for reasoning models).

@@ -1,5 +1,6 @@
 """Tests for daemon orchestration."""
 
+import asyncio
 import base64
 from unittest.mock import AsyncMock, MagicMock
 
@@ -38,6 +39,23 @@ def mock_label_manager():
     # get_existing_priority is synchronous — use MagicMock so it returns a value, not a coroutine
     mgr.get_existing_priority = MagicMock(return_value=None)
     return mgr
+
+
+@pytest.fixture
+def mock_local_llm():
+    llm = AsyncMock()
+    llm.is_available.return_value = True
+    return llm
+
+
+@pytest.fixture
+def cloud_sem():
+    return asyncio.Semaphore(2)
+
+
+@pytest.fixture
+def local_sem():
+    return asyncio.Semaphore(1)
 
 
 @pytest.fixture
@@ -115,7 +133,8 @@ class TestFormatThreadTranscript:
 
 class TestProcessSingleThread:
     async def test_classifies_thread(
-        self, mock_proxy, mock_classifier, mock_label_manager, mock_thread_response
+        self, mock_proxy, mock_classifier, mock_label_manager, mock_local_llm,
+        cloud_sem, local_sem, mock_thread_response,
     ):
         mock_proxy.get_thread.return_value = mock_thread_response
         mock_classifier.classify.return_value = ClassificationResult(
@@ -131,7 +150,9 @@ class TestProcessSingleThread:
             mock_proxy,
             mock_classifier,
             mock_label_manager,
-            mlx_available=True,
+            mock_local_llm,
+            cloud_sem,
+            local_sem,
             max_thread_chars=50000,
         )
 
@@ -144,10 +165,12 @@ class TestProcessSingleThread:
         assert call_args.args[0] == ["msg_001", "msg_002"]  # all message IDs
 
     async def test_skips_person_thread_when_mlx_unavailable(
-        self, mock_proxy, mock_classifier, mock_label_manager, mock_thread_response
+        self, mock_proxy, mock_classifier, mock_label_manager, mock_local_llm,
+        cloud_sem, local_sem, mock_thread_response,
     ):
         mock_proxy.get_thread.return_value = mock_thread_response
         mock_classifier.classify_sender.return_value = (SenderType.PERSON, "PERSON", "")
+        mock_local_llm.is_available.return_value = False
 
         result = await process_single_thread(
             "thread_001",
@@ -155,7 +178,9 @@ class TestProcessSingleThread:
             mock_proxy,
             mock_classifier,
             mock_label_manager,
-            mlx_available=False,
+            mock_local_llm,
+            cloud_sem,
+            local_sem,
             max_thread_chars=50000,
         )
 
@@ -164,7 +189,8 @@ class TestProcessSingleThread:
         mock_label_manager.apply_classification.assert_not_called()
 
     async def test_skips_downgrade(
-        self, mock_proxy, mock_classifier, mock_label_manager, mock_thread_response
+        self, mock_proxy, mock_classifier, mock_label_manager, mock_local_llm,
+        cloud_sem, local_sem, mock_thread_response,
     ):
         """Thread already at FYI should not be downgraded to LOW_PRIORITY."""
         mock_proxy.get_thread.return_value = mock_thread_response
@@ -183,7 +209,9 @@ class TestProcessSingleThread:
             mock_proxy,
             mock_classifier,
             mock_label_manager,
-            mlx_available=True,
+            mock_local_llm,
+            cloud_sem,
+            local_sem,
             max_thread_chars=50000,
         )
 
@@ -191,7 +219,8 @@ class TestProcessSingleThread:
         mock_label_manager.apply_classification.assert_not_called()
 
     async def test_allows_upgrade(
-        self, mock_proxy, mock_classifier, mock_label_manager, mock_thread_response
+        self, mock_proxy, mock_classifier, mock_label_manager, mock_local_llm,
+        cloud_sem, local_sem, mock_thread_response,
     ):
         """Thread at FYI can be upgraded to NEEDS_RESPONSE."""
         mock_proxy.get_thread.return_value = mock_thread_response
@@ -210,14 +239,19 @@ class TestProcessSingleThread:
             mock_proxy,
             mock_classifier,
             mock_label_manager,
-            mlx_available=True,
+            mock_local_llm,
+            cloud_sem,
+            local_sem,
             max_thread_chars=50000,
         )
 
         assert result is True
         mock_label_manager.apply_classification.assert_called_once()
 
-    async def test_error_in_processing_returns_false(self, mock_proxy, mock_classifier, mock_label_manager):
+    async def test_error_in_processing_returns_false(
+        self, mock_proxy, mock_classifier, mock_label_manager, mock_local_llm,
+        cloud_sem, local_sem,
+    ):
         """Errors during processing don't crash — return False."""
         mock_proxy.get_thread.side_effect = RuntimeError("API error")
 
@@ -227,14 +261,17 @@ class TestProcessSingleThread:
             mock_proxy,
             mock_classifier,
             mock_label_manager,
-            mlx_available=True,
+            mock_local_llm,
+            cloud_sem,
+            local_sem,
             max_thread_chars=50000,
         )
 
         assert result is False
 
     async def test_service_thread_processed_when_mlx_unavailable(
-        self, mock_proxy, mock_classifier, mock_label_manager, mock_thread_response
+        self, mock_proxy, mock_classifier, mock_label_manager, mock_local_llm,
+        cloud_sem, local_sem, mock_thread_response,
     ):
         """Service threads still processed even when MLX is down."""
         mock_proxy.get_thread.return_value = mock_thread_response
@@ -245,6 +282,7 @@ class TestProcessSingleThread:
             label=EmailLabel.LOW_PRIORITY,
             label_raw="LOW_PRIORITY",
         )
+        mock_local_llm.is_available.return_value = False
 
         result = await process_single_thread(
             "thread_001",
@@ -252,7 +290,9 @@ class TestProcessSingleThread:
             mock_proxy,
             mock_classifier,
             mock_label_manager,
-            mlx_available=False,
+            mock_local_llm,
+            cloud_sem,
+            local_sem,
             max_thread_chars=50000,
         )
 
@@ -307,3 +347,10 @@ class TestLoadConfig:
         config = load_config()
         assert "max_thread_chars" in config["daemon"]
         assert isinstance(config["daemon"]["max_thread_chars"], int)
+
+    def test_config_has_parallel_settings(self):
+        config = load_config()
+        assert "cloud_parallel" in config["daemon"]
+        assert "local_parallel" in config["daemon"]
+        assert config["daemon"]["cloud_parallel"] >= 1
+        assert config["daemon"]["local_parallel"] >= 1

@@ -90,13 +90,22 @@ async def process_single_thread(
     proxy_client: GmailProxyClient,
     classifier: EmailClassifier,
     label_manager: LabelManager,
-    mlx_available: bool,
+    local_llm: LLMClient,
+    cloud_sem: asyncio.Semaphore,
+    local_sem: asyncio.Semaphore,
     max_thread_chars: int,
 ) -> bool:
     """Process a single thread through the classification pipeline.
 
     Fetches the full thread, formats all messages into a transcript,
     classifies once, and applies labels to all messages in the thread.
+
+    Uses semaphores to bound concurrent LLM requests:
+    - cloud_sem: acquired for Stage 1 (sender classification) and Stage 2 SERVICE emails
+    - local_sem: acquired for Stage 2 PERSON emails (local MLX LLM)
+
+    MLX availability is checked per-thread under the local semaphore.
+    If the local LLM is unreachable, PERSON threads are skipped.
 
     Enforces no-downgrade rule: if the thread already has a classification
     with equal or higher priority, it is skipped.
@@ -107,7 +116,9 @@ async def process_single_thread(
         proxy_client: Gmail proxy client.
         classifier: Email classifier instance.
         label_manager: Label manager instance.
-        mlx_available: Whether the local MLX LLM is available.
+        local_llm: Local LLM client (for MLX availability checks).
+        cloud_sem: Semaphore bounding concurrent cloud LLM requests.
+        local_sem: Semaphore bounding concurrent local LLM requests.
         max_thread_chars: Maximum characters for thread transcript.
 
     Returns:
@@ -162,15 +173,20 @@ async def process_single_thread(
         # Format thread transcript
         transcript = format_thread_transcript(messages, max_thread_chars)
 
-        # Classify
-        if not mlx_available:
-            sender_type, sender_raw, _ = await classifier.classify_sender(metadata)
-            if sender_type == SenderType.PERSON:
-                log.info("Skipping person thread %s (MLX unavailable): %s", thread_id, subject)
-                return False
-            result = await classifier.classify(metadata, transcript, sender_type, sender_raw)
+        # Stage 1: classify sender (always cloud LLM)
+        async with cloud_sem:
+            sender_type, sender_raw, sender_cot = await classifier.classify_sender(metadata)
+
+        # Stage 2: classify email (routed by sender type)
+        if sender_type == SenderType.PERSON:
+            async with local_sem:
+                if not await local_llm.is_available():
+                    log.info("Skipping person thread %s (MLX unavailable): %s", thread_id, subject)
+                    return False
+                result = await classifier.classify(metadata, transcript, sender_type, sender_raw)
         else:
-            result = await classifier.classify(metadata, transcript)
+            async with cloud_sem:
+                result = await classifier.classify(metadata, transcript, sender_type, sender_raw)
 
         # Enforce no-downgrade
         new_priority = _get_priority(result.label)
@@ -240,6 +256,10 @@ async def run_daemon() -> None:
     )
     label_manager = LabelManager(proxy_client=proxy_client, config=config)
 
+    cloud_sem = asyncio.Semaphore(daemon_config.get("cloud_parallel", 2))
+    local_sem = asyncio.Semaphore(daemon_config.get("local_parallel", 1))
+    log.info("Concurrency limits: cloud=%d, local=%d", cloud_sem._value, local_sem._value)
+
     # Wait for api-proxy to become available, then verify labels
     startup_backoff = 5
     max_startup_backoff = 60
@@ -270,11 +290,6 @@ async def run_daemon() -> None:
 
     while True:
         try:
-            # Check MLX availability each cycle
-            mlx_available = await local_llm.is_available()
-            if not mlx_available:
-                log.warning("Local MLX LLM unavailable — person emails will be skipped")
-
             response = await proxy_client.list_messages(q=gmail_query, max_results=max_emails)
             messages = response.get("messages", [])
 
@@ -291,19 +306,24 @@ async def run_daemon() -> None:
                 log.info("Grouped into %d thread(s)", len(threads))
 
             max_thread_chars = daemon_config.get("max_thread_chars", 50000)
-            processed = 0
-            for tid, msg_ids in threads.items():
-                success = await process_single_thread(
-                    tid,
-                    msg_ids,
-                    proxy_client,
-                    classifier,
-                    label_manager,
-                    mlx_available,
-                    max_thread_chars,
-                )
-                if success:
-                    processed += 1
+            results = await asyncio.gather(
+                *(
+                    process_single_thread(
+                        tid,
+                        msg_ids,
+                        proxy_client,
+                        classifier,
+                        label_manager,
+                        local_llm,
+                        cloud_sem,
+                        local_sem,
+                        max_thread_chars,
+                    )
+                    for tid, msg_ids in threads.items()
+                ),
+                return_exceptions=True,
+            )
+            processed = sum(r for r in results if r is True)
 
             if threads:
                 log.info("Processed %d/%d threads", processed, len(threads))

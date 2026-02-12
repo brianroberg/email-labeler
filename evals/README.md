@@ -122,7 +122,7 @@ uv run python -m evals.run_eval --max-threads 10
 | `--config` | Path to config.toml (default: `./config.toml`) |
 | `--output-dir` | Output directory for results (default: `evals/results/`) |
 | `--stages` | `full`, `stage1_only`, or `stage2_only` (default: `full`) |
-| `--parallelism` | Concurrent evaluations (default: `3`) |
+| `--parallelism` | Concurrent evaluations (default: `cloud_parallel` from config) |
 | `--include-unreviewed` | Also evaluate threads not yet reviewed (default: reviewed only) |
 | `--dry-run` | Show what would be evaluated without calling LLMs |
 | `--tag` | Tag for the results filename (e.g. `new-prompts`) |

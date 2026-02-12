@@ -34,6 +34,13 @@ from llm_client import LLMClient
 VALID_STAGES = ("full", "stage1_only", "stage2_only")
 
 
+def resolve_parallelism(cli_value: int | None, config: dict) -> int:
+    """Resolve parallelism: CLI flag wins, otherwise fall back to config."""
+    if cli_value is not None:
+        return cli_value
+    return config.get("daemon", {}).get("cloud_parallel", 1)
+
+
 def load_golden_set(path: Path, reviewed_only: bool = False) -> list[GoldenThread]:
     """Load golden set from JSONL."""
     threads = []
@@ -267,6 +274,9 @@ async def main(args: argparse.Namespace) -> None:
         config = tomllib.load(f)
     config = substitute_env_vars(config)
 
+    # Resolve parallelism: CLI wins, otherwise fall back to config
+    args.parallelism = resolve_parallelism(args.parallelism, config)
+
     # Apply CLI overrides to config (CLI always wins over config file)
     _overrides = {
         "cloud": {"model": args.cloud_model, "temperature": args.cloud_temperature,
@@ -419,7 +429,8 @@ def cli():
     parser.add_argument("--output-dir", default="evals/results/", help="Output directory for results")
     parser.add_argument("--stages", choices=VALID_STAGES, default="full",
                         help="Which stages to evaluate")
-    parser.add_argument("--parallelism", type=int, default=3, help="Concurrent evaluations")
+    parser.add_argument("--parallelism", type=int, default=None,
+                        help="Concurrent evaluations (default: cloud_parallel from config)")
     parser.add_argument("--include-unreviewed", action="store_true",
                         help="Also evaluate threads not yet reviewed (default: reviewed only)")
     parser.add_argument("--dry-run", action="store_true", help="Show what would be evaluated")
