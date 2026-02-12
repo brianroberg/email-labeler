@@ -75,8 +75,24 @@ class CachedLLMClient:
         tk = self._task_key()
 
         if key in self._cache:
-            self.hits += 1
             response, thinking = self._cache[key]
+            # Backfill thinking for old cache entries that lack it
+            if include_thinking and not thinking:
+                self.misses += 1
+                start = time.monotonic()
+                _, thinking = await self.inner.complete(
+                    system_prompt, user_content, include_thinking=True,
+                )
+                self._llm_seconds += time.monotonic() - start
+                self._cache[key] = (response, thinking)
+                self._pending.append({
+                    "key": key,
+                    "model": self.inner.model,
+                    "response": response,
+                    "thinking": thinking,
+                })
+            else:
+                self.hits += 1
             if thinking:
                 self._thinking_buffers.setdefault(tk, []).append(thinking)
             if include_thinking:

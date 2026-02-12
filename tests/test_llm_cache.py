@@ -207,7 +207,7 @@ class TestCorruptCacheFile:
         inner.complete.assert_not_awaited()
 
     async def test_old_cache_without_thinking_field(self, tmp_path: Path):
-        """Cache entries from before thinking support still work."""
+        """Cache entries from before thinking support still work for plain calls."""
         cache_path = tmp_path / "cache.jsonl"
         inner = _make_inner()
         valid_key = CachedLLMClient(inner, cache_path)._cache_key("sys", "usr")
@@ -222,6 +222,74 @@ class TestCorruptCacheFile:
         assert result == "SERVICE"
         assert cached.hits == 1
         assert cached.take_thinking() == ""  # No thinking in old entries
+
+    async def test_old_cache_backfills_thinking_on_include_thinking(self, tmp_path: Path):
+        """When include_thinking=True and a cache hit has no thinking, re-fetch to backfill."""
+        cache_path = tmp_path / "cache.jsonl"
+        inner = _make_inner()
+        valid_key = CachedLLMClient(inner, cache_path)._cache_key("sys", "usr")
+        # Old format: no "thinking" field
+        cache_path.write_text(
+            json.dumps({"key": valid_key, "model": "test-model", "response": "SERVICE"}) + "\n"
+        )
+
+        # Inner LLM will be called to backfill thinking
+        _set_return(inner, "SERVICE", "reasoning about sender type")
+        cached = CachedLLMClient(inner, cache_path)
+        response, thinking = await cached.complete("sys", "usr", include_thinking=True)
+
+        assert response == "SERVICE"  # cached response preserved
+        assert thinking == "reasoning about sender type"  # backfilled from LLM
+        assert cached.misses == 1  # counts as a miss (LLM was called)
+        assert cached.hits == 0
+        inner.complete.assert_awaited_once()
+
+    async def test_old_cache_backfill_updates_cache(self, tmp_path: Path):
+        """After backfilling, subsequent calls serve from cache with thinking."""
+        cache_path = tmp_path / "cache.jsonl"
+        inner = _make_inner()
+        valid_key = CachedLLMClient(inner, cache_path)._cache_key("sys", "usr")
+        cache_path.write_text(
+            json.dumps({"key": valid_key, "model": "test-model", "response": "SERVICE"}) + "\n"
+        )
+
+        _set_return(inner, "SERVICE", "reasoning about sender type")
+        cached = CachedLLMClient(inner, cache_path)
+
+        # First call: backfills
+        await cached.complete("sys", "usr", include_thinking=True)
+        cached.take_thinking()  # drain
+
+        # Second call: should hit cache with thinking now populated
+        response, thinking = await cached.complete("sys", "usr", include_thinking=True)
+        assert response == "SERVICE"
+        assert thinking == "reasoning about sender type"
+        assert cached.hits == 1  # this one was a real hit
+        assert inner.complete.await_count == 1  # no second LLM call
+
+    async def test_old_cache_backfill_persists_to_disk(self, tmp_path: Path):
+        """Backfilled thinking is flushed to disk for future sessions."""
+        cache_path = tmp_path / "cache.jsonl"
+        inner = _make_inner()
+        valid_key = CachedLLMClient(inner, cache_path)._cache_key("sys", "usr")
+        cache_path.write_text(
+            json.dumps({"key": valid_key, "model": "test-model", "response": "SERVICE"}) + "\n"
+        )
+
+        _set_return(inner, "SERVICE", "reasoning about sender type")
+        cached = CachedLLMClient(inner, cache_path)
+        await cached.complete("sys", "usr", include_thinking=True)
+        cached.flush()
+
+        # Reload from disk — second instance should have thinking
+        inner2 = _make_inner()
+        cached2 = CachedLLMClient(inner2, cache_path)
+        response, thinking = await cached2.complete("sys", "usr", include_thinking=True)
+
+        assert response == "SERVICE"
+        assert thinking == "reasoning about sender type"
+        assert cached2.hits == 1
+        inner2.complete.assert_not_awaited()
 
 
     async def test_old_cache_with_unstripped_double_bracket_think(self, tmp_path: Path):
