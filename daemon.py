@@ -90,7 +90,6 @@ async def process_single_thread(
     proxy_client: GmailProxyClient,
     classifier: EmailClassifier,
     label_manager: LabelManager,
-    local_llm: LLMClient,
     cloud_sem: asyncio.Semaphore,
     local_sem: asyncio.Semaphore,
     max_thread_chars: int,
@@ -104,8 +103,8 @@ async def process_single_thread(
     - cloud_sem: acquired for Stage 1 (sender classification) and Stage 2 SERVICE emails
     - local_sem: acquired for Stage 2 PERSON emails (local MLX LLM)
 
-    MLX availability is checked per-thread under the local semaphore.
-    If the local LLM is unreachable, PERSON threads are skipped.
+    If the local LLM is unreachable, ConnectError is raised immediately.
+    If it times out (e.g. model loading), the configured timeout applies.
 
     Enforces no-downgrade rule: if the thread already has a classification
     with equal or higher priority, it is skipped.
@@ -116,7 +115,6 @@ async def process_single_thread(
         proxy_client: Gmail proxy client.
         classifier: Email classifier instance.
         label_manager: Label manager instance.
-        local_llm: Local LLM client (for MLX availability checks).
         cloud_sem: Semaphore bounding concurrent cloud LLM requests.
         local_sem: Semaphore bounding concurrent local LLM requests.
         max_thread_chars: Maximum characters for thread transcript.
@@ -180,9 +178,6 @@ async def process_single_thread(
         # Stage 2: classify email (routed by sender type)
         if sender_type == SenderType.PERSON:
             async with local_sem:
-                if not await local_llm.is_available():
-                    log.info("Skipping person thread %s (MLX unavailable): %s", thread_id, subject)
-                    return False
                 result = await classifier.classify(metadata, transcript, sender_type, sender_raw)
         else:
             async with cloud_sem:
@@ -217,7 +212,7 @@ async def process_single_thread(
         log.warning("Connection error processing thread %s: %s", thread_id, exc)
         return False
     except TimeoutError as exc:
-        log.warning("Timeout processing thread %s: %s", thread_id, exc)
+        log.error("Timeout processing thread %s: %s", thread_id, exc)
         return False
     except RuntimeError as exc:
         log.error("Thread %s: %s", thread_id, exc)
@@ -317,7 +312,6 @@ async def run_daemon() -> None:
                         proxy_client,
                         classifier,
                         label_manager,
-                        local_llm,
                         cloud_sem,
                         local_sem,
                         max_thread_chars,

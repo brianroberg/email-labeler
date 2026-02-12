@@ -4,6 +4,7 @@ import asyncio
 import base64
 from unittest.mock import AsyncMock, MagicMock
 
+import httpx
 import pytest
 
 from classifier import (
@@ -39,13 +40,6 @@ def mock_label_manager():
     # get_existing_priority is synchronous — use MagicMock so it returns a value, not a coroutine
     mgr.get_existing_priority = MagicMock(return_value=None)
     return mgr
-
-
-@pytest.fixture
-def mock_local_llm():
-    llm = AsyncMock()
-    llm.is_available.return_value = True
-    return llm
 
 
 @pytest.fixture
@@ -133,7 +127,7 @@ class TestFormatThreadTranscript:
 
 class TestProcessSingleThread:
     async def test_classifies_thread(
-        self, mock_proxy, mock_classifier, mock_label_manager, mock_local_llm,
+        self, mock_proxy, mock_classifier, mock_label_manager,
         cloud_sem, local_sem, mock_thread_response,
     ):
         mock_proxy.get_thread.return_value = mock_thread_response
@@ -150,7 +144,6 @@ class TestProcessSingleThread:
             mock_proxy,
             mock_classifier,
             mock_label_manager,
-            mock_local_llm,
             cloud_sem,
             local_sem,
             max_thread_chars=50000,
@@ -164,13 +157,14 @@ class TestProcessSingleThread:
         call_args = mock_label_manager.apply_classification.call_args
         assert call_args.args[0] == ["msg_001", "msg_002"]  # all message IDs
 
-    async def test_skips_person_thread_when_mlx_unavailable(
-        self, mock_proxy, mock_classifier, mock_label_manager, mock_local_llm,
+    async def test_person_thread_returns_false_when_mlx_unreachable(
+        self, mock_proxy, mock_classifier, mock_label_manager,
         cloud_sem, local_sem, mock_thread_response,
     ):
+        """PERSON threads fail gracefully when local LLM is unreachable."""
         mock_proxy.get_thread.return_value = mock_thread_response
         mock_classifier.classify_sender.return_value = (SenderType.PERSON, "PERSON", "")
-        mock_local_llm.is_available.return_value = False
+        mock_classifier.classify.side_effect = httpx.ConnectError("Connection refused")
 
         result = await process_single_thread(
             "thread_001",
@@ -178,18 +172,16 @@ class TestProcessSingleThread:
             mock_proxy,
             mock_classifier,
             mock_label_manager,
-            mock_local_llm,
             cloud_sem,
             local_sem,
             max_thread_chars=50000,
         )
 
         assert result is False
-        mock_classifier.classify.assert_not_called()
         mock_label_manager.apply_classification.assert_not_called()
 
     async def test_skips_downgrade(
-        self, mock_proxy, mock_classifier, mock_label_manager, mock_local_llm,
+        self, mock_proxy, mock_classifier, mock_label_manager,
         cloud_sem, local_sem, mock_thread_response,
     ):
         """Thread already at FYI should not be downgraded to LOW_PRIORITY."""
@@ -209,7 +201,6 @@ class TestProcessSingleThread:
             mock_proxy,
             mock_classifier,
             mock_label_manager,
-            mock_local_llm,
             cloud_sem,
             local_sem,
             max_thread_chars=50000,
@@ -219,7 +210,7 @@ class TestProcessSingleThread:
         mock_label_manager.apply_classification.assert_not_called()
 
     async def test_allows_upgrade(
-        self, mock_proxy, mock_classifier, mock_label_manager, mock_local_llm,
+        self, mock_proxy, mock_classifier, mock_label_manager,
         cloud_sem, local_sem, mock_thread_response,
     ):
         """Thread at FYI can be upgraded to NEEDS_RESPONSE."""
@@ -239,7 +230,6 @@ class TestProcessSingleThread:
             mock_proxy,
             mock_classifier,
             mock_label_manager,
-            mock_local_llm,
             cloud_sem,
             local_sem,
             max_thread_chars=50000,
@@ -249,7 +239,7 @@ class TestProcessSingleThread:
         mock_label_manager.apply_classification.assert_called_once()
 
     async def test_error_in_processing_returns_false(
-        self, mock_proxy, mock_classifier, mock_label_manager, mock_local_llm,
+        self, mock_proxy, mock_classifier, mock_label_manager,
         cloud_sem, local_sem,
     ):
         """Errors during processing don't crash — return False."""
@@ -261,7 +251,6 @@ class TestProcessSingleThread:
             mock_proxy,
             mock_classifier,
             mock_label_manager,
-            mock_local_llm,
             cloud_sem,
             local_sem,
             max_thread_chars=50000,
@@ -269,11 +258,11 @@ class TestProcessSingleThread:
 
         assert result is False
 
-    async def test_service_thread_processed_when_mlx_unavailable(
-        self, mock_proxy, mock_classifier, mock_label_manager, mock_local_llm,
+    async def test_service_thread_classified_via_cloud(
+        self, mock_proxy, mock_classifier, mock_label_manager,
         cloud_sem, local_sem, mock_thread_response,
     ):
-        """Service threads still processed even when MLX is down."""
+        """Service threads are classified via cloud LLM regardless of local LLM state."""
         mock_proxy.get_thread.return_value = mock_thread_response
         mock_classifier.classify_sender.return_value = (SenderType.SERVICE, "SERVICE", "")
         mock_classifier.classify.return_value = ClassificationResult(
@@ -282,7 +271,6 @@ class TestProcessSingleThread:
             label=EmailLabel.LOW_PRIORITY,
             label_raw="LOW_PRIORITY",
         )
-        mock_local_llm.is_available.return_value = False
 
         result = await process_single_thread(
             "thread_001",
@@ -290,7 +278,6 @@ class TestProcessSingleThread:
             mock_proxy,
             mock_classifier,
             mock_label_manager,
-            mock_local_llm,
             cloud_sem,
             local_sem,
             max_thread_chars=50000,
