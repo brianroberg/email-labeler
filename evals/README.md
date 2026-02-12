@@ -57,6 +57,9 @@ uv run python -m evals.review
 # Show existing labels while reviewing
 uv run python -m evals.review --show-labels
 
+# Curses TUI for editing reviewed threads
+uv run python -m evals.review --edit
+
 # Review only sender classification (stage 1)
 uv run python -m evals.review --stage 1
 
@@ -77,6 +80,7 @@ uv run python -m evals.review --start-at 5
 |---|---|
 | `--golden-set` | Path to golden set JSONL (default: `evals/golden_set.jsonl`) |
 | `--show-labels` | Show existing labels (default is blind mode) |
+| `--edit` | Curses TUI for editing reviewed threads (auto-saves on each change) |
 | `--stage` | Review only stage 1 (sender) or stage 2 (label) |
 | `--unreviewed-only` | Show only threads not yet reviewed |
 | `--filter-label` | Show only threads with this label |

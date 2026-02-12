@@ -3,6 +3,7 @@
 Usage:
     python -m evals.review                    # blind mode (default)
     python -m evals.review --show-labels      # see existing labels
+    python -m evals.review --edit             # curses TUI for editing reviewed threads
     python -m evals.review --stage 1          # review sender type only
     python -m evals.review --stage 2          # review label only
     python -m evals.review --unreviewed-only
@@ -363,6 +364,7 @@ def cli():
     parser.add_argument("--unreviewed-only", action="store_true", help="Show only unreviewed threads")
     parser.add_argument("--filter-label", choices=LABELS, help="Show only threads with this label")
     parser.add_argument("--start-at", type=int, default=0, help="Start at thread index (0-based)")
+    parser.add_argument("--edit", action="store_true", help="Curses TUI for editing reviewed threads")
     args = parser.parse_args()
 
     path = Path(args.golden_set)
@@ -371,12 +373,33 @@ def cli():
         print("Run 'python -m evals.harvest' first to create it.", file=sys.stderr)
         sys.exit(1)
 
-    threads = load_golden_set(path)
-    if not threads:
+    all_threads = load_golden_set(path)
+    if not all_threads:
         print("Golden set is empty.", file=sys.stderr)
         sys.exit(1)
 
-    # Apply filters
+    # Edit mode: default to reviewed-only, but respect explicit filters
+    if args.edit:
+        from evals.edit_tui import run_edit_tui
+
+        threads = all_threads
+        if args.unreviewed_only:
+            threads = [t for t in threads if not t.reviewed]
+        elif not args.filter_label:
+            # Default: show only reviewed threads
+            threads = [t for t in threads if t.reviewed]
+        if args.filter_label:
+            threads = [t for t in threads if t.expected_label == args.filter_label]
+
+        if not threads:
+            print("No threads match the filters.", file=sys.stderr)
+            sys.exit(0)
+
+        run_edit_tui(threads, all_threads, path)
+        return
+
+    # Regular review mode
+    threads = list(all_threads)
     filtered = False
     if args.unreviewed_only:
         threads = [t for t in threads if not t.reviewed]
@@ -394,12 +417,12 @@ def cli():
 
     if filtered:
         # Merge changes from filtered subset back into the full set
-        all_threads = load_golden_set(path)
+        full_threads = load_golden_set(path)
         filtered_map = {t.thread_id: t for t in threads}
-        for i, t in enumerate(all_threads):
+        for i, t in enumerate(full_threads):
             if t.thread_id in filtered_map:
-                all_threads[i] = filtered_map[t.thread_id]
-        save_golden_set(all_threads, path)
+                full_threads[i] = filtered_map[t.thread_id]
+        save_golden_set(full_threads, path)
     else:
         save_golden_set(threads, path)
 
