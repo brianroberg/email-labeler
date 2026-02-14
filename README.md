@@ -146,6 +146,7 @@ CLOUD_LLM_API_KEY=your_api_key_here
 
 # Recommended: Local LLM (MLX/Qwen3 for person email privacy)
 MLX_URL=http://macbook:8080/v1/chat/completions
+MLX_MODEL=qwen/qwen3-14b
 
 # Optional: Override proxy URL (defaults to http://host.docker.internal:8000)
 # PROXY_URL=http://api-proxy:8000
@@ -200,6 +201,7 @@ EMAIL_LABELER_API_KEY=aproxy_your_key_here
 CLOUD_LLM_URL=https://your-llm-provider.com/v1/chat/completions
 CLOUD_LLM_API_KEY=your_api_key_here
 MLX_URL=http://macbook:8080/v1/chat/completions
+MLX_MODEL=qwen/qwen3-14b
 TS_AUTHKEY=tskey-auth-...  # for Tailscale sidecar
 ```
 
@@ -287,7 +289,7 @@ temperature = 0.2
 timeout = 60
 
 [llm.local]
-model = "mlx-community/Qwen3-14B-4bit"
+model = "{env.MLX_MODEL}"              # set MLX_MODEL in .env (shared with email-agent)
 max_tokens = 8096
 temperature = 0.2
 timeout = 120       # Local LLM gets more time (runs on consumer hardware)
@@ -344,5 +346,6 @@ The daemon is designed to run unattended and recover from transient failures:
 | `CLOUD_LLM_URL` | Yes | — | Cloud LLM chat completion endpoint (any OpenAI-compatible API) |
 | `CLOUD_LLM_API_KEY` | Yes | — | API key for the cloud LLM |
 | `MLX_URL` | No | — | Local MLX LLM chat completion endpoint. If unset or unreachable, person emails are skipped. |
+| `MLX_MODEL` | No | — | Local LLM model name. Shared with email-agent so both services use the same model. Referenced in `config.toml` as `{env.MLX_MODEL}`. |
 
-Note: The cloud LLM **model name** is configured in `config.toml` under `[llm.cloud]`, not in `.env`. This keeps secrets (keys, URLs) in `.env` while operational parameters (model, temperature, prompts) stay in version-controlled `config.toml`.
+Note: The cloud LLM **model name** is configured in `config.toml` under `[llm.cloud]`, not in `.env`. The local LLM **model name** is set via the `MLX_MODEL` environment variable (shared with email-agent) and referenced in `config.toml` as `{env.MLX_MODEL}`. This keeps secrets (keys, URLs) in `.env` while operational parameters (temperature, prompts) stay in version-controlled `config.toml`.

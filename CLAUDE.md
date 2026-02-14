@@ -60,6 +60,7 @@ Poll loop → find unprocessed emails
 - `CLOUD_LLM_URL` — Cloud LLM endpoint (any OpenAI-compatible API)
 - `CLOUD_LLM_API_KEY` — Cloud LLM API key
 - `MLX_URL` — Local MLX LLM endpoint
+- `MLX_MODEL` — Local LLM model name (shared with email-agent, referenced in config.toml as `{env.MLX_MODEL}`)
 
 ## Testing
 

@@ -27,7 +27,7 @@ temperature = 0
 timeout = 60
 
 [llm.local]
-model = "qwen3-coder-30b-a3b-instruct-mlx"
+model = "{env.MLX_MODEL}"
 max_tokens = 1024
 temperature = 0
 timeout = 180
