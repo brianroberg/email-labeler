@@ -61,6 +61,7 @@ Poll loop → find unprocessed emails
 - `CLOUD_LLM_API_KEY` — Cloud LLM API key
 - `MLX_URL` — Local MLX LLM endpoint
 - `MLX_MODEL` — Local LLM model name (shared with email-agent, referenced in config.toml as `{env.MLX_MODEL}`)
+- `MLX_API_KEY` — Local LLM API key (empty for real MLX, set for public API stand-ins like Novita.ai)
 
 ## Testing
 

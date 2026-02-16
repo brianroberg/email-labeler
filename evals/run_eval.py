@@ -322,7 +322,7 @@ async def main(args: argparse.Namespace) -> None:
     )
     local_llm_base = LLMClient(
         base_url=os.environ.get("MLX_URL", ""),
-        api_key="",
+        api_key=os.environ.get("MLX_API_KEY", ""),
         model=config["llm"]["local"]["model"],
         max_tokens=config["llm"]["local"]["max_tokens"],
         temperature=config["llm"]["local"]["temperature"],
