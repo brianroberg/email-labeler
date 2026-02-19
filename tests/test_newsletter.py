@@ -422,3 +422,67 @@ class TestWriteAssessment:
         assert record["stories"][0]["scores"] is None
         assert record["stories"][0]["tier"] is None
         assert record["overall_tier"] is None
+
+
+from newsletter import is_newsletter
+
+
+class TestIsNewsletter:
+    def test_detects_to_header(self):
+        messages = [
+            {"payload": {"headers": [
+                {"name": "To", "value": "newsletters@dm.org"},
+                {"name": "From", "value": "john@dm.org"},
+            ]}}
+        ]
+        assert is_newsletter(messages, "newsletters@dm.org") is True
+
+    def test_detects_in_cc(self):
+        messages = [
+            {"payload": {"headers": [
+                {"name": "To", "value": "someone@dm.org"},
+                {"name": "Cc", "value": "newsletters@dm.org"},
+            ]}}
+        ]
+        assert is_newsletter(messages, "newsletters@dm.org") is True
+
+    def test_not_newsletter(self):
+        messages = [
+            {"payload": {"headers": [
+                {"name": "To", "value": "other@dm.org"},
+                {"name": "From", "value": "john@dm.org"},
+            ]}}
+        ]
+        assert is_newsletter(messages, "newsletters@dm.org") is False
+
+    def test_case_insensitive(self):
+        messages = [
+            {"payload": {"headers": [
+                {"name": "To", "value": "Newsletters@DM.org"},
+            ]}}
+        ]
+        assert is_newsletter(messages, "newsletters@dm.org") is True
+
+    def test_multiple_recipients(self):
+        messages = [
+            {"payload": {"headers": [
+                {"name": "To", "value": "someone@dm.org, newsletters@dm.org, other@dm.org"},
+            ]}}
+        ]
+        assert is_newsletter(messages, "newsletters@dm.org") is True
+
+    def test_checks_all_messages_in_thread(self):
+        messages = [
+            {"payload": {"headers": [{"name": "To", "value": "other@dm.org"}]}},
+            {"payload": {"headers": [{"name": "To", "value": "newsletters@dm.org"}]}},
+        ]
+        assert is_newsletter(messages, "newsletters@dm.org") is True
+
+    def test_missing_to_header(self):
+        messages = [
+            {"payload": {"headers": [{"name": "From", "value": "john@dm.org"}]}}
+        ]
+        assert is_newsletter(messages, "newsletters@dm.org") is False
+
+    def test_empty_messages(self):
+        assert is_newsletter([], "newsletters@dm.org") is False

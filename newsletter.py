@@ -13,6 +13,7 @@ from datetime import datetime, timezone
 from enum import Enum
 from pathlib import Path
 
+from gmail_utils import get_header
 from llm_client import LLMClient
 
 log = logging.getLogger(__name__)
@@ -164,6 +165,21 @@ def write_assessment(
     path.parent.mkdir(parents=True, exist_ok=True)
     with open(path, "a") as f:
         f.write(json.dumps(record) + "\n")
+
+
+def is_newsletter(messages: list[dict], recipient: str) -> bool:
+    """Check if any message in a thread was sent to the newsletter address.
+
+    Checks both To and Cc headers, case-insensitive.
+    """
+    target = recipient.lower()
+    for msg in messages:
+        headers = msg.get("payload", {}).get("headers", [])
+        for header_name in ("To", "Cc"):
+            value = get_header(headers, header_name).lower()
+            if target in value:
+                return True
+    return False
 
 
 class NewsletterClassifier:
