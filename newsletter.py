@@ -10,6 +10,8 @@ import re
 from dataclasses import dataclass, field
 from enum import Enum
 
+from llm_client import LLMClient
+
 log = logging.getLogger(__name__)
 
 
@@ -122,3 +124,74 @@ def compute_tier(scores: dict[str, int]) -> NewsletterTier:
     if avg >= 2.0:
         return NewsletterTier.FAIR
     return NewsletterTier.POOR
+
+
+class NewsletterClassifier:
+    """Classifies newsletter stories for quality and themes."""
+
+    def __init__(self, cloud_llm: LLMClient, config: dict):
+        self.cloud_llm = cloud_llm
+        nl_config = config["newsletter"]
+        self.extraction_config = nl_config["prompts"]["story_extraction"]
+        self.quality_config = nl_config["prompts"]["quality_assessment"]
+        self.theme_config = nl_config["prompts"]["theme_classification"]
+
+    async def extract_stories(self, body: str) -> list[tuple[str, str]]:
+        """Extract individual stories from a newsletter body."""
+        user_content = self.extraction_config["user_template"].format(body=body)
+        raw, _ = await self.cloud_llm.complete(
+            self.extraction_config["system"], user_content, include_thinking=True,
+        )
+        return parse_stories(raw)
+
+    async def assess_quality(self, title: str, text: str) -> tuple[dict[str, int] | None, str]:
+        """Score a story on the 4-dimension quality rubric."""
+        user_content = self.quality_config["user_template"].format(title=title, text=text)
+        raw, cot = await self.cloud_llm.complete(
+            self.quality_config["system"], user_content, include_thinking=True,
+        )
+        scores = parse_quality_scores(raw)
+        return scores, cot
+
+    async def classify_themes(self, title: str, text: str) -> tuple[list[str], str]:
+        """Tag a story with Ends Statement themes."""
+        user_content = self.theme_config["user_template"].format(title=title, text=text)
+        raw, cot = await self.cloud_llm.complete(
+            self.theme_config["system"], user_content, include_thinking=True,
+        )
+        return parse_themes(raw), cot
+
+    async def classify_newsletter(self, body: str) -> list[StoryResult]:
+        """Run the full newsletter classification pipeline.
+
+        Individual story failures are isolated — a quality failure doesn't
+        prevent theme classification, and vice versa.
+        """
+        stories = await self.extract_stories(body)
+        if not stories:
+            return []
+
+        results = []
+        for title, text in stories:
+            result = StoryResult(title=title, text=text)
+
+            try:
+                scores, quality_cot = await self.assess_quality(title, text)
+                result.quality_cot = quality_cot
+                if scores:
+                    result.scores = scores
+                    result.average_score = sum(scores.values()) / len(scores)
+                    result.tier = compute_tier(scores)
+            except Exception:
+                log.warning("Quality assessment failed for story: %s", title)
+
+            try:
+                themes, theme_cot = await self.classify_themes(title, text)
+                result.themes = themes
+                result.theme_cot = theme_cot
+            except Exception:
+                log.warning("Theme classification failed for story: %s", title)
+
+            results.append(result)
+
+        return results
