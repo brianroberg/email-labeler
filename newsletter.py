@@ -27,8 +27,11 @@ class NewsletterTier(Enum):
 
 
 _VALID_THEMES = {
-    "SCRIPTURE", "CHRISTLIKENESS", "CHURCH",
-    "VOCATION_FAMILY", "DISCIPLE_MAKING",
+    "SCRIPTURE",
+    "CHRISTLIKENESS",
+    "CHURCH",
+    "VOCATION_FAMILY",
+    "DISCIPLE_MAKING",
 }
 
 _DIMENSIONS = ("simple", "concrete", "personal", "dynamic")
@@ -196,7 +199,9 @@ class NewsletterClassifier:
         """Extract individual stories from a newsletter body."""
         user_content = self.extraction_config["user_template"].format(body=body)
         raw, _ = await self.cloud_llm.complete(
-            self.extraction_config["system"], user_content, include_thinking=True,
+            self.extraction_config["system"],
+            user_content,
+            include_thinking=True,
         )
         return parse_stories(raw)
 
@@ -204,7 +209,9 @@ class NewsletterClassifier:
         """Score a story on the 4-dimension quality rubric."""
         user_content = self.quality_config["user_template"].format(title=title, text=text)
         raw, cot = await self.cloud_llm.complete(
-            self.quality_config["system"], user_content, include_thinking=True,
+            self.quality_config["system"],
+            user_content,
+            include_thinking=True,
         )
         scores = parse_quality_scores(raw)
         return scores, cot
@@ -213,7 +220,9 @@ class NewsletterClassifier:
         """Tag a story with Ends Statement themes."""
         user_content = self.theme_config["user_template"].format(title=title, text=text)
         raw, cot = await self.cloud_llm.complete(
-            self.theme_config["system"], user_content, include_thinking=True,
+            self.theme_config["system"],
+            user_content,
+            include_thinking=True,
         )
         return parse_themes(raw), cot
 

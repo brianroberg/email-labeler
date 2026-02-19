@@ -332,7 +332,7 @@ class TestNewsletterApplyLabels:
         mock_proxy.modify_message.assert_called_once()
         call_kwargs = mock_proxy.modify_message.call_args.kwargs
         add_ids = call_kwargs["add_label_ids"]
-        assert "Label_4" in add_ids   # processed
+        assert "Label_4" in add_ids  # processed
         assert "Label_10" in add_ids  # newsletter marker
         assert "Label_11" in add_ids  # excellent
         assert "Label_20" in add_ids  # theme/scripture
@@ -354,7 +354,7 @@ class TestNewsletterApplyLabels:
 
         call_kwargs = mock_proxy.modify_message.call_args.kwargs
         add_ids = call_kwargs["add_label_ids"]
-        assert "Label_4" in add_ids   # processed
+        assert "Label_4" in add_ids  # processed
         assert "Label_10" in add_ids  # newsletter marker
         assert "Label_15" in add_ids  # no-stories
         assert "INBOX" in call_kwargs["remove_label_ids"]
