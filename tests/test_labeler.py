@@ -6,6 +6,7 @@ import pytest
 
 from classifier import EmailLabel, SenderType
 from labeler import LabelManager, _get_priority
+from newsletter import NewsletterTier
 
 
 @pytest.fixture
@@ -219,3 +220,155 @@ class TestGetExistingPriority:
         ]
         priority = label_manager.get_existing_priority(messages)
         assert priority == _get_priority(EmailLabel.NEEDS_RESPONSE)
+
+
+@pytest.fixture
+def newsletter_config():
+    return {
+        "labels": {
+            "needs_response": "agent/needs-response",
+            "fyi": "agent/fyi",
+            "low_priority": "agent/low-priority",
+            "processed": "agent/processed",
+            "personal": "agent/personal",
+            "non_personal": "agent/non-personal",
+            "actions": {
+                "needs_response": "inbox",
+                "fyi": "inbox",
+                "low_priority": "archive",
+            },
+        },
+        "newsletter": {
+            "labels": {
+                "newsletter": "agent/newsletter",
+                "excellent": "agent/newsletter/excellent",
+                "good": "agent/newsletter/good",
+                "fair": "agent/newsletter/fair",
+                "poor": "agent/newsletter/poor",
+                "no_stories": "agent/newsletter/no-stories",
+                "themes": {
+                    "scripture": "agent/newsletter/theme/scripture",
+                    "christlikeness": "agent/newsletter/theme/christlikeness",
+                    "church": "agent/newsletter/theme/church",
+                    "vocation_family": "agent/newsletter/theme/vocation-family",
+                    "disciple_making": "agent/newsletter/theme/disciple-making",
+                },
+            },
+        },
+    }
+
+
+@pytest.fixture
+def all_labels_with_newsletter():
+    return {
+        "labels": [
+            {"id": "INBOX", "name": "INBOX", "type": "system"},
+            {"id": "Label_1", "name": "agent/needs-response", "type": "user"},
+            {"id": "Label_2", "name": "agent/fyi", "type": "user"},
+            {"id": "Label_3", "name": "agent/low-priority", "type": "user"},
+            {"id": "Label_4", "name": "agent/processed", "type": "user"},
+            {"id": "Label_5", "name": "agent/personal", "type": "user"},
+            {"id": "Label_6", "name": "agent/non-personal", "type": "user"},
+            {"id": "Label_10", "name": "agent/newsletter", "type": "user"},
+            {"id": "Label_11", "name": "agent/newsletter/excellent", "type": "user"},
+            {"id": "Label_12", "name": "agent/newsletter/good", "type": "user"},
+            {"id": "Label_13", "name": "agent/newsletter/fair", "type": "user"},
+            {"id": "Label_14", "name": "agent/newsletter/poor", "type": "user"},
+            {"id": "Label_15", "name": "agent/newsletter/no-stories", "type": "user"},
+            {"id": "Label_20", "name": "agent/newsletter/theme/scripture", "type": "user"},
+            {"id": "Label_21", "name": "agent/newsletter/theme/christlikeness", "type": "user"},
+            {"id": "Label_22", "name": "agent/newsletter/theme/church", "type": "user"},
+            {"id": "Label_23", "name": "agent/newsletter/theme/vocation-family", "type": "user"},
+            {"id": "Label_24", "name": "agent/newsletter/theme/disciple-making", "type": "user"},
+        ]
+    }
+
+
+@pytest.fixture
+def newsletter_label_manager(mock_proxy, newsletter_config):
+    return LabelManager(proxy_client=mock_proxy, config=newsletter_config)
+
+
+class TestNewsletterVerifyLabels:
+    async def test_all_newsletter_labels_present(
+        self, newsletter_label_manager, mock_proxy, all_labels_with_newsletter
+    ):
+        mock_proxy.list_labels.return_value = all_labels_with_newsletter
+        missing = await newsletter_label_manager.verify_labels()
+        assert missing == []
+
+    async def test_missing_newsletter_labels_detected(self, newsletter_label_manager, mock_proxy):
+        mock_proxy.list_labels.return_value = {
+            "labels": [
+                {"id": "INBOX", "name": "INBOX", "type": "system"},
+                {"id": "Label_1", "name": "agent/needs-response", "type": "user"},
+                {"id": "Label_2", "name": "agent/fyi", "type": "user"},
+                {"id": "Label_3", "name": "agent/low-priority", "type": "user"},
+                {"id": "Label_4", "name": "agent/processed", "type": "user"},
+                {"id": "Label_5", "name": "agent/personal", "type": "user"},
+                {"id": "Label_6", "name": "agent/non-personal", "type": "user"},
+            ]
+        }
+        missing = await newsletter_label_manager.verify_labels()
+        assert "agent/newsletter" in missing
+        assert "agent/newsletter/excellent" in missing
+        assert len(missing) == 11
+
+
+class TestNewsletterApplyLabels:
+    async def test_apply_newsletter_excellent(
+        self, newsletter_label_manager, mock_proxy, all_labels_with_newsletter
+    ):
+        mock_proxy.list_labels.return_value = all_labels_with_newsletter
+        await newsletter_label_manager.verify_labels()
+        mock_proxy.modify_message.return_value = {"id": "msg_001"}
+
+        await newsletter_label_manager.apply_newsletter_classification(
+            message_ids=["msg_001"],
+            tier=NewsletterTier.EXCELLENT,
+            themes=["scripture", "christlikeness"],
+        )
+
+        mock_proxy.modify_message.assert_called_once()
+        call_kwargs = mock_proxy.modify_message.call_args.kwargs
+        add_ids = call_kwargs["add_label_ids"]
+        assert "Label_4" in add_ids   # processed
+        assert "Label_10" in add_ids  # newsletter marker
+        assert "Label_11" in add_ids  # excellent
+        assert "Label_20" in add_ids  # theme/scripture
+        assert "Label_21" in add_ids  # theme/christlikeness
+        assert "INBOX" in call_kwargs["remove_label_ids"]
+
+    async def test_apply_newsletter_no_stories(
+        self, newsletter_label_manager, mock_proxy, all_labels_with_newsletter
+    ):
+        mock_proxy.list_labels.return_value = all_labels_with_newsletter
+        await newsletter_label_manager.verify_labels()
+        mock_proxy.modify_message.return_value = {"id": "msg_001"}
+
+        await newsletter_label_manager.apply_newsletter_classification(
+            message_ids=["msg_001"],
+            tier=None,
+            themes=[],
+        )
+
+        call_kwargs = mock_proxy.modify_message.call_args.kwargs
+        add_ids = call_kwargs["add_label_ids"]
+        assert "Label_4" in add_ids   # processed
+        assert "Label_10" in add_ids  # newsletter marker
+        assert "Label_15" in add_ids  # no-stories
+        assert "INBOX" in call_kwargs["remove_label_ids"]
+
+    async def test_apply_to_multiple_messages(
+        self, newsletter_label_manager, mock_proxy, all_labels_with_newsletter
+    ):
+        mock_proxy.list_labels.return_value = all_labels_with_newsletter
+        await newsletter_label_manager.verify_labels()
+        mock_proxy.modify_message.return_value = {"id": "msg_001"}
+
+        await newsletter_label_manager.apply_newsletter_classification(
+            message_ids=["msg_001", "msg_002"],
+            tier=NewsletterTier.GOOD,
+            themes=["church"],
+        )
+        assert mock_proxy.modify_message.call_count == 2

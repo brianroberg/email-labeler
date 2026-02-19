@@ -78,7 +78,7 @@ class GmailProxyClient:
         try:
             error_data = response.json()
             return error_data.get("message", default)
-        except ValueError, KeyError:
+        except (ValueError, KeyError):
             # Response is not valid JSON or doesn't have expected structure
             return default
 
