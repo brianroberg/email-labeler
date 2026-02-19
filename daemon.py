@@ -191,9 +191,11 @@ async def process_single_thread(
                 story_count = len(story_results)
                 log.info(
                     "Newsletter thread %s: %d stories, tier=%s, themes=%s — %s",
-                    thread_id, story_count,
+                    thread_id,
+                    story_count,
                     best_tier.value if best_tier else "no-stories",
-                    all_themes, subject,
+                    all_themes,
+                    subject,
                 )
                 return True
 

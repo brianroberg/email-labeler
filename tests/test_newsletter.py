@@ -1,18 +1,20 @@
 """Tests for newsletter classifier — parsing functions and data models."""
 
 import json
-from pathlib import Path
-
-import pytest
 from unittest.mock import AsyncMock
 
+import pytest
+
 from newsletter import (
+    NewsletterClassifier,
     NewsletterTier,
     StoryResult,
-    parse_stories,
-    parse_quality_scores,
-    parse_themes,
     compute_tier,
+    is_newsletter,
+    parse_quality_scores,
+    parse_stories,
+    parse_themes,
+    write_assessment,
 )
 
 
@@ -143,7 +145,8 @@ class TestParseThemes:
 
 class TestComputeTier:
     def test_excellent(self):
-        assert compute_tier({"simple": 5, "concrete": 4, "personal": 4, "dynamic": 5}) == NewsletterTier.EXCELLENT
+        scores = {"simple": 5, "concrete": 4, "personal": 4, "dynamic": 5}
+        assert compute_tier(scores) == NewsletterTier.EXCELLENT
 
     def test_good(self):
         assert compute_tier({"simple": 3, "concrete": 3, "personal": 4, "dynamic": 3}) == NewsletterTier.GOOD
@@ -155,16 +158,14 @@ class TestComputeTier:
         assert compute_tier({"simple": 1, "concrete": 1, "personal": 2, "dynamic": 1}) == NewsletterTier.POOR
 
     def test_boundary_excellent(self):
-        assert compute_tier({"simple": 4, "concrete": 4, "personal": 4, "dynamic": 4}) == NewsletterTier.EXCELLENT
+        scores = {"simple": 4, "concrete": 4, "personal": 4, "dynamic": 4}
+        assert compute_tier(scores) == NewsletterTier.EXCELLENT
 
     def test_boundary_good(self):
         assert compute_tier({"simple": 3, "concrete": 3, "personal": 3, "dynamic": 3}) == NewsletterTier.GOOD
 
     def test_boundary_fair(self):
         assert compute_tier({"simple": 2, "concrete": 2, "personal": 2, "dynamic": 2}) == NewsletterTier.FAIR
-
-
-from newsletter import NewsletterClassifier
 
 
 @pytest.fixture
@@ -242,7 +243,8 @@ class TestAssessQuality:
 
     async def test_passes_title_and_text(self, nl_classifier, mock_cloud_llm):
         mock_cloud_llm.complete.return_value = (
-            "SIMPLE: 3\nCONCRETE: 3\nPERSONAL: 3\nDYNAMIC: 3", "",
+            "SIMPLE: 3\nCONCRETE: 3\nPERSONAL: 3\nDYNAMIC: 3",
+            "",
         )
         await nl_classifier.assess_quality("My Title", "My story text")
         user_content = mock_cloud_llm.complete.call_args.args[1]
@@ -324,9 +326,6 @@ class TestClassifyNewsletter:
         assert results[0].tier == NewsletterTier.EXCELLENT
         assert results[1].tier == NewsletterTier.FAIR
         assert mock_cloud_llm.complete.call_count == 5
-
-
-from newsletter import write_assessment
 
 
 class TestWriteAssessment:
@@ -424,50 +423,67 @@ class TestWriteAssessment:
         assert record["overall_tier"] is None
 
 
-from newsletter import is_newsletter
-
-
 class TestIsNewsletter:
     def test_detects_to_header(self):
         messages = [
-            {"payload": {"headers": [
-                {"name": "To", "value": "newsletters@dm.org"},
-                {"name": "From", "value": "john@dm.org"},
-            ]}}
+            {
+                "payload": {
+                    "headers": [
+                        {"name": "To", "value": "newsletters@dm.org"},
+                        {"name": "From", "value": "john@dm.org"},
+                    ]
+                }
+            }
         ]
         assert is_newsletter(messages, "newsletters@dm.org") is True
 
     def test_detects_in_cc(self):
         messages = [
-            {"payload": {"headers": [
-                {"name": "To", "value": "someone@dm.org"},
-                {"name": "Cc", "value": "newsletters@dm.org"},
-            ]}}
+            {
+                "payload": {
+                    "headers": [
+                        {"name": "To", "value": "someone@dm.org"},
+                        {"name": "Cc", "value": "newsletters@dm.org"},
+                    ]
+                }
+            }
         ]
         assert is_newsletter(messages, "newsletters@dm.org") is True
 
     def test_not_newsletter(self):
         messages = [
-            {"payload": {"headers": [
-                {"name": "To", "value": "other@dm.org"},
-                {"name": "From", "value": "john@dm.org"},
-            ]}}
+            {
+                "payload": {
+                    "headers": [
+                        {"name": "To", "value": "other@dm.org"},
+                        {"name": "From", "value": "john@dm.org"},
+                    ]
+                }
+            }
         ]
         assert is_newsletter(messages, "newsletters@dm.org") is False
 
     def test_case_insensitive(self):
         messages = [
-            {"payload": {"headers": [
-                {"name": "To", "value": "Newsletters@DM.org"},
-            ]}}
+            {
+                "payload": {
+                    "headers": [
+                        {"name": "To", "value": "Newsletters@DM.org"},
+                    ]
+                }
+            }
         ]
         assert is_newsletter(messages, "newsletters@dm.org") is True
 
     def test_multiple_recipients(self):
         messages = [
-            {"payload": {"headers": [
-                {"name": "To", "value": "someone@dm.org, newsletters@dm.org, other@dm.org"},
-            ]}}
+            {
+                "payload": {
+                    "headers": [
+                        {"name": "To", "value": "someone@dm.org, newsletters@dm.org, other@dm.org"},
+                    ]
+                }
+            }
         ]
         assert is_newsletter(messages, "newsletters@dm.org") is True
 
@@ -479,9 +495,7 @@ class TestIsNewsletter:
         assert is_newsletter(messages, "newsletters@dm.org") is True
 
     def test_missing_to_header(self):
-        messages = [
-            {"payload": {"headers": [{"name": "From", "value": "john@dm.org"}]}}
-        ]
+        messages = [{"payload": {"headers": [{"name": "From", "value": "john@dm.org"}]}}]
         assert is_newsletter(messages, "newsletters@dm.org") is False
 
     def test_empty_messages(self):

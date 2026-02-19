@@ -2,7 +2,7 @@
 
 import asyncio
 import base64
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock
 
 import httpx
 import pytest
@@ -128,8 +128,13 @@ class TestFormatThreadTranscript:
 
 class TestProcessSingleThread:
     async def test_classifies_thread(
-        self, mock_proxy, mock_classifier, mock_label_manager,
-        cloud_sem, local_sem, mock_thread_response,
+        self,
+        mock_proxy,
+        mock_classifier,
+        mock_label_manager,
+        cloud_sem,
+        local_sem,
+        mock_thread_response,
     ):
         mock_proxy.get_thread.return_value = mock_thread_response
         mock_classifier.classify.return_value = ClassificationResult(
@@ -159,8 +164,13 @@ class TestProcessSingleThread:
         assert call_args.args[0] == ["msg_001", "msg_002"]  # all message IDs
 
     async def test_person_thread_returns_false_when_mlx_unreachable(
-        self, mock_proxy, mock_classifier, mock_label_manager,
-        cloud_sem, local_sem, mock_thread_response,
+        self,
+        mock_proxy,
+        mock_classifier,
+        mock_label_manager,
+        cloud_sem,
+        local_sem,
+        mock_thread_response,
     ):
         """PERSON threads fail gracefully when local LLM is unreachable."""
         mock_proxy.get_thread.return_value = mock_thread_response
@@ -182,8 +192,13 @@ class TestProcessSingleThread:
         mock_label_manager.apply_classification.assert_not_called()
 
     async def test_skips_downgrade(
-        self, mock_proxy, mock_classifier, mock_label_manager,
-        cloud_sem, local_sem, mock_thread_response,
+        self,
+        mock_proxy,
+        mock_classifier,
+        mock_label_manager,
+        cloud_sem,
+        local_sem,
+        mock_thread_response,
     ):
         """Thread already at FYI should not be downgraded to LOW_PRIORITY."""
         mock_proxy.get_thread.return_value = mock_thread_response
@@ -211,8 +226,13 @@ class TestProcessSingleThread:
         mock_label_manager.apply_classification.assert_not_called()
 
     async def test_allows_upgrade(
-        self, mock_proxy, mock_classifier, mock_label_manager,
-        cloud_sem, local_sem, mock_thread_response,
+        self,
+        mock_proxy,
+        mock_classifier,
+        mock_label_manager,
+        cloud_sem,
+        local_sem,
+        mock_thread_response,
     ):
         """Thread at FYI can be upgraded to NEEDS_RESPONSE."""
         mock_proxy.get_thread.return_value = mock_thread_response
@@ -240,8 +260,12 @@ class TestProcessSingleThread:
         mock_label_manager.apply_classification.assert_called_once()
 
     async def test_error_in_processing_returns_false(
-        self, mock_proxy, mock_classifier, mock_label_manager,
-        cloud_sem, local_sem,
+        self,
+        mock_proxy,
+        mock_classifier,
+        mock_label_manager,
+        cloud_sem,
+        local_sem,
     ):
         """Errors during processing don't crash — return False."""
         mock_proxy.get_thread.side_effect = RuntimeError("API error")
@@ -260,8 +284,13 @@ class TestProcessSingleThread:
         assert result is False
 
     async def test_service_thread_classified_via_cloud(
-        self, mock_proxy, mock_classifier, mock_label_manager,
-        cloud_sem, local_sem, mock_thread_response,
+        self,
+        mock_proxy,
+        mock_classifier,
+        mock_label_manager,
+        cloud_sem,
+        local_sem,
+        mock_thread_response,
     ):
         """Service threads are classified via cloud LLM regardless of local LLM state."""
         mock_proxy.get_thread.return_value = mock_thread_response
@@ -409,24 +438,36 @@ def newsletter_thread_response():
 
 class TestNewsletterRouting:
     async def test_newsletter_skips_priority_classification(
-        self, mock_proxy, mock_classifier, mock_label_manager,
-        mock_newsletter_classifier, cloud_sem, local_sem,
+        self,
+        mock_proxy,
+        mock_classifier,
+        mock_label_manager,
+        mock_newsletter_classifier,
+        cloud_sem,
+        local_sem,
         newsletter_thread_response,
     ):
         mock_proxy.get_thread.return_value = newsletter_thread_response
         mock_newsletter_classifier.classify_newsletter.return_value = [
             StoryResult(
-                title="Test", text="Content",
+                title="Test",
+                text="Content",
                 scores={"simple": 4, "concrete": 4, "personal": 4, "dynamic": 4},
-                average_score=4.0, tier=NewsletterTier.EXCELLENT,
+                average_score=4.0,
+                tier=NewsletterTier.EXCELLENT,
                 themes=["scripture"],
             )
         ]
 
         result = await process_single_thread(
-            "thread_nl", ["msg_nl_001"],
-            mock_proxy, mock_classifier, mock_label_manager,
-            cloud_sem, local_sem, max_thread_chars=50000,
+            "thread_nl",
+            ["msg_nl_001"],
+            mock_proxy,
+            mock_classifier,
+            mock_label_manager,
+            cloud_sem,
+            local_sem,
+            max_thread_chars=50000,
             newsletter_classifier=mock_newsletter_classifier,
             newsletter_recipient="newsletters@dm.org",
             newsletter_output_file="/tmp/test.jsonl",
@@ -439,16 +480,26 @@ class TestNewsletterRouting:
         mock_label_manager.apply_newsletter_classification.assert_called_once()
 
     async def test_non_newsletter_uses_priority_pipeline(
-        self, mock_proxy, mock_classifier, mock_label_manager,
-        mock_newsletter_classifier, cloud_sem, local_sem,
+        self,
+        mock_proxy,
+        mock_classifier,
+        mock_label_manager,
+        mock_newsletter_classifier,
+        cloud_sem,
+        local_sem,
         mock_thread_response,
     ):
         mock_proxy.get_thread.return_value = mock_thread_response
 
         result = await process_single_thread(
-            "thread_001", ["msg_001", "msg_002"],
-            mock_proxy, mock_classifier, mock_label_manager,
-            cloud_sem, local_sem, max_thread_chars=50000,
+            "thread_001",
+            ["msg_001", "msg_002"],
+            mock_proxy,
+            mock_classifier,
+            mock_label_manager,
+            cloud_sem,
+            local_sem,
+            max_thread_chars=50000,
             newsletter_classifier=mock_newsletter_classifier,
             newsletter_recipient="newsletters@dm.org",
             newsletter_output_file="/tmp/test.jsonl",
@@ -460,17 +511,27 @@ class TestNewsletterRouting:
         mock_newsletter_classifier.classify_newsletter.assert_not_called()
 
     async def test_newsletter_no_stories(
-        self, mock_proxy, mock_classifier, mock_label_manager,
-        mock_newsletter_classifier, cloud_sem, local_sem,
+        self,
+        mock_proxy,
+        mock_classifier,
+        mock_label_manager,
+        mock_newsletter_classifier,
+        cloud_sem,
+        local_sem,
         newsletter_thread_response,
     ):
         mock_proxy.get_thread.return_value = newsletter_thread_response
         mock_newsletter_classifier.classify_newsletter.return_value = []
 
         result = await process_single_thread(
-            "thread_nl", ["msg_nl_001"],
-            mock_proxy, mock_classifier, mock_label_manager,
-            cloud_sem, local_sem, max_thread_chars=50000,
+            "thread_nl",
+            ["msg_nl_001"],
+            mock_proxy,
+            mock_classifier,
+            mock_label_manager,
+            cloud_sem,
+            local_sem,
+            max_thread_chars=50000,
             newsletter_classifier=mock_newsletter_classifier,
             newsletter_recipient="newsletters@dm.org",
             newsletter_output_file="/tmp/test.jsonl",
@@ -482,15 +543,25 @@ class TestNewsletterRouting:
         assert call_kwargs["themes"] == []
 
     async def test_newsletter_without_classifier_falls_through(
-        self, mock_proxy, mock_classifier, mock_label_manager,
-        cloud_sem, local_sem, newsletter_thread_response,
+        self,
+        mock_proxy,
+        mock_classifier,
+        mock_label_manager,
+        cloud_sem,
+        local_sem,
+        newsletter_thread_response,
     ):
         mock_proxy.get_thread.return_value = newsletter_thread_response
 
         result = await process_single_thread(
-            "thread_nl", ["msg_nl_001"],
-            mock_proxy, mock_classifier, mock_label_manager,
-            cloud_sem, local_sem, max_thread_chars=50000,
+            "thread_nl",
+            ["msg_nl_001"],
+            mock_proxy,
+            mock_classifier,
+            mock_label_manager,
+            cloud_sem,
+            local_sem,
+            max_thread_chars=50000,
         )
 
         assert result is True
