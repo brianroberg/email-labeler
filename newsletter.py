@@ -153,6 +153,7 @@ def write_assessment(
         "stories": [
             {
                 "title": s.title,
+                "text": s.text,
                 "scores": s.scores,
                 "average_score": s.average_score,
                 "tier": s.tier.value if s.tier else None,

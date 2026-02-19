@@ -363,6 +363,7 @@ class TestWriteAssessment:
         assert record["overall_tier"] == "good"
         assert len(record["stories"]) == 1
         assert record["stories"][0]["title"] == "Test Story"
+        assert record["stories"][0]["text"] == "Story content"
         assert record["stories"][0]["scores"]["simple"] == 4
         assert record["stories"][0]["themes"] == ["scripture", "church"]
         assert record["stories"][0]["quality_cot"] == "quality reasoning"
