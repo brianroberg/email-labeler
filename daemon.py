@@ -369,6 +369,9 @@ async def run_daemon() -> None:
     poll_interval = daemon_config["poll_interval_seconds"]
     max_emails = daemon_config["max_emails_per_cycle"]
     gmail_query = daemon_config["gmail_query"]
+    if newsletter_only and newsletter_recipient:
+        gmail_query += f" to:{newsletter_recipient}"
+        log.info("Gmail query narrowed to: %s", gmail_query)
     healthcheck_file = Path(daemon_config["healthcheck_file"])
     backoff = poll_interval
 
