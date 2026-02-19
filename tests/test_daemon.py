@@ -2,7 +2,7 @@
 
 import asyncio
 import base64
-from unittest.mock import AsyncMock, MagicMock
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import httpx
 import pytest
@@ -14,6 +14,7 @@ from classifier import (
 )
 from daemon import format_thread_transcript, load_config, process_single_thread
 from labeler import _get_priority
+from newsletter import NewsletterTier, StoryResult
 
 
 @pytest.fixture
@@ -371,3 +372,126 @@ class TestLoadConfig:
         for key in ("story_extraction", "quality_assessment", "theme_classification"):
             assert "system" in prompts[key]
             assert "user_template" in prompts[key]
+
+
+@pytest.fixture
+def mock_newsletter_classifier():
+    return AsyncMock()
+
+
+@pytest.fixture
+def newsletter_thread_response():
+    body = "This month's campus update features Sarah's journey..."
+    return {
+        "id": "thread_nl",
+        "snippet": "This month's campus update...",
+        "messages": [
+            {
+                "id": "msg_nl_001",
+                "threadId": "thread_nl",
+                "internalDate": "1704067200000",
+                "labelIds": ["INBOX", "UNREAD"],
+                "payload": {
+                    "headers": [
+                        {"name": "From", "value": "John Staff <john@dm.org>"},
+                        {"name": "To", "value": "newsletters@dm.org"},
+                        {"name": "Subject", "value": "February Campus Update"},
+                        {"name": "Date", "value": "Mon, 1 Jan 2024 12:00:00 +0000"},
+                    ],
+                    "body": {
+                        "data": base64.urlsafe_b64encode(body.encode()).decode(),
+                    },
+                },
+            },
+        ],
+    }
+
+
+class TestNewsletterRouting:
+    async def test_newsletter_skips_priority_classification(
+        self, mock_proxy, mock_classifier, mock_label_manager,
+        mock_newsletter_classifier, cloud_sem, local_sem,
+        newsletter_thread_response,
+    ):
+        mock_proxy.get_thread.return_value = newsletter_thread_response
+        mock_newsletter_classifier.classify_newsletter.return_value = [
+            StoryResult(
+                title="Test", text="Content",
+                scores={"simple": 4, "concrete": 4, "personal": 4, "dynamic": 4},
+                average_score=4.0, tier=NewsletterTier.EXCELLENT,
+                themes=["scripture"],
+            )
+        ]
+
+        result = await process_single_thread(
+            "thread_nl", ["msg_nl_001"],
+            mock_proxy, mock_classifier, mock_label_manager,
+            cloud_sem, local_sem, max_thread_chars=50000,
+            newsletter_classifier=mock_newsletter_classifier,
+            newsletter_recipient="newsletters@dm.org",
+            newsletter_output_file="/tmp/test.jsonl",
+        )
+
+        assert result is True
+        mock_classifier.classify_sender.assert_not_called()
+        mock_classifier.classify.assert_not_called()
+        mock_newsletter_classifier.classify_newsletter.assert_called_once()
+        mock_label_manager.apply_newsletter_classification.assert_called_once()
+
+    async def test_non_newsletter_uses_priority_pipeline(
+        self, mock_proxy, mock_classifier, mock_label_manager,
+        mock_newsletter_classifier, cloud_sem, local_sem,
+        mock_thread_response,
+    ):
+        mock_proxy.get_thread.return_value = mock_thread_response
+
+        result = await process_single_thread(
+            "thread_001", ["msg_001", "msg_002"],
+            mock_proxy, mock_classifier, mock_label_manager,
+            cloud_sem, local_sem, max_thread_chars=50000,
+            newsletter_classifier=mock_newsletter_classifier,
+            newsletter_recipient="newsletters@dm.org",
+            newsletter_output_file="/tmp/test.jsonl",
+        )
+
+        assert result is True
+        mock_classifier.classify_sender.assert_called_once()
+        mock_classifier.classify.assert_called_once()
+        mock_newsletter_classifier.classify_newsletter.assert_not_called()
+
+    async def test_newsletter_no_stories(
+        self, mock_proxy, mock_classifier, mock_label_manager,
+        mock_newsletter_classifier, cloud_sem, local_sem,
+        newsletter_thread_response,
+    ):
+        mock_proxy.get_thread.return_value = newsletter_thread_response
+        mock_newsletter_classifier.classify_newsletter.return_value = []
+
+        result = await process_single_thread(
+            "thread_nl", ["msg_nl_001"],
+            mock_proxy, mock_classifier, mock_label_manager,
+            cloud_sem, local_sem, max_thread_chars=50000,
+            newsletter_classifier=mock_newsletter_classifier,
+            newsletter_recipient="newsletters@dm.org",
+            newsletter_output_file="/tmp/test.jsonl",
+        )
+
+        assert result is True
+        call_kwargs = mock_label_manager.apply_newsletter_classification.call_args.kwargs
+        assert call_kwargs["tier"] is None
+        assert call_kwargs["themes"] == []
+
+    async def test_newsletter_without_classifier_falls_through(
+        self, mock_proxy, mock_classifier, mock_label_manager,
+        cloud_sem, local_sem, newsletter_thread_response,
+    ):
+        mock_proxy.get_thread.return_value = newsletter_thread_response
+
+        result = await process_single_thread(
+            "thread_nl", ["msg_nl_001"],
+            mock_proxy, mock_classifier, mock_label_manager,
+            cloud_sem, local_sem, max_thread_chars=50000,
+        )
+
+        assert result is True
+        mock_classifier.classify_sender.assert_called_once()
