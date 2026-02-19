@@ -104,6 +104,7 @@ async def process_single_thread(
     newsletter_classifier: NewsletterClassifier | None = None,
     newsletter_recipient: str = "",
     newsletter_output_file: str = "",
+    newsletter_only: bool = False,
 ) -> bool:
     """Process a single thread through the classification pipeline.
 
@@ -198,6 +199,11 @@ async def process_single_thread(
                     subject,
                 )
                 return True
+
+        # Newsletter-only mode: skip non-newsletter threads
+        if newsletter_only:
+            log.debug("Skipping non-newsletter thread %s (newsletter-only mode)", thread_id)
+            return False
 
         # Check priority — skip if already classified at max priority
         existing_priority = label_manager.get_existing_priority(messages)
@@ -330,6 +336,10 @@ async def run_daemon() -> None:
         newsletter_output_file = nl_config.get("output_file", "")
         log.info("Newsletter classification enabled for: %s", newsletter_recipient)
 
+    newsletter_only = os.environ.get("NEWSLETTER_ONLY", "").strip().lower() in ("1", "true", "yes")
+    if newsletter_only:
+        log.info("Newsletter-only mode: non-newsletter threads will be skipped")
+
     cloud_sem = asyncio.Semaphore(daemon_config.get("cloud_parallel", 2))
     local_sem = asyncio.Semaphore(daemon_config.get("local_parallel", 1))
     log.info("Concurrency limits: cloud=%d, local=%d", cloud_sem._value, local_sem._value)
@@ -394,6 +404,7 @@ async def run_daemon() -> None:
                         newsletter_classifier=newsletter_classifier,
                         newsletter_recipient=newsletter_recipient,
                         newsletter_output_file=newsletter_output_file,
+                        newsletter_only=newsletter_only,
                     )
                     for tid, msg_ids in threads.items()
                 ),
