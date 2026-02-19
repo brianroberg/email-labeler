@@ -1,5 +1,8 @@
 """Tests for newsletter classifier — parsing functions and data models."""
 
+import json
+from pathlib import Path
+
 import pytest
 from unittest.mock import AsyncMock
 
@@ -321,3 +324,101 @@ class TestClassifyNewsletter:
         assert results[0].tier == NewsletterTier.EXCELLENT
         assert results[1].tier == NewsletterTier.FAIR
         assert mock_cloud_llm.complete.call_count == 5
+
+
+from newsletter import write_assessment
+
+
+class TestWriteAssessment:
+    def test_writes_jsonl_record(self, tmp_path):
+        output_file = tmp_path / "assessments.jsonl"
+        stories = [
+            StoryResult(
+                title="Test Story",
+                text="Story content",
+                scores={"simple": 4, "concrete": 3, "personal": 5, "dynamic": 2},
+                average_score=3.5,
+                tier=NewsletterTier.GOOD,
+                themes=["scripture", "church"],
+                quality_cot="quality reasoning",
+                theme_cot="theme reasoning",
+            )
+        ]
+        write_assessment(
+            output_file=str(output_file),
+            message_id="msg_001",
+            thread_id="thread_001",
+            sender="john@dm.org",
+            subject="February Update",
+            overall_tier=NewsletterTier.GOOD,
+            stories=stories,
+        )
+
+        lines = output_file.read_text().strip().splitlines()
+        assert len(lines) == 1
+        record = json.loads(lines[0])
+        assert record["message_id"] == "msg_001"
+        assert record["thread_id"] == "thread_001"
+        assert record["from"] == "john@dm.org"
+        assert record["subject"] == "February Update"
+        assert record["overall_tier"] == "good"
+        assert len(record["stories"]) == 1
+        assert record["stories"][0]["title"] == "Test Story"
+        assert record["stories"][0]["scores"]["simple"] == 4
+        assert record["stories"][0]["themes"] == ["scripture", "church"]
+        assert record["stories"][0]["quality_cot"] == "quality reasoning"
+        assert "timestamp" in record
+
+    def test_appends_to_existing_file(self, tmp_path):
+        output_file = tmp_path / "assessments.jsonl"
+        story = StoryResult(title="S", text="T", tier=NewsletterTier.FAIR)
+        for i in range(3):
+            write_assessment(
+                output_file=str(output_file),
+                message_id=f"msg_{i}",
+                thread_id=f"thread_{i}",
+                sender="a@b.com",
+                subject="Subj",
+                overall_tier=NewsletterTier.FAIR,
+                stories=[story],
+            )
+        lines = output_file.read_text().strip().splitlines()
+        assert len(lines) == 3
+
+    def test_creates_parent_directories(self, tmp_path):
+        output_file = tmp_path / "sub" / "dir" / "assessments.jsonl"
+        story = StoryResult(title="S", text="T", tier=NewsletterTier.POOR)
+        write_assessment(
+            output_file=str(output_file),
+            message_id="msg_001",
+            thread_id="t_001",
+            sender="a@b.com",
+            subject="Subj",
+            overall_tier=NewsletterTier.POOR,
+            stories=[story],
+        )
+        assert output_file.exists()
+
+    def test_story_without_scores(self, tmp_path):
+        output_file = tmp_path / "assessments.jsonl"
+        story = StoryResult(
+            title="No Scores",
+            text="Content",
+            scores=None,
+            average_score=None,
+            tier=None,
+            themes=["scripture"],
+        )
+        write_assessment(
+            output_file=str(output_file),
+            message_id="msg_001",
+            thread_id="t_001",
+            sender="a@b.com",
+            subject="Subj",
+            overall_tier=None,
+            stories=[story],
+        )
+        record = json.loads(output_file.read_text().strip())
+        assert record["stories"][0]["scores"] is None
+        assert record["stories"][0]["tier"] is None
+        assert record["overall_tier"] is None

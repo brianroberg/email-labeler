@@ -5,10 +5,13 @@ and tags them with Ends Statement themes. All LLM calls use the cloud endpoint
 (newsletter content is not privacy-sensitive).
 """
 
+import json
 import logging
 import re
 from dataclasses import dataclass, field
+from datetime import datetime, timezone
 from enum import Enum
+from pathlib import Path
 
 from llm_client import LLMClient
 
@@ -124,6 +127,43 @@ def compute_tier(scores: dict[str, int]) -> NewsletterTier:
     if avg >= 2.0:
         return NewsletterTier.FAIR
     return NewsletterTier.POOR
+
+
+def write_assessment(
+    output_file: str,
+    message_id: str,
+    thread_id: str,
+    sender: str,
+    subject: str,
+    overall_tier: NewsletterTier | None,
+    stories: list[StoryResult],
+) -> None:
+    """Append a newsletter assessment record to the JSONL output file."""
+    record = {
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "message_id": message_id,
+        "thread_id": thread_id,
+        "from": sender,
+        "subject": subject,
+        "overall_tier": overall_tier.value if overall_tier else None,
+        "stories": [
+            {
+                "title": s.title,
+                "scores": s.scores,
+                "average_score": s.average_score,
+                "tier": s.tier.value if s.tier else None,
+                "themes": s.themes,
+                "quality_cot": s.quality_cot,
+                "theme_cot": s.theme_cot,
+            }
+            for s in stories
+        ],
+    }
+
+    path = Path(output_file)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with open(path, "a") as f:
+        f.write(json.dumps(record) + "\n")
 
 
 class NewsletterClassifier:
