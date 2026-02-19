@@ -341,3 +341,33 @@ class TestLoadConfig:
         assert "local_parallel" in config["daemon"]
         assert config["daemon"]["cloud_parallel"] >= 1
         assert config["daemon"]["local_parallel"] >= 1
+
+    def test_config_has_newsletter_section(self):
+        config = load_config()
+        assert "newsletter" in config
+        assert "recipient" in config["newsletter"]
+        assert "output_file" in config["newsletter"]
+        assert "labels" in config["newsletter"]
+        assert "prompts" in config["newsletter"]
+
+    def test_config_has_newsletter_labels(self):
+        config = load_config()
+        nl = config["newsletter"]["labels"]
+        assert "newsletter" in nl
+        assert "excellent" in nl
+        assert "good" in nl
+        assert "fair" in nl
+        assert "poor" in nl
+        assert "no_stories" in nl
+        assert "themes" in nl
+        assert len(nl["themes"]) == 5
+
+    def test_config_has_newsletter_prompts(self):
+        config = load_config()
+        prompts = config["newsletter"]["prompts"]
+        assert "story_extraction" in prompts
+        assert "quality_assessment" in prompts
+        assert "theme_classification" in prompts
+        for key in ("story_extraction", "quality_assessment", "theme_classification"):
+            assert "system" in prompts[key]
+            assert "user_template" in prompts[key]

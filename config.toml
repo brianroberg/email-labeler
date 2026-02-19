@@ -85,3 +85,85 @@ Thread transcript:
 NEEDS_RESPONSE = "The email requires a reply, decision, or action from {env.USER_NAME}. Examples: direct questions from colleagues or contacts, meeting requests, invitations needing RSVP, requests for information or approval. Note: 'Let me know if you have any questions' (or similar) does not by itself require a response. Cold emails and sales pitches do NOT qualify, even if they ask a question."
 FYI = "The email is informational and worth reading but requires no action. Examples: status updates from colleagues, team announcements, shared articles from contacts, policy updates, organizational news, event recaps, forwarded information relevant to {env.USER_NAME}'s work."
 LOW_PRIORITY = "The email has low importance or is unwanted. Examples: marketing newsletters, automated notifications, social media digests, promotional offers, spam, unsolicited sales or partnership pitches, cold outreach, phishing attempts, subscription digests. Anything that does not need to be read."
+
+[newsletter]
+recipient = "newsletters@dm.org"
+output_file = "data/newsletter_assessments.jsonl"
+
+[newsletter.labels]
+newsletter = "agent/newsletter"
+excellent = "agent/newsletter/excellent"
+good = "agent/newsletter/good"
+fair = "agent/newsletter/fair"
+poor = "agent/newsletter/poor"
+no_stories = "agent/newsletter/no-stories"
+
+[newsletter.labels.themes]
+scripture = "agent/newsletter/theme/scripture"
+christlikeness = "agent/newsletter/theme/christlikeness"
+church = "agent/newsletter/theme/church"
+vocation_family = "agent/newsletter/theme/vocation-family"
+disciple_making = "agent/newsletter/theme/disciple-making"
+
+[newsletter.prompts.story_extraction]
+system = """You are a newsletter analyst. Given a ministry newsletter email, extract each distinct story from the content.
+
+A "story" is a narrative segment about people, events, or ministry activities. Skip non-story content like:
+- Headers, footers, signatures
+- Donation appeals or fundraising asks
+- Event calendar listings
+- Administrative announcements
+- Contact information
+
+For each story, provide:
+1. A short title (5-10 words)
+2. The full text of the story as it appears in the newsletter
+
+Respond in this exact format (one story per block, separated by blank lines):
+
+TITLE: [short title]
+TEXT: [full story text]
+
+If the newsletter contains no stories, respond with exactly: NO_STORIES"""
+
+user_template = """Newsletter content:
+{body}"""
+
+[newsletter.prompts.quality_assessment]
+system = """You are a writing quality assessor for ministry newsletter stories. Score the following story on four dimensions, each on a 1-5 scale.
+
+Dimensions:
+- SIMPLE (1-5): Does the story focus on one key idea or progression? A 5 means no tangents or extraneous details. A 1 means it tries to cover too many things and feels scattered.
+- CONCRETE (1-5): Does the story narrate particular events involving particular people at particular times and places? A 5 means vivid specifics. A 1 means abstract and generalized.
+- PERSONAL (1-5): Does the story center around one person or a few people, such that what's important to them is what's important to the story? A 5 means deeply personal. A 1 means it's mainly about events, numbers, or ideas disconnected from people.
+- DYNAMIC (1-5): Does the story describe how a person changes over time? A 5 means a clear arc of transformation. A 1 means static — no change, no before-and-after.
+
+Think step by step about each dimension. Use <think> tags for your reasoning, then respond in this exact format:
+
+SIMPLE: [1-5]
+CONCRETE: [1-5]
+PERSONAL: [1-5]
+DYNAMIC: [1-5]"""
+
+user_template = """Story title: {title}
+Story text:
+{text}"""
+
+[newsletter.prompts.theme_classification]
+system = """You are a ministry theme classifier. Given a story from a ministry newsletter, identify which themes from the organization's Ends Statement it illustrates.
+
+The Ends Statement themes are:
+
+- SCRIPTURE: Study the Scriptures correctly, apply them to all of life, and teach them to others
+- CHRISTLIKENESS: Exhibit increasing Christlikeness in response to the Gospel
+- CHURCH: Serve not only in their campus fellowship but also in a Bible-believing local church
+- VOCATION_FAMILY: Honor God in their vocation and family relationships
+- DISCIPLE_MAKING: Continue to make disciples wherever God takes them
+
+A story may match multiple themes, or none at all. Only select themes that the story clearly illustrates — do not force a match.
+
+Think step by step. Use <think> tags for your reasoning, then respond with ONLY the matching theme names, one per line. If no themes match, respond with: NONE"""
+
+user_template = """Story title: {title}
+Story text:
+{text}"""
