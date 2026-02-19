@@ -4,8 +4,15 @@ Manages Gmail labels for the email classification system.
 All labels must be pre-created in Gmail (api-proxy blocks label creation).
 """
 
+from __future__ import annotations
+
+from typing import TYPE_CHECKING
+
 from classifier import EmailLabel, SenderType
 from proxy_client import GmailProxyClient
+
+if TYPE_CHECKING:
+    from newsletter import NewsletterTier
 
 # Mapping from EmailLabel enum to config key names
 _LABEL_CONFIG_KEY = {
@@ -33,6 +40,7 @@ class LabelManager:
 
     def __init__(self, proxy_client: GmailProxyClient, config: dict):
         self.proxy = proxy_client
+        self.config = config
         self.labels_config = config["labels"]
         self.label_ids: dict[str, str] = {}
 
@@ -58,6 +66,15 @@ class LabelManager:
         ):
             name = self.labels_config[key]
             required_names.add(name)
+
+        # Newsletter labels (if configured)
+        nl_config = self.config.get("newsletter", {}).get("labels", {})
+        if nl_config:
+            for key in ("newsletter", "excellent", "good", "fair", "poor", "no_stories"):
+                if key in nl_config:
+                    required_names.add(nl_config[key])
+            for theme_name in nl_config.get("themes", {}).values():
+                required_names.add(theme_name)
 
         missing = []
         for name in required_names:
@@ -122,6 +139,45 @@ class LabelManager:
             if remove_label_ids:
                 kwargs["remove_label_ids"] = remove_label_ids
             await self.proxy.modify_message(**kwargs)
+
+    async def apply_newsletter_classification(
+        self,
+        message_ids: list[str],
+        tier: NewsletterTier | None,
+        themes: list[str],
+    ) -> None:
+        """Apply newsletter classification labels to message(s).
+
+        Args:
+            message_ids: Message IDs to label.
+            tier: Quality tier of the best story, or None for no-stories.
+            themes: List of theme keys (e.g. ["scripture", "church"]).
+        """
+        nl_labels = self.config["newsletter"]["labels"]
+        processed_name = self.labels_config["processed"]
+
+        add_label_ids = [
+            self.label_ids[processed_name],
+            self.label_ids[nl_labels["newsletter"]],
+        ]
+
+        if tier is not None:
+            tier_name = nl_labels[tier.value]
+            add_label_ids.append(self.label_ids[tier_name])
+        else:
+            add_label_ids.append(self.label_ids[nl_labels["no_stories"]])
+
+        for theme in themes:
+            theme_name = nl_labels["themes"].get(theme)
+            if theme_name and theme_name in self.label_ids:
+                add_label_ids.append(self.label_ids[theme_name])
+
+        for msg_id in message_ids:
+            await self.proxy.modify_message(
+                message_id=msg_id,
+                add_label_ids=add_label_ids,
+                remove_label_ids=["INBOX"],
+            )
 
     def get_existing_priority(self, thread_messages: list[dict]) -> int | None:
         """Check existing classification labels on thread messages.
