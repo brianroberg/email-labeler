@@ -21,9 +21,17 @@ from config_utils import substitute_env_vars
 from gmail_utils import decode_body, get_header
 from labeler import LabelManager, _get_priority
 from llm_client import LLMClient
+from newsletter import NewsletterClassifier, NewsletterTier, is_newsletter, write_assessment
 from proxy_client import GmailProxyClient
 
 load_dotenv()
+
+_TIER_RANK = {
+    NewsletterTier.POOR: 0,
+    NewsletterTier.FAIR: 1,
+    NewsletterTier.GOOD: 2,
+    NewsletterTier.EXCELLENT: 3,
+}
 
 logging.basicConfig(
     level=logging.INFO,
@@ -93,6 +101,9 @@ async def process_single_thread(
     cloud_sem: asyncio.Semaphore,
     local_sem: asyncio.Semaphore,
     max_thread_chars: int,
+    newsletter_classifier: NewsletterClassifier | None = None,
+    newsletter_recipient: str = "",
+    newsletter_output_file: str = "",
 ) -> bool:
     """Process a single thread through the classification pipeline.
 
@@ -133,6 +144,58 @@ async def process_single_thread(
 
         # Sort chronologically
         messages.sort(key=lambda m: int(m.get("internalDate", "0")))
+
+        # Newsletter detection — route to newsletter pipeline if applicable
+        if newsletter_classifier and newsletter_recipient:
+            if is_newsletter(messages, newsletter_recipient):
+                all_msg_ids = [msg["id"] for msg in messages]
+                first_headers = messages[0]["payload"]["headers"]
+                subject = get_header(first_headers, "Subject")
+                sender = get_header(first_headers, "From")
+                transcript = format_thread_transcript(messages, max_thread_chars)
+
+                async with cloud_sem:
+                    story_results = await newsletter_classifier.classify_newsletter(transcript)
+
+                # Determine overall tier (best story's tier)
+                best_tier = None
+                all_themes = []
+                for sr in story_results:
+                    if sr.tier is not None:
+                        if best_tier is None or _TIER_RANK.get(sr.tier, 0) > _TIER_RANK.get(best_tier, 0):
+                            best_tier = sr.tier
+                    all_themes.extend(sr.themes)
+                all_themes = list(dict.fromkeys(all_themes))  # dedupe, preserve order
+
+                await label_manager.apply_newsletter_classification(
+                    message_ids=all_msg_ids,
+                    tier=best_tier,
+                    themes=all_themes,
+                )
+
+                # Write structured results
+                if newsletter_output_file:
+                    try:
+                        write_assessment(
+                            output_file=newsletter_output_file,
+                            message_id=all_msg_ids[0],
+                            thread_id=thread_id,
+                            sender=sender,
+                            subject=subject,
+                            overall_tier=best_tier,
+                            stories=story_results,
+                        )
+                    except Exception:
+                        log.exception("Failed to write newsletter assessment for thread %s", thread_id)
+
+                story_count = len(story_results)
+                log.info(
+                    "Newsletter thread %s: %d stories, tier=%s, themes=%s — %s",
+                    thread_id, story_count,
+                    best_tier.value if best_tier else "no-stories",
+                    all_themes, subject,
+                )
+                return True
 
         # Check priority — skip if already classified at max priority
         existing_priority = label_manager.get_existing_priority(messages)
@@ -254,6 +317,17 @@ async def run_daemon() -> None:
     )
     label_manager = LabelManager(proxy_client=proxy_client, config=config)
 
+    # Newsletter classifier (if configured)
+    nl_config = config.get("newsletter")
+    newsletter_classifier = None
+    newsletter_recipient = ""
+    newsletter_output_file = ""
+    if nl_config:
+        newsletter_classifier = NewsletterClassifier(cloud_llm=cloud_llm, config=config)
+        newsletter_recipient = nl_config["recipient"]
+        newsletter_output_file = nl_config.get("output_file", "")
+        log.info("Newsletter classification enabled for: %s", newsletter_recipient)
+
     cloud_sem = asyncio.Semaphore(daemon_config.get("cloud_parallel", 2))
     local_sem = asyncio.Semaphore(daemon_config.get("local_parallel", 1))
     log.info("Concurrency limits: cloud=%d, local=%d", cloud_sem._value, local_sem._value)
@@ -315,6 +389,9 @@ async def run_daemon() -> None:
                         cloud_sem,
                         local_sem,
                         max_thread_chars,
+                        newsletter_classifier=newsletter_classifier,
+                        newsletter_recipient=newsletter_recipient,
+                        newsletter_output_file=newsletter_output_file,
                     )
                     for tid, msg_ids in threads.items()
                 ),
