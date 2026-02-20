@@ -115,3 +115,32 @@ class AssessmentApp(App):
             f"Tier: {tier_text}  |  Theme: {theme_text}"
             f"  |  {count} of {total} newsletters"
         )
+
+    @on(DataTable.RowHighlighted, "#newsletters")
+    def on_newsletter_highlighted(self, event: DataTable.RowHighlighted) -> None:
+        if event.row_key in self._row_to_assessment:
+            self._populate_stories(self._row_to_assessment[event.row_key])
+
+    @on(DataTable.RowHighlighted, "#stories")
+    def on_story_highlighted(self, event: DataTable.RowHighlighted) -> None:
+        if event.row_key in self._row_to_story:
+            self._show_detail(self._row_to_story[event.row_key])
+
+    def _populate_stories(self, assessment: Assessment) -> None:
+        table = self.query_one("#stories", DataTable)
+        table.clear()
+        self._row_to_story.clear()
+
+        for story in assessment.stories:
+            avg = f"{story.average_score:.2f}" if story.average_score is not None else "\u2014"
+            themes = ", ".join(story.themes) if story.themes else "\u2014"
+            row_key = table.add_row(story.title, story.tier or "\u2014", avg, themes)
+            self._row_to_story[row_key] = story
+
+        if assessment.stories:
+            self._show_detail(assessment.stories[0])
+        else:
+            self.query_one("#detail", Static).update("No stories in this newsletter")
+
+    def _show_detail(self, story: Story) -> None:
+        self.query_one("#detail", Static).update(format_detail(story))

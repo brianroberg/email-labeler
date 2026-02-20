@@ -80,3 +80,37 @@ class TestAppLaunch:
         async with app.run_test(size=(120, 40)) as pilot:
             bar = app.query_one("#filter-bar", Static)
             assert "3" in bar.content
+
+
+class TestDrillDown:
+    async def test_first_newsletter_stories_shown_on_mount(self, sample_assessments):
+        app = AssessmentApp(sample_assessments)
+        async with app.run_test(size=(120, 40)) as pilot:
+            await pilot.pause()
+            story_table = app.query_one("#stories", DataTable)
+            assert story_table.row_count == 2
+
+    async def test_first_story_detail_shown_on_mount(self, sample_assessments):
+        app = AssessmentApp(sample_assessments)
+        async with app.run_test(size=(120, 40)) as pilot:
+            await pilot.pause()
+            detail = app.query_one("#detail", Static)
+            assert "Sarah's Journey" in detail.content
+
+    async def test_navigating_newsletters_updates_stories(self, sample_assessments):
+        app = AssessmentApp(sample_assessments)
+        async with app.run_test(size=(120, 40)) as pilot:
+            await pilot.pause()
+            await pilot.press("down")
+            await pilot.pause()
+            story_table = app.query_one("#stories", DataTable)
+            assert story_table.row_count == 1
+
+    async def test_detail_shows_cot_text(self, sample_assessments):
+        app = AssessmentApp(sample_assessments)
+        async with app.run_test(size=(120, 40)) as pilot:
+            await pilot.pause()
+            detail = app.query_one("#detail", Static)
+            text = detail.content
+            assert "Follows one person" in text
+            assert "Reflects Christlikeness" in text
