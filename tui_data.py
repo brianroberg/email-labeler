@@ -100,3 +100,31 @@ def available_themes(assessments: list[Assessment]) -> list[str]:
         for s in a.stories:
             themes.update(s.themes)
     return sorted(themes)
+
+
+def format_detail(story: Story) -> str:
+    """Format a Story as readable text for the detail panel."""
+    tier = story.tier or "\u2014"
+    avg = f"{story.average_score:.2f}" if story.average_score is not None else "\u2014"
+
+    if story.scores:
+        scores_str = "  ".join(f"{k}: {v}" for k, v in story.scores.items())
+    else:
+        scores_str = "(not available)"
+
+    themes_str = ", ".join(story.themes) if story.themes else "(none)"
+    quality_cot = story.quality_cot or "(no reasoning recorded)"
+    theme_cot = story.theme_cot or "(no reasoning recorded)"
+
+    return (
+        f"{story.title}\n"
+        f"Tier: {tier}  |  Average: {avg}\n"
+        f"Scores: {scores_str}\n"
+        f"Themes: {themes_str}\n"
+        f"\n\u2500\u2500 Quality CoT \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\n"
+        f"{quality_cot}\n"
+        f"\n\u2500\u2500 Theme CoT \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\n"
+        f"{theme_cot}\n"
+        f"\n\u2500\u2500 Story Text \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\n"
+        f"{story.text}\n"
+    )

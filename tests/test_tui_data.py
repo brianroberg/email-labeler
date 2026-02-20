@@ -4,7 +4,16 @@ import json
 
 import pytest
 
-from tui_data import Assessment, Story, available_themes, available_tiers, filter_by_theme, filter_by_tier, load_assessments
+from tui_data import (
+    Assessment,
+    Story,
+    available_themes,
+    available_tiers,
+    filter_by_theme,
+    filter_by_tier,
+    format_detail,
+    load_assessments,
+)
 
 
 def _write_jsonl(tmp_path, records):
@@ -184,3 +193,87 @@ class TestAvailableThemes:
 
     def test_empty_list(self):
         assert available_themes([]) == []
+
+
+class TestFormatDetail:
+    def test_includes_title(self):
+        story = Story(
+            title="Sarah's Journey",
+            text="Campus story.",
+            scores={"simple": 5, "concrete": 4, "personal": 5, "dynamic": 5},
+            average_score=4.75,
+            tier="excellent",
+            themes=["christlikeness", "disciple_making"],
+            quality_cot="Follows one person.",
+            theme_cot="Reflects Christlikeness.",
+        )
+        assert "Sarah's Journey" in format_detail(story)
+
+    def test_includes_scores(self):
+        story = Story(
+            title="T",
+            text="X",
+            scores={"simple": 5, "concrete": 4, "personal": 5, "dynamic": 5},
+            average_score=4.75,
+            tier="excellent",
+            themes=[],
+            quality_cot="",
+            theme_cot="",
+        )
+        result = format_detail(story)
+        assert "simple: 5" in result
+        assert "concrete: 4" in result
+
+    def test_null_scores_shows_placeholder(self):
+        story = Story(
+            title="T",
+            text="X",
+            scores=None,
+            average_score=None,
+            tier=None,
+            themes=["scripture"],
+            quality_cot="",
+            theme_cot="R.",
+        )
+        assert "not available" in format_detail(story).lower()
+
+    def test_includes_cot_text(self):
+        story = Story(
+            title="T",
+            text="X",
+            scores=None,
+            average_score=None,
+            tier=None,
+            themes=[],
+            quality_cot="Quality reasoning here.",
+            theme_cot="Theme reasoning here.",
+        )
+        result = format_detail(story)
+        assert "Quality reasoning here." in result
+        assert "Theme reasoning here." in result
+
+    def test_empty_cot_shows_placeholder(self):
+        story = Story(
+            title="T",
+            text="X",
+            scores=None,
+            average_score=None,
+            tier=None,
+            themes=[],
+            quality_cot="",
+            theme_cot="",
+        )
+        assert "no reasoning recorded" in format_detail(story).lower()
+
+    def test_includes_story_text(self):
+        story = Story(
+            title="T",
+            text="Full story content here.",
+            scores=None,
+            average_score=None,
+            tier=None,
+            themes=[],
+            quality_cot="",
+            theme_cot="",
+        )
+        assert "Full story content here." in format_detail(story)
