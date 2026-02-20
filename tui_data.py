@@ -76,3 +76,27 @@ def load_assessments(path: str) -> list[Assessment]:
             log.warning("Skipping malformed line %d: %s", line_num, exc)
 
     return assessments
+
+
+def filter_by_tier(assessments: list[Assessment], tier: str) -> list[Assessment]:
+    """Return assessments matching the given overall tier."""
+    return [a for a in assessments if a.overall_tier == tier]
+
+
+def filter_by_theme(assessments: list[Assessment], theme: str) -> list[Assessment]:
+    """Return assessments where any story has the given theme."""
+    return [a for a in assessments if any(theme in s.themes for s in a.stories)]
+
+
+def available_tiers(assessments: list[Assessment]) -> list[str]:
+    """Return sorted unique non-None tier values present in assessments."""
+    return sorted({a.overall_tier for a in assessments if a.overall_tier is not None})
+
+
+def available_themes(assessments: list[Assessment]) -> list[str]:
+    """Return sorted unique theme values across all stories."""
+    themes: set[str] = set()
+    for a in assessments:
+        for s in a.stories:
+            themes.update(s.themes)
+    return sorted(themes)

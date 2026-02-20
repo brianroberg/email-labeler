@@ -4,7 +4,7 @@ import json
 
 import pytest
 
-from tui_data import Assessment, Story, load_assessments
+from tui_data import Assessment, Story, available_themes, available_tiers, filter_by_theme, filter_by_tier, load_assessments
 
 
 def _write_jsonl(tmp_path, records):
@@ -95,3 +95,92 @@ class TestLoadAssessments:
 
     def test_missing_file_returns_empty_list(self, tmp_path):
         assert load_assessments(str(tmp_path / "nonexistent.jsonl")) == []
+
+
+@pytest.fixture
+def three_assessments(tmp_path):
+    """Three assessments covering different tiers and themes."""
+    records = [
+        _make_record(
+            message_id="msg001",
+            subject="Penn State",
+            overall_tier="excellent",
+            stories=[
+                _make_story_dict(themes=["christlikeness", "disciple_making"]),
+                _make_story_dict(tier="fair", themes=["church"]),
+            ],
+        ),
+        _make_record(
+            message_id="msg002",
+            subject="Ohio State",
+            overall_tier="good",
+            stories=[_make_story_dict(themes=["scripture"])],
+        ),
+        _make_record(
+            message_id="msg003",
+            subject="Michigan",
+            overall_tier=None,
+            stories=[_make_story_dict(scores=None, tier=None, themes=["vocation_family"])],
+        ),
+    ]
+    path = _write_jsonl(tmp_path, records)
+    return load_assessments(path)
+
+
+class TestFilterByTier:
+    def test_filters_excellent(self, three_assessments):
+        result = filter_by_tier(three_assessments, "excellent")
+        assert len(result) == 1
+        assert result[0].subject == "Penn State"
+
+    def test_filters_good(self, three_assessments):
+        result = filter_by_tier(three_assessments, "good")
+        assert len(result) == 1
+        assert result[0].subject == "Ohio State"
+
+    def test_no_matches_returns_empty(self, three_assessments):
+        assert filter_by_tier(three_assessments, "poor") == []
+
+    def test_null_tier_not_matched(self, three_assessments):
+        result = filter_by_tier(three_assessments, "excellent")
+        assert all(a.overall_tier is not None for a in result)
+
+
+class TestFilterByTheme:
+    def test_filters_by_theme(self, three_assessments):
+        result = filter_by_theme(three_assessments, "scripture")
+        assert len(result) == 1
+        assert result[0].subject == "Ohio State"
+
+    def test_matches_any_story_theme(self, three_assessments):
+        result = filter_by_theme(three_assessments, "church")
+        assert len(result) == 1
+        assert result[0].subject == "Penn State"
+
+    def test_no_matches_returns_empty(self, three_assessments):
+        assert filter_by_theme(three_assessments, "nonexistent") == []
+
+
+class TestAvailableTiers:
+    def test_returns_unique_tiers(self, three_assessments):
+        assert set(available_tiers(three_assessments)) == {"excellent", "good"}
+
+    def test_excludes_none(self, three_assessments):
+        assert None not in available_tiers(three_assessments)
+
+    def test_empty_list(self):
+        assert available_tiers([]) == []
+
+
+class TestAvailableThemes:
+    def test_returns_unique_themes(self, three_assessments):
+        assert set(available_themes(three_assessments)) == {
+            "christlikeness",
+            "disciple_making",
+            "church",
+            "scripture",
+            "vocation_family",
+        }
+
+    def test_empty_list(self):
+        assert available_themes([]) == []
