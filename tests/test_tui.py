@@ -72,8 +72,7 @@ class TestAppLaunch:
         async with app.run_test(size=(120, 40)) as pilot:
             table = app.query_one("#newsletters", DataTable)
             labels = [col.label.plain for col in table.columns.values()]
-            assert "Subject" in labels
-            assert "Tier" in labels
+            assert labels == ["Sender", "Subject", "Tier", "Date"]
 
     async def test_shows_filter_bar(self, sample_assessments):
         app = AssessmentApp(sample_assessments)

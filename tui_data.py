@@ -2,7 +2,9 @@
 
 import json
 import logging
+import re
 from dataclasses import dataclass
+from email.utils import parseaddr
 from pathlib import Path
 
 log = logging.getLogger(__name__)
@@ -29,6 +31,23 @@ class Assessment:
     subject: str
     overall_tier: str | None
     stories: list[Story]
+
+
+_SUBJECT_PREFIX_RE = re.compile(r"^\[DM Newsletters\]\s*")
+
+
+def display_sender(raw_from: str) -> str:
+    """Extract display name from a raw From header, falling back to email address."""
+    name, addr = parseaddr(raw_from)
+    return name if name else addr
+
+
+def display_subject(subject: str, max_len: int = 40) -> str:
+    """Strip the [DM Newsletters] prefix and truncate for display."""
+    cleaned = _SUBJECT_PREFIX_RE.sub("", subject)
+    if len(cleaned) > max_len:
+        return cleaned[: max_len - 1] + "\u2026"
+    return cleaned
 
 
 def load_assessments(path: str) -> list[Assessment]:

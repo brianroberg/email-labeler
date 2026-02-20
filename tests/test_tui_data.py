@@ -9,6 +9,8 @@ from tui_data import (
     Story,
     available_themes,
     available_tiers,
+    display_sender,
+    display_subject,
     filter_by_theme,
     filter_by_tier,
     format_detail,
@@ -277,3 +279,43 @@ class TestFormatDetail:
             theme_cot="",
         )
         assert "Full story content here." in format_detail(story)
+
+
+class TestDisplaySender:
+    def test_extracts_name_from_full_address(self):
+        assert display_sender("John Doe <john@example.com>") == "John Doe"
+
+    def test_falls_back_to_email_when_no_name(self):
+        assert display_sender("john@example.com") == "john@example.com"
+
+    def test_handles_empty_string(self):
+        assert display_sender("") == ""
+
+    def test_handles_quoted_name(self):
+        assert display_sender('"Jane Smith" <jane@example.com>') == "Jane Smith"
+
+
+class TestDisplaySubject:
+    def test_strips_dm_newsletters_prefix(self):
+        assert display_subject("[DM Newsletters] Feb Update") == "Feb Update"
+
+    def test_leaves_other_subjects_alone(self):
+        assert display_subject("Regular Subject") == "Regular Subject"
+
+    def test_truncates_long_subjects(self):
+        long_subject = "A" * 50
+        result = display_subject(long_subject)
+        assert len(result) == 40
+        assert result.endswith("\u2026")
+
+    def test_strips_prefix_then_truncates(self):
+        result = display_subject("[DM Newsletters] " + "B" * 50)
+        assert len(result) == 40
+        assert not result.startswith("[")
+
+    def test_short_subject_not_truncated(self):
+        assert display_subject("Short") == "Short"
+
+    def test_exact_max_length_not_truncated(self):
+        subject = "A" * 40
+        assert display_subject(subject) == subject

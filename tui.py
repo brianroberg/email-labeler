@@ -11,6 +11,8 @@ from textual import on
 from tui_data import (
     Assessment,
     Story,
+    display_sender,
+    display_subject,
     filter_by_tier,
     filter_by_theme,
     format_detail,
@@ -78,7 +80,7 @@ class AssessmentApp(App):
     def on_mount(self) -> None:
         nl_table = self.query_one("#newsletters", DataTable)
         nl_table.cursor_type = "row"
-        nl_table.add_columns("Subject", "From", "Tier", "Date")
+        nl_table.add_columns("Sender", "Subject", "Tier", "Date")
 
         story_table = self.query_one("#stories", DataTable)
         story_table.cursor_type = "row"
@@ -99,8 +101,8 @@ class AssessmentApp(App):
             except ValueError:
                 date_str = "\u2014"
             row_key = table.add_row(
-                assessment.subject,
-                assessment.sender,
+                display_sender(assessment.sender),
+                display_subject(assessment.subject),
                 assessment.overall_tier or "\u2014",
                 date_str,
             )
