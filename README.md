@@ -34,6 +34,18 @@ Additional labels are used as markers:
 | `agent/personal` | Applied when Stage 1 classified the sender as a real person. Indicates the email body was processed by the local LLM only. |
 | `agent/non-personal` | Applied when Stage 1 classified the sender as an automated service. Indicates the email body was processed by the cloud LLM. |
 
+Newsletter labels (see [Newsletter Classification](#newsletter-classification)):
+
+| Label | Purpose |
+|---|---|
+| `agent/newsletter` | Marker applied to all newsletter emails |
+| `agent/newsletter/excellent` | Best story scored >= 4.0 average |
+| `agent/newsletter/good` | Best story scored >= 3.0 average |
+| `agent/newsletter/fair` | Best story scored >= 2.0 average |
+| `agent/newsletter/poor` | Best story scored < 2.0 average |
+| `agent/newsletter/no-stories` | No extractable stories found |
+| `agent/newsletter/theme/*` | Theme tags: `scripture`, `christlikeness`, `church`, `vocation-family`, `disciple-making` |
+
 ## Architecture
 
 ```
@@ -52,7 +64,13 @@ Additional labels are used as markers:
               |    │                               |
               |    ├─ list unprocessed emails       |
               |    │                               |
-              |    ├─ For each email:              |
+              |    ├─ For each thread:             |
+              |    │   │                           |
+              |    │   ├─ Newsletter? (To: check)  |
+              |    │   │   YES ──► Cloud LLM ×3   |
+              |    │   │   (extract, score, theme) |
+              |    │   │   └─► label + JSONL       |
+              |    │   │                           |
               |    │   ├─ Stage 1 ──► Cloud LLM   |
               |    │   │  (metadata only)          |
               |    │   │    └─► PERSON or SERVICE  |
@@ -71,6 +89,75 @@ Additional labels are used as markers:
               +------------------------------------+
 ```
 
+## Newsletter Classification
+
+Emails sent to a configured newsletter recipient address (e.g. `newsletters@dm.org`) are detected by a deterministic `To:`/`Cc:` header check and routed to a dedicated classification pipeline instead of the standard priority classification.
+
+### Pipeline
+
+The pipeline makes 1 + 2N cloud LLM calls for a newsletter containing N stories:
+
+1. **Story Extraction** (1 call) — The cloud LLM receives the full newsletter body and extracts individual stories, each with a title and text. Non-story content (headers, footers, donation appeals, event calendars) is skipped. If no stories are found, the email is labeled `agent/newsletter/no-stories`.
+
+2. **Quality Assessment** (1 call per story) — Each story is scored on four dimensions (1–5 scale):
+
+   | Dimension | High score means... |
+   |---|---|
+   | Simple | Focuses on one key idea; no tangents |
+   | Concrete | Narrates particular events, people, places |
+   | Personal | Centers around one or a few people |
+   | Dynamic | Shows transformation; a before and after |
+
+   The average score determines a quality tier: **excellent** (>= 4.0), **good** (>= 3.0), **fair** (>= 2.0), **poor** (< 2.0). The LLM's chain-of-thought reasoning is captured for later review.
+
+3. **Theme Classification** (1 call per story) — Each story is tagged with themes from the organization's Ends Statement: `scripture`, `christlikeness`, `church`, `vocation_family`, `disciple_making`. Multiple themes per story are allowed. Chain-of-thought reasoning is captured.
+
+### Output
+
+Each classified newsletter is:
+- **Labeled in Gmail** with `agent/newsletter`, a quality tier label (from the best story), and theme labels (union across all stories), then archived.
+- **Recorded to JSONL** at `data/newsletter_assessments.jsonl` with per-story scores, themes, and chain-of-thought reasoning.
+
+### Configuration
+
+Newsletter classification is configured in `config.toml`:
+
+```toml
+[newsletter]
+recipient = "newsletters@dm.org"
+output_file = "data/newsletter_assessments.jsonl"
+```
+
+Set `NEWSLETTER_ONLY=1` in `.env` to skip non-newsletter threads (useful for testing newsletter classification in isolation).
+
+## Newsletter Assessment TUI
+
+A Textual-based terminal UI for browsing and filtering the `newsletter_assessments.jsonl` data.
+
+```
+uv run python -m tui [path/to/assessments.jsonl]
+```
+
+Defaults to `data/newsletter_assessments.jsonl` if no path is given.
+
+### Layout
+
+Three-panel vertical layout:
+
+- **Newsletter list** — Filterable table of newsletters showing subject, sender, tier, and date
+- **Story list** — Stories from the selected newsletter with tier, average score, and themes
+- **Detail panel** — Full detail for the selected story: dimension scores, themes, quality chain-of-thought, theme chain-of-thought, and story text
+
+### Key Bindings
+
+| Key | Action |
+|---|---|
+| `↑` / `↓` | Navigate within a list |
+| `Tab` | Cycle focus between newsletter list, story list, and detail panel |
+| `t` | Cycle tier filter: All → excellent → good → fair → poor → All |
+| `h` | Cycle theme filter: All → scripture → christlikeness → church → vocation_family → disciple_making → All |
+| `q` | Quit |
+
 ## Project Structure
 
 ```
@@ -78,10 +165,13 @@ email-labeler/
 ├── daemon.py           Main entry point: polling loop and orchestration
 ├── classifier.py       Two-tier classification logic and LLM output parsing
 ├── labeler.py          Gmail label verification and application
+├── newsletter.py       Newsletter story extraction, quality scoring, theme tagging
 ├── llm_client.py       LLM abstraction for cloud and local endpoints
 ├── proxy_client.py     Gmail API proxy client (shared with email-agent)
 ├── gmail_utils.py      Email header and body parsing (shared with email-agent)
 ├── config_utils.py     Config loading and env var substitution
+├── tui.py              Newsletter assessment TUI (Textual app)
+├── tui_data.py         TUI data loading, filtering, and formatting
 ├── config.toml         Label definitions, prompts, and operational parameters
 ├── pyproject.toml      Python project metadata and dependencies
 ├── Dockerfile          Container image definition
@@ -100,6 +190,9 @@ email-labeler/
     ├── test_labeler.py      Label manager tests
     ├── test_daemon.py       Daemon orchestration tests
     ├── test_config_utils.py Config loading tests
+    ├── test_newsletter.py   Newsletter pipeline tests
+    ├── test_tui_data.py     TUI data loading and filtering tests
+    ├── test_tui.py          TUI app behavior tests (Textual pilot)
     ├── test_eval_schemas.py Golden set and result serialization tests
     ├── test_eval_harvest.py Ground truth inference and deduplication tests
     └── test_eval_report.py  Metrics computation and report formatting tests
@@ -112,7 +205,7 @@ email-labeler/
 - Access to an [api-proxy](../api-proxy) instance with a valid API key
 - A cloud LLM endpoint (any OpenAI-compatible chat completion API)
 - A local MLX LLM endpoint for person email classification (optional but recommended)
-- All eight Gmail labels created manually (see [Label Setup](#label-setup))
+- All Gmail labels created manually (see [Label Setup](#label-setup))
 
 ## Setup
 
@@ -165,6 +258,17 @@ agent/low-priority
 agent/processed
 agent/personal
 agent/non-personal
+agent/newsletter
+agent/newsletter/excellent
+agent/newsletter/good
+agent/newsletter/fair
+agent/newsletter/poor
+agent/newsletter/no-stories
+agent/newsletter/theme/scripture
+agent/newsletter/theme/christlikeness
+agent/newsletter/theme/church
+agent/newsletter/theme/vocation-family
+agent/newsletter/theme/disciple-making
 ```
 
 Gmail will treat the `/` as a label hierarchy separator, nesting them under an `agent` parent. The daemon verifies all labels exist on startup and exits with an error if any are missing.
@@ -253,6 +357,9 @@ uv run --extra dev pytest tests/
 | `test_config_utils.py` | `config_utils.py` | Config loading, `{env.VAR}` substitution |
 | `test_eval_schemas.py` | `evals/schemas.py` | GoldenThread/PredictionResult/RunMeta serialization round-trips |
 | `test_eval_harvest.py` | `evals/harvest.py` | Ground truth inference from labels, deduplication |
+| `test_newsletter.py` | `newsletter.py` | Story parsing, quality score parsing, theme parsing, tier computation, JSONL writing, full pipeline, newsletter detection |
+| `test_tui_data.py` | `tui_data.py` | JSONL loading, story field parsing, null handling, malformed lines, tier/theme filtering, detail formatting |
+| `test_tui.py` | `tui.py` | App launch, newsletter table rendering, drill-down navigation, CoT display, tier/theme filter cycling |
 | `test_eval_report.py` | `evals/report.py` | Confusion matrix, precision/recall/F1, accuracy, privacy violation metrics |
 
 ### Linting
