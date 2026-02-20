@@ -144,3 +144,31 @@ class AssessmentApp(App):
 
     def _show_detail(self, story: Story) -> None:
         self.query_one("#detail", Static).update(format_detail(story))
+
+    def action_cycle_tier(self) -> None:
+        idx = TIER_CYCLE.index(self._tier_filter)
+        self._tier_filter = TIER_CYCLE[(idx + 1) % len(TIER_CYCLE)]
+        self._apply_filters()
+
+    def action_cycle_theme(self) -> None:
+        idx = THEME_CYCLE.index(self._theme_filter)
+        self._theme_filter = THEME_CYCLE[(idx + 1) % len(THEME_CYCLE)]
+        self._apply_filters()
+
+    def _apply_filters(self) -> None:
+        filtered = self.all_assessments
+        if self._tier_filter:
+            filtered = filter_by_tier(filtered, self._tier_filter)
+        if self._theme_filter:
+            filtered = filter_by_theme(filtered, self._theme_filter)
+        self.filtered_assessments = filtered
+        self._populate_newsletters()
+        self._update_filter_bar()
+
+        if not self.filtered_assessments:
+            story_table = self.query_one("#stories", DataTable)
+            story_table.clear()
+            self._row_to_story.clear()
+            self.query_one("#detail", Static).update(
+                "No newsletters match current filters"
+            )

@@ -114,3 +114,47 @@ class TestDrillDown:
             text = detail.content
             assert "Follows one person" in text
             assert "Reflects Christlikeness" in text
+
+
+class TestFiltering:
+    async def test_tier_filter_narrows_list(self, sample_assessments):
+        app = AssessmentApp(sample_assessments)
+        async with app.run_test(size=(120, 40)) as pilot:
+            await pilot.pause()
+            nl_table = app.query_one("#newsletters", DataTable)
+            assert nl_table.row_count == 3
+
+            await pilot.press("t")
+            await pilot.pause()
+            assert nl_table.row_count == 1
+
+    async def test_tier_filter_cycles_back_to_all(self, sample_assessments):
+        app = AssessmentApp(sample_assessments)
+        async with app.run_test(size=(120, 40)) as pilot:
+            await pilot.pause()
+            nl_table = app.query_one("#newsletters", DataTable)
+            for _ in range(5):
+                await pilot.press("t")
+                await pilot.pause()
+            assert nl_table.row_count == 3
+
+    async def test_theme_filter_narrows_list(self, sample_assessments):
+        app = AssessmentApp(sample_assessments)
+        async with app.run_test(size=(120, 40)) as pilot:
+            await pilot.pause()
+            nl_table = app.query_one("#newsletters", DataTable)
+
+            await pilot.press("h")
+            await pilot.pause()
+            assert nl_table.row_count == 1
+
+    async def test_filter_bar_updates(self, sample_assessments):
+        app = AssessmentApp(sample_assessments)
+        async with app.run_test(size=(120, 40)) as pilot:
+            await pilot.pause()
+            bar = app.query_one("#filter-bar", Static)
+            assert "All" in bar.content
+
+            await pilot.press("t")
+            await pilot.pause()
+            assert "excellent" in bar.content
