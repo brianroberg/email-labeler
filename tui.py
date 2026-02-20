@@ -172,3 +172,25 @@ class AssessmentApp(App):
             self.query_one("#detail", Static).update(
                 "No newsletters match current filters"
             )
+
+
+def main():
+    """CLI entry point for the newsletter assessment TUI."""
+    import argparse
+
+    parser = argparse.ArgumentParser(description="Browse newsletter assessments")
+    parser.add_argument(
+        "file",
+        nargs="?",
+        default="data/newsletter_assessments.jsonl",
+        help="Path to the JSONL assessment file (default: data/newsletter_assessments.jsonl)",
+    )
+    args = parser.parse_args()
+
+    assessments = load_assessments(args.file)
+    app = AssessmentApp(assessments)
+    app.run()
+
+
+if __name__ == "__main__":
+    main()
