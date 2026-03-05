@@ -2,6 +2,13 @@
 
 Background daemon that continuously polls Gmail for unclassified emails and applies labels using a two-tier LLM classification system.
 
+## Documentation
+
+- `README.md` — Human-oriented overview: privacy model, architecture, setup instructions, running commands
+- `README-technical.md` — Agent/reference: project structure, config.toml reference, environment variables, test coverage
+- `evals/README.md` — Human-oriented eval suite guide: pipeline stages, common workflows, key commands
+- `evals/README-technical.md` — Agent/reference: complete CLI flags for all eval tools, LLM cache internals, chain-of-thought capture format
+
 ## Privacy Invariant
 
 Person email bodies NEVER leave the local network. Cloud LLM only sees metadata (sender, subject, snippet) for Stage 1 classification. Person email bodies are processed by local MLX/Qwen3 only.

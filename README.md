@@ -2,6 +2,8 @@
 
 A background daemon that continuously polls Gmail for unclassified emails, classifies them using a two-tier LLM system, and applies labels autonomously.
 
+> For detailed configuration reference, environment variables, project structure, and test coverage, see [README-technical.md](README-technical.md).
+
 ## Privacy Model
 
 Email labeler enforces a strict privacy invariant: **person email bodies never leave the local network.**
@@ -18,7 +20,7 @@ If the local LLM is unavailable, person emails are silently skipped and retried 
 
 ## Label Taxonomy
 
-The daemon classifies emails into four categories and applies the corresponding Gmail label:
+The daemon classifies emails into three categories and applies the corresponding Gmail label:
 
 | Label | Meaning | Action |
 |---|---|---|
@@ -26,13 +28,7 @@ The daemon classifies emails into four categories and applies the corresponding 
 | `agent/fyi` | Worth reading, no action needed | Stays in inbox |
 | `agent/low-priority` | Routine notifications, newsletters, spam, unwanted | Archived |
 
-Additional labels are used as markers:
-
-| Label | Purpose |
-|---|---|
-| `agent/processed` | Applied to every classified email. Used by the poll query to skip already-processed messages. |
-| `agent/personal` | Applied when Stage 1 classified the sender as a real person. Indicates the email body was processed by the local LLM only. |
-| `agent/non-personal` | Applied when Stage 1 classified the sender as an automated service. Indicates the email body was processed by the cloud LLM. |
+Additional marker labels (`agent/processed`, `agent/personal`, `agent/non-personal`) track processing state and routing decisions. The newsletter pipeline adds its own labels under `agent/newsletter/`.
 
 ## Architecture
 
@@ -71,40 +67,6 @@ Additional labels are used as markers:
               +------------------------------------+
 ```
 
-## Project Structure
-
-```
-email-labeler/
-├── daemon.py           Main entry point: polling loop and orchestration
-├── classifier.py       Two-tier classification logic and LLM output parsing
-├── labeler.py          Gmail label verification and application
-├── llm_client.py       LLM abstraction for cloud and local endpoints
-├── proxy_client.py     Gmail API proxy client (shared with email-agent)
-├── gmail_utils.py      Email header and body parsing (shared with email-agent)
-├── config_utils.py     Config loading and env var substitution
-├── config.toml         Label definitions, prompts, and operational parameters
-├── pyproject.toml      Python project metadata and dependencies
-├── Dockerfile          Container image definition
-├── .env.example        Environment variable template
-├── evals/              Classification evaluation suite
-│   ├── schemas.py      Dataclasses: GoldenThread, PredictionResult, RunMeta
-│   ├── harvest.py      Pull processed threads → golden set JSONL
-│   ├── review.py       Interactive CLI for label review and correction
-│   ├── run_eval.py     Replay golden set through real classifier
-│   ├── report.py       Metrics: accuracy, confusion matrix, P/R/F1, privacy
-│   └── results/        Timestamped result files from evaluation runs
-└── tests/
-    ├── conftest.py          Shared fixtures and sample Gmail data
-    ├── test_llm_client.py   LLM client tests
-    ├── test_classifier.py   Classifier tests
-    ├── test_labeler.py      Label manager tests
-    ├── test_daemon.py       Daemon orchestration tests
-    ├── test_config_utils.py Config loading tests
-    ├── test_eval_schemas.py Golden set and result serialization tests
-    ├── test_eval_harvest.py Ground truth inference and deduplication tests
-    └── test_eval_report.py  Metrics computation and report formatting tests
-```
-
 ## Prerequisites
 
 - Python 3.14+
@@ -112,7 +74,7 @@ email-labeler/
 - Access to an [api-proxy](../api-proxy) instance with a valid API key
 - A cloud LLM endpoint (any OpenAI-compatible chat completion API)
 - A local MLX LLM endpoint for person email classification (optional but recommended)
-- All eight Gmail labels created manually (see [Label Setup](#label-setup))
+- All Gmail labels created manually (see [Label Setup](#label-setup))
 
 ## Setup
 
@@ -124,7 +86,7 @@ uv sync --extra dev
 
 ### 2. Create environment file
 
-If running as part of the `agent-stack` setup (recommended), symlink to the shared `.env` to avoid maintaining variables in two places:
+If running as part of the `agent-stack` setup (recommended), symlink to the shared `.env`:
 
 ```bash
 ln -s ../agent-stack/.env .env
@@ -136,21 +98,17 @@ Otherwise, copy the example and fill in your values:
 cp .env.example .env
 ```
 
-```env
-# Required: api-proxy authentication
-PROXY_API_KEY=aproxy_your_key_here
+At minimum you need:
 
-# Required: Cloud LLM (any OpenAI-compatible chat completion endpoint)
+```env
+PROXY_API_KEY=aproxy_your_key_here
 CLOUD_LLM_URL=https://your-llm-provider.com/v1/chat/completions
 CLOUD_LLM_API_KEY=your_api_key_here
-
-# Recommended: Local LLM (MLX/Qwen3 for person email privacy)
 MLX_URL=http://macbook:8080/v1/chat/completions
 MLX_MODEL=qwen/qwen3-14b
-
-# Optional: Override proxy URL (defaults to http://host.docker.internal:8000)
-# PROXY_URL=http://api-proxy:8000
 ```
+
+See [README-technical.md](README-technical.md#environment-variables) for the full variable reference.
 
 ### 3. Label Setup
 
@@ -178,154 +136,25 @@ uv run python daemon.py
 ```
 
 The daemon will:
-1. Verify all eight Gmail labels exist (exits if any are missing)
+1. Verify all Gmail labels exist (exits if any are missing)
 2. Enter the poll loop, querying Gmail every 60 seconds
 3. Classify and label each unprocessed email
 4. Write a healthcheck timestamp to `/tmp/healthcheck`
 
-### Docker
-
-Build and run with Docker Compose from the `agent-stack` directory:
+### Docker (via agent-stack)
 
 ```bash
 docker compose build email-labeler
 docker compose up email-labeler
 ```
 
-The Docker Compose configuration also starts a Tailscale sidecar (`email-labeler-tailscale`) that shares the network namespace with the daemon container. This allows the daemon to reach the local MLX server via Tailscale hostname.
-
-Required environment variables in `agent-stack/.env`:
-
-```env
-EMAIL_LABELER_API_KEY=aproxy_your_key_here
-CLOUD_LLM_URL=https://your-llm-provider.com/v1/chat/completions
-CLOUD_LLM_API_KEY=your_api_key_here
-MLX_URL=http://macbook:8080/v1/chat/completions
-MLX_MODEL=qwen/qwen3-14b
-TS_AUTHKEY=tskey-auth-...  # for Tailscale sidecar
-```
-
-### Health checking
-
-The daemon writes a timestamp to `/tmp/healthcheck` after each successful poll cycle. The Dockerfile includes a `HEALTHCHECK` instruction that verifies this file was updated within the last 180 seconds:
-
-```dockerfile
-HEALTHCHECK --interval=120s --timeout=5s --retries=3 \
-    CMD test -f /tmp/healthcheck && \
-        test $(($(date +%s) - $(stat -c %Y /tmp/healthcheck))) -lt 180
-```
-
-Check container health with:
+To classify only newsletters (skipping all other emails):
 
 ```bash
-docker inspect --format='{{.State.Health.Status}}' agent-stack-email-labeler-1
+NEWSLETTER_ONLY=1 docker compose up email-labeler
 ```
 
-## Evaluation Suite
-
-The `evals/` directory provides a 4-stage pipeline (`harvest → review → run_eval → report`) for measuring classification accuracy against a golden set of human-reviewed threads. It includes an LLM response cache for fast re-runs and supports prompt A/B testing, model comparison, and ongoing monitoring workflows.
-
-See [`evals/README.md`](evals/README.md) for full documentation and CLI reference.
-
-## Testing
-
-All tests use mocks and require no external services.
-
-```bash
-# Run all 66 tests
-uv run --extra dev pytest tests/ -v
-
-# Run a specific test file
-uv run --extra dev pytest tests/test_classifier.py -v
-
-# Run with short output
-uv run --extra dev pytest tests/
-```
-
-### Test coverage by module
-
-| Test file | Module | What's covered |
-|---|---|---|
-| `test_llm_client.py` | `llm_client.py` | Request format, auth headers, `<think>` tag stripping, error handling, availability checks |
-| `test_classifier.py` | `classifier.py` | `parse_sender` formats, `parse_sender_type` edge cases and defaults, `parse_email_label` edge cases and defaults, cloud/local routing, full pipeline |
-| `test_labeler.py` | `labeler.py` | Label verification (all present, partial, none), label ID mapping, inbox/archive actions, single API call per email |
-| `test_daemon.py` | `daemon.py` | Service email path, person email path, MLX-unavailable skip, error isolation, config loading |
-| `test_config_utils.py` | `config_utils.py` | Config loading, `{env.VAR}` substitution |
-| `test_eval_schemas.py` | `evals/schemas.py` | GoldenThread/PredictionResult/RunMeta serialization round-trips |
-| `test_eval_harvest.py` | `evals/harvest.py` | Ground truth inference from labels, deduplication |
-| `test_eval_report.py` | `evals/report.py` | Confusion matrix, precision/recall/F1, accuracy, privacy violation metrics |
-
-### Linting
-
-```bash
-uv run --extra dev ruff check .
-```
-
-## Configuration
-
-All operational parameters are in `config.toml`. The daemon reads this file on startup.
-
-### Daemon settings
-
-```toml
-[daemon]
-poll_interval_seconds = 60     # How often to poll Gmail
-max_emails_per_cycle = 10      # Max emails to process per poll
-gmail_query = "in:inbox -label:agent/processed"  # Gmail search query
-healthcheck_file = "/tmp/healthcheck"            # Healthcheck timestamp path
-```
-
-### LLM settings
-
-The cloud LLM model is configured here, not in `.env`. The URL and API key come from
-`.env`, but the model name and inference parameters live in `config.toml` so they stay
-in version control.
-
-```toml
-[llm.cloud]
-model = "deepseek/deepseek-v3.2"   # must match your provider's model ID
-max_tokens = 8096
-temperature = 0.2
-timeout = 60
-
-[llm.local]
-model = "{env.MLX_MODEL}"              # set MLX_MODEL in .env (shared with email-agent)
-max_tokens = 8096
-temperature = 0.2
-timeout = 120       # Local LLM gets more time (runs on consumer hardware)
-```
-
-### Extra request body fields
-
-Each `[llm.*]` section supports an optional `extra_body` table. Any key-value pairs defined here are merged into every API request body sent to that endpoint. This is useful for provider-specific parameters that aren't part of the standard OpenAI chat completion format.
-
-**Disabling thinking for reasoning models** — Models like Qwen3, DeepSeek-R1, and GLM-4.5 generate chain-of-thought reasoning in `<think>` tags before answering. While the daemon already strips these tags from responses, you can disable thinking entirely to save tokens and reduce latency.
-
-For providers that accept a top-level `enable_thinking` flag (Novita.ai, many OpenAI-compatible APIs):
-
-```toml
-[llm.local.extra_body]
-enable_thinking = false
-```
-
-For LM Studio with models that use `chat_template_kwargs` (e.g. Qwen3):
-
-```toml
-[llm.local.extra_body.chat_template_kwargs]
-enable_thinking = false
-```
-
-You can put any provider-specific fields in `extra_body` — it is not limited to thinking controls. For example:
-
-```toml
-[llm.cloud.extra_body]
-top_p = 0.9
-frequency_penalty = 0.5
-```
-
-### Prompt templates
-
-The `[prompts.sender_classification]` and `[prompts.email_classification]` sections contain the system prompts and user message templates used for each classification stage. Templates use Python format strings with `{sender}`, `{subject}`, `{snippet}`, and `{body}` placeholders.
+The Docker Compose configuration also starts a Tailscale sidecar that shares the network namespace, allowing the daemon to reach the local MLX server via Tailscale hostname.
 
 ## Resilience
 
@@ -334,22 +163,28 @@ The daemon is designed to run unattended and recover from transient failures:
 - **Exponential backoff**: If a poll cycle fails, the sleep interval doubles (up to 10x the base interval), then resets on the next successful cycle.
 - **Per-email error isolation**: If one email fails to classify, the error is logged and the loop continues with the next email.
 - **MLX graceful degradation**: If the local MLX server is unreachable, person emails are skipped (retried next cycle) while service emails continue to be classified via the cloud LLM.
-- **Safe defaults**: If the LLM returns an unrecognizable sender type, it defaults to SERVICE (body goes to cloud, safe for non-person content). If the LLM returns an unrecognizable classification, it defaults to LOW_PRIORITY (archived).
-- **Startup validation**: The daemon verifies all required Gmail labels exist before entering the poll loop, preventing silent misclassification from misconfigured labels.
+- **Safe defaults**: Unrecognizable sender type → SERVICE (safe). Unrecognizable classification → LOW_PRIORITY (archived, not deleted).
+- **Startup validation**: The daemon verifies all required Gmail labels exist before entering the poll loop.
 
-## Environment Variables
+## Evaluation Suite
 
-| Variable | Required | Default | Description |
-|---|---|---|---|
-| `PROXY_API_KEY` | Yes | — | API key for the api-proxy server |
-| `PROXY_URL` | No | `http://host.docker.internal:8000` | URL of the api-proxy server |
-| `CLOUD_LLM_URL` | Yes | — | Cloud LLM chat completion endpoint (any OpenAI-compatible API) |
-| `CLOUD_LLM_API_KEY` | Yes | — | API key for the cloud LLM |
-| `MLX_URL` | No | — | Local MLX LLM chat completion endpoint. If unset or unreachable, person emails are skipped. |
-| `MLX_MODEL` | No | — | Local LLM model name. Shared with email-agent so both services use the same model. Referenced in `config.toml` as `{env.MLX_MODEL}`. |
-| `USER_NAME` | No | — | User's display name, substituted into classification prompts via `{env.USER_NAME}` in `config.toml`. |
-| `VIP_SENDERS` | No | — | Comma-separated email addresses of VIP senders. VIP threads skip the sender classification LLM call. |
-| `EMAIL_LABELER_API_KEY` | No | — | Fallback API key for the api-proxy server, used when `PROXY_API_KEY` is not set. |
-| `NEWSLETTER_ONLY` | No | — | Set to `1`, `true`, or `yes` to skip non-newsletter threads. Useful for testing newsletter classification in isolation. |
+The `evals/` directory provides a 4-stage pipeline (`harvest → review → run_eval → report`) for measuring classification accuracy against a golden set of human-reviewed threads.
 
-Note: The cloud LLM **model name** is configured in `config.toml` under `[llm.cloud]`, not in `.env`. The local LLM **model name** is set via the `MLX_MODEL` environment variable (shared with email-agent) and referenced in `config.toml` as `{env.MLX_MODEL}`. This keeps secrets (keys, URLs) in `.env` while operational parameters (temperature, prompts) stay in version-controlled `config.toml`.
+See [`evals/README.md`](evals/README.md) for full documentation and CLI reference.
+
+## Testing
+
+All tests use mocks and require no external services.
+
+```bash
+# Run all tests
+uv run --extra dev pytest tests/ -v
+
+# Run a specific test file
+uv run --extra dev pytest tests/test_classifier.py -v
+
+# Lint
+uv run --extra dev ruff check .
+```
+
+See [README-technical.md](README-technical.md#test-coverage-by-module) for per-module coverage details.
