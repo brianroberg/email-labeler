@@ -11,7 +11,7 @@ import re
 from pathlib import Path
 
 ROOT = Path(__file__).parent.parent
-README_PATH = ROOT / "README.md"
+README_PATH = ROOT / "README-technical.md"
 CONFIG_PATH = ROOT / "config.toml"
 
 # Daemon runtime source files (not tests, not evals)
