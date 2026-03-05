@@ -7,6 +7,7 @@ import pytest
 from newsletter_review.tui import (
     apply_filters,
     build_detail_lines,
+    format_filter_summary,
     format_list_row,
     load_assessments,
     wrap_text,
@@ -274,6 +275,40 @@ class TestBuildDetailLines:
         lines = build_detail_lines(record)
         text = "\n".join(lines)
         assert "No stories" in text.lower() or "0" in text
+
+
+# ---------------------------------------------------------------------------
+# wrap_text
+# ---------------------------------------------------------------------------
+
+# ---------------------------------------------------------------------------
+# format_filter_summary
+# ---------------------------------------------------------------------------
+
+class TestFormatFilterSummary:
+    def test_no_filters(self):
+        assert format_filter_summary(tier=None, theme=None, sender=None) == ""
+
+    def test_tier_only(self):
+        result = format_filter_summary(tier="good", theme=None, sender=None)
+        assert "tier:good" in result
+
+    def test_theme_only(self):
+        result = format_filter_summary(tier=None, theme="scripture", sender=None)
+        assert "theme:scripture" in result
+
+    def test_sender_only(self):
+        result = format_filter_summary(tier=None, theme=None, sender="dm.org")
+        assert "sender:dm.org" in result
+
+    def test_all_filters(self):
+        result = format_filter_summary(tier="poor", theme="church", sender="john")
+        assert "tier:poor" in result
+        assert "theme:church" in result
+        assert "sender:john" in result
+
+    def test_returns_empty_for_all_none(self):
+        assert format_filter_summary() == ""
 
 
 # ---------------------------------------------------------------------------

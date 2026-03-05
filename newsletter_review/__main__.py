@@ -12,7 +12,7 @@ import argparse
 import sys
 from pathlib import Path
 
-from newsletter_review.tui import apply_filters, load_assessments, run_review_tui
+from newsletter_review.tui import load_assessments, run_review_tui
 
 
 def cli() -> None:
@@ -50,13 +50,7 @@ def cli() -> None:
         print(f"Error loading {args.file}: {exc}", file=sys.stderr)
         sys.exit(1)
 
-    records = apply_filters(records, tier=args.tier, theme=args.theme, sender=args.sender)
-
-    if not records:
-        print("No records match the given filters.")
-        sys.exit(0)
-
-    run_review_tui(records)
+    run_review_tui(records, init_tier=args.tier, init_theme=args.theme, init_sender=args.sender)
 
 
 if __name__ == "__main__":
