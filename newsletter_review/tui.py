@@ -306,7 +306,7 @@ def _detail_view(stdscr, records: list[dict], index: int) -> str:
                 break
             _safe_addstr(stdscr, row_i, 0, lines[line_i])
 
-        help_text = "\u2191/\u2193:Scroll  PgUp/PgDn:Page  Home/End  Esc:Back  q:Quit"
+        help_text = "\u2191/\u2193:Scroll  ^B/^F:Page  Home/End  Esc:Back  q:Quit"
         _safe_addstr(stdscr, max_y - 2, 0, help_text, curses.A_DIM)
 
         scroll_pct = ""
@@ -324,9 +324,9 @@ def _detail_view(stdscr, records: list[dict], index: int) -> str:
             scroll_y -= 1
         elif key == curses.KEY_DOWN and scroll_y < max_scroll:
             scroll_y += 1
-        elif key == curses.KEY_PPAGE:
+        elif key in (curses.KEY_PPAGE, 2):  # PgUp or Ctrl-B
             scroll_y = max(0, scroll_y - content_rows)
-        elif key == curses.KEY_NPAGE:
+        elif key in (curses.KEY_NPAGE, 6):  # PgDn or Ctrl-F
             scroll_y = min(max_scroll, scroll_y + content_rows)
         elif key == curses.KEY_HOME:
             scroll_y = 0
@@ -394,7 +394,7 @@ def _list_view(
             attr = curses.A_REVERSE if ti == cursor else curses.A_NORMAL
             _safe_addstr(stdscr, header_rows + vi, 0, row_text, attr)
 
-        help_text = "\u2191/\u2193:Nav  PgUp/PgDn:Page  Enter:Detail  [f]ilter  q:Quit"
+        help_text = "\u2191/\u2193:Nav  ^B/^F:Page  Enter:Detail  [f]ilter  q:Quit"
         _safe_addstr(stdscr, max_y - 1, 0, help_text, curses.A_DIM)
 
         stdscr.refresh()
@@ -408,10 +408,10 @@ def _list_view(
             cursor += 1
             if cursor >= scroll_offset + page_size:
                 scroll_offset = cursor - page_size + 1
-        elif key == curses.KEY_PPAGE:
+        elif key in (curses.KEY_PPAGE, 2):  # PgUp or Ctrl-B
             cursor = max(0, cursor - page_size)
             scroll_offset = max(0, scroll_offset - page_size)
-        elif key == curses.KEY_NPAGE:
+        elif key in (curses.KEY_NPAGE, 6):  # PgDn or Ctrl-F
             cursor = min(len(filtered) - 1, cursor + page_size)
             scroll_offset = min(max(0, len(filtered) - page_size), scroll_offset + page_size)
         elif key == curses.KEY_HOME:
