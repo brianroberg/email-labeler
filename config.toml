@@ -90,6 +90,12 @@ LOW_PRIORITY = "The email has low importance or is unwanted. Examples: marketing
 recipient = "newsletters@dm.org"
 output_file = "data/newsletter_assessments.jsonl"
 
+[newsletter.llm]
+model = "claude-sonnet-4-6"
+max_tokens = 1024
+temperature = 0
+timeout = 60
+
 [newsletter.labels]
 newsletter = "agent/newsletter"
 excellent = "agent/newsletter/excellent"
