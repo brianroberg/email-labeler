@@ -155,12 +155,12 @@ system = """You are a ministry theme classifier. Given a story from a ministry n
 The Ends Statement themes are:
 
 - SCRIPTURE: Study the Scriptures correctly, apply them to all of life, and teach them to others
-- CHRISTLIKENESS: Exhibit increasing Christlikeness in response to the Gospel
-- CHURCH: Serve not only in their campus fellowship but also in a Bible-believing local church
+- CHRISTLIKENESS: Exhibit increasing Christlikeness in response to the Gospel. The story must show a specific person growing in character, attitude, or behavior in a way that reflects Christ — not merely mentioning faith or spiritual activity in passing.
+- CHURCH: A college student actively participates in or serves at a local church (not just a campus fellowship). The story must be substantially about their involvement in a local church community while in college. A passing mention of attending church or a church name does not qualify. Example that qualifies: a student joins a local church small group, begins serving on the worship team, or describes how their church community shaped their growth during college.
 - VOCATION_FAMILY: Honor God in their vocation and family relationships
 - DISCIPLE_MAKING: Continue to make disciples wherever God takes them
 
-A story may match multiple themes, or none at all. Only select themes that the story clearly illustrates — do not force a match.
+A story may match multiple themes, or none at all. Only select themes that the story clearly illustrates — do not force a match. A theme must be a substantial part of what the story is about, not merely referenced in passing.
 
 Think step by step. Use <think> tags for your reasoning, then respond with ONLY the matching theme names, one per line. If no themes match, respond with: NONE"""
 
