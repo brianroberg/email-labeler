@@ -32,6 +32,7 @@ uv run --extra dev ruff check .  # Lint
 - `proxy_client.py` — Gmail API proxy client (copied from email-agent)
 - `gmail_utils.py` — Header/body parsing (copied from email-agent)
 - `config.toml` — Label definitions, prompts, operational params
+- `newsletter_review/` — Curses TUI for browsing newsletter assessment results (`python -m newsletter_review`)
 
 ## Architecture
 
@@ -42,6 +43,41 @@ Poll loop → find unprocessed emails
   → Stage 2b (person): full body → Local MLX → classify
   → Apply label + action via api-proxy → Gmail
 ```
+
+## Newsletter Classification
+
+When `NEWSLETTER_ONLY=1`, the daemon switches to a newsletter-specific pipeline that grades ministry newsletter stories on writing quality and thematic alignment.
+
+```
+Poll loop → find unprocessed newsletters (To/Cc matches config recipient)
+  → Extract individual stories from newsletter body (Cloud LLM)
+  → Score each story on 4 quality dimensions: simple, concrete, personal, dynamic (Cloud LLM)
+  → Classify each story against Ends Statement themes (Cloud LLM)
+  → Compute overall tier (excellent/good/fair/poor) from averaged scores
+  → Apply tier + theme labels via api-proxy → Gmail
+  → Append assessment record to JSONL file
+```
+
+Newsletter uses its own `[newsletter.llm]` config (currently Sonnet 4.6) independent of the email classification LLM settings.
+
+### Newsletter Labels (must be pre-created in Gmail)
+
+- `agent/newsletter` — Marker (always applied)
+- `agent/newsletter/excellent|good|fair|poor` — Overall quality tier
+- `agent/newsletter/no-stories` — Newsletter contained no extractable stories
+- `agent/newsletter/theme/*` — Per-story theme labels (scripture, christlikeness, church, vocation-family, disciple-making)
+
+### Newsletter Review TUI
+
+```bash
+python -m newsletter_review                          # Browse all assessments
+python -m newsletter_review --tier poor              # Filter by tier
+python -m newsletter_review --theme scripture        # Filter by theme
+python -m newsletter_review --sender dm.org          # Filter by sender
+python -m newsletter_review --file path/to/file.jsonl  # Custom JSONL path
+```
+
+Hotkeys: `e/g/f/p` filter by tier, `1-5` filter by theme, `s` filter by sender, `c` clear filters, `q` quit.
 
 ## Key Design Decisions
 
@@ -68,6 +104,7 @@ Poll loop → find unprocessed emails
 - `CLOUD_LLM_API_KEY` — Cloud LLM API key
 - `MLX_URL` — Local MLX LLM endpoint
 - `MLX_MODEL` — Local LLM model name (shared with email-agent, referenced in config.toml as `{env.MLX_MODEL}`)
+- `NEWSLETTER_ONLY` — When `1`/`true`/`yes`, daemon runs newsletter classification pipeline instead of email labeling
 
 ## Testing
 
@@ -82,3 +119,4 @@ All tests use mocks — no external services needed. Test files mirror source fi
 - `test_classifier.py` — Parsing functions + classification routing
 - `test_labeler.py` — Label verification + application actions
 - `test_daemon.py` — Processing pipeline + config loading
+- `test_newsletter_review.py` — TUI data loading, filtering, formatting, detail view
