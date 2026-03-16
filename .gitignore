@@ -26,3 +26,4 @@ htmlcov/
 evals/golden_set.jsonl
 evals/results/*.jsonl
 evals/cache/
+newsletter_assessments.jsonl

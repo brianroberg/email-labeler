@@ -331,7 +331,20 @@ async def run_daemon() -> None:
     newsletter_recipient = ""
     newsletter_output_file = ""
     if nl_config:
-        newsletter_classifier = NewsletterClassifier(cloud_llm=cloud_llm, config=config)
+        nl_llm_config = nl_config.get("llm")
+        if nl_llm_config:
+            nl_llm = LLMClient(
+                base_url=os.environ.get("CLOUD_LLM_URL", ""),
+                api_key=os.environ.get("CLOUD_LLM_API_KEY", ""),
+                model=nl_llm_config["model"],
+                max_tokens=nl_llm_config.get("max_tokens", 1024),
+                temperature=nl_llm_config.get("temperature", 0),
+                timeout=nl_llm_config.get("timeout", 60),
+                extra_body=nl_llm_config.get("extra_body"),
+            )
+        else:
+            nl_llm = cloud_llm
+        newsletter_classifier = NewsletterClassifier(cloud_llm=nl_llm, config=config)
         newsletter_recipient = nl_config["recipient"]
         newsletter_output_file = nl_config.get("output_file", "")
         log.info("Newsletter classification enabled for: %s", newsletter_recipient)
