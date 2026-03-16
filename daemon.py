@@ -263,7 +263,9 @@ async def process_single_thread(
                 existing_priority,
                 new_priority,
             )
-            return False
+            # Still mark as processed so the thread isn't retried every cycle
+            await label_manager.mark_processed(all_msg_ids)
+            return True
 
         # Apply labels to ALL messages in thread
         await label_manager.apply_classification(all_msg_ids, result.label, result.sender_type)

@@ -95,8 +95,8 @@ def _match_sender_type(text: str) -> SenderType | None:
 def parse_sender_type(raw_llm_output: str) -> SenderType:
     """Parse LLM output into SenderType. Defaults to SERVICE (safe).
 
-    Checks the full output first, then falls back to the last non-empty line
-    to handle models that emit preamble text before their final answer.
+    Checks the full output first, then the last line, then scans all lines
+    to handle models that emit verbose reasoning around their final answer.
     """
     cleaned = raw_llm_output.strip().upper()
     result = _match_sender_type(cleaned)
@@ -105,11 +105,28 @@ def parse_sender_type(raw_llm_output: str) -> SenderType:
         last_line = cleaned.rsplit("\n", 1)[-1].strip()
         result = _match_sender_type(last_line)
     if result is None:
+        # Scan all lines for a keyword anywhere (handles verbose reasoning models)
+        result = _scan_lines_for_sender_type(cleaned)
+    if result is None:
         result = SenderType.SERVICE
         log.warning(
             "Unexpected sender type output (interpreting as %s): %.40s",
             result.name, raw_llm_output.strip(),
         )
+    return result
+
+
+_SENDER_TYPE_SCAN = re.compile(r"\b(PERSON|SERVICE)\b")
+
+
+def _scan_lines_for_sender_type(text: str) -> SenderType | None:
+    """Scan text for a sender type keyword as a whole word. Returns the last match found."""
+    result = None
+    for m in _SENDER_TYPE_SCAN.finditer(text):
+        if m.group() == "PERSON":
+            result = SenderType.PERSON
+        else:
+            result = SenderType.SERVICE
     return result
 
 
@@ -132,8 +149,8 @@ def _match_email_label(text: str) -> EmailLabel | None:
 def parse_email_label(raw_llm_output: str) -> EmailLabel:
     """Parse LLM output into EmailLabel. Defaults to LOW_PRIORITY (safe).
 
-    Checks the full output first, then falls back to the last non-empty line
-    to handle models that emit preamble text before their final answer.
+    Checks the full output first, then the last line, then scans all lines
+    to handle models that emit verbose reasoning around their final answer.
     """
     cleaned = raw_llm_output.strip().upper()
     result = _match_email_label(cleaned)
@@ -141,11 +158,31 @@ def parse_email_label(raw_llm_output: str) -> EmailLabel:
         last_line = cleaned.rsplit("\n", 1)[-1].strip()
         result = _match_email_label(last_line)
     if result is None:
+        # Scan all lines for a keyword anywhere (handles verbose reasoning models)
+        result = _scan_lines_for_email_label(cleaned)
+    if result is None:
         result = EmailLabel.LOW_PRIORITY
         log.warning(
             "Unexpected email label output (interpreting as %s): %.40s",
             result.name, raw_llm_output.strip(),
         )
+    return result
+
+
+_EMAIL_LABEL_SCAN = re.compile(r"\b(NEEDS_RESPONSE|FYI|LOW_PRIORITY|UNWANTED)\b")
+
+
+def _scan_lines_for_email_label(text: str) -> EmailLabel | None:
+    """Scan text for an email label keyword as a whole word. Returns the last match found."""
+    result = None
+    for m in _EMAIL_LABEL_SCAN.finditer(text):
+        word = m.group()
+        if word == "NEEDS_RESPONSE":
+            result = EmailLabel.NEEDS_RESPONSE
+        elif word == "FYI":
+            result = EmailLabel.FYI
+        else:  # LOW_PRIORITY or UNWANTED
+            result = EmailLabel.LOW_PRIORITY
     return result
 
 

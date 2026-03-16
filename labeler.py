@@ -140,6 +140,23 @@ class LabelManager:
                 kwargs["remove_label_ids"] = remove_label_ids
             await self.proxy.modify_message(**kwargs)
 
+    async def mark_processed(self, message_ids: str | list[str]) -> None:
+        """Apply only the agent/processed marker label.
+
+        Used when a thread already has a classification label at equal or
+        higher priority, so we skip re-classification but still need to
+        mark it processed to prevent infinite retry loops.
+        """
+        if isinstance(message_ids, str):
+            ids = [message_ids]
+        else:
+            ids = list(message_ids)
+
+        processed_name = self.labels_config["processed"]
+        add_label_ids = [self.label_ids[processed_name]]
+        for msg_id in ids:
+            await self.proxy.modify_message(message_id=msg_id, add_label_ids=add_label_ids)
+
     async def apply_newsletter_classification(
         self,
         message_ids: list[str],

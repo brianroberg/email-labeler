@@ -222,8 +222,9 @@ class TestProcessSingleThread:
             max_thread_chars=50000,
         )
 
-        assert result is False
+        assert result is True
         mock_label_manager.apply_classification.assert_not_called()
+        mock_label_manager.mark_processed.assert_called_once_with(["msg_001", "msg_002"])
 
     async def test_allows_upgrade(
         self,

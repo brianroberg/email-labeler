@@ -222,6 +222,27 @@ class TestGetExistingPriority:
         assert priority == _get_priority(EmailLabel.NEEDS_RESPONSE)
 
 
+class TestMarkProcessed:
+    async def test_applies_only_processed_label(self, label_manager, mock_proxy, all_labels_response):
+        mock_proxy.list_labels.return_value = all_labels_response
+        await label_manager.verify_labels()
+
+        await label_manager.mark_processed(["msg1", "msg2"])
+        assert mock_proxy.modify_message.call_count == 2
+        for call in mock_proxy.modify_message.call_args_list:
+            assert call.kwargs["add_label_ids"] == ["Label_4"]  # agent/processed
+            assert "remove_label_ids" not in call.kwargs
+
+    async def test_single_message_id(self, label_manager, mock_proxy, all_labels_response):
+        mock_proxy.list_labels.return_value = all_labels_response
+        await label_manager.verify_labels()
+
+        await label_manager.mark_processed("msg1")
+        mock_proxy.modify_message.assert_called_once_with(
+            message_id="msg1", add_label_ids=["Label_4"],
+        )
+
+
 @pytest.fixture
 def newsletter_config():
     return {

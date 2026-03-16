@@ -113,6 +113,28 @@ class TestParseSenderType:
         assert "interpreting as SERVICE" in caplog.records[0].message
         assert "I think this is a human" in caplog.records[0].message
 
+    def test_scan_keyword_in_middle_of_reasoning(self):
+        """Qwen 3.5 style: keyword buried in verbose reasoning text."""
+        output = "Thinking Process:\n\n1. Analyze the sender\n2. This is clearly a PERSON\n3. Done"
+        assert parse_sender_type(output) == SenderType.PERSON
+
+    def test_scan_last_keyword_wins(self):
+        """When model reasons through multiple types, last mention wins."""
+        output = "Could be SERVICE but actually PERSON based on the name"
+        assert parse_sender_type(output) == SenderType.PERSON
+
+    def test_scan_no_false_match_on_substring(self):
+        """Scan stage uses whole-word matching — PERSONAL shouldn't match PERSON."""
+        output = "Some preamble\nPERSONAL thoughts on this\nNo clear answer"
+        # First/last line checks fail (neither starts with PERSON/SERVICE),
+        # scan correctly rejects PERSONAL as not a whole-word match.
+        assert parse_sender_type(output) == SenderType.SERVICE
+
+    def test_no_warning_on_scan_match(self, caplog):
+        with caplog.at_level("WARNING", logger="classifier"):
+            parse_sender_type("Thinking:\nThe answer is SERVICE\nDone")
+        assert caplog.records == []
+
 
 class TestParseEmailLabel:
     def test_needs_response(self):
@@ -177,6 +199,35 @@ class TestParseEmailLabel:
         assert len(caplog.records) == 1
         assert "interpreting as LOW_PRIORITY" in caplog.records[0].message
         assert "IMPORTANT" in caplog.records[0].message
+
+    def test_scan_keyword_in_middle_of_reasoning(self):
+        """Qwen 3.5 style: keyword buried in verbose reasoning text."""
+        output = (
+            "Thinking Process:\n\n"
+            "1. Analyze the email content\n"
+            "2. The email requires a response\n"
+            "3. Classification: NEEDS_RESPONSE\n"
+            "4. Final answer above"
+        )
+        assert parse_email_label(output) == EmailLabel.NEEDS_RESPONSE
+
+    def test_scan_fyi_in_reasoning(self):
+        output = "The user wants me to classify an email.\nAfter analysis, this is FYI material.\nDone."
+        assert parse_email_label(output) == EmailLabel.FYI
+
+    def test_scan_last_keyword_wins(self):
+        """When model reasons through multiple labels, last mention wins."""
+        output = "Could be FYI but on reflection this is NEEDS_RESPONSE because it asks a question"
+        assert parse_email_label(output) == EmailLabel.NEEDS_RESPONSE
+
+    def test_scan_no_false_match_on_substring(self):
+        """FYI must be a whole word — 'NOTIFY' should not match."""
+        assert parse_email_label("NOTIFY the team about this") == EmailLabel.LOW_PRIORITY
+
+    def test_no_warning_on_scan_match(self, caplog):
+        with caplog.at_level("WARNING", logger="classifier"):
+            parse_email_label("Thinking:\nThe answer is FYI\nDone")
+        assert caplog.records == []
 
 
 # ── EmailClassifier class tests ──────────────────────────────────────────
