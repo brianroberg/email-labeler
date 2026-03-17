@@ -27,3 +27,5 @@ evals/golden_set.jsonl
 evals/results/*.jsonl
 evals/cache/
 newsletter_assessments.jsonl
+email-labeler-2.log
+email-labeler.log
