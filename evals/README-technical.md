@@ -49,6 +49,33 @@ Complete CLI flag references, cache internals, and chain-of-thought capture deta
 | `--local-temperature` | Override local LLM temperature (alias: `--local-temp`) |
 | `--cloud-max-tokens` | Override cloud LLM max tokens from config |
 | `--local-max-tokens` | Override local LLM max tokens from config |
+| `--cloud-extra-body` | JSON object merged into every cloud LLM request body (e.g. `'{"top_p": 0.9}'`) |
+| `--local-extra-body` | JSON object merged into every local LLM request body (e.g. `'{"chat_template_kwargs": {"enable_thinking": false}}'`) |
+| `--cloud-no-think` | Disable thinking for the cloud LLM (shortcut for `--cloud-extra-body '{"chat_template_kwargs": {"enable_thinking": false}}'`) |
+| `--local-no-think` | Disable thinking for the local LLM (shortcut for `--local-extra-body '{"chat_template_kwargs": {"enable_thinking": false}}'`) |
+
+#### A/B testing thinking on vs. off
+
+The local model (person-body label classification) is a reasoning model by
+default. To measure the accuracy impact of disabling thinking before changing
+`config.toml`, run two evaluations and compare:
+
+```bash
+# Baseline (thinking on, from config) — person threads only
+uv run python -m evals.run_eval --stages stage2_only --sender-type person --tag think-on
+
+# Thinking off
+uv run python -m evals.run_eval --stages stage2_only --sender-type person \
+    --local-no-think --tag think-off
+
+uv run python -m evals.report --compare evals/results/<think-on>.jsonl evals/results/<think-off>.jsonl
+```
+
+Because `extra_body` is part of the cache key, the two runs are cached
+independently — no `--no-cache` needed. The exact disable payload is
+server-specific; `--local-no-think` uses the `chat_template_kwargs` form
+(Qwen3 / LM Studio). If your server expects a top-level flag instead, pass it
+explicitly, e.g. `--local-extra-body '{"enable_thinking": false}'`.
 
 ### report
 
