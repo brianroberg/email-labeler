@@ -85,7 +85,7 @@ Hotkeys: `e/g/f/p` filter by tier, `1-5` filter by theme, `s` filter by sender, 
 2. **Safe defaults**: Unknown sender type → SERVICE (body goes to cloud, safe for non-person). Unknown email label → LOW_PRIORITY (archived, not deleted).
 3. **MLX degradation**: If local MLX is down, person emails are skipped (retried next cycle). Privacy invariant preserved.
 4. **No web server**: Pure asyncio daemon. Health check via file timestamp + Docker HEALTHCHECK.
-5. **Bounded-concurrency processing**: Threads in a poll cycle are processed concurrently, bounded by the `cloud_parallel`/`local_parallel` semaphores. `local_parallel` defaults to 4 (env override: `LOCAL_PARALLEL`); modern MLX servers batch the concurrent local requests, so concurrency mostly costs KV cache, not weight memory. Keep it ≤ 8.
+5. **Bounded-concurrency processing**: Threads in a poll cycle are processed concurrently, bounded by the `cloud_parallel`/`local_parallel` semaphores. `local_parallel` defaults to **1** (env override: `LOCAL_PARALLEL`): each concurrent local request needs its own KV cache, and long transcripts make those multi-GB, so concurrent requests can exceed the GPU's Metal working set and OOM-crash the local server. Raise it only after confirming the model + N KV caches fit; keep ≤ 8. See README-technical "Local Model Serving & Memory".
 
 ## Labels (must be pre-created in Gmail)
 

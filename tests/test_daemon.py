@@ -12,7 +12,13 @@ from classifier import (
     EmailLabel,
     SenderType,
 )
-from daemon import format_thread_transcript, load_config, process_single_thread, resolve_int_env
+from daemon import (
+    FailureTracker,
+    format_thread_transcript,
+    load_config,
+    process_single_thread,
+    resolve_int_env,
+)
 from labeler import _get_priority
 from newsletter import NewsletterTier, StoryResult
 
@@ -284,6 +290,44 @@ class TestProcessSingleThread:
 
         assert result is False
 
+    async def test_gives_up_on_thread_after_repeated_failures(
+        self, mock_proxy, mock_classifier, mock_label_manager, cloud_sem, local_sem,
+    ):
+        """A thread that keeps failing is marked processed after max_failures, breaking the loop."""
+        mock_proxy.get_thread.side_effect = RuntimeError("API error")
+        tracker = FailureTracker(max_failures=3)
+
+        results = [
+            await process_single_thread(
+                "thread_stuck", ["msg_1"], mock_proxy, mock_classifier, mock_label_manager,
+                cloud_sem, local_sem, max_thread_chars=16000, failure_tracker=tracker,
+            )
+            for _ in range(3)
+        ]
+
+        # First two failures: retry next cycle (not handled), nothing marked processed.
+        assert results[0] is False
+        assert results[1] is False
+        # Third failure hits the threshold: give up — mark processed and report handled.
+        assert results[2] is True
+        mock_label_manager.mark_processed.assert_called_once_with(["msg_1"])
+
+    async def test_connect_error_does_not_count_toward_give_up(
+        self, mock_proxy, mock_classifier, mock_label_manager, cloud_sem, local_sem,
+    ):
+        """An endpoint outage (ConnectError) is transient and must never trigger give-up."""
+        mock_proxy.get_thread.side_effect = httpx.ConnectError("connection refused")
+        tracker = FailureTracker(max_failures=2)
+
+        for _ in range(5):
+            result = await process_single_thread(
+                "thread_down", ["msg_1"], mock_proxy, mock_classifier, mock_label_manager,
+                cloud_sem, local_sem, max_thread_chars=16000, failure_tracker=tracker,
+            )
+            assert result is False
+
+        mock_label_manager.mark_processed.assert_not_called()
+
     async def test_service_thread_classified_via_cloud(
         self,
         mock_proxy,
@@ -317,6 +361,34 @@ class TestProcessSingleThread:
         assert result is True
         mock_classifier.classify.assert_called_once()
         mock_label_manager.apply_classification.assert_called_once()
+
+
+class TestFailureTracker:
+    def test_gives_up_only_at_threshold(self):
+        t = FailureTracker(max_failures=3)
+        assert t.should_give_up("x") is False
+        t.record_failure("x")
+        assert t.should_give_up("x") is False
+        t.record_failure("x")
+        assert t.should_give_up("x") is False
+        t.record_failure("x")
+        assert t.should_give_up("x") is True
+
+    def test_clear_resets_count(self):
+        t = FailureTracker(max_failures=2)
+        t.record_failure("x")
+        t.record_failure("x")
+        assert t.should_give_up("x") is True
+        t.clear("x")
+        assert t.should_give_up("x") is False
+
+    def test_threads_tracked_independently(self):
+        t = FailureTracker(max_failures=2)
+        t.record_failure("a")
+        t.record_failure("a")
+        t.record_failure("b")
+        assert t.should_give_up("a") is True
+        assert t.should_give_up("b") is False
 
 
 class TestLoadConfig:

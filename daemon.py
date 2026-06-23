@@ -71,6 +71,60 @@ def resolve_int_env(env_var: str, default: int) -> int:
         return default
 
 
+class FailureTracker:
+    """Counts consecutive thread-specific failures to break infinite retry loops.
+
+    Only genuine processing failures are recorded — never transient
+    unavailability (a ConnectError when an LLM endpoint is down) — so an outage
+    doesn't cause threads to be given up. In-memory and session-scoped: counts
+    reset on daemon restart, so a thread that failed for a since-resolved reason
+    gets another chance after a restart.
+    """
+
+    def __init__(self, max_failures: int = 5):
+        self.max_failures = max_failures
+        self._counts: dict[str, int] = {}
+
+    def record_failure(self, thread_id: str) -> None:
+        self._counts[thread_id] = self._counts.get(thread_id, 0) + 1
+
+    def should_give_up(self, thread_id: str) -> bool:
+        return self._counts.get(thread_id, 0) >= self.max_failures
+
+    def clear(self, thread_id: str) -> None:
+        self._counts.pop(thread_id, None)
+
+
+async def _give_up_if_stuck(
+    thread_id: str,
+    msg_ids: list[str],
+    failure_tracker: "FailureTracker | None",
+    label_manager: LabelManager,
+) -> bool:
+    """Record a thread-specific failure; if it has failed too many times, mark it
+    processed so it stops being retried every cycle.
+
+    Returns True if the thread was given up (marked processed → handled), or False
+    if it should simply be retried next cycle.
+    """
+    if failure_tracker is None:
+        return False
+    failure_tracker.record_failure(thread_id)
+    if not failure_tracker.should_give_up(thread_id):
+        return False
+    log.error(
+        "Thread %s failed %d+ times — marking processed to break the retry loop",
+        thread_id, failure_tracker.max_failures,
+    )
+    try:
+        await label_manager.mark_processed(msg_ids)
+    except Exception:
+        log.exception("Could not mark stuck thread %s processed", thread_id)
+        return False
+    failure_tracker.clear(thread_id)
+    return True
+
+
 def format_thread_transcript(messages: list[dict], max_chars: int) -> str:
     """Format Gmail messages into a chronological thread transcript.
 
@@ -123,6 +177,7 @@ async def process_single_thread(
     newsletter_recipient: str = "",
     newsletter_output_file: str = "",
     newsletter_only: bool = False,
+    failure_tracker: "FailureTracker | None" = None,
 ) -> bool:
     """Process a single thread through the classification pipeline.
 
@@ -300,17 +355,19 @@ async def process_single_thread(
         return True
 
     except httpx.ConnectError as exc:
+        # Endpoint unreachable (e.g. local MLX down) — transient. Don't count it
+        # toward give-up; just retry next cycle (preserves graceful degradation).
         log.warning("Connection error processing thread %s: %s", thread_id, exc)
         return False
     except TimeoutError as exc:
         log.error("Timeout processing thread %s: %s", thread_id, exc)
-        return False
+        return await _give_up_if_stuck(thread_id, msg_ids, failure_tracker, label_manager)
     except RuntimeError as exc:
         log.error("Thread %s: %s", thread_id, exc)
-        return False
+        return await _give_up_if_stuck(thread_id, msg_ids, failure_tracker, label_manager)
     except Exception:
         log.exception("Error processing thread %s", thread_id)
-        return False
+        return await _give_up_if_stuck(thread_id, msg_ids, failure_tracker, label_manager)
 
 
 async def run_daemon() -> None:
@@ -374,7 +431,7 @@ async def run_daemon() -> None:
         log.info("Newsletter-only mode: non-newsletter threads will be skipped")
 
     cloud_sem = asyncio.Semaphore(daemon_config.get("cloud_parallel", 2))
-    local_parallel = resolve_int_env("LOCAL_PARALLEL", daemon_config.get("local_parallel", 4))
+    local_parallel = resolve_int_env("LOCAL_PARALLEL", daemon_config.get("local_parallel", 1))
     local_sem = asyncio.Semaphore(local_parallel)
     log.info("Concurrency limits: cloud=%d, local=%d", cloud_sem._value, local_sem._value)
     if local_parallel > 8:
@@ -383,6 +440,11 @@ async def run_daemon() -> None:
             "cross-contamination at high concurrency (mlx-lm at 16+)",
             local_parallel,
         )
+
+    # Breaks infinite retry loops: a thread that keeps failing for a
+    # thread-specific reason (not a transient outage) is marked processed after
+    # a few attempts. Session-scoped — counts reset on restart.
+    failure_tracker = FailureTracker()
 
     # Wait for api-proxy to become available, then verify labels
     startup_backoff = 5
@@ -432,7 +494,8 @@ async def run_daemon() -> None:
             if threads:
                 log.info("Grouped into %d thread(s)", len(threads))
 
-            max_thread_chars = daemon_config.get("max_thread_chars", 50000)
+            max_thread_chars = daemon_config.get("max_thread_chars", 16000)
+            thread_items = list(threads.items())
             results = await asyncio.gather(
                 *(
                     process_single_thread(
@@ -448,12 +511,17 @@ async def run_daemon() -> None:
                         newsletter_recipient=newsletter_recipient,
                         newsletter_output_file=newsletter_output_file,
                         newsletter_only=newsletter_only,
+                        failure_tracker=failure_tracker,
                     )
-                    for tid, msg_ids in threads.items()
+                    for tid, msg_ids in thread_items
                 ),
                 return_exceptions=True,
             )
-            processed = sum(r for r in results if r is True)
+            processed = 0
+            for (tid, _msg_ids), result in zip(thread_items, results):
+                if result is True:
+                    processed += 1
+                    failure_tracker.clear(tid)  # success/give-up resets the failure count
 
             if threads:
                 log.info("Processed %d/%d threads", processed, len(threads))

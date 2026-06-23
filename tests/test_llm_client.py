@@ -222,6 +222,36 @@ class TestComplete:
             with pytest.raises(TimeoutError, match="timed out after 60s"):
                 await cloud_client.complete("sys", "user")
 
+    async def test_surfaces_read_error_as_informative_runtime_error(self, cloud_client):
+        """A dropped/reset connection (httpx.ReadError) surfaces as a non-empty RuntimeError.
+
+        Regression: a bare reset previously propagated as an exception whose str() was
+        empty, so callers recorded it as an empty error / no result instead of a failure.
+        """
+        with patch("llm_client.httpx.AsyncClient") as mock_client_cls:
+            mock_client = AsyncMock()
+            mock_client.post.side_effect = httpx.ReadError("")  # empty msg, like a bare reset
+            mock_client_cls.return_value.__aenter__ = AsyncMock(return_value=mock_client)
+            mock_client_cls.return_value.__aexit__ = AsyncMock(return_value=False)
+
+            with pytest.raises(RuntimeError) as exc_info:
+                await cloud_client.complete("sys", "user")
+            msg = str(exc_info.value)
+            assert msg  # non-empty even though the underlying error message was empty
+            assert "ReadError" in msg
+            assert "test-cloud-model" in msg
+
+    async def test_surfaces_remote_protocol_error(self, cloud_client):
+        """A server disconnect (httpx.RemoteProtocolError) surfaces as RuntimeError."""
+        with patch("llm_client.httpx.AsyncClient") as mock_client_cls:
+            mock_client = AsyncMock()
+            mock_client.post.side_effect = httpx.RemoteProtocolError("Server disconnected")
+            mock_client_cls.return_value.__aenter__ = AsyncMock(return_value=mock_client)
+            mock_client_cls.return_value.__aexit__ = AsyncMock(return_value=False)
+
+            with pytest.raises(RuntimeError, match="RemoteProtocolError"):
+                await cloud_client.complete("sys", "user")
+
     async def test_uses_configured_timeout(self, cloud_client):
         """Verify timeout is passed to httpx client."""
         mock_response = _mock_response(json_data={

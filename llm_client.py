@@ -83,6 +83,18 @@ class LLMClient:
             raise TimeoutError(
                 f"LLM request to {self.model} timed out after {self.timeout}s"
             ) from None
+        except httpx.ConnectError:
+            # Couldn't establish a connection (server down) — let callers handle
+            # this as "endpoint unavailable" (the daemon skips + retries next cycle).
+            raise
+        except httpx.TransportError as exc:
+            # Connection established then dropped/reset mid-request (ReadError,
+            # WriteError, RemoteProtocolError, ...). Surface it as an informative
+            # error; some of these stringify to "" and would otherwise look like a
+            # silent empty result downstream.
+            raise RuntimeError(
+                f"LLM connection to {self.model} dropped ({type(exc).__name__}): {exc}"
+            ) from exc
 
         if response.status_code != 200:
             prompt_chars = len(system_prompt) + len(user_content)
