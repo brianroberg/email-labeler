@@ -12,7 +12,7 @@ from classifier import (
     EmailLabel,
     SenderType,
 )
-from daemon import format_thread_transcript, load_config, process_single_thread
+from daemon import format_thread_transcript, load_config, process_single_thread, resolve_int_env
 from labeler import _get_priority
 from newsletter import NewsletterTier, StoryResult
 
@@ -402,6 +402,28 @@ class TestLoadConfig:
         for key in ("story_extraction", "quality_assessment", "theme_classification"):
             assert "system" in prompts[key]
             assert "user_template" in prompts[key]
+
+
+class TestResolveIntEnv:
+    def test_returns_default_when_unset(self, monkeypatch):
+        monkeypatch.delenv("LOCAL_PARALLEL", raising=False)
+        assert resolve_int_env("LOCAL_PARALLEL", 4) == 4
+
+    def test_env_overrides_default(self, monkeypatch):
+        monkeypatch.setenv("LOCAL_PARALLEL", "6")
+        assert resolve_int_env("LOCAL_PARALLEL", 4) == 6
+
+    def test_blank_env_falls_back_to_default(self, monkeypatch):
+        monkeypatch.setenv("LOCAL_PARALLEL", "   ")
+        assert resolve_int_env("LOCAL_PARALLEL", 4) == 4
+
+    def test_invalid_env_falls_back_to_default(self, monkeypatch):
+        monkeypatch.setenv("MAX_EMAILS_PER_CYCLE", "lots")
+        assert resolve_int_env("MAX_EMAILS_PER_CYCLE", 10) == 10
+
+    def test_strips_whitespace_around_value(self, monkeypatch):
+        monkeypatch.setenv("LOCAL_PARALLEL", "  2 ")
+        assert resolve_int_env("LOCAL_PARALLEL", 4) == 2
 
 
 @pytest.fixture

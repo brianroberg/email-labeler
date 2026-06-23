@@ -53,6 +53,24 @@ def load_config() -> dict:
     return substitute_env_vars(config)
 
 
+def resolve_int_env(env_var: str, default: int) -> int:
+    """Return an int from *env_var* if set and valid, otherwise *default*.
+
+    Lets operators override numeric daemon settings (e.g. concurrency) per run
+    without editing config.toml. {env.VAR} substitution only works for string
+    config values, so numeric overrides are read here instead. An unparseable
+    value falls back to the default with a warning rather than crashing.
+    """
+    raw = os.environ.get(env_var, "").strip()
+    if not raw:
+        return default
+    try:
+        return int(raw)
+    except ValueError:
+        log.warning("Invalid %s=%r (expected an integer); using %d", env_var, raw, default)
+        return default
+
+
 def format_thread_transcript(messages: list[dict], max_chars: int) -> str:
     """Format Gmail messages into a chronological thread transcript.
 
@@ -356,8 +374,15 @@ async def run_daemon() -> None:
         log.info("Newsletter-only mode: non-newsletter threads will be skipped")
 
     cloud_sem = asyncio.Semaphore(daemon_config.get("cloud_parallel", 2))
-    local_sem = asyncio.Semaphore(daemon_config.get("local_parallel", 1))
+    local_parallel = resolve_int_env("LOCAL_PARALLEL", daemon_config.get("local_parallel", 4))
+    local_sem = asyncio.Semaphore(local_parallel)
     log.info("Concurrency limits: cloud=%d, local=%d", cloud_sem._value, local_sem._value)
+    if local_parallel > 8:
+        log.warning(
+            "local_parallel=%d exceeds 8 — some MLX servers exhibit KV-cache "
+            "cross-contamination at high concurrency (mlx-lm at 16+)",
+            local_parallel,
+        )
 
     # Wait for api-proxy to become available, then verify labels
     startup_backoff = 5
@@ -382,7 +407,7 @@ async def run_daemon() -> None:
     log.info("All labels verified. Starting poll loop.")
 
     poll_interval = daemon_config["poll_interval_seconds"]
-    max_emails = daemon_config["max_emails_per_cycle"]
+    max_emails = resolve_int_env("MAX_EMAILS_PER_CYCLE", daemon_config["max_emails_per_cycle"])
     gmail_query = daemon_config["gmail_query"]
     if newsletter_only and newsletter_recipient:
         gmail_query += f" to:{newsletter_recipient}"

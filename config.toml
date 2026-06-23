@@ -1,10 +1,15 @@
 [daemon]
 poll_interval_seconds = 60
-max_emails_per_cycle = 10
+max_emails_per_cycle = 10       # Override per-run with the MAX_EMAILS_PER_CYCLE env var
 gmail_query = "in:inbox -label:agent/processed"
 max_thread_chars = 50000
 cloud_parallel = 2
-local_parallel = 1
+# Max concurrent local MLX requests. Modern MLX servers (mlx-lm 0.30.4+,
+# LM Studio 0.4.2+) batch these: weights are loaded once and shared across
+# requests, so only the per-request KV cache grows. Keep <= 8 — mlx-lm has a
+# KV-cache cross-contamination bug at 16+ concurrent requests. Override
+# per-run with the LOCAL_PARALLEL env var (e.g. to bump it for a backlog drain).
+local_parallel = 4
 healthcheck_file = "/tmp/healthcheck"
 
 [labels]

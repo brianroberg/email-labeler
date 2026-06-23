@@ -85,7 +85,7 @@ Hotkeys: `e/g/f/p` filter by tier, `1-5` filter by theme, `s` filter by sender, 
 2. **Safe defaults**: Unknown sender type → SERVICE (body goes to cloud, safe for non-person). Unknown email label → LOW_PRIORITY (archived, not deleted).
 3. **MLX degradation**: If local MLX is down, person emails are skipped (retried next cycle). Privacy invariant preserved.
 4. **No web server**: Pure asyncio daemon. Health check via file timestamp + Docker HEALTHCHECK.
-5. **Sequential processing**: Emails processed one at a time per poll cycle.
+5. **Bounded-concurrency processing**: Threads in a poll cycle are processed concurrently, bounded by the `cloud_parallel`/`local_parallel` semaphores. `local_parallel` defaults to 4 (env override: `LOCAL_PARALLEL`); modern MLX servers batch the concurrent local requests, so concurrency mostly costs KV cache, not weight memory. Keep it ≤ 8.
 
 ## Labels (must be pre-created in Gmail)
 
@@ -106,6 +106,8 @@ Hotkeys: `e/g/f/p` filter by tier, `1-5` filter by theme, `s` filter by sender, 
 - `MLX_MODEL` — Local LLM model name (shared with email-agent, referenced in config.toml as `{env.MLX_MODEL}`)
 - `MLX_API_KEY` — Local LLM API key (empty for real MLX, set for public API stand-ins like Novita.ai)
 - `NEWSLETTER_ONLY` — When `1`/`true`/`yes`, daemon runs newsletter classification pipeline instead of email labeling
+- `LOCAL_PARALLEL` — Override `local_parallel` (max concurrent local MLX requests; default 4, keep ≤ 8)
+- `MAX_EMAILS_PER_CYCLE` — Override `max_emails_per_cycle` (max threads per poll cycle; default 10)
 
 ## Testing
 

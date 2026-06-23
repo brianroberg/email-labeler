@@ -53,6 +53,8 @@ email-labeler/
 | `VIP_SENDERS` | No | — | Comma-separated email addresses of VIP senders. VIP threads skip the sender classification LLM call. |
 | `EMAIL_LABELER_API_KEY` | No | — | Fallback API key for the api-proxy server, used when `PROXY_API_KEY` is not set. |
 | `NEWSLETTER_ONLY` | No | — | Set to `1`, `true`, or `yes` to skip non-newsletter threads. Useful for testing newsletter classification in isolation. |
+| `LOCAL_PARALLEL` | No | `4` (from `config.toml`) | Max concurrent local MLX requests, overriding `local_parallel` in `config.toml`. Modern MLX servers batch these (shared weights), so concurrency mostly costs KV cache. Keep ≤ 8 — mlx-lm has a KV-cache cross-contamination bug at 16+. |
+| `MAX_EMAILS_PER_CYCLE` | No | `10` (from `config.toml`) | Max threads processed per poll cycle, overriding `max_emails_per_cycle` in `config.toml`. Raise temporarily to drain a large backlog faster. |
 
 Note: The cloud LLM **model name** is configured in `config.toml` under `[llm.cloud]`, not in `.env`. The local LLM **model name** is set via the `MLX_MODEL` environment variable (shared with email-agent) and referenced in `config.toml` as `{env.MLX_MODEL}`. This keeps secrets (keys, URLs) in `.env` while operational parameters (temperature, prompts) stay in version-controlled `config.toml`.
 
@@ -65,10 +67,20 @@ All operational parameters are in `config.toml`. The daemon reads this file on s
 ```toml
 [daemon]
 poll_interval_seconds = 60     # How often to poll Gmail
-max_emails_per_cycle = 10      # Max emails to process per poll
+max_emails_per_cycle = 10      # Max threads per poll (override: MAX_EMAILS_PER_CYCLE)
 gmail_query = "in:inbox -label:agent/processed"  # Gmail search query
+cloud_parallel = 2             # Max concurrent cloud LLM requests
+local_parallel = 4             # Max concurrent local MLX requests (override: LOCAL_PARALLEL)
 healthcheck_file = "/tmp/healthcheck"            # Healthcheck timestamp path
 ```
+
+Threads found in a poll cycle are processed concurrently, bounded by the
+`cloud_parallel` and `local_parallel` semaphores. `local_parallel` defaults to 4
+because modern MLX servers (mlx-lm 0.30.4+, LM Studio 0.4.2+) batch concurrent
+requests — weights are loaded once and shared, so only the per-request KV cache
+grows. Keep it ≤ 8 to avoid mlx-lm's KV-cache cross-contamination bug at 16+
+concurrent requests. Both `local_parallel` and `max_emails_per_cycle` can be
+overridden per run via the `LOCAL_PARALLEL` and `MAX_EMAILS_PER_CYCLE` env vars.
 
 ### LLM settings
 
