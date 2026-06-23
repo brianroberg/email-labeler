@@ -72,6 +72,25 @@ def resolve_extra_body(base: dict | None, no_think: bool, override_json: str | N
     return result or None
 
 
+def apply_config_overrides(config: dict, args: argparse.Namespace) -> None:
+    """Apply CLI model/temperature/max_tokens/timeout overrides onto *config* in place.
+
+    A CLI value of None means "not provided" and leaves the config value intact.
+    0 / 0.0 are valid overrides (e.g. temperature 0), so the guard is `is not None`,
+    not truthiness.
+    """
+    overrides = {
+        "cloud": {"model": args.cloud_model, "temperature": args.cloud_temperature,
+                  "max_tokens": args.cloud_max_tokens, "timeout": args.cloud_timeout},
+        "local": {"model": args.local_model, "temperature": args.local_temperature,
+                  "max_tokens": args.local_max_tokens, "timeout": args.local_timeout},
+    }
+    for section, fields in overrides.items():
+        for key, value in fields.items():
+            if value is not None:
+                config["llm"][section][key] = value
+
+
 def load_golden_set(path: Path, reviewed_only: bool = False) -> list[GoldenThread]:
     """Load golden set from JSONL."""
     threads = []
@@ -309,16 +328,7 @@ async def main(args: argparse.Namespace) -> None:
     args.parallelism = resolve_parallelism(args.parallelism, config)
 
     # Apply CLI overrides to config (CLI always wins over config file)
-    _overrides = {
-        "cloud": {"model": args.cloud_model, "temperature": args.cloud_temperature,
-                  "max_tokens": args.cloud_max_tokens},
-        "local": {"model": args.local_model, "temperature": args.local_temperature,
-                  "max_tokens": args.local_max_tokens},
-    }
-    for section, fields in _overrides.items():
-        for key, value in fields.items():
-            if value is not None:
-                config["llm"][section][key] = value
+    apply_config_overrides(config, args)
 
     # Merge extra_body overrides (thinking toggles, provider-specific params).
     # Cache keys include extra_body, so thinking-on vs -off runs don't collide.
@@ -496,6 +506,8 @@ def cli():
                         help="Override local LLM temperature")
     parser.add_argument("--cloud-max-tokens", type=int, help="Override cloud LLM max tokens")
     parser.add_argument("--local-max-tokens", type=int, help="Override local LLM max tokens")
+    parser.add_argument("--cloud-timeout", type=int, help="Override cloud LLM request timeout (seconds)")
+    parser.add_argument("--local-timeout", type=int, help="Override local LLM request timeout (seconds)")
     parser.add_argument("--cloud-extra-body",
                         help="JSON object merged into every cloud LLM request body")
     parser.add_argument("--local-extra-body",

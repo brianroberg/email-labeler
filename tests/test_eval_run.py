@@ -1,9 +1,68 @@
 """Tests for eval runner parallelism defaults and extra_body overrides."""
 
+import argparse
+
 import pytest
 
 from daemon import load_config
-from evals.run_eval import resolve_extra_body, resolve_parallelism
+from evals.run_eval import apply_config_overrides, resolve_extra_body, resolve_parallelism
+
+
+def _override_args(**kw):
+    """argparse.Namespace with every override field defaulting to None (not provided)."""
+    base = dict(
+        cloud_model=None, cloud_temperature=None, cloud_max_tokens=None, cloud_timeout=None,
+        local_model=None, local_temperature=None, local_max_tokens=None, local_timeout=None,
+    )
+    base.update(kw)
+    return argparse.Namespace(**base)
+
+
+def _override_config():
+    return {"llm": {
+        "cloud": {"model": "cloud-default", "temperature": 0.5, "max_tokens": 100, "timeout": 60},
+        "local": {"model": "local-default", "temperature": 0.7, "max_tokens": 200, "timeout": 180},
+    }}
+
+
+class TestApplyConfigOverrides:
+    def test_no_overrides_leaves_config_unchanged(self):
+        cfg = _override_config()
+        apply_config_overrides(cfg, _override_args())
+        assert cfg == _override_config()
+
+    def test_local_timeout_override(self):
+        cfg = _override_config()
+        apply_config_overrides(cfg, _override_args(local_timeout=900))
+        assert cfg["llm"]["local"]["timeout"] == 900
+        assert cfg["llm"]["cloud"]["timeout"] == 60  # cloud untouched
+
+    def test_cloud_timeout_override(self):
+        cfg = _override_config()
+        apply_config_overrides(cfg, _override_args(cloud_timeout=45))
+        assert cfg["llm"]["cloud"]["timeout"] == 45
+        assert cfg["llm"]["local"]["timeout"] == 180  # local untouched
+
+    def test_timeout_override_does_not_disturb_other_fields(self):
+        cfg = _override_config()
+        apply_config_overrides(cfg, _override_args(local_timeout=900))
+        assert cfg["llm"]["local"]["model"] == "local-default"
+        assert cfg["llm"]["local"]["max_tokens"] == 200
+
+    def test_zero_is_a_valid_override(self):
+        # 0.0 is not None, so it must override even though it's falsy.
+        cfg = _override_config()
+        apply_config_overrides(cfg, _override_args(local_temperature=0.0))
+        assert cfg["llm"]["local"]["temperature"] == 0.0
+
+    def test_multiple_overrides_at_once(self):
+        cfg = _override_config()
+        apply_config_overrides(cfg, _override_args(
+            local_model="m", local_max_tokens=512, local_timeout=600, cloud_timeout=30))
+        assert cfg["llm"]["local"]["model"] == "m"
+        assert cfg["llm"]["local"]["max_tokens"] == 512
+        assert cfg["llm"]["local"]["timeout"] == 600
+        assert cfg["llm"]["cloud"]["timeout"] == 30
 
 
 class TestResolveParallelism:

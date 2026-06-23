@@ -49,6 +49,8 @@ Complete CLI flag references, cache internals, and chain-of-thought capture deta
 | `--local-temperature` | Override local LLM temperature (alias: `--local-temp`) |
 | `--cloud-max-tokens` | Override cloud LLM max tokens from config |
 | `--local-max-tokens` | Override local LLM max tokens from config |
+| `--cloud-timeout` | Override cloud LLM request timeout in seconds (for slow prefills on long inputs) |
+| `--local-timeout` | Override local LLM request timeout in seconds (for slow prefills on long inputs) |
 | `--cloud-extra-body` | JSON object merged into every cloud LLM request body (e.g. `'{"top_p": 0.9}'`) |
 | `--local-extra-body` | JSON object merged into every local LLM request body (e.g. `'{"chat_template_kwargs": {"enable_thinking": false}}'`) |
 | `--cloud-no-think` | Disable thinking for the cloud LLM (shortcut for `--cloud-extra-body '{"chat_template_kwargs": {"enable_thinking": false}}'`) |
