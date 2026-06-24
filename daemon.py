@@ -23,7 +23,7 @@ from gmail_utils import decode_body, get_header
 from labeler import LabelManager, _get_priority
 from llm_client import LLMClient, LLMUnavailableError
 from newsletter import NewsletterClassifier, NewsletterTier, is_newsletter, write_assessment
-from proxy_client import GmailProxyClient
+from proxy_client import GmailProxyClient, ProxyError
 
 load_dotenv()
 
@@ -85,6 +85,26 @@ def resolve_int_env(env_var: str, default: int, minimum: int = 1) -> int:
         )
         return default
     return value
+
+
+def resolve_newsletter_llm_endpoint() -> tuple[str, str]:
+    """Return (base_url, api_key) for the newsletter grading LLM.
+
+    Defaults to the cloud classification endpoint (CLOUD_LLM_URL / CLOUD_LLM_API_KEY)
+    so a single provider serves both. Set NEWSLETTER_LLM_URL / NEWSLETTER_LLM_API_KEY
+    when the newsletter model lives elsewhere — e.g. config.toml grades newsletters with
+    a Claude model (`claude-sonnet-4-6`) that the cloud provider doesn't serve, so it must
+    target a Claude-serving endpoint (Anthropic's OpenAI-compatible API, or a gateway).
+
+    The override is atomic: once NEWSLETTER_LLM_URL is set, the key comes solely
+    from NEWSLETTER_LLM_API_KEY (empty if unset) and never falls back to the cloud
+    key — pairing an override endpoint with the cloud provider's credential would
+    authenticate against the wrong provider and fail in a confusing way.
+    """
+    override_url = os.environ.get("NEWSLETTER_LLM_URL")
+    if override_url:
+        return override_url, os.environ.get("NEWSLETTER_LLM_API_KEY", "")
+    return os.environ.get("CLOUD_LLM_URL", ""), os.environ.get("CLOUD_LLM_API_KEY", "")
 
 
 class FailureTracker:
@@ -455,6 +475,61 @@ def summarize_cycle(
     return processed, given_up
 
 
+# Transport faults that mean the api-proxy is *transiently* unreachable —
+# connection refused, any timeout, a dropped/garbled connection — so the daemon
+# should wait and retry rather than crash. This is a deliberate subset of
+# httpx.TransportError: httpx.UnsupportedProtocol (a missing/unsupported
+# PROXY_URL scheme) is also a TransportError but is a permanent misconfiguration
+# that must surface immediately instead of being retried forever.
+TRANSIENT_TRANSPORT_ERRORS = (
+    httpx.TimeoutException,
+    httpx.NetworkError,
+    httpx.ProtocolError,
+)
+
+
+async def verify_labels_with_retry(
+    label_manager: LabelManager,
+    initial_backoff: int = 5,
+    max_backoff: int = 60,
+) -> list[str]:
+    """Verify required Gmail labels, waiting out a transiently-unreachable proxy.
+
+    The api-proxy may be slow, not yet up, or up-but-still-warming when the
+    daemon starts. Two failure modes are transient and worth waiting out with
+    capped exponential backoff, instead of letting the daemon exit and crash-loop
+    under Docker:
+
+      * a transport fault — connection refused, a connect/read timeout, a
+        dropped connection (``TRANSIENT_TRANSPORT_ERRORS``); and
+      * a proxy that is reachable but whose Gmail backend is still initializing,
+        which answers 5xx and surfaces as ``proxy_client.ProxyError`` (NOT an
+        ``httpx.TransportError``, so it must be named explicitly).
+
+    Permanent failures propagate immediately so the operator sees an actionable
+    error rather than a silent, endless retry: a misconfigured ``PROXY_URL``
+    (``httpx.UnsupportedProtocol`` — itself a ``TransportError`` we deliberately
+    do NOT catch), a bad key (``ProxyAuthError``), a blocked op
+    (``ProxyForbiddenError``), or a programming error.
+
+    Returns the list of missing label names (see LabelManager.verify_labels).
+    """
+    proxy_url = label_manager.proxy.proxy_url
+    backoff = initial_backoff
+    while True:
+        try:
+            return await label_manager.verify_labels()
+        except TRANSIENT_TRANSPORT_ERRORS + (ProxyError,) as exc:
+            log.warning(
+                "Cannot reach api-proxy at %s (%s) — retrying in %ds",
+                proxy_url,
+                type(exc).__name__,
+                backoff,
+            )
+            await asyncio.sleep(backoff)
+            backoff = min(backoff * 2, max_backoff)
+
+
 async def run_daemon() -> None:
     """Main polling loop."""
     config = load_config()
@@ -495,9 +570,10 @@ async def run_daemon() -> None:
     if nl_config:
         nl_llm_config = nl_config.get("llm")
         if nl_llm_config:
+            nl_base_url, nl_api_key = resolve_newsletter_llm_endpoint()
             nl_llm = LLMClient(
-                base_url=os.environ.get("CLOUD_LLM_URL", ""),
-                api_key=os.environ.get("CLOUD_LLM_API_KEY", ""),
+                base_url=nl_base_url,
+                api_key=nl_api_key,
                 model=nl_llm_config["model"],
                 max_tokens=nl_llm_config.get("max_tokens", 1024),
                 temperature=nl_llm_config.get("temperature", 0),
@@ -535,25 +611,12 @@ async def run_daemon() -> None:
     # a few attempts. Session-scoped — counts reset on restart.
     failure_tracker = FailureTracker()
 
-    # Wait for api-proxy to become available, then verify labels
-    startup_backoff = 5
-    max_startup_backoff = 60
-    while True:
-        try:
-            missing = await label_manager.verify_labels()
-            if missing:
-                log.error("Missing Gmail labels: %s", missing)
-                log.error("Create these labels manually in Gmail before running the daemon.")
-                sys.exit(1)
-            break
-        except httpx.ConnectError:
-            log.warning(
-                "Cannot reach api-proxy at %s — retrying in %ds",
-                proxy_client.proxy_url,
-                startup_backoff,
-            )
-            await asyncio.sleep(startup_backoff)
-            startup_backoff = min(startup_backoff * 2, max_startup_backoff)
+    # Wait for a transiently-unreachable api-proxy to come up, then verify labels.
+    missing = await verify_labels_with_retry(label_manager)
+    if missing:
+        log.error("Missing Gmail labels: %s", missing)
+        log.error("Create these labels manually in Gmail before running the daemon.")
+        sys.exit(1)
 
     log.info("All labels verified. Starting poll loop.")
 
@@ -623,10 +686,11 @@ async def run_daemon() -> None:
             # Reset backoff on success
             backoff = poll_interval
 
-        except httpx.ConnectError:
+        except TRANSIENT_TRANSPORT_ERRORS as exc:
             log.warning(
-                "Lost connection to api-proxy at %s — retrying in %ds",
+                "Lost connection to api-proxy at %s (%s) — retrying in %ds",
                 proxy_client.proxy_url,
+                type(exc).__name__,
                 backoff,
             )
             backoff = min(backoff * 2, poll_interval * 10)

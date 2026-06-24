@@ -46,6 +46,8 @@ email-labeler/
 | `PROXY_URL` | No | `http://host.docker.internal:8000` | URL of the api-proxy server |
 | `CLOUD_LLM_URL` | Yes | — | Cloud LLM chat completion endpoint (any OpenAI-compatible API) |
 | `CLOUD_LLM_API_KEY` | Yes | — | API key for the cloud LLM |
+| `NEWSLETTER_LLM_URL` | No | `CLOUD_LLM_URL` | Endpoint for the newsletter grading LLM (`[newsletter.llm]` in `config.toml`). Set when that model needs a different provider than the cloud classifier — e.g. a Claude model via Anthropic's OpenAI-compatible endpoint. |
+| `NEWSLETTER_LLM_API_KEY` | No | `CLOUD_LLM_API_KEY` | API key for the newsletter LLM endpoint. The override is atomic: once `NEWSLETTER_LLM_URL` is set, the key comes only from this var (never the cloud key), so set both together. |
 | `MLX_URL` | No | — | Local MLX LLM chat completion endpoint. If unset or unreachable, person emails are skipped. |
 | `MLX_MODEL` | No | — | Local LLM model name. Shared with email-agent so both services use the same model. Referenced in `config.toml` as `{env.MLX_MODEL}`. |
 | `MLX_API_KEY` | No | — | Local LLM API key. Empty string for real MLX; set for public API stand-ins like Novita.ai. |
