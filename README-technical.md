@@ -123,14 +123,16 @@ Each `[llm.*]` section supports an optional `extra_body` table. Any key-value pa
 
 **Disabling thinking for reasoning models** — Models like Qwen3, DeepSeek-R1, and GLM-4.5 generate chain-of-thought reasoning in `<think>` tags before answering. While the daemon already strips these tags from responses, you can disable thinking entirely to save tokens and reduce latency.
 
-For providers that accept a top-level `enable_thinking` flag (Novita.ai, many OpenAI-compatible APIs):
+The shipped `config.toml` **disables native thinking on the local person-email classifier** (`[llm.local.extra_body.chat_template_kwargs]` → `enable_thinking = false`). A paired `stage2_only --sender-type person` eval (n=20) found native thinking strictly worse here: the model spent its `max_tokens` budget reasoning in the `<think>` channel and emitted no label on some threads (a `KeyError: 'content'` failure), while think-off was ≥ think-on on every thread (85% vs 78% accuracy, 0 vs 2 errors). The classification prompt already drives step-by-step reasoning into the *content* channel, so disabling native thinking preserves reasoning quality without the budget-split failure. `mlx_lm.server` honors this request-level `chat_template_kwargs` form; a top-level `enable_thinking` is ignored by that server.
+
+For providers that accept a top-level `enable_thinking` flag instead (Novita.ai, many OpenAI-compatible APIs):
 
 ```toml
 [llm.local.extra_body]
 enable_thinking = false
 ```
 
-For LM Studio with models that use `chat_template_kwargs` (e.g. Qwen3):
+For LM Studio and `mlx_lm.server` with models that use `chat_template_kwargs` (e.g. Qwen3) — the shipped default:
 
 ```toml
 [llm.local.extra_body.chat_template_kwargs]

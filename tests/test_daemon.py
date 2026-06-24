@@ -593,6 +593,17 @@ class TestLoadConfig:
         assert config["daemon"]["cloud_parallel"] >= 1
         assert config["daemon"]["local_parallel"] >= 1
 
+    def test_config_disables_native_thinking_on_local_classifier(self):
+        # Issue #10: the eval showed native thinking on the local person-email
+        # classifier is strictly worse (budget-split failures where reasoning
+        # overruns max_tokens and no label is emitted). The classification prompt
+        # already drives reasoning into the content channel, so native thinking is
+        # disabled via request-level chat_template_kwargs (the form mlx_lm.server
+        # honors). The cloud classifier is unaffected.
+        config = load_config()
+        ctk = config["llm"]["local"]["extra_body"]["chat_template_kwargs"]
+        assert ctk["enable_thinking"] is False
+
     def test_config_has_newsletter_section(self):
         config = load_config()
         assert "newsletter" in config
