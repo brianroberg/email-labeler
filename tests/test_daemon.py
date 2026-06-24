@@ -18,6 +18,7 @@ from daemon import (
     load_config,
     process_single_thread,
     resolve_int_env,
+    summarize_cycle,
 )
 from labeler import _get_priority
 from llm_client import LLMUnavailableError
@@ -506,6 +507,34 @@ class TestFailureTracker:
         t.record_failure("active")
         t.prune({"active"})
         assert t.should_give_up("active") is True  # still counted toward give-up
+
+
+class TestSummarizeCycle:
+    def test_counts_handled_threads_and_drains_give_ups(self):
+        t = FailureTracker(max_failures=1)
+        t.record_give_up("gaveup")
+        items = [("ok", ["1"]), ("retry", ["2"]), ("gaveup", ["3"])]
+        results = [True, False, True]  # gaveup returned True (handled via give-up)
+        processed, given_up = summarize_cycle(items, results, t)
+        assert processed == 2  # ok + gaveup
+        assert given_up == ["gaveup"]  # a subset of processed
+        assert t.take_given_up() == []  # already drained
+
+    def test_clears_counts_for_handled_threads(self):
+        t = FailureTracker(max_failures=2)
+        t.record_failure("ok")  # failed last cycle, succeeds now
+        summarize_cycle([("ok", ["1"])], [True], t)
+        t.record_failure("ok")
+        assert t.should_give_up("ok") is False  # count was reset on success
+
+    def test_prunes_counts_for_threads_absent_this_cycle(self):
+        t = FailureTracker(max_failures=2)
+        t.record_failure("stale")
+        t.record_failure("stale")  # at threshold from a prior cycle
+        assert t.should_give_up("stale") is True
+        # This cycle only has "active"; "stale" is gone from the query.
+        summarize_cycle([("active", ["1"])], [False], t)
+        assert t.should_give_up("stale") is False  # pruned
 
 
 class TestLoadConfig:

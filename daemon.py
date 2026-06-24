@@ -432,6 +432,29 @@ async def process_single_thread(
         return await _give_up_if_stuck(thread_id, ids_to_mark, failure_tracker, label_manager)
 
 
+def summarize_cycle(
+    thread_items: list[tuple[str, list[str]]],
+    results: list,
+    failure_tracker: FailureTracker,
+) -> tuple[int, list[str]]:
+    """Tally a poll cycle's outcomes and update the failure tracker.
+
+    A thread is "handled" when process_single_thread returned True (classified,
+    skipped at max priority, or given up — all return True); its failure count is
+    cleared. Drains the per-cycle give-up list and prunes counts for threads no
+    longer pending. Returns (handled_count, given_up_thread_ids); given_up is a
+    subset of the handled count (a give-up also returns True).
+    """
+    processed = 0
+    for (tid, _msg_ids), result in zip(thread_items, results):
+        if result is True:
+            processed += 1
+            failure_tracker.clear(tid)  # success/give-up resets the failure count
+    given_up = failure_tracker.take_given_up()
+    failure_tracker.prune(tid for tid, _msg_ids in thread_items)
+    return processed, given_up
+
+
 async def run_daemon() -> None:
     """Main polling loop."""
     config = load_config()
@@ -584,19 +607,11 @@ async def run_daemon() -> None:
                 ),
                 return_exceptions=True,
             )
-            processed = 0
-            for (tid, _msg_ids), result in zip(thread_items, results):
-                if result is True:
-                    processed += 1
-                    failure_tracker.clear(tid)  # success/give-up resets the failure count
-
-            given_up = failure_tracker.take_given_up()
-            # Keep the failure map bounded: drop counts for threads no longer pending.
-            failure_tracker.prune(threads)
+            processed, given_up = summarize_cycle(thread_items, results, failure_tracker)
             if threads:
                 if given_up:
                     log.info(
-                        "Processed %d/%d threads (%d abandoned after repeated failures: %s)",
+                        "Processed %d/%d threads (%d of them abandoned after repeated failures: %s)",
                         processed, len(threads), len(given_up), given_up,
                     )
                 else:
