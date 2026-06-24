@@ -87,6 +87,21 @@ def resolve_int_env(env_var: str, default: int, minimum: int = 1) -> int:
     return value
 
 
+def resolve_newsletter_llm_endpoint() -> tuple[str, str]:
+    """Return (base_url, api_key) for the newsletter grading LLM.
+
+    Defaults to the cloud classification endpoint (CLOUD_LLM_URL / CLOUD_LLM_API_KEY)
+    so a single provider serves both. Set NEWSLETTER_LLM_URL / NEWSLETTER_LLM_API_KEY
+    when the newsletter model lives elsewhere — e.g. config.toml grades newsletters with
+    a Claude model (`claude-sonnet-4-6`) that the cloud provider doesn't serve, so it must
+    target a Claude-serving endpoint (Anthropic's OpenAI-compatible API, or a gateway).
+    Each var falls back independently, so set both together when overriding.
+    """
+    base_url = os.environ.get("NEWSLETTER_LLM_URL") or os.environ.get("CLOUD_LLM_URL", "")
+    api_key = os.environ.get("NEWSLETTER_LLM_API_KEY") or os.environ.get("CLOUD_LLM_API_KEY", "")
+    return base_url, api_key
+
+
 class FailureTracker:
     """Counts consecutive thread-specific failures to break infinite retry loops.
 
@@ -495,9 +510,10 @@ async def run_daemon() -> None:
     if nl_config:
         nl_llm_config = nl_config.get("llm")
         if nl_llm_config:
+            nl_base_url, nl_api_key = resolve_newsletter_llm_endpoint()
             nl_llm = LLMClient(
-                base_url=os.environ.get("CLOUD_LLM_URL", ""),
-                api_key=os.environ.get("CLOUD_LLM_API_KEY", ""),
+                base_url=nl_base_url,
+                api_key=nl_api_key,
                 model=nl_llm_config["model"],
                 max_tokens=nl_llm_config.get("max_tokens", 1024),
                 temperature=nl_llm_config.get("temperature", 0),

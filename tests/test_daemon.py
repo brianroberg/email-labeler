@@ -7,6 +7,7 @@ from unittest.mock import AsyncMock, MagicMock
 import httpx
 import pytest
 
+import daemon
 from classifier import (
     ClassificationResult,
     EmailLabel,
@@ -900,3 +901,38 @@ class TestNewsletterRouting:
 
         assert result is True
         mock_classifier.classify_sender.assert_called_once()
+
+
+class TestNewsletterLLMEndpoint:
+    """The newsletter grader can use a different provider than the cloud classifier.
+
+    Newsletter quality grading is configured for a Claude model
+    (config.toml [newsletter.llm] model = "claude-sonnet-4-6"), but the cloud
+    classification endpoint (CLOUD_LLM_URL) points at a provider that doesn't
+    serve Claude (e.g. Novita) — so requesting that model there 404s. These env
+    vars let the newsletter LLM target its own Claude-serving endpoint.
+    """
+
+    def test_defaults_to_cloud_endpoint(self, monkeypatch):
+        """Without NEWSLETTER_LLM_*, the newsletter LLM shares the cloud endpoint."""
+        monkeypatch.setenv("CLOUD_LLM_URL", "https://novita.example/v1/chat/completions")
+        monkeypatch.setenv("CLOUD_LLM_API_KEY", "novita-key")
+        monkeypatch.delenv("NEWSLETTER_LLM_URL", raising=False)
+        monkeypatch.delenv("NEWSLETTER_LLM_API_KEY", raising=False)
+
+        url, key = daemon.resolve_newsletter_llm_endpoint()
+
+        assert url == "https://novita.example/v1/chat/completions"
+        assert key == "novita-key"
+
+    def test_overrides_with_newsletter_env(self, monkeypatch):
+        """NEWSLETTER_LLM_* point the newsletter LLM at its own provider (e.g. Anthropic)."""
+        monkeypatch.setenv("CLOUD_LLM_URL", "https://novita.example/v1/chat/completions")
+        monkeypatch.setenv("CLOUD_LLM_API_KEY", "novita-key")
+        monkeypatch.setenv("NEWSLETTER_LLM_URL", "https://api.anthropic.com/v1/chat/completions")
+        monkeypatch.setenv("NEWSLETTER_LLM_API_KEY", "sk-ant-newsletter")
+
+        url, key = daemon.resolve_newsletter_llm_endpoint()
+
+        assert url == "https://api.anthropic.com/v1/chat/completions"
+        assert key == "sk-ant-newsletter"
