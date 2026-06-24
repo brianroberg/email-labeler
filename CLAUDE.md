@@ -106,7 +106,7 @@ Hotkeys: `e/g/f/p` filter by tier, `1-5` filter by theme, `s` filter by sender, 
 - `MLX_MODEL` — Local LLM model name (shared with email-agent, referenced in config.toml as `{env.MLX_MODEL}`)
 - `MLX_API_KEY` — Local LLM API key (empty for real MLX, set for public API stand-ins like Novita.ai)
 - `NEWSLETTER_ONLY` — When `1`/`true`/`yes`, daemon runs newsletter classification pipeline instead of email labeling
-- `LOCAL_PARALLEL` — Override `local_parallel` (max concurrent local MLX requests; default 4, keep ≤ 8)
+- `LOCAL_PARALLEL` — Override `local_parallel` (max concurrent local MLX requests; default 1, keep ≤ 8)
 - `MAX_EMAILS_PER_CYCLE` — Override `max_emails_per_cycle` (max threads per poll cycle; default 10)
 
 ## Testing
