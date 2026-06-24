@@ -471,6 +471,81 @@ class TestGLMReasoningContent:
             body = mock_client.post.call_args.kwargs["json"]
             assert body["thinking"] == {"type": "enabled"}
 
+    async def test_glm_no_think_extra_body_disables_native_thinking(self):
+        """--no-think (chat_template_kwargs.enable_thinking=False) must disable GLM's
+        native thinking, not be contradicted by an unconditional thinking=enabled.
+
+        Regression (review finding #4): GLM is the default cloud model, so the
+        documented thinking on/off A/B run would otherwise send enable_thinking=false
+        AND thinking={type:enabled} in the same body.
+        """
+        client = LLMClient(
+            base_url="https://api.example.com/v1/chat/completions",
+            api_key="sk-test",
+            model="zai-org/glm-5",
+            extra_body={"chat_template_kwargs": {"enable_thinking": False}},
+        )
+        mock_response = _mock_response(json_data={
+            "choices": [{"message": {"content": "SERVICE"}}]
+        })
+
+        with patch("llm_client.httpx.AsyncClient") as mock_client_cls:
+            mock_client = AsyncMock()
+            mock_client.post.return_value = mock_response
+            mock_client_cls.return_value.__aenter__ = AsyncMock(return_value=mock_client)
+            mock_client_cls.return_value.__aexit__ = AsyncMock(return_value=False)
+
+            await client.complete("sys", "user", include_thinking=True)
+
+            body = mock_client.post.call_args.kwargs["json"]
+            assert body["thinking"] == {"type": "disabled"}
+
+    async def test_glm_top_level_enable_thinking_false_disables_native_thinking(self):
+        """A top-level enable_thinking=False in extra_body also disables GLM thinking."""
+        client = LLMClient(
+            base_url="https://api.example.com/v1/chat/completions",
+            api_key="sk-test",
+            model="zai-org/glm-5",
+            extra_body={"enable_thinking": False},
+        )
+        mock_response = _mock_response(json_data={
+            "choices": [{"message": {"content": "SERVICE"}}]
+        })
+
+        with patch("llm_client.httpx.AsyncClient") as mock_client_cls:
+            mock_client = AsyncMock()
+            mock_client.post.return_value = mock_response
+            mock_client_cls.return_value.__aenter__ = AsyncMock(return_value=mock_client)
+            mock_client_cls.return_value.__aexit__ = AsyncMock(return_value=False)
+
+            await client.complete("sys", "user", include_thinking=True)
+
+            body = mock_client.post.call_args.kwargs["json"]
+            assert body["thinking"] == {"type": "disabled"}
+
+    async def test_glm_explicit_thinking_field_is_not_overridden(self):
+        """An explicit `thinking` field in extra_body wins over the auto-injection."""
+        client = LLMClient(
+            base_url="https://api.example.com/v1/chat/completions",
+            api_key="sk-test",
+            model="zai-org/glm-5",
+            extra_body={"thinking": {"type": "disabled"}},
+        )
+        mock_response = _mock_response(json_data={
+            "choices": [{"message": {"content": "SERVICE"}}]
+        })
+
+        with patch("llm_client.httpx.AsyncClient") as mock_client_cls:
+            mock_client = AsyncMock()
+            mock_client.post.return_value = mock_response
+            mock_client_cls.return_value.__aenter__ = AsyncMock(return_value=mock_client)
+            mock_client_cls.return_value.__aexit__ = AsyncMock(return_value=False)
+
+            await client.complete("sys", "user", include_thinking=True)
+
+            body = mock_client.post.call_args.kwargs["json"]
+            assert body["thinking"] == {"type": "disabled"}
+
     async def test_glm_no_thinking_param_without_include(self, glm_client):
         """GLM models don't get thinking param when include_thinking=False."""
         mock_response = _mock_response(json_data={

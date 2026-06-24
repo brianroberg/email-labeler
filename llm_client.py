@@ -46,6 +46,19 @@ class LLMClient:
         """Check if model uses GLM-style reasoning_content instead of inline think tags."""
         return "glm" in self.model.lower()
 
+    def _extra_body_disables_thinking(self) -> bool:
+        """True if extra_body asks to turn thinking off.
+
+        Recognizes both the chat_template_kwargs.enable_thinking form (Qwen / LM
+        Studio, what --no-think emits) and a top-level enable_thinking flag. GLM
+        ignores those fields, so complete() uses this to set GLM's native thinking
+        field to disabled rather than contradicting the request with enabled.
+        """
+        ctk = self.extra_body.get("chat_template_kwargs")
+        if isinstance(ctk, dict) and ctk.get("enable_thinking") is False:
+            return True
+        return self.extra_body.get("enable_thinking") is False
+
     async def complete(
         self, system_prompt: str, user_content: str, include_thinking: bool = False,
     ) -> str | tuple[str, str]:
@@ -83,9 +96,13 @@ class LLMClient:
             **self.extra_body,
         }
 
-        # GLM models require explicit thinking enablement in request
-        if include_thinking and self._is_glm_model():
-            body["thinking"] = {"type": "enabled"}
+        # GLM models require an explicit thinking field. Honor a disable request
+        # from extra_body (e.g. --no-think, which GLM otherwise ignores) instead of
+        # contradicting it with enabled, and never override a `thinking` field the
+        # caller set explicitly in extra_body.
+        if include_thinking and self._is_glm_model() and "thinking" not in body:
+            disabled = self._extra_body_disables_thinking()
+            body["thinking"] = {"type": "disabled" if disabled else "enabled"}
 
         async def _do_request() -> httpx.Response:
             async with httpx.AsyncClient(timeout=self.timeout) as client:
