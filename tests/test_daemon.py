@@ -24,6 +24,7 @@ from daemon import (
 from labeler import _get_priority
 from llm_client import LLMUnavailableError
 from newsletter import NewsletterTier, StoryResult
+from proxy_client import ProxyAuthError, ProxyError
 
 
 @pytest.fixture
@@ -906,22 +907,30 @@ class TestNewsletterRouting:
 class TestVerifyLabelsWithRetry:
     """Startup label verification must survive a transiently-unreachable api-proxy.
 
-    Regression guard for the daemon crash-loop: the proxy being slow/down at
-    boot raised httpx.ConnectTimeout, which the original startup loop did not
-    catch (it caught only httpx.ConnectError), so the process exited and Docker
-    restarted it endlessly instead of waiting for the proxy.
+    Regression guard for the daemon crash-loop. Two boot-time conditions are
+    transient and must be waited out rather than crashed on:
+      * the proxy is slow/down — a transport fault (ConnectError/ConnectTimeout/
+        read timeout/dropped connection); and
+      * the proxy is up but its Gmail backend is still warming, answering 5xx,
+        which surfaces as proxy_client.ProxyError (NOT an httpx.TransportError).
+    Permanent failures (a misconfigured PROXY_URL → httpx.UnsupportedProtocol, a
+    bad key → ProxyAuthError, a programming error) must surface immediately so a
+    real misconfiguration is not masked as a silent, endless retry.
     """
+
+    @staticmethod
+    def _label_manager(side_effect):
+        label_manager = AsyncMock()
+        label_manager.proxy.proxy_url = "http://proxy:8000"
+        label_manager.verify_labels.side_effect = side_effect
+        return label_manager
 
     async def test_retries_on_connect_timeout(self):
         """ConnectTimeout (proxy slow/unreachable at startup) is retried, not propagated."""
-        label_manager = AsyncMock()
-        label_manager.verify_labels.side_effect = [
-            httpx.ConnectTimeout("connect timed out"),
-            [],
-        ]
+        label_manager = self._label_manager([httpx.ConnectTimeout("connect timed out"), []])
 
         missing = await daemon.verify_labels_with_retry(
-            label_manager, "http://proxy:8000", initial_backoff=0, max_backoff=0,
+            label_manager, initial_backoff=0, max_backoff=0,
         )
 
         assert missing == []
@@ -929,27 +938,68 @@ class TestVerifyLabelsWithRetry:
 
     async def test_retries_on_connect_error(self):
         """ConnectError stays retryable (existing transient-outage behavior preserved)."""
-        label_manager = AsyncMock()
-        label_manager.verify_labels.side_effect = [
-            httpx.ConnectError("connection refused"),
-            ["agent/processed"],
-        ]
+        label_manager = self._label_manager(
+            [httpx.ConnectError("connection refused"), ["agent/processed"]]
+        )
 
         missing = await daemon.verify_labels_with_retry(
-            label_manager, "http://proxy:8000", initial_backoff=0, max_backoff=0,
+            label_manager, initial_backoff=0, max_backoff=0,
         )
 
         assert missing == ["agent/processed"]
         assert label_manager.verify_labels.call_count == 2
 
-    async def test_propagates_non_transport_errors(self):
-        """A non-transport failure must surface immediately, not retry forever."""
-        label_manager = AsyncMock()
-        label_manager.verify_labels.side_effect = RuntimeError("boom")
+    async def test_retries_on_proxy_5xx_error(self):
+        """A warming proxy answers 5xx → ProxyError; this is transient and must retry.
+
+        Regression for the original crash-loop: ProxyError is not an
+        httpx.TransportError, so a TransportError-only catch let it propagate and
+        the daemon exited — the exact failure this helper exists to prevent.
+        """
+        label_manager = self._label_manager([ProxyError("Proxy error: 503"), []])
+
+        missing = await daemon.verify_labels_with_retry(
+            label_manager, initial_backoff=0, max_backoff=0,
+        )
+
+        assert missing == []
+        assert label_manager.verify_labels.call_count == 2
+
+    async def test_propagates_unsupported_protocol(self):
+        """A misconfigured PROXY_URL (UnsupportedProtocol) is permanent — fail fast.
+
+        UnsupportedProtocol is an httpx.TransportError subclass, so a base-class
+        catch would retry it forever and mask the misconfiguration as a hang.
+        """
+        label_manager = self._label_manager(
+            httpx.UnsupportedProtocol("Request URL has no scheme")
+        )
+
+        with pytest.raises(httpx.UnsupportedProtocol):
+            await daemon.verify_labels_with_retry(
+                label_manager, initial_backoff=0, max_backoff=0,
+            )
+
+        assert label_manager.verify_labels.call_count == 1
+
+    async def test_propagates_auth_error(self):
+        """A bad PROXY_API_KEY (ProxyAuthError) is permanent — surface immediately."""
+        label_manager = self._label_manager(ProxyAuthError("Unauthorized"))
+
+        with pytest.raises(ProxyAuthError):
+            await daemon.verify_labels_with_retry(
+                label_manager, initial_backoff=0, max_backoff=0,
+            )
+
+        assert label_manager.verify_labels.call_count == 1
+
+    async def test_propagates_programming_error(self):
+        """A non-transient programming error must surface immediately, not retry forever."""
+        label_manager = self._label_manager(RuntimeError("boom"))
 
         with pytest.raises(RuntimeError, match="boom"):
             await daemon.verify_labels_with_retry(
-                label_manager, "http://proxy:8000", initial_backoff=0, max_backoff=0,
+                label_manager, initial_backoff=0, max_backoff=0,
             )
 
         assert label_manager.verify_labels.call_count == 1
@@ -988,3 +1038,21 @@ class TestNewsletterLLMEndpoint:
 
         assert url == "https://api.anthropic.com/v1/chat/completions"
         assert key == "sk-ant-newsletter"
+
+    def test_partial_override_does_not_borrow_cloud_key(self, monkeypatch):
+        """An override URL must never silently pair with the cloud provider's key.
+
+        The override is atomic: setting NEWSLETTER_LLM_URL alone targets the new
+        endpoint with an empty key (auth fails clearly) rather than the cloud key
+        (which would authenticate against the wrong provider and 401 confusingly).
+        """
+        monkeypatch.setenv("CLOUD_LLM_URL", "https://novita.example/v1/chat/completions")
+        monkeypatch.setenv("CLOUD_LLM_API_KEY", "novita-key")
+        monkeypatch.setenv("NEWSLETTER_LLM_URL", "https://api.anthropic.com/v1/chat/completions")
+        monkeypatch.delenv("NEWSLETTER_LLM_API_KEY", raising=False)
+
+        url, key = daemon.resolve_newsletter_llm_endpoint()
+
+        assert url == "https://api.anthropic.com/v1/chat/completions"
+        assert key != "novita-key"
+        assert key == ""

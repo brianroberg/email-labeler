@@ -102,6 +102,8 @@ Hotkeys: `e/g/f/p` filter by tier, `1-5` filter by theme, `s` filter by sender, 
 - `PROXY_API_KEY` — API proxy authentication key
 - `CLOUD_LLM_URL` — Cloud LLM endpoint (any OpenAI-compatible API)
 - `CLOUD_LLM_API_KEY` — Cloud LLM API key
+- `NEWSLETTER_LLM_URL` — Endpoint for the newsletter grading LLM (`[newsletter.llm]`); defaults to `CLOUD_LLM_URL`. Set when the newsletter model needs a different provider (e.g. a Claude model via Anthropic's OpenAI-compatible endpoint)
+- `NEWSLETTER_LLM_API_KEY` — API key for `NEWSLETTER_LLM_URL`. The override is atomic: once `NEWSLETTER_LLM_URL` is set the key comes only from this var (never the cloud key), so set both together
 - `MLX_URL` — Local MLX LLM endpoint
 - `MLX_MODEL` — Local LLM model name (shared with email-agent, referenced in config.toml as `{env.MLX_MODEL}`)
 - `MLX_API_KEY` — Local LLM API key (empty for real MLX, set for public API stand-ins like Novita.ai)
