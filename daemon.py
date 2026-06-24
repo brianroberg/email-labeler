@@ -95,6 +95,7 @@ class FailureTracker:
     def __init__(self, max_failures: int = 5):
         self.max_failures = max_failures
         self._counts: dict[str, int] = {}
+        self._given_up: list[str] = []  # threads abandoned since the last take_given_up()
 
     def record_failure(self, thread_id: str) -> None:
         self._counts[thread_id] = self._counts.get(thread_id, 0) + 1
@@ -104,6 +105,17 @@ class FailureTracker:
 
     def clear(self, thread_id: str) -> None:
         self._counts.pop(thread_id, None)
+
+    def record_give_up(self, thread_id: str) -> None:
+        """Record that a thread was abandoned (marked processed without a label),
+        so the per-cycle summary can report give-ups distinctly from classifications."""
+        self._given_up.append(thread_id)
+
+    def take_given_up(self) -> list[str]:
+        """Return the thread ids given up since the last call, resetting the list."""
+        out = self._given_up
+        self._given_up = []
+        return out
 
 
 async def _give_up_if_stuck(
@@ -132,6 +144,7 @@ async def _give_up_if_stuck(
     except Exception:
         log.exception("Could not mark stuck thread %s processed", thread_id)
         return False
+    failure_tracker.record_give_up(thread_id)
     failure_tracker.clear(thread_id)
     return True
 
@@ -559,8 +572,15 @@ async def run_daemon() -> None:
                     processed += 1
                     failure_tracker.clear(tid)  # success/give-up resets the failure count
 
+            given_up = failure_tracker.take_given_up()
             if threads:
-                log.info("Processed %d/%d threads", processed, len(threads))
+                if given_up:
+                    log.info(
+                        "Processed %d/%d threads (%d abandoned after repeated failures: %s)",
+                        processed, len(threads), len(given_up), given_up,
+                    )
+                else:
+                    log.info("Processed %d/%d threads", processed, len(threads))
 
             # Update healthcheck
             healthcheck_file.write_text(str(asyncio.get_event_loop().time()))

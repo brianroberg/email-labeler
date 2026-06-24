@@ -312,6 +312,8 @@ class TestProcessSingleThread:
         # Third failure hits the threshold: give up — mark processed and report handled.
         assert results[2] is True
         mock_label_manager.mark_processed.assert_called_once_with(["msg_1"])
+        # The give-up is recorded so the cycle summary can report it distinctly.
+        assert tracker.take_given_up() == ["thread_stuck"]
 
     async def test_connect_error_does_not_count_toward_give_up(
         self, mock_proxy, mock_classifier, mock_label_manager, cloud_sem, local_sem,
@@ -479,6 +481,14 @@ class TestFailureTracker:
         t.record_failure("b")
         assert t.should_give_up("a") is True
         assert t.should_give_up("b") is False
+
+    def test_records_and_takes_give_ups(self):
+        t = FailureTracker(max_failures=1)
+        assert t.take_given_up() == []
+        t.record_give_up("a")
+        t.record_give_up("b")
+        assert t.take_given_up() == ["a", "b"]
+        assert t.take_given_up() == []  # draining resets the per-cycle list
 
 
 class TestLoadConfig:
