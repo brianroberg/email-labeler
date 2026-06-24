@@ -112,7 +112,7 @@ timeout = 60
 model = "{env.MLX_MODEL}"              # set MLX_MODEL in .env (shared with email-agent)
 max_tokens = 8096
 temperature = 0.2
-timeout = 120       # Local LLM gets more time (runs on consumer hardware)
+timeout = 180       # Local LLM gets more time (runs on consumer hardware)
 ```
 
 ### Extra request body fields
