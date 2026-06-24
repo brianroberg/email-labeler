@@ -22,7 +22,7 @@ from daemon import (
     summarize_cycle,
 )
 from labeler import _get_priority
-from llm_client import LLMUnavailableError
+from llm_client import LLMClient, LLMUnavailableError
 from newsletter import NewsletterTier, StoryResult
 from proxy_client import ProxyAuthError, ProxyError
 
@@ -601,8 +601,21 @@ class TestLoadConfig:
         # disabled via request-level chat_template_kwargs (the form mlx_lm.server
         # honors). The cloud classifier is unaffected.
         config = load_config()
-        ctk = config["llm"]["local"]["extra_body"]["chat_template_kwargs"]
+        local = config["llm"]["local"]
+        # Layout guard: the flag must be in the nested chat_template_kwargs form.
+        # mlx_lm.server (the real local server) honors this form and ignores a
+        # top-level enable_thinking, so this specific nesting is load-bearing — a
+        # refactor to the top-level form would silently re-enable thinking on the
+        # local server even though llm_client treats both as no-think.
+        ctk = local["extra_body"]["chat_template_kwargs"]
         assert ctk["enable_thinking"] is False
+        # Behavior guard: the LLMClient the daemon builds from this config must
+        # actually treat the request as thinking-disabled.
+        client = LLMClient(
+            base_url="", api_key="", model=local["model"],
+            extra_body=local.get("extra_body"),
+        )
+        assert client._extra_body_disables_thinking() is True
 
     def test_config_has_newsletter_section(self):
         config = load_config()
