@@ -455,6 +455,42 @@ def summarize_cycle(
     return processed, given_up
 
 
+async def verify_labels_with_retry(
+    label_manager: LabelManager,
+    proxy_url: str,
+    initial_backoff: int = 5,
+    max_backoff: int = 60,
+) -> list[str]:
+    """Verify required Gmail labels, waiting out a transiently-unreachable proxy.
+
+    The api-proxy may be slow or not yet up when the daemon starts. Any
+    transport-level failure — connection refused, connect/read timeout, a
+    dropped connection — means the proxy is *unreachable*, not that the request
+    is malformed, so we retry with capped exponential backoff instead of letting
+    the daemon exit and crash-loop under Docker. Note ConnectTimeout is a sibling
+    of ConnectError (both httpx.TransportError, not a parent/child), so catching
+    the shared base is what keeps a slow-to-start proxy from crashing the daemon.
+
+    Non-transport failures (e.g. a 4xx/auth ProxyError, a programming error)
+    are not transient and propagate immediately.
+
+    Returns the list of missing label names (see LabelManager.verify_labels).
+    """
+    backoff = initial_backoff
+    while True:
+        try:
+            return await label_manager.verify_labels()
+        except httpx.TransportError as exc:
+            log.warning(
+                "Cannot reach api-proxy at %s (%s) — retrying in %ds",
+                proxy_url,
+                type(exc).__name__,
+                backoff,
+            )
+            await asyncio.sleep(backoff)
+            backoff = min(backoff * 2, max_backoff)
+
+
 async def run_daemon() -> None:
     """Main polling loop."""
     config = load_config()
@@ -535,25 +571,12 @@ async def run_daemon() -> None:
     # a few attempts. Session-scoped — counts reset on restart.
     failure_tracker = FailureTracker()
 
-    # Wait for api-proxy to become available, then verify labels
-    startup_backoff = 5
-    max_startup_backoff = 60
-    while True:
-        try:
-            missing = await label_manager.verify_labels()
-            if missing:
-                log.error("Missing Gmail labels: %s", missing)
-                log.error("Create these labels manually in Gmail before running the daemon.")
-                sys.exit(1)
-            break
-        except httpx.ConnectError:
-            log.warning(
-                "Cannot reach api-proxy at %s — retrying in %ds",
-                proxy_client.proxy_url,
-                startup_backoff,
-            )
-            await asyncio.sleep(startup_backoff)
-            startup_backoff = min(startup_backoff * 2, max_startup_backoff)
+    # Wait for a transiently-unreachable api-proxy to come up, then verify labels.
+    missing = await verify_labels_with_retry(label_manager, proxy_client.proxy_url)
+    if missing:
+        log.error("Missing Gmail labels: %s", missing)
+        log.error("Create these labels manually in Gmail before running the daemon.")
+        sys.exit(1)
 
     log.info("All labels verified. Starting poll loop.")
 
