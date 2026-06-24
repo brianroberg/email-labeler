@@ -48,10 +48,16 @@ model = "{env.MLX_MODEL}"
 max_tokens = 1024
 temperature = 0
 timeout = 180
-# Optional: extra fields merged into every API request body.
-# See README for examples (e.g. disabling thinking for reasoning models).
-# [llm.local.extra_body]
-# enable_thinking = false
+# Extra fields merged into every API request body.
+# Disable native thinking on the local person-email classifier (issue #10): the
+# eval showed native thinking is strictly worse here — reasoning overruns the
+# max_tokens budget in the <think> channel and no label is emitted. The
+# classification prompt already drives step-by-step reasoning into the content
+# channel, so this keeps reasoning quality without the budget-split failure.
+# mlx_lm.server honors this request-level chat_template_kwargs form; a top-level
+# enable_thinking is ignored by that server.
+[llm.local.extra_body.chat_template_kwargs]
+enable_thinking = false
 
 [prompts.sender_classification]
 system = """You are an email classifier. Your job is to determine whether an email is from a real person or from an automated service/company.
