@@ -42,6 +42,18 @@ def extract(body):
     return text.strip()[:30] or f"<no text; message keys={list(msg)}>"
 
 
+def first_message(body):
+    """Best-effort message object from an OpenAI-style response; never raises.
+
+    Unlike body["choices"][0], this tolerates a present-but-empty choices array
+    (the `[{}]` default of dict.get only applies when the key is absent), falling
+    back to the whole body for display.
+    """
+    choices = body.get("choices") or [{}]
+    first = choices[0] if isinstance(choices, list) and choices else {}
+    return first.get("message", body) if isinstance(first, dict) else body
+
+
 def call(url, max_tokens, i):
     dt, body = post(url, max_tokens)
     return i, dt, extract(body)
@@ -61,7 +73,7 @@ def main():
 
     print(f"Endpoint {url}  N={n}  max_tokens={args.max_tokens}")
     _, warm = post(url, args.max_tokens)        # warmup: compiles graph / loads model
-    sample = warm.get("choices", [{}])[0].get("message", warm)
+    sample = first_message(warm)
     print(f"sample response message: {json.dumps(sample)[:200]}")
     base, _ = post(url, args.max_tokens)        # single-request baseline
     print(f"single request: {base:.2f}s")
