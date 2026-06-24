@@ -157,7 +157,8 @@ async def _give_up_if_stuck(
         log.exception("Could not mark stuck thread %s processed", thread_id)
         return False
     failure_tracker.record_give_up(thread_id)
-    failure_tracker.clear(thread_id)
+    # Note: the poll loop clears the failure count on every True result (which a
+    # give-up returns), so the count is reset there — no need to clear it here too.
     return True
 
 
