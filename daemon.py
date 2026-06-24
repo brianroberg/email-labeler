@@ -11,6 +11,7 @@ import logging
 import os
 import sys
 import tomllib
+from contextlib import nullcontext
 from pathlib import Path
 
 import httpx
@@ -188,6 +189,7 @@ async def process_single_thread(
     newsletter_output_file: str = "",
     newsletter_only: bool = False,
     failure_tracker: "FailureTracker | None" = None,
+    fetch_sem: asyncio.Semaphore | None = None,
 ) -> bool:
     """Process a single thread through the classification pipeline.
 
@@ -225,8 +227,11 @@ async def process_single_thread(
     # give-up exists to break never converges).
     ids_to_mark = msg_ids
     try:
-        # Fetch full thread (all messages in one API call)
-        thread_data = await proxy_client.get_thread(thread_id)
+        # Fetch full thread (all messages in one API call). Bounded by fetch_sem so
+        # a large max_emails_per_cycle can't burst one concurrent proxy read per
+        # thread (the cloud/local semaphores gate only the classify calls).
+        async with (fetch_sem or nullcontext()):
+            thread_data = await proxy_client.get_thread(thread_id)
         messages = thread_data.get("messages", [])
         if not messages:
             log.warning("Thread %s has no messages, skipping", thread_id)
@@ -459,7 +464,11 @@ async def run_daemon() -> None:
     cloud_sem = asyncio.Semaphore(daemon_config.get("cloud_parallel", 2))
     local_parallel = resolve_int_env("LOCAL_PARALLEL", daemon_config.get("local_parallel", 1))
     local_sem = asyncio.Semaphore(local_parallel)
-    log.info("Concurrency limits: cloud=%d, local=%d", cloud_sem._value, local_sem._value)
+    fetch_sem = asyncio.Semaphore(daemon_config.get("fetch_parallel", 4))
+    log.info(
+        "Concurrency limits: cloud=%d, local=%d, fetch=%d",
+        cloud_sem._value, local_sem._value, fetch_sem._value,
+    )
     if local_parallel > 8:
         log.warning(
             "local_parallel=%d exceeds 8 — some MLX servers exhibit KV-cache "
@@ -538,6 +547,7 @@ async def run_daemon() -> None:
                         newsletter_output_file=newsletter_output_file,
                         newsletter_only=newsletter_only,
                         failure_tracker=failure_tracker,
+                        fetch_sem=fetch_sem,
                     )
                     for tid, msg_ids in thread_items
                 ),

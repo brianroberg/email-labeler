@@ -379,6 +379,45 @@ class TestProcessSingleThread:
         assert results[1] is True   # threshold hit: give up
         mock_label_manager.mark_processed.assert_called_once_with(["msg_001", "msg_002"])
 
+    async def test_get_thread_is_bounded_by_fetch_sem(
+        self, mock_proxy, mock_classifier, mock_label_manager, cloud_sem, local_sem,
+        mock_thread_response,
+    ):
+        """get_thread runs under fetch_sem, so proxy fetches can't fan out unbounded.
+
+        Covers review finding #5: a large max_emails_per_cycle would otherwise burst
+        one simultaneous get_thread per thread (the LLM semaphores gate only the
+        classify calls, not the fetch).
+        """
+        mock_proxy.get_thread.return_value = mock_thread_response
+        exhausted = asyncio.Semaphore(0)  # no permits available
+
+        task = asyncio.create_task(process_single_thread(
+            "thread_001", ["msg_001"], mock_proxy, mock_classifier, mock_label_manager,
+            cloud_sem, local_sem, max_thread_chars=16000, fetch_sem=exhausted,
+        ))
+        await asyncio.sleep(0.05)
+        # Blocked acquiring the fetch semaphore — get_thread must not have run.
+        mock_proxy.get_thread.assert_not_called()
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+    async def test_processes_normally_with_available_fetch_sem(
+        self, mock_proxy, mock_classifier, mock_label_manager, cloud_sem, local_sem,
+        mock_thread_response,
+    ):
+        """With a permitting fetch_sem, the thread is fetched and classified normally."""
+        mock_proxy.get_thread.return_value = mock_thread_response
+
+        result = await process_single_thread(
+            "thread_001", ["msg_001"], mock_proxy, mock_classifier, mock_label_manager,
+            cloud_sem, local_sem, max_thread_chars=16000, fetch_sem=asyncio.Semaphore(2),
+        )
+
+        assert result is True
+        mock_proxy.get_thread.assert_called_once()
+
     async def test_service_thread_classified_via_cloud(
         self,
         mock_proxy,

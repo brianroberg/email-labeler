@@ -18,6 +18,10 @@ cloud_parallel = 2
 # --prompt-cache-size, and/or raise iogpu.wired_limit_mb); keep it <= 8
 # (mlx-lm has a KV-cache cross-contamination bug at 16+ concurrent requests).
 local_parallel = 1
+# Max concurrent Gmail thread fetches (get_thread). Bounds the proxy-read burst
+# when max_emails_per_cycle is large; the cloud/local semaphores gate only the
+# downstream classify calls, not the fetch.
+fetch_parallel = 4
 healthcheck_file = "/tmp/healthcheck"
 
 [labels]

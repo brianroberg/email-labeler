@@ -72,6 +72,7 @@ gmail_query = "in:inbox -label:agent/processed"  # Gmail search query
 max_thread_chars = 16000       # Cap on transcript chars sent to the classifier
 cloud_parallel = 2             # Max concurrent cloud LLM requests
 local_parallel = 1             # Max concurrent local MLX requests (override: LOCAL_PARALLEL)
+fetch_parallel = 4             # Max concurrent Gmail thread fetches (get_thread)
 healthcheck_file = "/tmp/healthcheck"            # Healthcheck timestamp path
 ```
 
