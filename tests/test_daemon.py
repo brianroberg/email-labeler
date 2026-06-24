@@ -7,6 +7,7 @@ from unittest.mock import AsyncMock, MagicMock
 import httpx
 import pytest
 
+import daemon
 from classifier import (
     ClassificationResult,
     EmailLabel,
@@ -900,3 +901,55 @@ class TestNewsletterRouting:
 
         assert result is True
         mock_classifier.classify_sender.assert_called_once()
+
+
+class TestVerifyLabelsWithRetry:
+    """Startup label verification must survive a transiently-unreachable api-proxy.
+
+    Regression guard for the daemon crash-loop: the proxy being slow/down at
+    boot raised httpx.ConnectTimeout, which the original startup loop did not
+    catch (it caught only httpx.ConnectError), so the process exited and Docker
+    restarted it endlessly instead of waiting for the proxy.
+    """
+
+    async def test_retries_on_connect_timeout(self):
+        """ConnectTimeout (proxy slow/unreachable at startup) is retried, not propagated."""
+        label_manager = AsyncMock()
+        label_manager.verify_labels.side_effect = [
+            httpx.ConnectTimeout("connect timed out"),
+            [],
+        ]
+
+        missing = await daemon.verify_labels_with_retry(
+            label_manager, "http://proxy:8000", initial_backoff=0, max_backoff=0,
+        )
+
+        assert missing == []
+        assert label_manager.verify_labels.call_count == 2
+
+    async def test_retries_on_connect_error(self):
+        """ConnectError stays retryable (existing transient-outage behavior preserved)."""
+        label_manager = AsyncMock()
+        label_manager.verify_labels.side_effect = [
+            httpx.ConnectError("connection refused"),
+            ["agent/processed"],
+        ]
+
+        missing = await daemon.verify_labels_with_retry(
+            label_manager, "http://proxy:8000", initial_backoff=0, max_backoff=0,
+        )
+
+        assert missing == ["agent/processed"]
+        assert label_manager.verify_labels.call_count == 2
+
+    async def test_propagates_non_transport_errors(self):
+        """A non-transport failure must surface immediately, not retry forever."""
+        label_manager = AsyncMock()
+        label_manager.verify_labels.side_effect = RuntimeError("boom")
+
+        with pytest.raises(RuntimeError, match="boom"):
+            await daemon.verify_labels_with_retry(
+                label_manager, "http://proxy:8000", initial_backoff=0, max_backoff=0,
+            )
+
+        assert label_manager.verify_labels.call_count == 1
