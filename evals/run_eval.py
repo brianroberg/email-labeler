@@ -82,22 +82,42 @@ def resolve_extra_body(base: dict | None, no_think: bool, override_json: str | N
 
 
 def apply_config_overrides(config: dict, args: argparse.Namespace) -> None:
-    """Apply CLI model/temperature/max_tokens/timeout overrides onto *config* in place.
+    """Apply all CLI overrides onto *config* in place (CLI always wins over config).
 
-    A CLI value of None means "not provided" and leaves the config value intact.
-    0 / 0.0 are valid overrides (e.g. temperature 0), so the guard is `is not None`,
-    not truthiness.
+    Covers the model/temperature/max_tokens/timeout scalars and extra_body
+    (thinking toggles / provider-specific params) in one pass, so all CLI->config
+    plumbing lives in a single tested function.
+
+    A scalar CLI value of None means "not provided" and leaves the config value
+    intact; 0 / 0.0 are valid overrides (e.g. temperature 0), so the guard is
+    `is not None`, not truthiness. extra_body is merged via resolve_extra_body
+    (the eval cache key includes extra_body, so thinking-on vs -off runs don't
+    collide).
+
+    Raises:
+        ValueError: if a --*-extra-body value is not a valid JSON object.
     """
-    overrides = {
+    scalars = {
         "cloud": {"model": args.cloud_model, "temperature": args.cloud_temperature,
                   "max_tokens": args.cloud_max_tokens, "timeout": args.cloud_timeout},
         "local": {"model": args.local_model, "temperature": args.local_temperature,
                   "max_tokens": args.local_max_tokens, "timeout": args.local_timeout},
     }
-    for section, fields in overrides.items():
+    for section, fields in scalars.items():
         for key, value in fields.items():
             if value is not None:
                 config["llm"][section][key] = value
+
+    extra_body = {
+        "cloud": (args.cloud_no_think, args.cloud_extra_body),
+        "local": (args.local_no_think, args.local_extra_body),
+    }
+    for section, (no_think, eb_json) in extra_body.items():
+        resolved = resolve_extra_body(
+            config["llm"][section].get("extra_body"), no_think, eb_json,
+        )
+        if resolved is not None:
+            config["llm"][section]["extra_body"] = resolved
 
 
 def load_golden_set(path: Path, reviewed_only: bool = False) -> list[GoldenThread]:
@@ -336,22 +356,10 @@ async def main(args: argparse.Namespace) -> None:
     # Resolve parallelism: CLI wins, otherwise fall back to config
     args.parallelism = resolve_parallelism(args.parallelism, config)
 
-    # Apply CLI overrides to config (CLI always wins over config file)
-    apply_config_overrides(config, args)
-
-    # Merge extra_body overrides (thinking toggles, provider-specific params).
-    # Cache keys include extra_body, so thinking-on vs -off runs don't collide.
-    _eb_overrides = {
-        "cloud": (args.cloud_no_think, args.cloud_extra_body),
-        "local": (args.local_no_think, args.local_extra_body),
-    }
+    # Apply CLI overrides to config (CLI always wins over config file). extra_body
+    # parsing can fail on bad JSON, so surface that as a clean exit.
     try:
-        for section, (no_think, eb_json) in _eb_overrides.items():
-            resolved = resolve_extra_body(
-                config["llm"][section].get("extra_body"), no_think, eb_json,
-            )
-            if resolved is not None:
-                config["llm"][section]["extra_body"] = resolved
+        apply_config_overrides(config, args)
     except ValueError as exc:
         print(f"Error: {exc}", file=sys.stderr)
         sys.exit(2)

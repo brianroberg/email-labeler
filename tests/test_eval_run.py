@@ -18,6 +18,8 @@ def _override_args(**kw):
     base = dict(
         cloud_model=None, cloud_temperature=None, cloud_max_tokens=None, cloud_timeout=None,
         local_model=None, local_temperature=None, local_max_tokens=None, local_timeout=None,
+        cloud_no_think=False, cloud_extra_body=None,
+        local_no_think=False, local_extra_body=None,
     )
     base.update(kw)
     return argparse.Namespace(**base)
@@ -68,6 +70,26 @@ class TestApplyConfigOverrides:
         assert cfg["llm"]["local"]["max_tokens"] == 512
         assert cfg["llm"]["local"]["timeout"] == 600
         assert cfg["llm"]["cloud"]["timeout"] == 30
+
+    def test_no_think_applies_extra_body_in_one_pass(self):
+        # extra_body overrides are folded into apply_config_overrides, not a second
+        # parallel loop in main() (review finding #10).
+        cfg = _override_config()
+        apply_config_overrides(cfg, _override_args(local_no_think=True))
+        assert cfg["llm"]["local"]["extra_body"] == {
+            "chat_template_kwargs": {"enable_thinking": False}
+        }
+        assert "extra_body" not in cfg["llm"]["cloud"]  # cloud untouched
+
+    def test_extra_body_json_is_merged(self):
+        cfg = _override_config()
+        apply_config_overrides(cfg, _override_args(cloud_extra_body='{"top_p": 0.9}'))
+        assert cfg["llm"]["cloud"]["extra_body"] == {"top_p": 0.9}
+
+    def test_invalid_extra_body_json_raises_valueerror(self):
+        cfg = _override_config()
+        with pytest.raises(ValueError):
+            apply_config_overrides(cfg, _override_args(local_extra_body="{not json}"))
 
 
 class TestResolveMaxThreadChars:
