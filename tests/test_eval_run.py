@@ -4,8 +4,13 @@ import argparse
 
 import pytest
 
-from daemon import load_config
-from evals.run_eval import apply_config_overrides, resolve_extra_body, resolve_parallelism
+from daemon import DEFAULT_MAX_THREAD_CHARS, load_config
+from evals.run_eval import (
+    apply_config_overrides,
+    resolve_extra_body,
+    resolve_max_thread_chars,
+    resolve_parallelism,
+)
 
 
 def _override_args(**kw):
@@ -63,6 +68,20 @@ class TestApplyConfigOverrides:
         assert cfg["llm"]["local"]["max_tokens"] == 512
         assert cfg["llm"]["local"]["timeout"] == 600
         assert cfg["llm"]["cloud"]["timeout"] == 30
+
+
+class TestResolveMaxThreadChars:
+    def test_uses_config_value_when_present(self):
+        assert resolve_max_thread_chars({"daemon": {"max_thread_chars": 12345}}) == 12345
+
+    def test_falls_back_to_shared_daemon_default(self):
+        assert resolve_max_thread_chars({"daemon": {}}) == DEFAULT_MAX_THREAD_CHARS
+        assert resolve_max_thread_chars({}) == DEFAULT_MAX_THREAD_CHARS
+
+    def test_default_is_not_the_stale_50000(self):
+        # Regression (finding #9): the eval fallback drifted to 50000 while the
+        # daemon/config canonical default moved to 16000.
+        assert resolve_max_thread_chars({}) == 16000
 
 
 class TestResolveParallelism:

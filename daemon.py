@@ -41,6 +41,11 @@ logging.basicConfig(
 )
 log = logging.getLogger("email-labeler")
 
+# Default cap on transcript chars sent to the classifier when config.toml omits
+# max_thread_chars. Shared with the eval harness (evals/run_eval.py) so the two
+# never drift — an eval must truncate transcripts exactly as production does.
+DEFAULT_MAX_THREAD_CHARS = 16000
+
 
 def load_config() -> dict:
     """Load configuration from config.toml.
@@ -555,7 +560,7 @@ async def run_daemon() -> None:
             if threads:
                 log.info("Grouped into %d thread(s)", len(threads))
 
-            max_thread_chars = daemon_config.get("max_thread_chars", 16000)
+            max_thread_chars = daemon_config.get("max_thread_chars", DEFAULT_MAX_THREAD_CHARS)
             thread_items = list(threads.items())
             results = await asyncio.gather(
                 *(

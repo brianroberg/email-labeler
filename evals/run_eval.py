@@ -24,7 +24,7 @@ import httpx
 
 from classifier import EmailClassifier, SenderType, ThreadMetadata
 from config_utils import substitute_env_vars
-from daemon import format_thread_transcript
+from daemon import DEFAULT_MAX_THREAD_CHARS, format_thread_transcript
 from evals import format_network_error
 from evals.llm_cache import CachedLLMClient
 from evals.schemas import GoldenThread, PredictionResult, RunMeta, ThinkingEntry
@@ -39,6 +39,15 @@ def resolve_parallelism(cli_value: int | None, config: dict) -> int:
     if cli_value is not None:
         return cli_value
     return config.get("daemon", {}).get("cloud_parallel", 1)
+
+
+def resolve_max_thread_chars(config: dict) -> int:
+    """Transcript char cap: config value if present, else the shared daemon default.
+
+    Uses DEFAULT_MAX_THREAD_CHARS (imported from daemon) so an eval run truncates
+    transcripts exactly as production does, even for a config that omits the key.
+    """
+    return config.get("daemon", {}).get("max_thread_chars", DEFAULT_MAX_THREAD_CHARS)
 
 
 def resolve_extra_body(base: dict | None, no_think: bool, override_json: str | None) -> dict | None:
@@ -399,7 +408,7 @@ async def main(args: argparse.Namespace) -> None:
 
     classifier = EmailClassifier(cloud_llm=cloud_llm, local_llm=local_llm, config=config)
 
-    max_thread_chars = config.get("daemon", {}).get("max_thread_chars", 50000)
+    max_thread_chars = resolve_max_thread_chars(config)
 
     # Run evaluation — flush cache even if something fails after evaluation
     try:
