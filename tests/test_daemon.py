@@ -20,6 +20,7 @@ from daemon import (
     resolve_int_env,
 )
 from labeler import _get_priority
+from llm_client import LLMUnavailableError
 from newsletter import NewsletterTier, StoryResult
 
 
@@ -328,6 +329,56 @@ class TestProcessSingleThread:
 
         mock_label_manager.mark_processed.assert_not_called()
 
+    async def test_llm_unavailable_does_not_count_toward_give_up(
+        self, mock_proxy, mock_classifier, mock_label_manager, cloud_sem, local_sem,
+        mock_thread_response,
+    ):
+        """An LLM endpoint outage (LLMUnavailableError) is transient and must never give up.
+
+        Covers review finding #1: a connect-timeout / dropped connection from a down
+        local MLX server surfaces as LLMUnavailableError, which must be retried, not
+        counted toward marking the thread processed.
+        """
+        mock_proxy.get_thread.return_value = mock_thread_response
+        mock_classifier.classify_sender.side_effect = LLMUnavailableError("MLX endpoint down")
+        tracker = FailureTracker(max_failures=2)
+
+        for _ in range(5):
+            result = await process_single_thread(
+                "thread_001", ["msg_001"], mock_proxy, mock_classifier, mock_label_manager,
+                cloud_sem, local_sem, max_thread_chars=16000, failure_tracker=tracker,
+            )
+            assert result is False
+
+        mock_label_manager.mark_processed.assert_not_called()
+
+    async def test_give_up_marks_all_thread_messages_not_just_query_stubs(
+        self, mock_proxy, mock_classifier, mock_label_manager, cloud_sem, local_sem,
+        mock_thread_response,
+    ):
+        """When a fetched thread is given up, ALL its messages are marked processed.
+
+        Covers review finding #3: the query may return a subset of a thread's messages,
+        but once get_thread succeeds the full thread is known. Give-up must mark every
+        message (so the thread stops re-matching the query) — not just the query stub.
+        """
+        # Thread has msg_001 + msg_002, but the query only surfaced msg_001.
+        mock_proxy.get_thread.return_value = mock_thread_response
+        mock_classifier.classify_sender.side_effect = RuntimeError("classification boom")
+        tracker = FailureTracker(max_failures=2)
+
+        results = [
+            await process_single_thread(
+                "thread_001", ["msg_001"], mock_proxy, mock_classifier, mock_label_manager,
+                cloud_sem, local_sem, max_thread_chars=16000, failure_tracker=tracker,
+            )
+            for _ in range(2)
+        ]
+
+        assert results[0] is False  # first failure: retry
+        assert results[1] is True   # threshold hit: give up
+        mock_label_manager.mark_processed.assert_called_once_with(["msg_001", "msg_002"])
+
     async def test_service_thread_classified_via_cloud(
         self,
         mock_proxy,
@@ -496,6 +547,26 @@ class TestResolveIntEnv:
     def test_strips_whitespace_around_value(self, monkeypatch):
         monkeypatch.setenv("LOCAL_PARALLEL", "  2 ")
         assert resolve_int_env("LOCAL_PARALLEL", 4) == 2
+
+    def test_zero_falls_back_to_default(self, monkeypatch):
+        # 0 parses fine but is out of range: Semaphore(0) deadlocks the daemon.
+        monkeypatch.setenv("LOCAL_PARALLEL", "0")
+        assert resolve_int_env("LOCAL_PARALLEL", 4) == 4
+
+    def test_negative_falls_back_to_default(self, monkeypatch):
+        # -1 parses fine but is out of range: Semaphore(-1) crashes at startup.
+        monkeypatch.setenv("LOCAL_PARALLEL", "-1")
+        assert resolve_int_env("LOCAL_PARALLEL", 4) == 4
+
+    def test_value_at_minimum_is_allowed(self, monkeypatch):
+        monkeypatch.setenv("LOCAL_PARALLEL", "1")
+        assert resolve_int_env("LOCAL_PARALLEL", 4) == 1
+
+    def test_max_emails_zero_falls_back_to_default(self, monkeypatch):
+        # The lower-bound guard protects every numeric override, not just concurrency:
+        # max_results=0 would make the daemon process nothing each cycle.
+        monkeypatch.setenv("MAX_EMAILS_PER_CYCLE", "0")
+        assert resolve_int_env("MAX_EMAILS_PER_CYCLE", 10) == 10
 
 
 @pytest.fixture

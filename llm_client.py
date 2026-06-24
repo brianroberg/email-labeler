@@ -11,6 +11,16 @@ import httpx
 from retry import retry_with_backoff
 
 
+class LLMUnavailableError(Exception):
+    """The LLM endpoint is unreachable or dropped the connection (transient).
+
+    Distinct from request-specific failures: a non-200 response or a read/write
+    timeout means the *request* is the problem (too-large input, bad payload) and
+    is eligible for the daemon's give-up logic, whereas an unavailable endpoint is
+    a transient outage that should simply be retried next cycle.
+    """
+
+
 class LLMClient:
     """Client for OpenAI-compatible chat completion endpoints."""
 
@@ -51,8 +61,12 @@ class LLMClient:
             If include_thinking is True: (stripped_response, thinking_content) tuple.
 
         Raises:
+            TimeoutError: If the request times out (read/write) — request-specific
+                (e.g. input too large to prefill within the timeout).
+            LLMUnavailableError: If the endpoint is unreachable (connection refused
+                or connect/pool timeout) or the connection drops mid-request —
+                transient unavailability.
             RuntimeError: If the LLM returns a non-200 response.
-            httpx.ConnectError: If the server is unreachable.
         """
         headers = {"Content-Type": "application/json"}
         if self.api_key:
@@ -79,20 +93,29 @@ class LLMClient:
 
         try:
             response = await retry_with_backoff(_do_request, f"LLM {self.model}")
+        except (httpx.ConnectError, httpx.ConnectTimeout, httpx.PoolTimeout) as exc:
+            # Couldn't establish a connection (server down / unreachable / pool
+            # exhausted). This is endpoint *unavailability*, not a problem with this
+            # request, so callers retry next cycle and never count it toward giving
+            # up on a thread. NOTE: ConnectTimeout/PoolTimeout subclass
+            # TimeoutException, so they must be caught before the timeout clause.
+            raise LLMUnavailableError(
+                f"LLM endpoint {self.model} unavailable ({type(exc).__name__}): {exc}"
+            ) from exc
         except httpx.TimeoutException:
+            # Connection established but the response was too slow (read/write
+            # timeout) — request-specific (e.g. a transcript too large to prefill
+            # within the timeout). Surfaced as TimeoutError so the daemon may give
+            # up on one oversized thread rather than retry it forever.
             raise TimeoutError(
                 f"LLM request to {self.model} timed out after {self.timeout}s"
             ) from None
-        except httpx.ConnectError:
-            # Couldn't establish a connection (server down) — let callers handle
-            # this as "endpoint unavailable" (the daemon skips + retries next cycle).
-            raise
         except httpx.TransportError as exc:
             # Connection established then dropped/reset mid-request (ReadError,
-            # WriteError, RemoteProtocolError, ...). Surface it as an informative
-            # error; some of these stringify to "" and would otherwise look like a
-            # silent empty result downstream.
-            raise RuntimeError(
+            # WriteError, RemoteProtocolError, ...): the server crashed, restarted,
+            # or flapped — an availability event, also transient. (Some of these
+            # stringify to ""; the wrapper guarantees an informative, non-empty msg.)
+            raise LLMUnavailableError(
                 f"LLM connection to {self.model} dropped ({type(exc).__name__}): {exc}"
             ) from exc
 

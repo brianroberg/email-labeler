@@ -20,7 +20,7 @@ from classifier import EmailClassifier, EmailLabel, SenderType, ThreadMetadata
 from config_utils import substitute_env_vars
 from gmail_utils import decode_body, get_header
 from labeler import LabelManager, _get_priority
-from llm_client import LLMClient
+from llm_client import LLMClient, LLMUnavailableError
 from newsletter import NewsletterClassifier, NewsletterTier, is_newsletter, write_assessment
 from proxy_client import GmailProxyClient
 
@@ -53,22 +53,32 @@ def load_config() -> dict:
     return substitute_env_vars(config)
 
 
-def resolve_int_env(env_var: str, default: int) -> int:
+def resolve_int_env(env_var: str, default: int, minimum: int = 1) -> int:
     """Return an int from *env_var* if set and valid, otherwise *default*.
 
     Lets operators override numeric daemon settings (e.g. concurrency) per run
     without editing config.toml. {env.VAR} substitution only works for string
-    config values, so numeric overrides are read here instead. An unparseable
-    value falls back to the default with a warning rather than crashing.
+    config values, so numeric overrides are read here instead.
+
+    A value that is unparseable OR below *minimum* falls back to the default with
+    a warning rather than crashing. The lower bound matters: these values feed
+    asyncio.Semaphore() and Gmail maxResults, where 0 deadlocks the poll loop and
+    a negative crashes the daemon at startup.
     """
     raw = os.environ.get(env_var, "").strip()
     if not raw:
         return default
     try:
-        return int(raw)
+        value = int(raw)
     except ValueError:
         log.warning("Invalid %s=%r (expected an integer); using %d", env_var, raw, default)
         return default
+    if value < minimum:
+        log.warning(
+            "%s=%d is below the minimum of %d; using %d", env_var, value, minimum, default
+        )
+        return default
+    return value
 
 
 class FailureTracker:
@@ -208,6 +218,12 @@ async def process_single_thread(
         True if the thread was successfully classified and labeled,
         False if skipped or errored.
     """
+    # Messages to mark processed if we give up. Starts as the query stubs (all we
+    # know before fetching); upgraded to the full message list once the thread is
+    # fetched, so a give-up marks every message and the thread stops re-matching
+    # the query (otherwise unmarked siblings re-surface it and the retry loop the
+    # give-up exists to break never converges).
+    ids_to_mark = msg_ids
     try:
         # Fetch full thread (all messages in one API call)
         thread_data = await proxy_client.get_thread(thread_id)
@@ -223,6 +239,7 @@ async def process_single_thread(
         if newsletter_classifier and newsletter_recipient:
             if is_newsletter(messages, newsletter_recipient):
                 all_msg_ids = [msg["id"] for msg in messages]
+                ids_to_mark = all_msg_ids
                 first_headers = messages[0]["payload"]["headers"]
                 subject = get_header(first_headers, "Subject")
                 sender = get_header(first_headers, "From")
@@ -286,6 +303,7 @@ async def process_single_thread(
 
         # Collect all message IDs (thread may have more messages than query returned)
         all_msg_ids = [msg["id"] for msg in messages]
+        ids_to_mark = all_msg_ids
 
         # Extract unique senders (preserve order)
         senders = []
@@ -354,20 +372,28 @@ async def process_single_thread(
         log.debug("Thread %s CoT — label: %s", thread_id, result.label_cot)
         return True
 
+    except LLMUnavailableError as exc:
+        # LLM endpoint unreachable or dropped mid-request (server down, connect
+        # timeout, reset) — transient. Don't count it toward give-up; just retry
+        # next cycle (preserves graceful degradation of the privacy invariant).
+        log.warning("LLM unavailable processing thread %s: %s", thread_id, exc)
+        return False
     except httpx.ConnectError as exc:
-        # Endpoint unreachable (e.g. local MLX down) — transient. Don't count it
-        # toward give-up; just retry next cycle (preserves graceful degradation).
+        # Proxy/endpoint unreachable — transient. Retry next cycle, don't give up.
         log.warning("Connection error processing thread %s: %s", thread_id, exc)
         return False
     except TimeoutError as exc:
+        # Request-specific slowness (e.g. a transcript too large to prefill within
+        # the timeout) — eligible for give-up so one huge thread can't be retried
+        # forever. (Connect/pool timeouts are LLMUnavailableError, handled above.)
         log.error("Timeout processing thread %s: %s", thread_id, exc)
-        return await _give_up_if_stuck(thread_id, msg_ids, failure_tracker, label_manager)
+        return await _give_up_if_stuck(thread_id, ids_to_mark, failure_tracker, label_manager)
     except RuntimeError as exc:
         log.error("Thread %s: %s", thread_id, exc)
-        return await _give_up_if_stuck(thread_id, msg_ids, failure_tracker, label_manager)
+        return await _give_up_if_stuck(thread_id, ids_to_mark, failure_tracker, label_manager)
     except Exception:
         log.exception("Error processing thread %s", thread_id)
-        return await _give_up_if_stuck(thread_id, msg_ids, failure_tracker, label_manager)
+        return await _give_up_if_stuck(thread_id, ids_to_mark, failure_tracker, label_manager)
 
 
 async def run_daemon() -> None:
