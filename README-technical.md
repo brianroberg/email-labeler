@@ -53,6 +53,8 @@ email-labeler/
 | `VIP_SENDERS` | No | — | Comma-separated email addresses of VIP senders. VIP threads skip the sender classification LLM call. |
 | `EMAIL_LABELER_API_KEY` | No | — | Fallback API key for the api-proxy server, used when `PROXY_API_KEY` is not set. |
 | `NEWSLETTER_ONLY` | No | — | Set to `1`, `true`, or `yes` to skip non-newsletter threads. Useful for testing newsletter classification in isolation. |
+| `LOCAL_PARALLEL` | No | `1` (from `config.toml`) | Max concurrent local MLX requests, overriding `local_parallel` in `config.toml`. Modern MLX servers batch these (shared weights), so concurrency mostly costs KV cache. Keep ≤ 8 — mlx-lm has a KV-cache cross-contamination bug at 16+. |
+| `MAX_EMAILS_PER_CYCLE` | No | `10` (from `config.toml`) | Max threads processed per poll cycle, overriding `max_emails_per_cycle` in `config.toml`. Raise temporarily to drain a large backlog faster. |
 
 Note: The cloud LLM **model name** is configured in `config.toml` under `[llm.cloud]`, not in `.env`. The local LLM **model name** is set via the `MLX_MODEL` environment variable (shared with email-agent) and referenced in `config.toml` as `{env.MLX_MODEL}`. This keeps secrets (keys, URLs) in `.env` while operational parameters (temperature, prompts) stay in version-controlled `config.toml`.
 
@@ -65,10 +67,33 @@ All operational parameters are in `config.toml`. The daemon reads this file on s
 ```toml
 [daemon]
 poll_interval_seconds = 60     # How often to poll Gmail
-max_emails_per_cycle = 10      # Max emails to process per poll
+max_emails_per_cycle = 10      # Max threads per poll (override: MAX_EMAILS_PER_CYCLE)
 gmail_query = "in:inbox -label:agent/processed"  # Gmail search query
+max_thread_chars = 16000       # Cap on transcript chars sent to the classifier
+cloud_parallel = 2             # Max concurrent cloud LLM requests
+local_parallel = 1             # Max concurrent local MLX requests (override: LOCAL_PARALLEL)
+fetch_parallel = 4             # Max concurrent Gmail thread fetches (get_thread)
 healthcheck_file = "/tmp/healthcheck"            # Healthcheck timestamp path
 ```
+
+Threads found in a poll cycle are processed concurrently, bounded by the
+`cloud_parallel` and `local_parallel` semaphores. **`local_parallel` defaults to 1**:
+modern MLX servers do batch concurrent requests (weights loaded once, shared), but
+each concurrent request still needs its own KV cache, and long email transcripts
+make those caches multi-GB. On a memory-constrained Mac, a few concurrent
+long-transcript requests can exceed the GPU's Metal working set (~75% of unified
+memory) and OOM-crash the server. Raise `local_parallel` (via `LOCAL_PARALLEL`)
+only once you've confirmed the model plus N concurrent KV caches fit the GPU
+working set — tune the serving side too (`--prompt-cache-size`, and on macOS
+`sudo sysctl iogpu.wired_limit_mb=...`). Keep it ≤ 8 regardless (mlx-lm KV-cache
+cross-contamination bug at 16+). See [Local Model Serving & Memory](#local-model-serving--memory).
+
+`max_thread_chars` caps the transcript fed to the classifier. It's deliberately
+modest: the local model prefills the entire transcript before answering, so a
+50k-char thread can take minutes and exceed the local request timeout — which, on
+a stateless daemon, means the thread errors and is retried every cycle forever.
+`max_emails_per_cycle`, `local_parallel`, and (via config) the LLM `timeout` are
+the levers that keep a single huge thread from stalling the loop.
 
 ### LLM settings
 
@@ -87,7 +112,7 @@ timeout = 60
 model = "{env.MLX_MODEL}"              # set MLX_MODEL in .env (shared with email-agent)
 max_tokens = 8096
 temperature = 0.2
-timeout = 120       # Local LLM gets more time (runs on consumer hardware)
+timeout = 180       # Local LLM gets more time (runs on consumer hardware)
 ```
 
 ### Extra request body fields
@@ -125,6 +150,45 @@ The `[prompts.sender_classification]` and `[prompts.email_classification]` secti
 ### Label configuration
 
 All label names and their inbox/archive actions are defined in `config.toml` under `[labels]` and `[labels.actions]`. Newsletter labels live under `[newsletter.labels]`.
+
+## Local Model Serving & Memory
+
+Person-email bodies are classified by a local MLX model (`MLX_URL`), typically
+`mlx_lm.server`. On a memory-constrained Mac this is the most failure-prone part
+of the stack, and the failures are non-obvious, so they're documented here.
+
+### Starting the server
+
+```bash
+mlx_lm.server --model <mlx-model> --host 0.0.0.0 --port 8080 --temp 0 \
+  --decode-concurrency 8 --prompt-cache-size 2
+```
+
+- `--host 0.0.0.0` — required to reach the server from another machine (e.g. over Tailscale). The default `127.0.0.1` accepts only localhost; a remote connection to a localhost-bound server is **reset**, surfacing in the daemon as a connection error.
+- The request's `model` field must match the loaded `--model`, or mlx_lm.server returns `404 Not Found`. So `MLX_MODEL` must name the served model.
+- `--prompt-cache-size N` bounds how many past request KV caches are retained for reuse. The default (10) accumulates several GB of KV across distinct emails (which share no prefix) and can exhaust GPU memory; **2 is recommended** for this workload.
+- `--decode-concurrency` sizes the continuous-batching slots; it only matters when the daemon sends concurrent requests (`local_parallel` > 1).
+
+### The GPU memory ceiling (why it OOM-crashes)
+
+Apple Silicon caps the GPU's Metal working set at roughly **75% of unified memory** (~48 GB on a 64 GB Mac). Model weights + every live KV cache + prefill activation buffers must fit under that ceiling, not the full RAM. Exceeding it aborts the server:
+
+```
+[METAL] Command buffer execution failed: Insufficient Memory
+  (kIOGPUCommandBufferCallbackErrorOutOfMemory)  ... SIGABRT
+```
+
+A 27B model at 8-bit is ~34 GB, leaving only ~14 GB of headroom. Long transcripts have multi-GB KV caches, so a few concurrent long-transcript requests (or a large retained prompt cache) blow the ceiling. Mitigations, in order of preference:
+
+1. **Free system RAM** — leaked/idle processes shrink what the GPU can wire.
+2. **`local_parallel = 1`** (the default) — one live KV cache at a time.
+3. **`--prompt-cache-size 2`** — stop the retained cache piling up.
+4. **`max_thread_chars`** — cap prefill size (also bounds latency).
+5. **Raise the ceiling**: `sudo sysctl iogpu.wired_limit_mb=53248` (~52 GB on a 64 GB Mac; resets on reboot; don't starve macOS).
+
+### Prefill latency and the request timeout
+
+The model prefills the whole transcript before emitting a label, at ~100–200 tokens/sec on consumer hardware. A 50k-char (~17k-token) thread can take minutes — longer than `[llm.local] timeout` (default 180s) — so the client times out and the thread errors. On the stateless daemon that thread would otherwise be retried every cycle forever; **`max_thread_chars`** (cap the input) and the **`FailureTracker`** (give up after repeated failures, see `daemon.py`) are the two guards.
 
 ## Health Checking
 

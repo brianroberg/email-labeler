@@ -1,10 +1,27 @@
 [daemon]
 poll_interval_seconds = 60
-max_emails_per_cycle = 10
+max_emails_per_cycle = 10       # Override per-run with the MAX_EMAILS_PER_CYCLE env var
 gmail_query = "in:inbox -label:agent/processed"
-max_thread_chars = 50000
+# Max characters of thread transcript sent to the classifier. Kept modest
+# because the local model prefills the WHOLE transcript before answering:
+# tens-of-thousands-of-char threads take minutes to prefill on consumer
+# hardware and can blow the local request timeout. Oldest messages are dropped
+# first when a thread exceeds this (see format_thread_transcript).
+max_thread_chars = 16000
 cloud_parallel = 2
+# Max concurrent local MLX requests. Defaults to 1: each concurrent request
+# adds a full KV cache on top of the model weights, and long email transcripts
+# make those caches multi-GB. Concurrent long-transcript requests can exceed
+# the GPU's Metal working set (~75% of unified memory) and OOM-crash the
+# server. Raise it via the LOCAL_PARALLEL env var ONLY if the model plus N
+# concurrent KV caches fit the GPU working set (tune the server's
+# --prompt-cache-size, and/or raise iogpu.wired_limit_mb); keep it <= 8
+# (mlx-lm has a KV-cache cross-contamination bug at 16+ concurrent requests).
 local_parallel = 1
+# Max concurrent Gmail thread fetches (get_thread). Bounds the proxy-read burst
+# when max_emails_per_cycle is large; the cloud/local semaphores gate only the
+# downstream classify calls, not the fetch.
+fetch_parallel = 4
 healthcheck_file = "/tmp/healthcheck"
 
 [labels]

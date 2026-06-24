@@ -12,8 +12,16 @@ from classifier import (
     EmailLabel,
     SenderType,
 )
-from daemon import format_thread_transcript, load_config, process_single_thread
+from daemon import (
+    FailureTracker,
+    format_thread_transcript,
+    load_config,
+    process_single_thread,
+    resolve_int_env,
+    summarize_cycle,
+)
 from labeler import _get_priority
+from llm_client import LLMUnavailableError
 from newsletter import NewsletterTier, StoryResult
 
 
@@ -284,6 +292,135 @@ class TestProcessSingleThread:
 
         assert result is False
 
+    async def test_gives_up_on_thread_after_repeated_failures(
+        self, mock_proxy, mock_classifier, mock_label_manager, cloud_sem, local_sem,
+    ):
+        """A thread that keeps failing is marked processed after max_failures, breaking the loop."""
+        mock_proxy.get_thread.side_effect = RuntimeError("API error")
+        tracker = FailureTracker(max_failures=3)
+
+        results = [
+            await process_single_thread(
+                "thread_stuck", ["msg_1"], mock_proxy, mock_classifier, mock_label_manager,
+                cloud_sem, local_sem, max_thread_chars=16000, failure_tracker=tracker,
+            )
+            for _ in range(3)
+        ]
+
+        # First two failures: retry next cycle (not handled), nothing marked processed.
+        assert results[0] is False
+        assert results[1] is False
+        # Third failure hits the threshold: give up — mark processed and report handled.
+        assert results[2] is True
+        mock_label_manager.mark_processed.assert_called_once_with(["msg_1"])
+        # The give-up is recorded so the cycle summary can report it distinctly.
+        assert tracker.take_given_up() == ["thread_stuck"]
+
+    async def test_connect_error_does_not_count_toward_give_up(
+        self, mock_proxy, mock_classifier, mock_label_manager, cloud_sem, local_sem,
+    ):
+        """An endpoint outage (ConnectError) is transient and must never trigger give-up."""
+        mock_proxy.get_thread.side_effect = httpx.ConnectError("connection refused")
+        tracker = FailureTracker(max_failures=2)
+
+        for _ in range(5):
+            result = await process_single_thread(
+                "thread_down", ["msg_1"], mock_proxy, mock_classifier, mock_label_manager,
+                cloud_sem, local_sem, max_thread_chars=16000, failure_tracker=tracker,
+            )
+            assert result is False
+
+        mock_label_manager.mark_processed.assert_not_called()
+
+    async def test_llm_unavailable_does_not_count_toward_give_up(
+        self, mock_proxy, mock_classifier, mock_label_manager, cloud_sem, local_sem,
+        mock_thread_response,
+    ):
+        """An LLM endpoint outage (LLMUnavailableError) is transient and must never give up.
+
+        Covers review finding #1: a connect-timeout / dropped connection from a down
+        local MLX server surfaces as LLMUnavailableError, which must be retried, not
+        counted toward marking the thread processed.
+        """
+        mock_proxy.get_thread.return_value = mock_thread_response
+        mock_classifier.classify_sender.side_effect = LLMUnavailableError("MLX endpoint down")
+        tracker = FailureTracker(max_failures=2)
+
+        for _ in range(5):
+            result = await process_single_thread(
+                "thread_001", ["msg_001"], mock_proxy, mock_classifier, mock_label_manager,
+                cloud_sem, local_sem, max_thread_chars=16000, failure_tracker=tracker,
+            )
+            assert result is False
+
+        mock_label_manager.mark_processed.assert_not_called()
+
+    async def test_give_up_marks_all_thread_messages_not_just_query_stubs(
+        self, mock_proxy, mock_classifier, mock_label_manager, cloud_sem, local_sem,
+        mock_thread_response,
+    ):
+        """When a fetched thread is given up, ALL its messages are marked processed.
+
+        Covers review finding #3: the query may return a subset of a thread's messages,
+        but once get_thread succeeds the full thread is known. Give-up must mark every
+        message (so the thread stops re-matching the query) — not just the query stub.
+        """
+        # Thread has msg_001 + msg_002, but the query only surfaced msg_001.
+        mock_proxy.get_thread.return_value = mock_thread_response
+        mock_classifier.classify_sender.side_effect = RuntimeError("classification boom")
+        tracker = FailureTracker(max_failures=2)
+
+        results = [
+            await process_single_thread(
+                "thread_001", ["msg_001"], mock_proxy, mock_classifier, mock_label_manager,
+                cloud_sem, local_sem, max_thread_chars=16000, failure_tracker=tracker,
+            )
+            for _ in range(2)
+        ]
+
+        assert results[0] is False  # first failure: retry
+        assert results[1] is True   # threshold hit: give up
+        mock_label_manager.mark_processed.assert_called_once_with(["msg_001", "msg_002"])
+
+    async def test_get_thread_is_bounded_by_fetch_sem(
+        self, mock_proxy, mock_classifier, mock_label_manager, cloud_sem, local_sem,
+        mock_thread_response,
+    ):
+        """get_thread runs under fetch_sem, so proxy fetches can't fan out unbounded.
+
+        Covers review finding #5: a large max_emails_per_cycle would otherwise burst
+        one simultaneous get_thread per thread (the LLM semaphores gate only the
+        classify calls, not the fetch).
+        """
+        mock_proxy.get_thread.return_value = mock_thread_response
+        exhausted = asyncio.Semaphore(0)  # no permits available
+
+        task = asyncio.create_task(process_single_thread(
+            "thread_001", ["msg_001"], mock_proxy, mock_classifier, mock_label_manager,
+            cloud_sem, local_sem, max_thread_chars=16000, fetch_sem=exhausted,
+        ))
+        await asyncio.sleep(0.05)
+        # Blocked acquiring the fetch semaphore — get_thread must not have run.
+        mock_proxy.get_thread.assert_not_called()
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+    async def test_processes_normally_with_available_fetch_sem(
+        self, mock_proxy, mock_classifier, mock_label_manager, cloud_sem, local_sem,
+        mock_thread_response,
+    ):
+        """With a permitting fetch_sem, the thread is fetched and classified normally."""
+        mock_proxy.get_thread.return_value = mock_thread_response
+
+        result = await process_single_thread(
+            "thread_001", ["msg_001"], mock_proxy, mock_classifier, mock_label_manager,
+            cloud_sem, local_sem, max_thread_chars=16000, fetch_sem=asyncio.Semaphore(2),
+        )
+
+        assert result is True
+        mock_proxy.get_thread.assert_called_once()
+
     async def test_service_thread_classified_via_cloud(
         self,
         mock_proxy,
@@ -317,6 +454,87 @@ class TestProcessSingleThread:
         assert result is True
         mock_classifier.classify.assert_called_once()
         mock_label_manager.apply_classification.assert_called_once()
+
+
+class TestFailureTracker:
+    def test_gives_up_only_at_threshold(self):
+        t = FailureTracker(max_failures=3)
+        assert t.should_give_up("x") is False
+        t.record_failure("x")
+        assert t.should_give_up("x") is False
+        t.record_failure("x")
+        assert t.should_give_up("x") is False
+        t.record_failure("x")
+        assert t.should_give_up("x") is True
+
+    def test_clear_resets_count(self):
+        t = FailureTracker(max_failures=2)
+        t.record_failure("x")
+        t.record_failure("x")
+        assert t.should_give_up("x") is True
+        t.clear("x")
+        assert t.should_give_up("x") is False
+
+    def test_threads_tracked_independently(self):
+        t = FailureTracker(max_failures=2)
+        t.record_failure("a")
+        t.record_failure("a")
+        t.record_failure("b")
+        assert t.should_give_up("a") is True
+        assert t.should_give_up("b") is False
+
+    def test_records_and_takes_give_ups(self):
+        t = FailureTracker(max_failures=1)
+        assert t.take_given_up() == []
+        t.record_give_up("a")
+        t.record_give_up("b")
+        assert t.take_given_up() == ["a", "b"]
+        assert t.take_given_up() == []  # draining resets the per-cycle list
+
+    def test_prune_evicts_counts_for_absent_threads(self):
+        # A thread that fails a few times then vanishes from the query must not
+        # leak its count forever (review finding #7).
+        t = FailureTracker(max_failures=2)
+        t.record_failure("gone")
+        t.record_failure("gone")
+        assert t.should_give_up("gone") is True
+        t.prune({"still_here"})
+        assert t.should_give_up("gone") is False  # evicted
+
+    def test_prune_keeps_active_threads(self):
+        t = FailureTracker(max_failures=2)
+        t.record_failure("active")
+        t.record_failure("active")
+        t.prune({"active"})
+        assert t.should_give_up("active") is True  # still counted toward give-up
+
+
+class TestSummarizeCycle:
+    def test_counts_handled_threads_and_drains_give_ups(self):
+        t = FailureTracker(max_failures=1)
+        t.record_give_up("gaveup")
+        items = [("ok", ["1"]), ("retry", ["2"]), ("gaveup", ["3"])]
+        results = [True, False, True]  # gaveup returned True (handled via give-up)
+        processed, given_up = summarize_cycle(items, results, t)
+        assert processed == 2  # ok + gaveup
+        assert given_up == ["gaveup"]  # a subset of processed
+        assert t.take_given_up() == []  # already drained
+
+    def test_clears_counts_for_handled_threads(self):
+        t = FailureTracker(max_failures=2)
+        t.record_failure("ok")  # failed last cycle, succeeds now
+        summarize_cycle([("ok", ["1"])], [True], t)
+        t.record_failure("ok")
+        assert t.should_give_up("ok") is False  # count was reset on success
+
+    def test_prunes_counts_for_threads_absent_this_cycle(self):
+        t = FailureTracker(max_failures=2)
+        t.record_failure("stale")
+        t.record_failure("stale")  # at threshold from a prior cycle
+        assert t.should_give_up("stale") is True
+        # This cycle only has "active"; "stale" is gone from the query.
+        summarize_cycle([("active", ["1"])], [False], t)
+        assert t.should_give_up("stale") is False  # pruned
 
 
 class TestLoadConfig:
@@ -402,6 +620,48 @@ class TestLoadConfig:
         for key in ("story_extraction", "quality_assessment", "theme_classification"):
             assert "system" in prompts[key]
             assert "user_template" in prompts[key]
+
+
+class TestResolveIntEnv:
+    def test_returns_default_when_unset(self, monkeypatch):
+        monkeypatch.delenv("LOCAL_PARALLEL", raising=False)
+        assert resolve_int_env("LOCAL_PARALLEL", 4) == 4
+
+    def test_env_overrides_default(self, monkeypatch):
+        monkeypatch.setenv("LOCAL_PARALLEL", "6")
+        assert resolve_int_env("LOCAL_PARALLEL", 4) == 6
+
+    def test_blank_env_falls_back_to_default(self, monkeypatch):
+        monkeypatch.setenv("LOCAL_PARALLEL", "   ")
+        assert resolve_int_env("LOCAL_PARALLEL", 4) == 4
+
+    def test_invalid_env_falls_back_to_default(self, monkeypatch):
+        monkeypatch.setenv("MAX_EMAILS_PER_CYCLE", "lots")
+        assert resolve_int_env("MAX_EMAILS_PER_CYCLE", 10) == 10
+
+    def test_strips_whitespace_around_value(self, monkeypatch):
+        monkeypatch.setenv("LOCAL_PARALLEL", "  2 ")
+        assert resolve_int_env("LOCAL_PARALLEL", 4) == 2
+
+    def test_zero_falls_back_to_default(self, monkeypatch):
+        # 0 parses fine but is out of range: Semaphore(0) deadlocks the daemon.
+        monkeypatch.setenv("LOCAL_PARALLEL", "0")
+        assert resolve_int_env("LOCAL_PARALLEL", 4) == 4
+
+    def test_negative_falls_back_to_default(self, monkeypatch):
+        # -1 parses fine but is out of range: Semaphore(-1) crashes at startup.
+        monkeypatch.setenv("LOCAL_PARALLEL", "-1")
+        assert resolve_int_env("LOCAL_PARALLEL", 4) == 4
+
+    def test_value_at_minimum_is_allowed(self, monkeypatch):
+        monkeypatch.setenv("LOCAL_PARALLEL", "1")
+        assert resolve_int_env("LOCAL_PARALLEL", 4) == 1
+
+    def test_max_emails_zero_falls_back_to_default(self, monkeypatch):
+        # The lower-bound guard protects every numeric override, not just concurrency:
+        # max_results=0 would make the daemon process nothing each cycle.
+        monkeypatch.setenv("MAX_EMAILS_PER_CYCLE", "0")
+        assert resolve_int_env("MAX_EMAILS_PER_CYCLE", 10) == 10
 
 
 @pytest.fixture

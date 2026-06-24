@@ -5,7 +5,7 @@ from unittest.mock import AsyncMock, patch
 import httpx
 import pytest
 
-from llm_client import LLMClient
+from llm_client import LLMClient, LLMUnavailableError
 
 
 @pytest.fixture
@@ -200,19 +200,47 @@ class TestComplete:
             with pytest.raises(RuntimeError, match="LLM request failed"):
                 await cloud_client.complete("sys", "user")
 
-    async def test_raises_on_connection_error(self, cloud_client):
-        """Connection errors propagate."""
+    async def test_connect_error_surfaces_as_unavailable(self, cloud_client):
+        """A refused connection (server down) surfaces as LLMUnavailableError (transient)."""
         with patch("llm_client.httpx.AsyncClient") as mock_client_cls:
             mock_client = AsyncMock()
             mock_client.post.side_effect = httpx.ConnectError("Connection refused")
             mock_client_cls.return_value.__aenter__ = AsyncMock(return_value=mock_client)
             mock_client_cls.return_value.__aexit__ = AsyncMock(return_value=False)
 
-            with pytest.raises(httpx.ConnectError):
+            with pytest.raises(LLMUnavailableError):
                 await cloud_client.complete("sys", "user")
 
-    async def test_raises_timeout_error_on_timeout(self, cloud_client):
-        """Timeout exceptions are converted to TimeoutError with helpful message."""
+    async def test_connect_timeout_surfaces_as_unavailable_not_timeout(self, cloud_client):
+        """A connect timeout is endpoint unavailability, NOT a request-specific timeout.
+
+        Regression (review finding #1): httpx.ConnectTimeout is a subclass of
+        TimeoutException, so it used to be mapped to TimeoutError and counted toward
+        give-up. It must surface as LLMUnavailableError (transient) instead.
+        """
+        with patch("llm_client.httpx.AsyncClient") as mock_client_cls:
+            mock_client = AsyncMock()
+            mock_client.post.side_effect = httpx.ConnectTimeout("connect timed out")
+            mock_client_cls.return_value.__aenter__ = AsyncMock(return_value=mock_client)
+            mock_client_cls.return_value.__aexit__ = AsyncMock(return_value=False)
+
+            with pytest.raises(LLMUnavailableError):
+                await cloud_client.complete("sys", "user")
+
+    async def test_pool_timeout_surfaces_as_unavailable(self, cloud_client):
+        """A pool timeout (connection pool exhausted) is transient unavailability."""
+        with patch("llm_client.httpx.AsyncClient") as mock_client_cls:
+            mock_client = AsyncMock()
+            mock_client.post.side_effect = httpx.PoolTimeout("pool exhausted")
+            mock_client_cls.return_value.__aenter__ = AsyncMock(return_value=mock_client)
+            mock_client_cls.return_value.__aexit__ = AsyncMock(return_value=False)
+
+            with pytest.raises(LLMUnavailableError):
+                await cloud_client.complete("sys", "user")
+
+    async def test_read_timeout_stays_request_specific_timeout_error(self, cloud_client):
+        """A read timeout (slow prefill on large input) stays TimeoutError — request-specific,
+        so the daemon may give up on one oversized thread rather than retry forever."""
         with patch("llm_client.httpx.AsyncClient") as mock_client_cls:
             mock_client = AsyncMock()
             mock_client.post.side_effect = httpx.ReadTimeout("timed out")
@@ -220,6 +248,37 @@ class TestComplete:
             mock_client_cls.return_value.__aexit__ = AsyncMock(return_value=False)
 
             with pytest.raises(TimeoutError, match="timed out after 60s"):
+                await cloud_client.complete("sys", "user")
+
+    async def test_surfaces_read_error_as_informative_unavailable_error(self, cloud_client):
+        """A dropped/reset connection (httpx.ReadError) surfaces as a non-empty LLMUnavailableError.
+
+        Regression: a bare reset previously propagated as an exception whose str() was
+        empty, so callers recorded it as an empty error / no result instead of a failure.
+        It is treated as transient unavailability (server crashed/restarted/flapped).
+        """
+        with patch("llm_client.httpx.AsyncClient") as mock_client_cls:
+            mock_client = AsyncMock()
+            mock_client.post.side_effect = httpx.ReadError("")  # empty msg, like a bare reset
+            mock_client_cls.return_value.__aenter__ = AsyncMock(return_value=mock_client)
+            mock_client_cls.return_value.__aexit__ = AsyncMock(return_value=False)
+
+            with pytest.raises(LLMUnavailableError) as exc_info:
+                await cloud_client.complete("sys", "user")
+            msg = str(exc_info.value)
+            assert msg  # non-empty even though the underlying error message was empty
+            assert "ReadError" in msg
+            assert "test-cloud-model" in msg
+
+    async def test_surfaces_remote_protocol_error_as_unavailable(self, cloud_client):
+        """A server disconnect (httpx.RemoteProtocolError) surfaces as LLMUnavailableError."""
+        with patch("llm_client.httpx.AsyncClient") as mock_client_cls:
+            mock_client = AsyncMock()
+            mock_client.post.side_effect = httpx.RemoteProtocolError("Server disconnected")
+            mock_client_cls.return_value.__aenter__ = AsyncMock(return_value=mock_client)
+            mock_client_cls.return_value.__aexit__ = AsyncMock(return_value=False)
+
+            with pytest.raises(LLMUnavailableError, match="RemoteProtocolError"):
                 await cloud_client.complete("sys", "user")
 
     async def test_uses_configured_timeout(self, cloud_client):
@@ -411,6 +470,81 @@ class TestGLMReasoningContent:
 
             body = mock_client.post.call_args.kwargs["json"]
             assert body["thinking"] == {"type": "enabled"}
+
+    async def test_glm_no_think_extra_body_disables_native_thinking(self):
+        """--no-think (chat_template_kwargs.enable_thinking=False) must disable GLM's
+        native thinking, not be contradicted by an unconditional thinking=enabled.
+
+        Regression (review finding #4): GLM is the default cloud model, so the
+        documented thinking on/off A/B run would otherwise send enable_thinking=false
+        AND thinking={type:enabled} in the same body.
+        """
+        client = LLMClient(
+            base_url="https://api.example.com/v1/chat/completions",
+            api_key="sk-test",
+            model="zai-org/glm-5",
+            extra_body={"chat_template_kwargs": {"enable_thinking": False}},
+        )
+        mock_response = _mock_response(json_data={
+            "choices": [{"message": {"content": "SERVICE"}}]
+        })
+
+        with patch("llm_client.httpx.AsyncClient") as mock_client_cls:
+            mock_client = AsyncMock()
+            mock_client.post.return_value = mock_response
+            mock_client_cls.return_value.__aenter__ = AsyncMock(return_value=mock_client)
+            mock_client_cls.return_value.__aexit__ = AsyncMock(return_value=False)
+
+            await client.complete("sys", "user", include_thinking=True)
+
+            body = mock_client.post.call_args.kwargs["json"]
+            assert body["thinking"] == {"type": "disabled"}
+
+    async def test_glm_top_level_enable_thinking_false_disables_native_thinking(self):
+        """A top-level enable_thinking=False in extra_body also disables GLM thinking."""
+        client = LLMClient(
+            base_url="https://api.example.com/v1/chat/completions",
+            api_key="sk-test",
+            model="zai-org/glm-5",
+            extra_body={"enable_thinking": False},
+        )
+        mock_response = _mock_response(json_data={
+            "choices": [{"message": {"content": "SERVICE"}}]
+        })
+
+        with patch("llm_client.httpx.AsyncClient") as mock_client_cls:
+            mock_client = AsyncMock()
+            mock_client.post.return_value = mock_response
+            mock_client_cls.return_value.__aenter__ = AsyncMock(return_value=mock_client)
+            mock_client_cls.return_value.__aexit__ = AsyncMock(return_value=False)
+
+            await client.complete("sys", "user", include_thinking=True)
+
+            body = mock_client.post.call_args.kwargs["json"]
+            assert body["thinking"] == {"type": "disabled"}
+
+    async def test_glm_explicit_thinking_field_is_not_overridden(self):
+        """An explicit `thinking` field in extra_body wins over the auto-injection."""
+        client = LLMClient(
+            base_url="https://api.example.com/v1/chat/completions",
+            api_key="sk-test",
+            model="zai-org/glm-5",
+            extra_body={"thinking": {"type": "disabled"}},
+        )
+        mock_response = _mock_response(json_data={
+            "choices": [{"message": {"content": "SERVICE"}}]
+        })
+
+        with patch("llm_client.httpx.AsyncClient") as mock_client_cls:
+            mock_client = AsyncMock()
+            mock_client.post.return_value = mock_response
+            mock_client_cls.return_value.__aenter__ = AsyncMock(return_value=mock_client)
+            mock_client_cls.return_value.__aexit__ = AsyncMock(return_value=False)
+
+            await client.complete("sys", "user", include_thinking=True)
+
+            body = mock_client.post.call_args.kwargs["json"]
+            assert body["thinking"] == {"type": "disabled"}
 
     async def test_glm_no_thinking_param_without_include(self, glm_client):
         """GLM models don't get thinking param when include_thinking=False."""

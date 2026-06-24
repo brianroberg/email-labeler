@@ -11,6 +11,16 @@ import httpx
 from retry import retry_with_backoff
 
 
+class LLMUnavailableError(Exception):
+    """The LLM endpoint is unreachable or dropped the connection (transient).
+
+    Distinct from request-specific failures: a non-200 response or a read/write
+    timeout means the *request* is the problem (too-large input, bad payload) and
+    is eligible for the daemon's give-up logic, whereas an unavailable endpoint is
+    a transient outage that should simply be retried next cycle.
+    """
+
+
 class LLMClient:
     """Client for OpenAI-compatible chat completion endpoints."""
 
@@ -36,6 +46,19 @@ class LLMClient:
         """Check if model uses GLM-style reasoning_content instead of inline think tags."""
         return "glm" in self.model.lower()
 
+    def _extra_body_disables_thinking(self) -> bool:
+        """True if extra_body asks to turn thinking off.
+
+        Recognizes both the chat_template_kwargs.enable_thinking form (Qwen / LM
+        Studio, what --no-think emits) and a top-level enable_thinking flag. GLM
+        ignores those fields, so complete() uses this to set GLM's native thinking
+        field to disabled rather than contradicting the request with enabled.
+        """
+        ctk = self.extra_body.get("chat_template_kwargs")
+        if isinstance(ctk, dict) and ctk.get("enable_thinking") is False:
+            return True
+        return self.extra_body.get("enable_thinking") is False
+
     async def complete(
         self, system_prompt: str, user_content: str, include_thinking: bool = False,
     ) -> str | tuple[str, str]:
@@ -51,8 +74,12 @@ class LLMClient:
             If include_thinking is True: (stripped_response, thinking_content) tuple.
 
         Raises:
+            TimeoutError: If the request times out (read/write) — request-specific
+                (e.g. input too large to prefill within the timeout).
+            LLMUnavailableError: If the endpoint is unreachable (connection refused
+                or connect/pool timeout) or the connection drops mid-request —
+                transient unavailability.
             RuntimeError: If the LLM returns a non-200 response.
-            httpx.ConnectError: If the server is unreachable.
         """
         headers = {"Content-Type": "application/json"}
         if self.api_key:
@@ -69,9 +96,13 @@ class LLMClient:
             **self.extra_body,
         }
 
-        # GLM models require explicit thinking enablement in request
-        if include_thinking and self._is_glm_model():
-            body["thinking"] = {"type": "enabled"}
+        # GLM models require an explicit thinking field. Honor a disable request
+        # from extra_body (e.g. --no-think, which GLM otherwise ignores) instead of
+        # contradicting it with enabled, and never override a `thinking` field the
+        # caller set explicitly in extra_body.
+        if include_thinking and self._is_glm_model() and "thinking" not in body:
+            disabled = self._extra_body_disables_thinking()
+            body["thinking"] = {"type": "disabled" if disabled else "enabled"}
 
         async def _do_request() -> httpx.Response:
             async with httpx.AsyncClient(timeout=self.timeout) as client:
@@ -79,10 +110,31 @@ class LLMClient:
 
         try:
             response = await retry_with_backoff(_do_request, f"LLM {self.model}")
+        except (httpx.ConnectError, httpx.ConnectTimeout, httpx.PoolTimeout) as exc:
+            # Couldn't establish a connection (server down / unreachable / pool
+            # exhausted). This is endpoint *unavailability*, not a problem with this
+            # request, so callers retry next cycle and never count it toward giving
+            # up on a thread. NOTE: ConnectTimeout/PoolTimeout subclass
+            # TimeoutException, so they must be caught before the timeout clause.
+            raise LLMUnavailableError(
+                f"LLM endpoint {self.model} unavailable ({type(exc).__name__}): {exc}"
+            ) from exc
         except httpx.TimeoutException:
+            # Connection established but the response was too slow (read/write
+            # timeout) — request-specific (e.g. a transcript too large to prefill
+            # within the timeout). Surfaced as TimeoutError so the daemon may give
+            # up on one oversized thread rather than retry it forever.
             raise TimeoutError(
                 f"LLM request to {self.model} timed out after {self.timeout}s"
             ) from None
+        except httpx.TransportError as exc:
+            # Connection established then dropped/reset mid-request (ReadError,
+            # WriteError, RemoteProtocolError, ...): the server crashed, restarted,
+            # or flapped — an availability event, also transient. (Some of these
+            # stringify to ""; the wrapper guarantees an informative, non-empty msg.)
+            raise LLMUnavailableError(
+                f"LLM connection to {self.model} dropped ({type(exc).__name__}): {exc}"
+            ) from exc
 
         if response.status_code != 200:
             prompt_chars = len(system_prompt) + len(user_content)

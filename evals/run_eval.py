@@ -24,7 +24,7 @@ import httpx
 
 from classifier import EmailClassifier, SenderType, ThreadMetadata
 from config_utils import substitute_env_vars
-from daemon import format_thread_transcript
+from daemon import DEFAULT_MAX_THREAD_CHARS, format_thread_transcript
 from evals import format_network_error
 from evals.llm_cache import CachedLLMClient
 from evals.schemas import GoldenThread, PredictionResult, RunMeta, ThinkingEntry
@@ -39,6 +39,85 @@ def resolve_parallelism(cli_value: int | None, config: dict) -> int:
     if cli_value is not None:
         return cli_value
     return config.get("daemon", {}).get("cloud_parallel", 1)
+
+
+def resolve_max_thread_chars(config: dict) -> int:
+    """Transcript char cap: config value if present, else the shared daemon default.
+
+    Uses DEFAULT_MAX_THREAD_CHARS (imported from daemon) so an eval run truncates
+    transcripts exactly as production does, even for a config that omits the key.
+    """
+    return config.get("daemon", {}).get("max_thread_chars", DEFAULT_MAX_THREAD_CHARS)
+
+
+def resolve_extra_body(base: dict | None, no_think: bool, override_json: str | None) -> dict | None:
+    """Merge CLI extra_body overrides onto one LLM's config extra_body.
+
+    Precedence (later wins):
+      1. config's existing extra_body (*base*)
+      2. --no-think -> sets chat_template_kwargs.enable_thinking = False
+      3. --extra-body JSON object (its keys override the above)
+
+    Returns the merged dict, or None when nothing is set (so the LLMClient keeps
+    its default). The eval cache key includes extra_body, so thinking-on vs
+    thinking-off runs never collide in the cache. Does not mutate *base*.
+
+    Raises:
+        ValueError: if override_json is not a valid JSON object.
+    """
+    result = dict(base) if base else {}
+    if no_think:
+        ctk = dict(result.get("chat_template_kwargs") or {})
+        ctk["enable_thinking"] = False
+        result["chat_template_kwargs"] = ctk
+    if override_json:
+        try:
+            override = json.loads(override_json)
+        except json.JSONDecodeError as exc:
+            raise ValueError(f"Invalid --extra-body JSON: {exc}") from exc
+        if not isinstance(override, dict):
+            raise ValueError("--extra-body must be a JSON object")
+        result.update(override)
+    return result or None
+
+
+def apply_config_overrides(config: dict, args: argparse.Namespace) -> None:
+    """Apply all CLI overrides onto *config* in place (CLI always wins over config).
+
+    Covers the model/temperature/max_tokens/timeout scalars and extra_body
+    (thinking toggles / provider-specific params) in one pass, so all CLI->config
+    plumbing lives in a single tested function.
+
+    A scalar CLI value of None means "not provided" and leaves the config value
+    intact; 0 / 0.0 are valid overrides (e.g. temperature 0), so the guard is
+    `is not None`, not truthiness. extra_body is merged via resolve_extra_body
+    (the eval cache key includes extra_body, so thinking-on vs -off runs don't
+    collide).
+
+    Raises:
+        ValueError: if a --*-extra-body value is not a valid JSON object.
+    """
+    scalars = {
+        "cloud": {"model": args.cloud_model, "temperature": args.cloud_temperature,
+                  "max_tokens": args.cloud_max_tokens, "timeout": args.cloud_timeout},
+        "local": {"model": args.local_model, "temperature": args.local_temperature,
+                  "max_tokens": args.local_max_tokens, "timeout": args.local_timeout},
+    }
+    for section, fields in scalars.items():
+        for key, value in fields.items():
+            if value is not None:
+                config["llm"][section][key] = value
+
+    extra_body = {
+        "cloud": (args.cloud_no_think, args.cloud_extra_body),
+        "local": (args.local_no_think, args.local_extra_body),
+    }
+    for section, (no_think, eb_json) in extra_body.items():
+        resolved = resolve_extra_body(
+            config["llm"][section].get("extra_body"), no_think, eb_json,
+        )
+        if resolved is not None:
+            config["llm"][section]["extra_body"] = resolved
 
 
 def load_golden_set(path: Path, reviewed_only: bool = False) -> list[GoldenThread]:
@@ -277,17 +356,13 @@ async def main(args: argparse.Namespace) -> None:
     # Resolve parallelism: CLI wins, otherwise fall back to config
     args.parallelism = resolve_parallelism(args.parallelism, config)
 
-    # Apply CLI overrides to config (CLI always wins over config file)
-    _overrides = {
-        "cloud": {"model": args.cloud_model, "temperature": args.cloud_temperature,
-                  "max_tokens": args.cloud_max_tokens},
-        "local": {"model": args.local_model, "temperature": args.local_temperature,
-                  "max_tokens": args.local_max_tokens},
-    }
-    for section, fields in _overrides.items():
-        for key, value in fields.items():
-            if value is not None:
-                config["llm"][section][key] = value
+    # Apply CLI overrides to config (CLI always wins over config file). extra_body
+    # parsing can fail on bad JSON, so surface that as a clean exit.
+    try:
+        apply_config_overrides(config, args)
+    except ValueError as exc:
+        print(f"Error: {exc}", file=sys.stderr)
+        sys.exit(2)
 
     # Load golden set
     golden_path = Path(args.golden_set)
@@ -341,7 +416,7 @@ async def main(args: argparse.Namespace) -> None:
 
     classifier = EmailClassifier(cloud_llm=cloud_llm, local_llm=local_llm, config=config)
 
-    max_thread_chars = config.get("daemon", {}).get("max_thread_chars", 50000)
+    max_thread_chars = resolve_max_thread_chars(config)
 
     # Run evaluation — flush cache even if something fails after evaluation
     try:
@@ -448,6 +523,19 @@ def cli():
                         help="Override local LLM temperature")
     parser.add_argument("--cloud-max-tokens", type=int, help="Override cloud LLM max tokens")
     parser.add_argument("--local-max-tokens", type=int, help="Override local LLM max tokens")
+    parser.add_argument("--cloud-timeout", type=int, help="Override cloud LLM request timeout (seconds)")
+    parser.add_argument("--local-timeout", type=int, help="Override local LLM request timeout (seconds)")
+    parser.add_argument("--cloud-extra-body",
+                        help="JSON object merged into every cloud LLM request body")
+    parser.add_argument("--local-extra-body",
+                        help='JSON object merged into every local LLM request body '
+                             '(e.g. \'{"chat_template_kwargs": {"enable_thinking": false}}\')')
+    parser.add_argument("--cloud-no-think", action="store_true",
+                        help="Disable thinking for the cloud LLM "
+                             "(sets chat_template_kwargs.enable_thinking=false)")
+    parser.add_argument("--local-no-think", action="store_true",
+                        help="Disable thinking for the local LLM "
+                             "(sets chat_template_kwargs.enable_thinking=false)")
     args = parser.parse_args()
 
     if args.stages not in VALID_STAGES:
