@@ -106,6 +106,18 @@ class FailureTracker:
     def clear(self, thread_id: str) -> None:
         self._counts.pop(thread_id, None)
 
+    def prune(self, active_thread_ids) -> None:
+        """Drop failure counts for threads no longer pending.
+
+        A thread that fails a few times (below the give-up threshold) and then
+        disappears from the query — read, archived, or relabeled externally —
+        would otherwise leak its count for the daemon's lifetime. Pruning each
+        cycle to the still-pending set keeps the map bounded; a consecutively
+        failing thread reappears every cycle, so it is never pruned.
+        """
+        active = set(active_thread_ids)
+        self._counts = {tid: n for tid, n in self._counts.items() if tid in active}
+
     def record_give_up(self, thread_id: str) -> None:
         """Record that a thread was abandoned (marked processed without a label),
         so the per-cycle summary can report give-ups distinctly from classifications."""
@@ -573,6 +585,8 @@ async def run_daemon() -> None:
                     failure_tracker.clear(tid)  # success/give-up resets the failure count
 
             given_up = failure_tracker.take_given_up()
+            # Keep the failure map bounded: drop counts for threads no longer pending.
+            failure_tracker.prune(threads)
             if threads:
                 if given_up:
                     log.info(

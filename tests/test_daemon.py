@@ -490,6 +490,23 @@ class TestFailureTracker:
         assert t.take_given_up() == ["a", "b"]
         assert t.take_given_up() == []  # draining resets the per-cycle list
 
+    def test_prune_evicts_counts_for_absent_threads(self):
+        # A thread that fails a few times then vanishes from the query must not
+        # leak its count forever (review finding #7).
+        t = FailureTracker(max_failures=2)
+        t.record_failure("gone")
+        t.record_failure("gone")
+        assert t.should_give_up("gone") is True
+        t.prune({"still_here"})
+        assert t.should_give_up("gone") is False  # evicted
+
+    def test_prune_keeps_active_threads(self):
+        t = FailureTracker(max_failures=2)
+        t.record_failure("active")
+        t.record_failure("active")
+        t.prune({"active"})
+        assert t.should_give_up("active") is True  # still counted toward give-up
+
 
 class TestLoadConfig:
     def test_loads_config_toml(self):
