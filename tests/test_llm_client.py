@@ -298,6 +298,77 @@ class TestComplete:
             mock_client_cls.assert_called_once_with(timeout=60)
 
 
+class TestContentlessResponse:
+    """A response message lacking usable content must raise a clear, non-KeyError error.
+
+    A reasoning model (or GLM) that exhausts max_tokens mid-<think> returns a message
+    with reasoning/reasoning_content but no `content` — previously a raw KeyError. It is
+    request-specific/permanent (retrying as-is won't help), so it must surface as a
+    RuntimeError (give-up-eligible), NOT LLMUnavailableError (which would retry forever).
+    """
+
+    async def test_missing_content_key_raises_runtime_error(self, cloud_client):
+        """A message with no `content` key raises RuntimeError, not KeyError."""
+        mock_response = _mock_response(json_data={
+            "choices": [{"message": {"role": "assistant"}}]
+        })
+
+        with patch("llm_client.httpx.AsyncClient") as mock_client_cls:
+            mock_client = AsyncMock()
+            mock_client.post.return_value = mock_response
+            mock_client_cls.return_value.__aenter__ = AsyncMock(return_value=mock_client)
+            mock_client_cls.return_value.__aexit__ = AsyncMock(return_value=False)
+
+            with pytest.raises(RuntimeError, match="no content") as exc_info:
+                await cloud_client.complete("sys", "user")
+            msg = str(exc_info.value)
+            assert "test-cloud-model" in msg
+            assert "max_tokens" in msg  # names the likely cause
+
+    async def test_none_content_raises_runtime_error(self, cloud_client):
+        """An explicit `content: null` raises RuntimeError, not a downstream crash."""
+        mock_response = _mock_response(json_data={
+            "choices": [{"message": {"role": "assistant", "content": None}}]
+        })
+
+        with patch("llm_client.httpx.AsyncClient") as mock_client_cls:
+            mock_client = AsyncMock()
+            mock_client.post.return_value = mock_response
+            mock_client_cls.return_value.__aenter__ = AsyncMock(return_value=mock_client)
+            mock_client_cls.return_value.__aexit__ = AsyncMock(return_value=False)
+
+            with pytest.raises(RuntimeError, match="no content"):
+                await cloud_client.complete("sys", "user")
+
+    async def test_glm_reasoning_only_no_content_raises_runtime_error(self):
+        """GLM returning only reasoning_content (max_tokens exhausted mid-think) raises
+        RuntimeError, not KeyError — the cloud-tier case from issue #11's comment.
+
+        There is no final answer, only reasoning, so even include_thinking mode must
+        not silently treat a content-less reply as a classification.
+        """
+        glm_client = LLMClient(
+            base_url="https://api.example.com/v1/chat/completions",
+            api_key="sk-test",
+            model="zai-org/glm-5",
+        )
+        mock_response = _mock_response(json_data={
+            "choices": [{"message": {
+                "role": "assistant",
+                "reasoning_content": "Let me think about whether this is a person...",
+            }}]
+        })
+
+        with patch("llm_client.httpx.AsyncClient") as mock_client_cls:
+            mock_client = AsyncMock()
+            mock_client.post.return_value = mock_response
+            mock_client_cls.return_value.__aenter__ = AsyncMock(return_value=mock_client)
+            mock_client_cls.return_value.__aexit__ = AsyncMock(return_value=False)
+
+            with pytest.raises(RuntimeError, match="no content"):
+                await glm_client.complete("sys", "user", include_thinking=True)
+
+
 class TestIsAvailable:
     async def test_available_when_server_responds(self, local_client):
         """is_available returns True when server returns 200."""

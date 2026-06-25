@@ -145,7 +145,19 @@ class LLMClient:
             )
 
         msg = response.json()["choices"][0]["message"]
-        content = msg["content"]
+        content = msg.get("content")
+        if content is None:
+            # A reasoning model that exhausts max_tokens mid-<think> (or a GLM reply
+            # that returns only reasoning_content) yields a message with no usable
+            # `content`. Retrying as-is won't help, so this is request-specific/
+            # permanent: surface a clear RuntimeError (give-up-eligible via the daemon),
+            # never LLMUnavailableError (would retry forever) or a raw KeyError.
+            has_reasoning = bool(msg.get("reasoning_content") or msg.get("reasoning"))
+            raise RuntimeError(
+                f"LLM {self.model} returned no content "
+                f"(max_tokens={self.max_tokens} likely exhausted before a final answer; "
+                f"reasoning_content {'present' if has_reasoning else 'absent'})"
+            )
 
         if include_thinking:
             # GLM models return reasoning in a separate field
