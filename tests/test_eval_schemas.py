@@ -67,6 +67,39 @@ class TestGoldenThread:
         assert gt.harvested_at == ""
         assert gt.reviewed is False
         assert gt.notes == ""
+        assert gt.excluded is False
+
+    def test_excluded_round_trips(self):
+        gt = GoldenThread(
+            thread_id="t_excl",
+            messages=[],
+            senders=[],
+            subject="",
+            snippet="",
+            expected_sender_type="service",
+            expected_label="low_priority",
+            excluded=True,
+        )
+        d = gt.to_dict()
+        assert d["excluded"] is True
+        assert "skipped" not in d
+        restored = GoldenThread.from_dict(d)
+        assert restored.excluded is True
+
+    def test_legacy_skipped_key_maps_to_excluded(self):
+        # Pre-existing golden sets persisted the marker as "skipped".
+        d = {
+            "thread_id": "t_legacy",
+            "messages": [],
+            "senders": [],
+            "subject": "",
+            "snippet": "",
+            "expected_sender_type": "person",
+            "expected_label": "fyi",
+            "skipped": True,
+        }
+        gt = GoldenThread.from_dict(d)
+        assert gt.excluded is True
 
 
 class TestPredictionResult:

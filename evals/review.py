@@ -27,10 +27,10 @@ SENDER_TYPES = ["person", "service"]
 LABELS = ["needs_response", "fyi", "low_priority"]
 
 _SENDER_KEY_MAP = {"p": "person", "s": "service"}
-_LABEL_KEY_MAP = {"n": "needs_response", "f": "fyi", "l": "low_priority"}
+_LABEL_KEY_MAP = {"r": "needs_response", "f": "fyi", "l": "low_priority"}
 
 # Mutable fields that get snapshotted for undo
-_SNAPSHOT_FIELDS = ("expected_sender_type", "expected_label", "reviewed", "notes", "skipped")
+_SNAPSHOT_FIELDS = ("expected_sender_type", "expected_label", "reviewed", "notes", "excluded")
 
 
 def _capture_snapshot(thread: GoldenThread, index: int) -> dict:
@@ -118,7 +118,7 @@ def _prompt_sender_type() -> str | None:
 def _prompt_label() -> str | None:
     """Hotkey sub-menu for label. Returns value or None on cancel."""
     key = prompt_hotkey_menu(
-        "Select label:", [("n", "needs_response"), ("f", "fyi"), ("l", "low_priority")]
+        "Select label:", [("r", "needs_response"), ("f", "fyi"), ("l", "low_priority")]
     )
     return _LABEL_KEY_MAP.get(key)
 
@@ -186,7 +186,7 @@ def review_thread_normal(
         actions.append(("s", "sender"))
     if stage != 1:
         actions.append(("l", "label"))
-    actions.extend([("n", "notes"), ("z", "undo"), ("x", "skip"), ("q", "quit")])
+    actions.extend([("n", "notes"), ("z", "undo"), ("k", "skip"), ("e", "exclude"), ("q", "quit")])
 
     while True:
         key = prompt_hotkey_menu("Actions:", actions)
@@ -227,12 +227,17 @@ def review_thread_normal(
         if key == "z":
             return "back"
 
-        if key == "x":
+        if key == "k":
+            # Temporary skip: render no judgment; resurfaces in a later review.
+            print("  -> Skipped (no judgment).")
+            return "advance"
+
+        if key == "e":
             if undo_stack is not None:
                 undo_stack.append(_capture_snapshot(thread, index))
-            thread.skipped = True
+            thread.excluded = True
             thread.reviewed = True
-            print("  -> Thread marked as skipped.")
+            print("  -> Thread excluded (permanently set aside).")
             return "advance"
 
         if key == "q":
@@ -263,8 +268,8 @@ def review_thread_blind(
             key = prompt_hotkey_menu(
                 "Sender type:",
                 [
-                    ("p", "person"), ("s", "service"), ("z", "undo"),
-                    ("n", "notes"), ("x", "skip"), ("q", "quit"),
+                    ("p", "person"), ("s", "service"), ("n", "notes"), ("z", "undo"),
+                    ("k", "skip"), ("e", "exclude"), ("q", "quit"),
                 ],
             )
             if key in _SENDER_KEY_MAP:
@@ -279,12 +284,15 @@ def review_thread_blind(
                 thread.notes = _prompt_notes()
                 print("  -> Notes saved.")
                 continue
-            if key == "x":
+            if key == "k":
+                print("  -> Skipped (no judgment).")
+                return "advance"
+            if key == "e":
                 if undo_stack is not None:
                     undo_stack.append(_capture_snapshot(thread, index))
-                thread.skipped = True
+                thread.excluded = True
                 thread.reviewed = True
-                print("  -> Thread marked as skipped.")
+                print("  -> Thread excluded (permanently set aside).")
                 return "advance"
             if key == "q":
                 return "quit"
@@ -296,8 +304,8 @@ def review_thread_blind(
             key = prompt_hotkey_menu(
                 "Label:",
                 [
-                    ("n", "needs_response"), ("f", "fyi"),
-                    ("l", "low_priority"), ("z", "undo"), ("q", "quit"),
+                    ("r", "needs_response"), ("f", "fyi"), ("l", "low_priority"),
+                    ("n", "notes"), ("z", "undo"), ("k", "skip"), ("e", "exclude"), ("q", "quit"),
                 ],
             )
             if key in _LABEL_KEY_MAP:
@@ -307,8 +315,22 @@ def review_thread_blind(
                 thread.reviewed = True
                 print(f"  -> Classified as {thread.expected_sender_type} / {thread.expected_label}")
                 return "advance"
+            if key == "n":
+                thread.notes = _prompt_notes()
+                print("  -> Notes saved.")
+                continue
             if key == "z":
                 return "back"
+            if key == "k":
+                print("  -> Skipped (no judgment).")
+                return "advance"
+            if key == "e":
+                if undo_stack is not None:
+                    undo_stack.append(_capture_snapshot(thread, index))
+                thread.excluded = True
+                thread.reviewed = True
+                print("  -> Thread excluded (permanently set aside).")
+                return "advance"
             if key == "q":
                 return "quit"
             print(f"  Invalid key: {key!r}")
@@ -317,6 +339,26 @@ def review_thread_blind(
     # (snapshot already captured before the sender type mutation above)
     thread.reviewed = True
     return "advance"
+
+
+# ---------------------------------------------------------------------------
+# Queue selection
+# ---------------------------------------------------------------------------
+
+def select_review_threads(
+    threads: list[GoldenThread], *, unreviewed_only: bool = False, filter_label: str | None = None
+) -> list[GoldenThread]:
+    """Threads to queue for review.
+
+    Excluded threads are permanently set aside and are never queued, regardless
+    of the other filters.
+    """
+    result = [t for t in threads if not t.excluded]
+    if unreviewed_only:
+        result = [t for t in result if not t.reviewed]
+    if filter_label:
+        result = [t for t in result if t.expected_label == filter_label]
+    return result
 
 
 # ---------------------------------------------------------------------------
@@ -398,15 +440,13 @@ def cli():
         run_edit_tui(threads, all_threads, path)
         return
 
-    # Regular review mode
-    threads = list(all_threads)
-    filtered = False
-    if args.unreviewed_only:
-        threads = [t for t in threads if not t.reviewed]
-        filtered = True
-    if args.filter_label:
-        threads = [t for t in threads if t.expected_label == args.filter_label]
-        filtered = True
+    # Regular review mode. Excluded threads are never queued; un-exclude via --edit.
+    threads = select_review_threads(
+        all_threads, unreviewed_only=args.unreviewed_only, filter_label=args.filter_label
+    )
+    # A reduced queue means we must merge changes back to avoid dropping the
+    # threads we didn't touch (excluded ones, and those filtered out) on save.
+    filtered = len(threads) != len(all_threads)
 
     if not threads:
         print("No threads match the filters.", file=sys.stderr)

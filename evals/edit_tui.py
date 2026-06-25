@@ -81,8 +81,8 @@ def _build_detail_lines(thread: GoldenThread, index: int, total: int) -> list[st
     ]
     if thread.notes:
         lines.append(f"Notes:       {thread.notes}")
-    if thread.skipped:
-        lines.append("Skipped:     True")
+    if thread.excluded:
+        lines.append("Excluded:    True")
 
     lines.append("")
     lines.append(f"Sender type: {thread.expected_sender_type}")
@@ -177,7 +177,8 @@ def _detail_view(
             _safe_addstr(stdscr, row_i, 0, lines[line_i])
 
         # Help bar
-        help_text = "\u2191/\u2193:Scroll  [s]ender  [l]abel  Esc:Back  q:Quit"
+        unexclude = "  [e]unexclude" if thread.excluded else ""
+        help_text = f"\u2191/\u2193:Scroll  [s]ender  [l]abel{unexclude}  Esc:Back  q:Quit"
         _safe_addstr(stdscr, max_y - 2, 0, help_text, curses.A_DIM)
 
         # Status bar
@@ -218,6 +219,9 @@ def _detail_view(
             if new_val:
                 thread.expected_label = new_val
                 _auto_save(all_threads, path, stdscr)
+        elif key == ord("e") and thread.excluded:
+            thread.excluded = False
+            _auto_save(all_threads, path, stdscr)
 
         # Exit
         elif key == 27:  # Esc
