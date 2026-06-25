@@ -44,6 +44,13 @@ uv run python -m evals.harvest --proxy-url http://localhost:8000 --label needs_r
 
 Interactive CLI for reviewing and correcting labels in the golden set. Saves atomically after each session. Press `z` at any prompt to undo the last classification — undo works as a stack, walking back through previous decisions.
 
+**Setting an email aside.** Some threads aren't useful as test cases. Two options:
+
+- **Skip** (`k`) — render no judgment. The thread is left unreviewed and resurfaces in a later review session.
+- **Exclude** (`e`) — permanently set the thread aside. It is dropped from the review queue and never evaluated. Excluded threads are flagged with an `X` in the `--edit` list view; to bring one back, open `--edit`, select it, and press `e` to un-exclude.
+
+Hotkeys: sender type `p`/`s` (person/service); label `r`/`f`/`l` (needs_response/fyi/low_priority); `n` notes; `z` undo; `k` skip; `e` exclude; `q` quit.
+
 ```bash
 # Review all threads (blind mode by default)
 uv run python -m evals.review
@@ -51,7 +58,7 @@ uv run python -m evals.review
 # Show existing labels while reviewing
 uv run python -m evals.review --show-labels
 
-# Curses TUI for editing reviewed threads
+# Curses TUI for editing reviewed threads (also where you un-exclude)
 uv run python -m evals.review --edit
 
 # Review only sender classification (stage 1) or label classification (stage 2)

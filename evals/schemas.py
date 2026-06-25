@@ -21,7 +21,7 @@ class GoldenThread:
     harvested_at: str = ""  # ISO 8601
     reviewed: bool = False
     notes: str = ""
-    skipped: bool = False
+    excluded: bool = False  # permanently set aside: never reviewed-queued or evaluated
 
     def to_dict(self) -> dict:
         return {
@@ -36,7 +36,7 @@ class GoldenThread:
             "harvested_at": self.harvested_at,
             "reviewed": self.reviewed,
             "notes": self.notes,
-            "skipped": self.skipped,
+            "excluded": self.excluded,
         }
 
     @classmethod
@@ -53,7 +53,8 @@ class GoldenThread:
             harvested_at=d.get("harvested_at", ""),
             reviewed=d.get("reviewed", False),
             notes=d.get("notes", ""),
-            skipped=d.get("skipped", False),
+            # Backward compat: pre-existing golden sets persisted this as "skipped".
+            excluded=d.get("excluded", d.get("skipped", False)),
         )
 
 

@@ -28,6 +28,8 @@ Complete CLI flag references, cache internals, and chain-of-thought capture deta
 | `--filter-label` | Show only threads with this label |
 | `--start-at` | Start at thread index (0-based) |
 
+Review hotkeys: `p`/`s` sender (person/service); `r`/`f`/`l` label (needs_response/fyi/low_priority); `n` notes; `z` undo; `k` skip; `e` exclude; `q` quit. **Skip** (`k`) leaves the thread unreviewed so it reappears later. **Exclude** (`e`) sets `excluded=True` (also marks reviewed): excluded threads are dropped from the review queue here and from `run_eval` entirely. Un-exclude from the `--edit` TUI detail view with `e`. The `excluded` field is persisted in the golden set JSONL; legacy records using the old `skipped` key are still read as excluded.
+
 ### run_eval
 
 | Flag | Description |

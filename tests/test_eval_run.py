@@ -1,16 +1,32 @@
 """Tests for eval runner parallelism defaults and extra_body overrides."""
 
 import argparse
+import json
 
 import pytest
 
 from daemon import DEFAULT_MAX_THREAD_CHARS, load_config
 from evals.run_eval import (
     apply_config_overrides,
+    load_golden_set,
     resolve_extra_body,
     resolve_max_thread_chars,
     resolve_parallelism,
 )
+from evals.schemas import GoldenThread
+
+
+def _golden(thread_id, **kw):
+    base = dict(
+        thread_id=thread_id, messages=[], senders=[], subject="", snippet="",
+        expected_sender_type="person", expected_label="fyi",
+    )
+    base.update(kw)
+    return GoldenThread(**base)
+
+
+def _write_golden_set(path, threads):
+    path.write_text("".join(json.dumps(t.to_dict()) + "\n" for t in threads))
 
 
 def _override_args(**kw):
@@ -30,6 +46,26 @@ def _override_config():
         "cloud": {"model": "cloud-default", "temperature": 0.5, "max_tokens": 100, "timeout": 60},
         "local": {"model": "local-default", "temperature": 0.7, "max_tokens": 200, "timeout": 180},
     }}
+
+
+class TestLoadGoldenSet:
+    def test_excluded_threads_are_dropped(self, tmp_path):
+        path = tmp_path / "golden.jsonl"
+        _write_golden_set(path, [
+            _golden("keep", reviewed=True),
+            _golden("drop", reviewed=True, excluded=True),
+        ])
+        loaded = load_golden_set(path)
+        assert [t.thread_id for t in loaded] == ["keep"]
+
+    def test_excluded_dropped_even_when_unreviewed_included(self, tmp_path):
+        path = tmp_path / "golden.jsonl"
+        _write_golden_set(path, [
+            _golden("keep", reviewed=False),
+            _golden("drop", reviewed=False, excluded=True),
+        ])
+        loaded = load_golden_set(path, reviewed_only=False)
+        assert [t.thread_id for t in loaded] == ["keep"]
 
 
 class TestApplyConfigOverrides:
