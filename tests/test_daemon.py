@@ -359,27 +359,37 @@ class TestProcessSingleThread:
 
         mock_label_manager.mark_processed.assert_not_called()
 
-    async def test_proxy_unavailable_does_not_count_toward_give_up(
+    async def test_proxy_unavailable_is_give_up_eligible_per_thread(
         self, mock_proxy, mock_classifier, mock_label_manager, cloud_sem, local_sem,
     ):
-        """A transient api-proxy outage (ProxyUnavailableError) must defer, never give up.
+        """A per-thread ProxyUnavailableError is give-up-eligible (issue #26).
 
-        Covers issue #16: proxy-side timeouts / dropped connections / 5xx now surface
-        as ProxyUnavailableError, which is transient like LLMUnavailableError — it must
-        be retried next cycle, not counted toward abandoning the thread.
+        An endpoint-wide proxy outage is caught one level up: list_messages (also a
+        proxy call) fails first, so the whole cycle defers and no thread is processed
+        or counted. Reaching this per-thread handler means the proxy served other
+        calls this cycle but THIS thread's call failed — a fault that persists is
+        poison (e.g. a deterministic 5xx on one unserializable thread) and must be
+        bounded by the FailureTracker, not retried forever.
+
+        Contrast test_llm_unavailable_does_not_count_toward_give_up: an MLX outage is
+        NOT visible at the cycle level (the proxy is up), so it must never give up.
         """
-        mock_proxy.get_thread.side_effect = ProxyUnavailableError("proxy 503")
+        mock_proxy.get_thread.side_effect = ProxyUnavailableError("proxy 500 for one poison thread")
         tracker = FailureTracker(max_failures=2)
 
-        for _ in range(5):
-            result = await process_single_thread(
-                "thread_down", ["msg_1"], mock_proxy, mock_classifier, mock_label_manager,
+        results = [
+            await process_single_thread(
+                "thread_poison", ["msg_1"], mock_proxy, mock_classifier, mock_label_manager,
                 cloud_sem, local_sem, max_thread_chars=16000, failure_tracker=tracker,
             )
-            assert result is False
+            for _ in range(2)
+        ]
 
+        assert results[0] is False  # first failure: retry next cycle
+        assert results[1] is True   # threshold hit: give up
+        mock_label_manager.mark_attempted.assert_called_once_with(["msg_1"])
         mock_label_manager.mark_processed.assert_not_called()
-        mock_label_manager.mark_attempted.assert_not_called()
+        assert tracker.take_given_up() == ["thread_poison"]
 
     async def test_proxy_4xx_is_give_up_eligible(
         self, mock_proxy, mock_classifier, mock_label_manager, cloud_sem, local_sem,

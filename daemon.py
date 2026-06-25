@@ -115,11 +115,15 @@ def resolve_newsletter_llm_endpoint() -> tuple[str, str]:
 class FailureTracker:
     """Counts consecutive thread-specific failures to break infinite retry loops.
 
-    Only genuine processing failures are recorded — never transient
-    unavailability (a ConnectError when an LLM endpoint is down) — so an outage
-    doesn't cause threads to be given up. In-memory and session-scoped: counts
-    reset on daemon restart, so a thread that failed for a since-resolved reason
-    gets another chance after a restart.
+    Records only failures the caller deems give-up-eligible. An endpoint-wide
+    outage never lands here: an LLM outage (ConnectError → LLMUnavailableError) is
+    deferred per-thread without counting, and a proxy outage fails the cycle-level
+    list_messages first, so the whole cycle defers before any thread is counted.
+    A *persistent per-thread* fault — a poison thread, including a deterministic
+    per-request proxy 5xx (issue #26) — does accrue here and is given up once it
+    hits max_failures. In-memory and session-scoped: counts reset on daemon
+    restart, so a thread that failed for a since-resolved reason gets another
+    chance after a restart.
     """
 
     def __init__(self, max_failures: int = 5):
@@ -451,13 +455,23 @@ async def process_single_thread(
         log.warning("LLM unavailable processing thread %s: %s", thread_id, exc)
         return False
     except ProxyUnavailableError as exc:
-        # api-proxy transiently unreachable — connection refused, a timeout, a
-        # dropped connection, or a 5xx server error (almost always endpoint-wide).
-        # Transient like LLMUnavailableError: retry next cycle, never give up, so a
-        # proxy outage can't abandon emails. (A request-specific 4xx is a plain
-        # ProxyError and falls through to the give-up path below.)
+        # api-proxy unavailable for THIS thread's call — connection refused, a timeout,
+        # a dropped connection, or a 5xx / exhausted-429 response.
+        #
+        # Unlike LLMUnavailableError above, this is give-up-eligible (issue #26). The
+        # asymmetry is deliberate: an endpoint-wide PROXY outage is caught one level up
+        # — list_messages (also a proxy call) fails first, so the whole cycle defers
+        # (see the poll loop) and no thread is ever processed or counted. So reaching
+        # here means the proxy served other calls this cycle and only this thread's
+        # call failed; a fault that PERSISTS across cycles is poison (e.g. a
+        # deterministic 5xx on one unserializable thread) and must be bounded like
+        # Timeout/RuntimeError below, not retried forever. A transient blip clears its
+        # count via the poll-loop success-clear before reaching the threshold.
+        # (An LLM outage, by contrast, is invisible at the cycle level — the proxy is
+        # up — so LLMUnavailableError must never give up, or one MLX outage would
+        # abandon every person thread.)
         log.warning("api-proxy unavailable processing thread %s: %s", thread_id, exc)
-        return False
+        return await _give_up_if_stuck(thread_id, ids_to_mark, failure_tracker, label_manager, write_sem)
     except httpx.ConnectError as exc:
         # Defensive: a raw ConnectError shouldn't escape the wrapped clients, but if
         # one does it's still a transient outage — retry next cycle, don't give up.

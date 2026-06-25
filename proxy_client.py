@@ -59,16 +59,22 @@ class ProxyUnavailableError(ProxyError):
 
 
 # Transport faults that mean the proxy is *transiently* unreachable — connection
-# refused, any timeout, a dropped/garbled connection. NOTE: httpx.UnsupportedProtocol
-# (a missing/unsupported PROXY_URL scheme) is also a TransportError but is a permanent
-# misconfiguration that must surface immediately instead of being wrapped and retried
-# forever. This is the single source of truth for that classification; daemon.py
-# imports it (rather than re-declaring it) so the two layers can't silently disagree
-# about what counts as transient.
+# refused, any timeout, a dropped/garbled connection (RemoteProtocolError: the server
+# disconnected mid-response). This is the single source of truth for that
+# classification; daemon.py imports it (rather than re-declaring it) so the two layers
+# can't silently disagree about what counts as transient.
+#
+# Two TransportError siblings are DELIBERATELY excluded because they are permanent, not
+# transient, and must surface / be give-up-eligible rather than retried forever:
+#   * httpx.UnsupportedProtocol — a missing/unsupported PROXY_URL scheme.
+#   * httpx.LocalProtocolError — a client-side request-construction fault (e.g. an
+#     illegal header built from our own inputs). It is a subclass of httpx.ProtocolError,
+#     so we list the transient sibling (RemoteProtocolError) explicitly rather than the
+#     ProtocolError base, which would re-capture LocalProtocolError. (Issue #26.)
 TRANSIENT_TRANSPORT_ERRORS = (
     httpx.TimeoutException,
     httpx.NetworkError,
-    httpx.ProtocolError,
+    httpx.RemoteProtocolError,
 )
 
 

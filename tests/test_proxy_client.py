@@ -103,6 +103,18 @@ class TestTransientClassification:
         with pytest.raises(ProxyUnavailableError):
             await client.get_thread("t1")
 
+    async def test_local_protocol_error_propagates_not_transient(self, client):
+        """A LocalProtocolError (permanent CLIENT-side request-construction fault — e.g.
+        an illegal header value built from our own inputs) is NOT a transient outage.
+
+        It is a sibling of RemoteProtocolError under httpx.ProtocolError, but unlike its
+        sibling it must propagate (like UnsupportedProtocol) so it surfaces / is
+        give-up-eligible, rather than being wrapped as ProxyUnavailableError and retried
+        forever (issue #26)."""
+        _patch_transport(get_side_effect=httpx.LocalProtocolError("illegal header value"))
+        with pytest.raises(httpx.LocalProtocolError):
+            await client.get_thread("t1")
+
     async def test_unsupported_protocol_propagates_not_transient(self, client):
         """A bad PROXY_URL scheme (UnsupportedProtocol) is a permanent misconfig and
         must propagate, never be wrapped/retried as transient."""
