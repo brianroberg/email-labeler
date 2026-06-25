@@ -34,9 +34,40 @@ class ProxyForbiddenError(Exception):
 
 
 class ProxyError(Exception):
-    """Raised for other proxy errors (5xx, connection errors, etc.)."""
+    """Raised for request-specific proxy errors — a 4xx response (other than 401/403)
+    or a non-JSON success body. These are eligible for the daemon's give-up logic:
+    retrying the same request as-is won't help.
+
+    The transient subset (endpoint unavailable / 5xx) is raised as the more specific
+    ProxyUnavailableError below; catching ProxyError still catches both.
+    """
 
     pass
+
+
+class ProxyUnavailableError(ProxyError):
+    """The api-proxy is transiently unreachable — connection refused, a timeout, a
+    dropped/garbled connection, or a 5xx server error.
+
+    Mirrors llm_client.LLMUnavailableError: a transient outage that should be
+    deferred and retried next cycle, NOT counted toward giving up on a thread.
+    Subclasses ProxyError so existing `except ProxyError` sites (e.g. startup label
+    verification) keep treating it as retryable.
+    """
+
+    pass
+
+
+# Transport faults that mean the proxy is *transiently* unreachable — connection
+# refused, any timeout, a dropped/garbled connection. Mirrors
+# daemon.TRANSIENT_TRANSPORT_ERRORS: httpx.UnsupportedProtocol (a missing/unsupported
+# PROXY_URL scheme) is also a TransportError but is a permanent misconfiguration that
+# must surface immediately instead of being wrapped and retried forever.
+_TRANSIENT_TRANSPORT_ERRORS = (
+    httpx.TimeoutException,
+    httpx.NetworkError,
+    httpx.ProtocolError,
+)
 
 
 class GmailProxyClient:
@@ -105,8 +136,12 @@ class GmailProxyClient:
             raise ProxyForbiddenError(message)
 
         if response.status_code >= 500:
+            # Server-side failure — almost always endpoint-wide (proxy crashed, or
+            # Gmail returned 5xx upstream), so treat it as transient and defer,
+            # rather than abandoning the thread. 502/503/504 are already retried at
+            # the HTTP layer (retry.py) before reaching here.
             message = self._parse_error_message(response, f"Proxy error: {response.status_code}")
-            raise ProxyError(message)
+            raise ProxyUnavailableError(message)
 
         if response.status_code >= 400:
             message = self._parse_error_message(response, f"Request error: {response.status_code}")
@@ -116,6 +151,24 @@ class GmailProxyClient:
             return response.json()
         except ValueError:
             raise ProxyError("Proxy returned non-JSON response for successful request")
+
+    async def _send(self, do_request, operation: str) -> dict:
+        """Run a request (with HTTP-status retries) and classify its outcome.
+
+        Wraps transient transport faults (connection refused, timeouts, dropped
+        connections) in ProxyUnavailableError so the daemon defers-and-retries
+        instead of counting them toward giving up on a thread. Response-status
+        errors are classified by _handle_response (5xx → ProxyUnavailableError,
+        4xx → ProxyError).
+        """
+        try:
+            response = await retry_with_backoff(do_request, operation)
+        except _TRANSIENT_TRANSPORT_ERRORS as exc:
+            raise ProxyUnavailableError(
+                f"api-proxy unavailable during {operation} "
+                f"({type(exc).__name__}): {exc}"
+            ) from exc
+        return self._handle_response(response)
 
     async def list_messages(
         self,
@@ -146,7 +199,7 @@ class GmailProxyClient:
             async with httpx.AsyncClient(timeout=self.READ_TIMEOUT) as client:
                 return await client.get(url, headers=self._get_headers(), params=params)
 
-        return self._handle_response(await retry_with_backoff(_do_request, "Gmail list_messages"))
+        return await self._send(_do_request, "Gmail list_messages")
 
     async def get_message(
         self,
@@ -171,7 +224,7 @@ class GmailProxyClient:
             async with httpx.AsyncClient(timeout=self.READ_TIMEOUT) as client:
                 return await client.get(url, headers=self._get_headers(), params=params)
 
-        return self._handle_response(await retry_with_backoff(_do_request, "Gmail get_message"))
+        return await self._send(_do_request, "Gmail get_message")
 
     async def get_thread(
         self,
@@ -196,7 +249,7 @@ class GmailProxyClient:
             async with httpx.AsyncClient(timeout=self.READ_TIMEOUT) as client:
                 return await client.get(url, headers=self._get_headers(), params=params)
 
-        return self._handle_response(await retry_with_backoff(_do_request, "Gmail get_thread"))
+        return await self._send(_do_request, "Gmail get_thread")
 
     async def modify_message(
         self,
@@ -227,7 +280,7 @@ class GmailProxyClient:
             async with httpx.AsyncClient(timeout=self.WRITE_TIMEOUT) as client:
                 return await client.post(url, headers=self._get_headers(), json=body)
 
-        return self._handle_response(await retry_with_backoff(_do_request, "Gmail modify_message"))
+        return await self._send(_do_request, "Gmail modify_message")
 
     async def trash_message(self, message_id: str, user_id: str = "me") -> dict:
         """Move a message to trash.
@@ -245,7 +298,7 @@ class GmailProxyClient:
             async with httpx.AsyncClient(timeout=self.WRITE_TIMEOUT) as client:
                 return await client.post(url, headers=self._get_headers())
 
-        return self._handle_response(await retry_with_backoff(_do_request, "Gmail trash_message"))
+        return await self._send(_do_request, "Gmail trash_message")
 
     async def untrash_message(self, message_id: str, user_id: str = "me") -> dict:
         """Remove a message from trash.
@@ -263,7 +316,7 @@ class GmailProxyClient:
             async with httpx.AsyncClient(timeout=self.WRITE_TIMEOUT) as client:
                 return await client.post(url, headers=self._get_headers())
 
-        return self._handle_response(await retry_with_backoff(_do_request, "Gmail untrash_message"))
+        return await self._send(_do_request, "Gmail untrash_message")
 
     async def list_labels(self, user_id: str = "me") -> dict:
         """List all labels in the user's mailbox.
@@ -280,7 +333,7 @@ class GmailProxyClient:
             async with httpx.AsyncClient(timeout=self.READ_TIMEOUT) as client:
                 return await client.get(url, headers=self._get_headers())
 
-        return self._handle_response(await retry_with_backoff(_do_request, "Gmail list_labels"))
+        return await self._send(_do_request, "Gmail list_labels")
 
     async def get_label(self, label_id: str, user_id: str = "me") -> dict:
         """Get a specific label by ID.
@@ -298,7 +351,7 @@ class GmailProxyClient:
             async with httpx.AsyncClient(timeout=self.READ_TIMEOUT) as client:
                 return await client.get(url, headers=self._get_headers())
 
-        return self._handle_response(await retry_with_backoff(_do_request, "Gmail get_label"))
+        return await self._send(_do_request, "Gmail get_label")
 
 
 # Singleton instance for convenience

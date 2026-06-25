@@ -23,7 +23,7 @@ from gmail_utils import decode_body, get_header
 from labeler import LabelManager, _get_priority
 from llm_client import LLMClient, LLMUnavailableError
 from newsletter import NewsletterClassifier, NewsletterTier, is_newsletter, write_assessment
-from proxy_client import GmailProxyClient, ProxyError
+from proxy_client import GmailProxyClient, ProxyError, ProxyUnavailableError
 
 load_dotenv()
 
@@ -434,8 +434,17 @@ async def process_single_thread(
         # next cycle (preserves graceful degradation of the privacy invariant).
         log.warning("LLM unavailable processing thread %s: %s", thread_id, exc)
         return False
+    except ProxyUnavailableError as exc:
+        # api-proxy transiently unreachable — connection refused, a timeout, a
+        # dropped connection, or a 5xx server error (almost always endpoint-wide).
+        # Transient like LLMUnavailableError: retry next cycle, never give up, so a
+        # proxy outage can't abandon emails. (A request-specific 4xx is a plain
+        # ProxyError and falls through to the give-up path below.)
+        log.warning("api-proxy unavailable processing thread %s: %s", thread_id, exc)
+        return False
     except httpx.ConnectError as exc:
-        # Proxy/endpoint unreachable — transient. Retry next cycle, don't give up.
+        # Defensive: a raw ConnectError shouldn't escape the wrapped clients, but if
+        # one does it's still a transient outage — retry next cycle, don't give up.
         log.warning("Connection error processing thread %s: %s", thread_id, exc)
         return False
     except TimeoutError as exc:
@@ -686,7 +695,10 @@ async def run_daemon() -> None:
             # Reset backoff on success
             backoff = poll_interval
 
-        except TRANSIENT_TRANSPORT_ERRORS as exc:
+        except TRANSIENT_TRANSPORT_ERRORS + (ProxyUnavailableError,) as exc:
+            # A transiently-unreachable proxy (raw transport fault, or a wrapped
+            # ProxyUnavailableError — connection/timeout/5xx — from list_messages):
+            # back off and retry rather than logging a full traceback.
             log.warning(
                 "Lost connection to api-proxy at %s (%s) — retrying in %ds",
                 proxy_client.proxy_url,

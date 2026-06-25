@@ -24,7 +24,7 @@ from daemon import (
 from labeler import _get_priority
 from llm_client import LLMClient, LLMUnavailableError
 from newsletter import NewsletterTier, StoryResult
-from proxy_client import ProxyAuthError, ProxyError
+from proxy_client import ProxyAuthError, ProxyError, ProxyUnavailableError
 
 
 @pytest.fixture
@@ -356,6 +356,51 @@ class TestProcessSingleThread:
             assert result is False
 
         mock_label_manager.mark_processed.assert_not_called()
+
+    async def test_proxy_unavailable_does_not_count_toward_give_up(
+        self, mock_proxy, mock_classifier, mock_label_manager, cloud_sem, local_sem,
+    ):
+        """A transient api-proxy outage (ProxyUnavailableError) must defer, never give up.
+
+        Covers issue #16: proxy-side timeouts / dropped connections / 5xx now surface
+        as ProxyUnavailableError, which is transient like LLMUnavailableError — it must
+        be retried next cycle, not counted toward abandoning the thread.
+        """
+        mock_proxy.get_thread.side_effect = ProxyUnavailableError("proxy 503")
+        tracker = FailureTracker(max_failures=2)
+
+        for _ in range(5):
+            result = await process_single_thread(
+                "thread_down", ["msg_1"], mock_proxy, mock_classifier, mock_label_manager,
+                cloud_sem, local_sem, max_thread_chars=16000, failure_tracker=tracker,
+            )
+            assert result is False
+
+        mock_label_manager.mark_processed.assert_not_called()
+        mock_label_manager.mark_attempted.assert_not_called()
+
+    async def test_proxy_4xx_is_give_up_eligible(
+        self, mock_proxy, mock_classifier, mock_label_manager, cloud_sem, local_sem,
+    ):
+        """A request-specific proxy 4xx (plain ProxyError) stays give-up-eligible.
+
+        The transient subclass defers; the base ProxyError (e.g. a 404 for a thread
+        deleted between listing and fetching) should still be bounded by the
+        FailureTracker so it isn't retried forever.
+        """
+        mock_proxy.get_thread.side_effect = ProxyError("404 not found")
+        tracker = FailureTracker(max_failures=2)
+
+        results = [
+            await process_single_thread(
+                "thread_gone", ["msg_1"], mock_proxy, mock_classifier, mock_label_manager,
+                cloud_sem, local_sem, max_thread_chars=16000, failure_tracker=tracker,
+            )
+            for _ in range(2)
+        ]
+
+        assert results[0] is False  # first failure: retry
+        assert results[1] is True   # threshold hit: give up
 
     async def test_give_up_marks_all_thread_messages_not_just_query_stubs(
         self, mock_proxy, mock_classifier, mock_label_manager, cloud_sem, local_sem,
