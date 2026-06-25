@@ -73,6 +73,15 @@ class TestTransientClassification:
         # Must be the base class, not the transient subclass.
         assert not isinstance(exc_info.value, ProxyUnavailableError)
 
+    async def test_429_is_unavailable(self, client):
+        """A 429 (rate-limit) that survives retry.py's retry budget is a sustained
+        throttle — transient by nature (it clears on its own), so it must classify as
+        ProxyUnavailableError and be retried next cycle, NOT grouped with the permanent
+        4xx and routed to the give-up path. Asserted at _handle_response because a 429
+        only reaches it once the HTTP-layer retries are exhausted."""
+        with pytest.raises(ProxyUnavailableError):
+            client._handle_response(_mock_response(429, {"message": "rate limited"}))
+
     async def test_read_timeout_raises_unavailable(self, client):
         """A read timeout to the proxy is infrastructure slowness → transient.
 

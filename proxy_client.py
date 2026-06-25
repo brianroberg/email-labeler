@@ -59,11 +59,13 @@ class ProxyUnavailableError(ProxyError):
 
 
 # Transport faults that mean the proxy is *transiently* unreachable — connection
-# refused, any timeout, a dropped/garbled connection. Mirrors
-# daemon.TRANSIENT_TRANSPORT_ERRORS: httpx.UnsupportedProtocol (a missing/unsupported
-# PROXY_URL scheme) is also a TransportError but is a permanent misconfiguration that
-# must surface immediately instead of being wrapped and retried forever.
-_TRANSIENT_TRANSPORT_ERRORS = (
+# refused, any timeout, a dropped/garbled connection. NOTE: httpx.UnsupportedProtocol
+# (a missing/unsupported PROXY_URL scheme) is also a TransportError but is a permanent
+# misconfiguration that must surface immediately instead of being wrapped and retried
+# forever. This is the single source of truth for that classification; daemon.py
+# imports it (rather than re-declaring it) so the two layers can't silently disagree
+# about what counts as transient.
+TRANSIENT_TRANSPORT_ERRORS = (
     httpx.TimeoutException,
     httpx.NetworkError,
     httpx.ProtocolError,
@@ -135,11 +137,15 @@ class GmailProxyClient:
             message = self._parse_error_message(response, "Forbidden - operation blocked or rejected")
             raise ProxyForbiddenError(message)
 
-        if response.status_code >= 500:
-            # Server-side failure — almost always endpoint-wide (proxy crashed, or
-            # Gmail returned 5xx upstream), so treat it as transient and defer,
-            # rather than abandoning the thread. 502/503/504 are already retried at
-            # the HTTP layer (retry.py) before reaching here.
+        if response.status_code == 429 or response.status_code >= 500:
+            # Transient, endpoint-wide conditions that clear on their own → defer and
+            # retry rather than abandoning the thread:
+            #   * 429 — rate-limited. Reaching here means retry.py already exhausted
+            #     its retry budget (429 ∈ RETRYABLE_STATUS_CODES), so the throttle is
+            #     sustained; next poll cycle is the right place to retry, not give-up.
+            #   * 5xx — server-side failure (proxy crashed, or Gmail returned 5xx
+            #     upstream). 502/503/504 are likewise already retried at the HTTP
+            #     layer (retry.py) before reaching here.
             message = self._parse_error_message(response, f"Proxy error: {response.status_code}")
             raise ProxyUnavailableError(message)
 
@@ -163,7 +169,7 @@ class GmailProxyClient:
         """
         try:
             response = await retry_with_backoff(do_request, operation)
-        except _TRANSIENT_TRANSPORT_ERRORS as exc:
+        except TRANSIENT_TRANSPORT_ERRORS as exc:
             raise ProxyUnavailableError(
                 f"api-proxy unavailable during {operation} "
                 f"({type(exc).__name__}): {exc}"

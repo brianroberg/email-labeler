@@ -23,7 +23,12 @@ from gmail_utils import decode_body, get_header
 from labeler import LabelManager, _get_priority
 from llm_client import LLMClient, LLMUnavailableError
 from newsletter import NewsletterClassifier, NewsletterTier, is_newsletter, write_assessment
-from proxy_client import GmailProxyClient, ProxyError, ProxyUnavailableError
+from proxy_client import (
+    TRANSIENT_TRANSPORT_ERRORS,
+    GmailProxyClient,
+    ProxyError,
+    ProxyUnavailableError,
+)
 
 load_dotenv()
 
@@ -495,19 +500,6 @@ def summarize_cycle(
     return processed, given_up
 
 
-# Transport faults that mean the api-proxy is *transiently* unreachable —
-# connection refused, any timeout, a dropped/garbled connection — so the daemon
-# should wait and retry rather than crash. This is a deliberate subset of
-# httpx.TransportError: httpx.UnsupportedProtocol (a missing/unsupported
-# PROXY_URL scheme) is also a TransportError but is a permanent misconfiguration
-# that must surface immediately instead of being retried forever.
-TRANSIENT_TRANSPORT_ERRORS = (
-    httpx.TimeoutException,
-    httpx.NetworkError,
-    httpx.ProtocolError,
-)
-
-
 async def verify_labels_with_retry(
     label_manager: LabelManager,
     initial_backoff: int = 5,
@@ -521,10 +513,15 @@ async def verify_labels_with_retry(
     under Docker:
 
       * a transport fault — connection refused, a connect/read timeout, a
-        dropped connection (``TRANSIENT_TRANSPORT_ERRORS``); and
+        dropped connection; and
       * a proxy that is reachable but whose Gmail backend is still initializing,
-        which answers 5xx and surfaces as ``proxy_client.ProxyError`` (NOT an
-        ``httpx.TransportError``, so it must be named explicitly).
+        which answers 5xx (or 429).
+
+    ``verify_labels`` reaches the proxy through ``_send``, which already wraps both
+    of those into ``proxy_client.ProxyUnavailableError`` (a ``ProxyError`` subclass),
+    so catching ``ProxyError`` covers them. The ``TRANSIENT_TRANSPORT_ERRORS`` prefix
+    is kept as defence-in-depth in case a future code path reaches a raw transport
+    fault here without going through ``_send``.
 
     Permanent failures propagate immediately so the operator sees an actionable
     error rather than a silent, endless retry: a misconfigured ``PROXY_URL``
@@ -718,6 +715,17 @@ async def run_daemon() -> None:
                 proxy_client.proxy_url,
                 type(exc).__name__,
                 backoff,
+            )
+            backoff = min(backoff * 2, poll_interval * 10)
+        except ProxyError as exc:
+            # A request-specific proxy fault from the cycle-level list_messages call
+            # (a 4xx — e.g. a malformed gmail_query 400 — or a non-JSON 2xx body).
+            # It won't fix itself, but it's a known, named condition: log it as a
+            # warning and back off rather than spewing a full traceback every cycle.
+            # (ProxyUnavailableError is handled above as transient.)
+            log.warning(
+                "api-proxy rejected the poll request (%s: %s) — retrying in %ds",
+                type(exc).__name__, exc, backoff,
             )
             backoff = min(backoff * 2, poll_interval * 10)
         except Exception:

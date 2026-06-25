@@ -340,6 +340,26 @@ class TestContentlessResponse:
             with pytest.raises(RuntimeError, match="no content"):
                 await cloud_client.complete("sys", "user")
 
+    async def test_empty_string_content_raises_runtime_error(self, cloud_client):
+        """An empty-but-present `content: ""` is just as unusable as null/missing.
+
+        A reasoning model that exhausts max_tokens mid-think can emit `content: ""`
+        rather than null. That must raise the same no-content RuntimeError, not fall
+        through to be parsed as an empty classification (which would default to
+        SERVICE / LOW_PRIORITY and silently mislabel the email)."""
+        mock_response = _mock_response(json_data={
+            "choices": [{"message": {"role": "assistant", "content": ""}}]
+        })
+
+        with patch("llm_client.httpx.AsyncClient") as mock_client_cls:
+            mock_client = AsyncMock()
+            mock_client.post.return_value = mock_response
+            mock_client_cls.return_value.__aenter__ = AsyncMock(return_value=mock_client)
+            mock_client_cls.return_value.__aexit__ = AsyncMock(return_value=False)
+
+            with pytest.raises(RuntimeError, match="no content"):
+                await cloud_client.complete("sys", "user")
+
     async def test_glm_reasoning_only_no_content_raises_runtime_error(self):
         """GLM returning only reasoning_content (max_tokens exhausted mid-think) raises
         RuntimeError, not KeyError — the cloud-tier case from issue #11's comment.

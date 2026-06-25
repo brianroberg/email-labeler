@@ -146,12 +146,15 @@ class LLMClient:
 
         msg = response.json()["choices"][0]["message"]
         content = msg.get("content")
-        if content is None:
+        if not content:
             # A reasoning model that exhausts max_tokens mid-<think> (or a GLM reply
             # that returns only reasoning_content) yields a message with no usable
-            # `content`. Retrying as-is won't help, so this is request-specific/
+            # `content` — whether that arrives as null, a missing key, or an empty
+            # string. Retrying as-is won't help, so this is request-specific/
             # permanent: surface a clear RuntimeError (give-up-eligible via the daemon),
             # never LLMUnavailableError (would retry forever) or a raw KeyError.
+            # (An empty string must be caught too: it would otherwise parse to a
+            # default SERVICE / LOW_PRIORITY label and silently mislabel the email.)
             has_reasoning = bool(msg.get("reasoning_content") or msg.get("reasoning"))
             raise RuntimeError(
                 f"LLM {self.model} returned no content "
