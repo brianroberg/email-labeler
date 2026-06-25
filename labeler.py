@@ -61,6 +61,7 @@ class LabelManager:
             "fyi",
             "low_priority",
             "processed",
+            "attempted",
             "personal",
             "non_personal",
         ):
@@ -154,6 +155,25 @@ class LabelManager:
 
         processed_name = self.labels_config["processed"]
         add_label_ids = [self.label_ids[processed_name]]
+        for msg_id in ids:
+            await self.proxy.modify_message(message_id=msg_id, add_label_ids=add_label_ids)
+
+    async def mark_attempted(self, message_ids: str | list[str]) -> None:
+        """Apply only the agent/attempted marker label.
+
+        Used when the daemon gives up on a thread after repeated failures. Like
+        agent/processed it stops the thread re-matching the unprocessed query (so
+        the retry loop ends), but it is a *distinct* label so abandoned threads are
+        findable in Gmail for manual cleanup and remain semantically separate from
+        successfully-classified mail.
+        """
+        if isinstance(message_ids, str):
+            ids = [message_ids]
+        else:
+            ids = list(message_ids)
+
+        attempted_name = self.labels_config["attempted"]
+        add_label_ids = [self.label_ids[attempted_name]]
         for msg_id in ids:
             await self.proxy.modify_message(message_id=msg_id, add_label_ids=add_label_ids)
 

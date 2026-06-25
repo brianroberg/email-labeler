@@ -312,9 +312,11 @@ class TestProcessSingleThread:
         # First two failures: retry next cycle (not handled), nothing marked processed.
         assert results[0] is False
         assert results[1] is False
-        # Third failure hits the threshold: give up — mark processed and report handled.
+        # Third failure hits the threshold: give up — mark agent/attempted (not
+        # agent/processed) so the abandoned thread is findable, and report handled.
         assert results[2] is True
-        mock_label_manager.mark_processed.assert_called_once_with(["msg_1"])
+        mock_label_manager.mark_attempted.assert_called_once_with(["msg_1"])
+        mock_label_manager.mark_processed.assert_not_called()
         # The give-up is recorded so the cycle summary can report it distinctly.
         assert tracker.take_given_up() == ["thread_stuck"]
 
@@ -427,7 +429,7 @@ class TestProcessSingleThread:
 
         assert results[0] is False  # first failure: retry
         assert results[1] is True   # threshold hit: give up
-        mock_label_manager.mark_processed.assert_called_once_with(["msg_001", "msg_002"])
+        mock_label_manager.mark_attempted.assert_called_once_with(["msg_001", "msg_002"])
 
     async def test_get_thread_is_bounded_by_fetch_sem(
         self, mock_proxy, mock_classifier, mock_label_manager, cloud_sem, local_sem,

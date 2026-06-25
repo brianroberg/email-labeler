@@ -1,7 +1,7 @@
 [daemon]
 poll_interval_seconds = 60
 max_emails_per_cycle = 10       # Override per-run with the MAX_EMAILS_PER_CYCLE env var
-gmail_query = "in:inbox -label:agent/processed"
+gmail_query = "in:inbox -label:agent/processed -label:agent/attempted"
 # Max characters of thread transcript sent to the classifier. Kept modest
 # because the local model prefills the WHOLE transcript before answering:
 # tens-of-thousands-of-char threads take minutes to prefill on consumer
@@ -29,6 +29,7 @@ needs_response = "agent/needs-response"
 fyi = "agent/fyi"
 low_priority = "agent/low-priority"
 processed = "agent/processed"
+attempted = "agent/attempted"   # applied on give-up (repeated failures); excluded from gmail_query
 personal = "agent/personal"
 non_personal = "agent/non-personal"
 

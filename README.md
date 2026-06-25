@@ -28,7 +28,7 @@ The daemon classifies emails into three categories and applies the corresponding
 | `agent/fyi` | Worth reading, no action needed | Stays in inbox |
 | `agent/low-priority` | Routine notifications, newsletters, spam, unwanted | Archived |
 
-Additional marker labels (`agent/processed`, `agent/personal`, `agent/non-personal`) track processing state and routing decisions. The newsletter pipeline adds its own labels under `agent/newsletter/`.
+Additional marker labels (`agent/processed`, `agent/attempted`, `agent/personal`, `agent/non-personal`) track processing state and routing decisions. The newsletter pipeline adds its own labels under `agent/newsletter/`.
 
 Newsletter labels (see [Newsletter Classification](#newsletter-classification)):
 
@@ -139,6 +139,7 @@ agent/needs-response
 agent/fyi
 agent/low-priority
 agent/processed
+agent/attempted
 agent/personal
 agent/non-personal
 agent/newsletter

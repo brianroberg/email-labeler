@@ -92,7 +92,8 @@ Hotkeys: `e/g/f/p` filter by tier, `1-5` filter by theme, `s` filter by sender, 
 - `agent/needs-response` — Leave in inbox
 - `agent/fyi` — Leave in inbox
 - `agent/low-priority` — Archive
-- `agent/processed` — Marker (always applied)
+- `agent/processed` — Marker (applied on success / already-handled)
+- `agent/attempted` — Marker applied on give-up (after repeated failures); excluded from `gmail_query` like `agent/processed`, but kept distinct so abandoned threads stay findable
 - `agent/personal` — Sender classified as person (body processed locally)
 - `agent/non-personal` — Sender classified as service (body processed via cloud)
 

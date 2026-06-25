@@ -144,7 +144,7 @@ class FailureTracker:
         self._counts = {tid: n for tid, n in self._counts.items() if tid in active}
 
     def record_give_up(self, thread_id: str) -> None:
-        """Record that a thread was abandoned (marked processed without a label),
+        """Record that a thread was abandoned (marked agent/attempted, no classification),
         so the per-cycle summary can report give-ups distinctly from classifications."""
         self._given_up.append(thread_id)
 
@@ -162,10 +162,14 @@ async def _give_up_if_stuck(
     label_manager: LabelManager,
 ) -> bool:
     """Record a thread-specific failure; if it has failed too many times, mark it
-    processed so it stops being retried every cycle.
+    agent/attempted so it stops being retried every cycle.
 
-    Returns True if the thread was given up (marked processed → handled), or False
-    if it should simply be retried next cycle.
+    Uses agent/attempted (not agent/processed): the thread is excluded from the
+    unprocessed query either way, but the distinct label keeps abandoned threads
+    findable and separate from successfully-classified mail.
+
+    Returns True if the thread was given up (marked agent/attempted → handled), or
+    False if it should simply be retried next cycle.
     """
     if failure_tracker is None:
         return False
@@ -173,13 +177,13 @@ async def _give_up_if_stuck(
     if not failure_tracker.should_give_up(thread_id):
         return False
     log.error(
-        "Thread %s failed %d+ times — marking processed to break the retry loop",
+        "Thread %s failed %d+ times — marking agent/attempted to break the retry loop",
         thread_id, failure_tracker.max_failures,
     )
     try:
-        await label_manager.mark_processed(msg_ids)
+        await label_manager.mark_attempted(msg_ids)
     except Exception:
-        log.exception("Could not mark stuck thread %s processed", thread_id)
+        log.exception("Could not mark stuck thread %s attempted", thread_id)
         return False
     failure_tracker.record_give_up(thread_id)
     # Note: the poll loop clears the failure count on every True result (which a

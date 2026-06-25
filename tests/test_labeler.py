@@ -17,6 +17,7 @@ def config():
             "fyi": "agent/fyi",
             "low_priority": "agent/low-priority",
             "processed": "agent/processed",
+            "attempted": "agent/attempted",
             "personal": "agent/personal",
             "non_personal": "agent/non-personal",
             "actions": {
@@ -40,6 +41,7 @@ def all_labels_response():
             {"id": "Label_4", "name": "agent/processed", "type": "user"},
             {"id": "Label_5", "name": "agent/personal", "type": "user"},
             {"id": "Label_6", "name": "agent/non-personal", "type": "user"},
+            {"id": "Label_7", "name": "agent/attempted", "type": "user"},
         ]
     }
 
@@ -72,6 +74,7 @@ class TestVerifyLabels:
         assert set(missing) == {
             "agent/fyi",
             "agent/low-priority",
+            "agent/attempted",
             "agent/personal",
             "agent/non-personal",
         }
@@ -79,7 +82,7 @@ class TestVerifyLabels:
     async def test_no_labels_present(self, label_manager, mock_proxy):
         mock_proxy.list_labels.return_value = {"labels": [{"id": "INBOX", "name": "INBOX", "type": "system"}]}
         missing = await label_manager.verify_labels()
-        assert len(missing) == 6
+        assert len(missing) == 7
 
     async def test_builds_label_id_map(self, label_manager, mock_proxy, all_labels_response):
         """verify_labels populates the internal label name -> ID mapping."""
@@ -243,6 +246,29 @@ class TestMarkProcessed:
         )
 
 
+class TestMarkAttempted:
+    async def test_applies_only_attempted_label(self, label_manager, mock_proxy, all_labels_response):
+        """Give-up applies agent/attempted (not agent/processed), so abandoned
+        threads are findable in Gmail and distinct from successfully-processed mail."""
+        mock_proxy.list_labels.return_value = all_labels_response
+        await label_manager.verify_labels()
+
+        await label_manager.mark_attempted(["msg1", "msg2"])
+        assert mock_proxy.modify_message.call_count == 2
+        for call in mock_proxy.modify_message.call_args_list:
+            assert call.kwargs["add_label_ids"] == ["Label_7"]  # agent/attempted
+            assert "remove_label_ids" not in call.kwargs
+
+    async def test_single_message_id(self, label_manager, mock_proxy, all_labels_response):
+        mock_proxy.list_labels.return_value = all_labels_response
+        await label_manager.verify_labels()
+
+        await label_manager.mark_attempted("msg1")
+        mock_proxy.modify_message.assert_called_once_with(
+            message_id="msg1", add_label_ids=["Label_7"],
+        )
+
+
 @pytest.fixture
 def newsletter_config():
     return {
@@ -251,6 +277,7 @@ def newsletter_config():
             "fyi": "agent/fyi",
             "low_priority": "agent/low-priority",
             "processed": "agent/processed",
+            "attempted": "agent/attempted",
             "personal": "agent/personal",
             "non_personal": "agent/non-personal",
             "actions": {
@@ -290,6 +317,7 @@ def all_labels_with_newsletter():
             {"id": "Label_4", "name": "agent/processed", "type": "user"},
             {"id": "Label_5", "name": "agent/personal", "type": "user"},
             {"id": "Label_6", "name": "agent/non-personal", "type": "user"},
+            {"id": "Label_7", "name": "agent/attempted", "type": "user"},
             {"id": "Label_10", "name": "agent/newsletter", "type": "user"},
             {"id": "Label_11", "name": "agent/newsletter/excellent", "type": "user"},
             {"id": "Label_12", "name": "agent/newsletter/good", "type": "user"},
@@ -333,7 +361,8 @@ class TestNewsletterVerifyLabels:
         missing = await newsletter_label_manager.verify_labels()
         assert "agent/newsletter" in missing
         assert "agent/newsletter/excellent" in missing
-        assert len(missing) == 11
+        assert "agent/attempted" in missing
+        assert len(missing) == 12
 
 
 class TestNewsletterApplyLabels:
