@@ -14,7 +14,7 @@ from enum import Enum
 from pathlib import Path
 
 from gmail_utils import get_header
-from llm_client import LLMClient
+from llm_client import LLMClient, LLMUnavailableError
 
 log = logging.getLogger(__name__)
 
@@ -230,8 +230,14 @@ class NewsletterClassifier:
     async def classify_newsletter(self, body: str) -> list[StoryResult]:
         """Run the full newsletter classification pipeline.
 
-        Individual story failures are isolated — a quality failure doesn't
+        Individual *per-story* failures are isolated — a quality failure doesn't
         prevent theme classification, and vice versa.
+
+        A *transient* LLM outage (LLMUnavailableError) is NOT isolated: it
+        propagates so the daemon retries the whole newsletter thread next cycle,
+        rather than committing a permanently mis-graded newsletter (empty
+        tier/themes) and marking it processed. Mirrors the email pipeline's
+        transient-outage guarantee.
         """
         stories = await self.extract_stories(body)
         if not stories:
@@ -248,6 +254,8 @@ class NewsletterClassifier:
                     result.scores = scores
                     result.average_score = sum(scores.values()) / len(scores)
                     result.tier = compute_tier(scores)
+            except LLMUnavailableError:
+                raise  # transient — let the daemon retry the whole newsletter
             except Exception:
                 log.warning("Quality assessment failed for story: %s", title)
 
@@ -255,6 +263,8 @@ class NewsletterClassifier:
                 themes, theme_cot = await self.classify_themes(title, text)
                 result.themes = themes
                 result.theme_cot = theme_cot
+            except LLMUnavailableError:
+                raise  # transient — let the daemon retry the whole newsletter
             except Exception:
                 log.warning("Theme classification failed for story: %s", title)
 
