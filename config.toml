@@ -22,6 +22,12 @@ local_parallel = 1
 # when max_emails_per_cycle is large; the cloud/local semaphores gate only the
 # downstream classify calls, not the fetch.
 fetch_parallel = 4
+# Max concurrent label-application writes (modify_message via apply_classification /
+# mark_processed / mark_attempted / apply_newsletter_classification). Bounds the
+# proxy-WRITE burst when max_emails_per_cycle is large (e.g. draining a backlog).
+# Separate from fetch_parallel because writes may block on human approval
+# (WRITE_TIMEOUT, 300s), so the sizing tradeoff differs. Override: WRITE_PARALLEL.
+write_parallel = 4
 healthcheck_file = "/tmp/healthcheck"
 
 [labels]

@@ -111,6 +111,7 @@ Hotkeys: `e/g/f/p` filter by tier, `1-5` filter by theme, `s` filter by sender, 
 - `NEWSLETTER_ONLY` — When `1`/`true`/`yes`, daemon runs newsletter classification pipeline instead of email labeling
 - `LOCAL_PARALLEL` — Override `local_parallel` (max concurrent local MLX requests; default 1, keep ≤ 8)
 - `MAX_EMAILS_PER_CYCLE` — Override `max_emails_per_cycle` (max threads per poll cycle; default 10)
+- `WRITE_PARALLEL` — Override `write_parallel` (max concurrent label-application writes; default 4). Sized separately from reads because writes may block on human approval (`WRITE_TIMEOUT`, 300s)
 
 ## Testing
 

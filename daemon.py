@@ -160,6 +160,7 @@ async def _give_up_if_stuck(
     msg_ids: list[str],
     failure_tracker: "FailureTracker | None",
     label_manager: LabelManager,
+    write_sem: asyncio.Semaphore | None = None,
 ) -> bool:
     """Record a thread-specific failure; if it has failed too many times, mark it
     agent/attempted so it stops being retried every cycle.
@@ -181,7 +182,8 @@ async def _give_up_if_stuck(
         thread_id, failure_tracker.max_failures,
     )
     try:
-        await label_manager.mark_attempted(msg_ids)
+        async with (write_sem or nullcontext()):
+            await label_manager.mark_attempted(msg_ids)
     except Exception:
         log.exception("Could not mark stuck thread %s attempted", thread_id)
         return False
@@ -245,6 +247,7 @@ async def process_single_thread(
     newsletter_only: bool = False,
     failure_tracker: "FailureTracker | None" = None,
     fetch_sem: asyncio.Semaphore | None = None,
+    write_sem: asyncio.Semaphore | None = None,
 ) -> bool:
     """Process a single thread through the classification pipeline.
 
@@ -318,11 +321,12 @@ async def process_single_thread(
                     all_themes.extend(sr.themes)
                 all_themes = list(dict.fromkeys(all_themes))  # dedupe, preserve order
 
-                await label_manager.apply_newsletter_classification(
-                    message_ids=all_msg_ids,
-                    tier=best_tier,
-                    themes=all_themes,
-                )
+                async with (write_sem or nullcontext()):
+                    await label_manager.apply_newsletter_classification(
+                        message_ids=all_msg_ids,
+                        tier=best_tier,
+                        themes=all_themes,
+                    )
 
                 # Write structured results
                 if newsletter_output_file:
@@ -415,11 +419,14 @@ async def process_single_thread(
                 new_priority,
             )
             # Still mark as processed so the thread isn't retried every cycle
-            await label_manager.mark_processed(all_msg_ids)
+            async with (write_sem or nullcontext()):
+                await label_manager.mark_processed(all_msg_ids)
             return True
 
-        # Apply labels to ALL messages in thread
-        await label_manager.apply_classification(all_msg_ids, result.label, result.sender_type)
+        # Apply labels to ALL messages in thread (bounded by write_sem so a large
+        # max_emails_per_cycle can't burst one concurrent write per thread).
+        async with (write_sem or nullcontext()):
+            await label_manager.apply_classification(all_msg_ids, result.label, result.sender_type)
         log.info(
             "Classified thread %s (%d msgs): sender=%s label=%s — %s",
             thread_id,
@@ -456,13 +463,13 @@ async def process_single_thread(
         # the timeout) — eligible for give-up so one huge thread can't be retried
         # forever. (Connect/pool timeouts are LLMUnavailableError, handled above.)
         log.error("Timeout processing thread %s: %s", thread_id, exc)
-        return await _give_up_if_stuck(thread_id, ids_to_mark, failure_tracker, label_manager)
+        return await _give_up_if_stuck(thread_id, ids_to_mark, failure_tracker, label_manager, write_sem)
     except RuntimeError as exc:
         log.error("Thread %s: %s", thread_id, exc)
-        return await _give_up_if_stuck(thread_id, ids_to_mark, failure_tracker, label_manager)
+        return await _give_up_if_stuck(thread_id, ids_to_mark, failure_tracker, label_manager, write_sem)
     except Exception:
         log.exception("Error processing thread %s", thread_id)
-        return await _give_up_if_stuck(thread_id, ids_to_mark, failure_tracker, label_manager)
+        return await _give_up_if_stuck(thread_id, ids_to_mark, failure_tracker, label_manager, write_sem)
 
 
 def summarize_cycle(
@@ -608,9 +615,11 @@ async def run_daemon() -> None:
     local_parallel = resolve_int_env("LOCAL_PARALLEL", daemon_config.get("local_parallel", 1))
     local_sem = asyncio.Semaphore(local_parallel)
     fetch_sem = asyncio.Semaphore(daemon_config.get("fetch_parallel", 4))
+    write_parallel = resolve_int_env("WRITE_PARALLEL", daemon_config.get("write_parallel", 4))
+    write_sem = asyncio.Semaphore(write_parallel)
     log.info(
-        "Concurrency limits: cloud=%d, local=%d, fetch=%d",
-        cloud_sem._value, local_sem._value, fetch_sem._value,
+        "Concurrency limits: cloud=%d, local=%d, fetch=%d, write=%d",
+        cloud_sem._value, local_sem._value, fetch_sem._value, write_sem._value,
     )
     if local_parallel > 8:
         log.warning(
@@ -678,6 +687,7 @@ async def run_daemon() -> None:
                         newsletter_only=newsletter_only,
                         failure_tracker=failure_tracker,
                         fetch_sem=fetch_sem,
+                        write_sem=write_sem,
                     )
                     for tid, msg_ids in thread_items
                 ),

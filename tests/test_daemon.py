@@ -470,6 +470,34 @@ class TestProcessSingleThread:
         assert result is True
         mock_proxy.get_thread.assert_called_once()
 
+    async def test_label_application_is_bounded_by_write_sem(
+        self, mock_proxy, mock_classifier, mock_label_manager, cloud_sem, local_sem,
+        mock_thread_response,
+    ):
+        """Label-application writes run under write_sem, so they can't fan out unbounded.
+
+        Covers issue #17: the cloud/local/fetch semaphores gate reads + classify, but
+        the label-application phase (modify_message via apply_classification etc.)
+        previously ran with no bound, so a large max_emails_per_cycle could burst many
+        concurrent writes at the api-proxy / Gmail.
+        """
+        mock_proxy.get_thread.return_value = mock_thread_response
+        exhausted = asyncio.Semaphore(0)  # no write permits available
+
+        task = asyncio.create_task(process_single_thread(
+            "thread_001", ["msg_001"], mock_proxy, mock_classifier, mock_label_manager,
+            cloud_sem, local_sem, max_thread_chars=16000,
+            fetch_sem=asyncio.Semaphore(2), write_sem=exhausted,
+        ))
+        await asyncio.sleep(0.05)
+        # Fetch + classify ran, but blocked acquiring write_sem — no label write yet.
+        mock_proxy.get_thread.assert_called_once()
+        mock_label_manager.apply_classification.assert_not_called()
+        mock_label_manager.mark_processed.assert_not_called()
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
     async def test_service_thread_classified_via_cloud(
         self,
         mock_proxy,
