@@ -47,7 +47,7 @@ Interactive CLI for reviewing and correcting labels in the golden set. Saves ato
 **Setting an email aside.** Some threads aren't useful as test cases. Two options:
 
 - **Skip** (`k`) — render no judgment. The thread is left unreviewed and resurfaces in a later review session.
-- **Exclude** (`e`) — permanently set the thread aside. It is dropped from the review queue and never evaluated. To bring one back, open `--edit`, select it, and press `e` to un-exclude.
+- **Exclude** (`e`) — permanently set the thread aside. It is dropped from the review queue and never evaluated. Excluded threads are flagged with an `X` in the `--edit` list view; to bring one back, open `--edit`, select it, and press `e` to un-exclude.
 
 Hotkeys: sender type `p`/`s` (person/service); label `r`/`f`/`l` (needs_response/fyi/low_priority); `n` notes; `z` undo; `k` skip; `e` exclude; `q` quit.
 

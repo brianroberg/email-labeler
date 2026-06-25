@@ -15,11 +15,12 @@ from gmail_utils import decode_body
 _SENDER_ABBREV = {"person": "PER", "service": "SVC"}
 _LABEL_ABBREV = {"needs_response": "NR", "fyi": "FYI", "low_priority": "LP"}
 
-# Hotkey maps (same keys as regular review)
+# Hotkey maps (kept in lock-step with evals.review: needs_response is `r`, not `n`)
 _SENDER_KEY_MAP = {"p": "person", "s": "service"}
-_LABEL_KEY_MAP = {"n": "needs_response", "f": "fyi", "l": "low_priority"}
+_LABEL_KEY_MAP = {"r": "needs_response", "f": "fyi", "l": "low_priority"}
 
 # Column widths for list view
+_COL_FLAG = 1     # "X" for excluded threads, else blank
 _COL_S1 = 5       # "PER" / "SVC"
 _COL_S2 = 5       # "NR" / "FYI" / "LP"
 _COL_SENDER = 32  # sender name + email
@@ -50,18 +51,20 @@ def _safe_addstr(win, y: int, x: int, text: str, attr: int = curses.A_NORMAL) ->
 
 def _format_list_row(thread: GoldenThread, max_x: int) -> str:
     """Format a single thread as one list-view line."""
+    flag = "X" if thread.excluded else " "
     s1 = _SENDER_ABBREV.get(thread.expected_sender_type, "???")
     s2 = _LABEL_ABBREV.get(thread.expected_label, "???")
 
     sender = thread.senders[0] if thread.senders else "?"
     sender = _truncate(sender, _COL_SENDER)
 
-    fixed_width = _COL_S1 + _COL_S2 + _COL_SENDER + _COL_GAP * 3
+    fixed_width = _COL_FLAG + _COL_S1 + _COL_S2 + _COL_SENDER + _COL_GAP * 4
     subject_width = max(10, max_x - fixed_width)
     subject = _truncate(thread.subject, subject_width)
 
     return (
-        f"{s1:<{_COL_S1}}"
+        f"{flag:<{_COL_FLAG}}"
+        f"  {s1:<{_COL_S1}}"
         f"  {s2:<{_COL_S2}}"
         f"  {sender:<{_COL_SENDER}}"
         f"  {subject}"
@@ -119,7 +122,7 @@ def _prompt_sender_type_curses(stdscr) -> str | None:
 def _prompt_label_curses(stdscr) -> str | None:
     """Show label menu on the bottom line; return value or ``None``."""
     max_y, max_x = stdscr.getmaxyx()
-    prompt = "[n]eeds_response  [f]yi  [l]ow_priority  (other key cancels)"
+    prompt = "[r] needs_response  [f]yi  [l]ow_priority  (other key cancels)"
     _safe_addstr(stdscr, max_y - 1, 0, " " * (max_x - 1))
     _safe_addstr(stdscr, max_y - 1, 0, prompt, curses.A_REVERSE)
     stdscr.refresh()
@@ -260,9 +263,10 @@ def _list_view(
         title = f"Edit Mode \u2014 {len(threads)} threads"
         _safe_addstr(stdscr, 0, 0, title, curses.A_BOLD)
 
-        # Column headers
+        # Column headers ("X" column flags excluded threads)
         hdr = (
-            f"{'S1':<{_COL_S1}}"
+            f"{'X':<{_COL_FLAG}}"
+            f"  {'S1':<{_COL_S1}}"
             f"  {'S2':<{_COL_S2}}"
             f"  {'Sender':<{_COL_SENDER}}"
             f"  Subject"
@@ -279,7 +283,7 @@ def _list_view(
             _safe_addstr(stdscr, header_rows + vi, 0, row_text, attr)
 
         # Help / footer
-        help_text = "\u2191/\u2193:Nav  PgUp/PgDn:Page  Enter:Detail  q:Quit"
+        help_text = "\u2191/\u2193:Nav  PgUp/PgDn:Page  Enter:Detail  q:Quit  (X = excluded)"
         _safe_addstr(stdscr, max_y - 1, 0, help_text, curses.A_DIM)
 
         stdscr.refresh()

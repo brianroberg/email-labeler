@@ -6,7 +6,7 @@ sequence of keypresses, so the real key handlers run without a terminal.
 
 from pathlib import Path
 
-from evals.edit_tui import _build_detail_lines, _detail_view
+from evals.edit_tui import _build_detail_lines, _detail_view, _format_list_row
 from evals.review import load_golden_set
 from evals.schemas import GoldenThread
 
@@ -56,6 +56,16 @@ class TestBuildDetailLines:
         thread = _golden("t1", excluded=False)
         lines = _build_detail_lines(thread, 0, 1)
         assert not any(line.startswith("Excluded:") for line in lines)
+
+
+class TestListRowExcludedMarker:
+    def test_excluded_row_is_marked(self):
+        row = _format_list_row(_golden("t1", excluded=True), max_x=80)
+        assert row.lstrip().startswith("X")
+
+    def test_non_excluded_row_has_no_marker(self):
+        row = _format_list_row(_golden("t1", excluded=False), max_x=80)
+        assert not row.lstrip().startswith("X")
 
 
 class TestUnexclude:
