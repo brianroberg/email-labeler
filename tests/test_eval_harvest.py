@@ -2,7 +2,7 @@
 
 import json
 
-from evals.harvest import deduplicate, infer_ground_truth
+from evals.harvest import deduplicate, harvest_threads, infer_ground_truth
 from evals.schemas import GoldenThread
 
 # Label config matching the real config.toml structure
@@ -146,3 +146,38 @@ class TestDeduplicate:
     def test_empty_new_threads(self, tmp_path):
         result = deduplicate([], tmp_path / "golden.jsonl")
         assert len(result) == 0
+
+
+class FakeProxy:
+    """Records the Gmail query passed to list_messages; returns no messages."""
+
+    def __init__(self):
+        self.last_query = None
+
+    async def list_labels(self, user_id: str = "me"):
+        return {"labels": [{"id": lid, "name": name} for lid, name in LABEL_ID_TO_NAME.items()]}
+
+    async def list_messages(self, q=None, max_results=10, **kwargs):
+        self.last_query = q
+        return {"messages": []}
+
+
+class TestHarvestQuery:
+    """The Gmail query should AND in the classification label when filtering."""
+
+    CONFIG = {"labels": LABELS_CONFIG}
+
+    async def test_no_label_filter_queries_processed_only(self):
+        proxy = FakeProxy()
+        await harvest_threads(proxy, self.CONFIG, max_threads=10)
+        assert proxy.last_query == "label:agent/processed"
+
+    async def test_label_filter_anded_into_query(self):
+        proxy = FakeProxy()
+        await harvest_threads(proxy, self.CONFIG, max_threads=10, label_filter="needs_response")
+        assert proxy.last_query == "label:agent/processed label:agent/needs-response"
+
+    async def test_unknown_label_filter_falls_back_to_processed(self):
+        proxy = FakeProxy()
+        await harvest_threads(proxy, self.CONFIG, max_threads=10, label_filter="bogus")
+        assert proxy.last_query == "label:agent/processed"

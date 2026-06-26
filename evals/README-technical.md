@@ -12,7 +12,7 @@ Complete CLI flag references, cache internals, and chain-of-thought capture deta
 | `--max-threads` | Max threads to fetch (default: `200`) |
 | `--append` | Append to existing file, deduplicating by thread ID |
 | `--sender-type` | Filter: `person` or `service` |
-| `--label` | Filter: `needs_response`, `fyi`, `low_priority` |
+| `--label` | Filter: `needs_response`, `fyi`, `low_priority`. ANDed into the Gmail query (e.g. `label:agent/processed label:agent/needs-response`) so the fetch returns a dense pool of matching threads — useful for boosting a rare class like `needs_response` in the golden set |
 | `--config` | Path to config.toml (default: `./config.toml`) |
 | `--proxy-url` | API proxy URL (overrides `PROXY_URL` env var) |
 

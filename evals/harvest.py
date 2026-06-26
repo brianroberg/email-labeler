@@ -140,11 +140,20 @@ async def harvest_threads(
         sys.exit(1)
     label_id_to_name = {lbl["id"]: lbl["name"] for lbl in labels_response["labels"]}
 
-    # Fetch message stubs with agent/processed label
+    # Fetch message stubs with agent/processed label. When a classification
+    # filter is set, AND it into the Gmail query so the fetch returns a dense
+    # pool of matching threads instead of relying on the recent processed
+    # window happening to contain them (label_filter is also re-checked per
+    # thread below, since a thread's messages can carry multiple labels).
     processed_label = labels_config["processed"]
+    query = f"label:{processed_label}"
+    if label_filter:
+        filter_label_name = labels_config.get(label_filter, "")
+        if filter_label_name:
+            query += f" label:{filter_label_name}"
     try:
         response = await proxy.list_messages(
-            q=f"label:{processed_label}",
+            q=query,
             max_results=max_threads * 3,  # Over-fetch since we group by thread
         )
     except _NETWORK_ERRORS as exc:

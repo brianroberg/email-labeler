@@ -40,6 +40,12 @@ uv run python -m evals.harvest --proxy-url http://localhost:8000 --sender-type p
 uv run python -m evals.harvest --proxy-url http://localhost:8000 --label needs_response
 ```
 
+`--label` is ANDed into the Gmail query, so the fetch targets matching threads
+directly rather than filtering the recent processed window after the fact. This
+is the way to boost a rare class (e.g. `needs_response`) in the golden set:
+harvested threads still carry their inferred labels into `evals.review` for
+manual confirmation, so the manual classification step is not bypassed.
+
 ## 2. Review — Manually verify ground truth labels
 
 Interactive CLI for reviewing and correcting labels in the golden set. Saves atomically after each session. Press `z` at any prompt to undo the last classification — undo works as a stack, walking back through previous decisions.
