@@ -8,6 +8,7 @@ against a prior run.
     python scripts/eval_model.py qwen/qwen3-14b            # run + report
     python scripts/eval_model.py qwen/qwen3-14b qwen3-8b   # ...also compare vs newest qwen3-8b run
     python scripts/eval_model.py qwen/qwen3-14b evals/results/20250101_....jsonl  # vs explicit file
+    python scripts/eval_model.py qwen/qwen3-14b --preflight-timeout 600   # very slow cold load
 
 PREREQUISITES (inherently manual, not done here):
   1. `mlx_lm.server --model <hf-id> --host 0.0.0.0 --port 8080 --temp 0 --prompt-cache-size 2`
@@ -26,17 +27,27 @@ from pathlib import Path
 DEFAULT_RESULTS_DIR = "evals/results/"
 
 
-def build_run_eval_command(model: str, compare_to: str | None) -> list[str]:
+def build_run_eval_command(
+    model: str,
+    compare_to: str | None,
+    skip_preflight: bool = False,
+    preflight_timeout: float | None = None,
+) -> list[str]:
     """Build the `uv run python -m evals.run_eval` argv for a local-only eval.
 
     --local-only restricts the run to the local classifier; --local-model sets
     (and, via run_eval's default-tag behaviour, names) the model; --report prints
-    metrics inline.
+    metrics inline. The preflight passthroughs let a caller skip or lengthen the
+    endpoint check for a server that cold-loads a large model on demand.
     """
     cmd = [
         "uv", "run", "python", "-m", "evals.run_eval",
         "--local-only", "--local-model", model, "--report",
     ]
+    if skip_preflight:
+        cmd.append("--skip-preflight")
+    if preflight_timeout is not None:
+        cmd += ["--preflight-timeout", str(preflight_timeout)]
     if compare_to:
         cmd += ["--compare-to", compare_to]
     return cmd
@@ -77,6 +88,10 @@ def main(argv: list[str] | None = None) -> int:
                         help="Prior results file path, or a tag to match the newest run of")
     parser.add_argument("--results-dir", default=DEFAULT_RESULTS_DIR,
                         help=f"Where to look up a baseline tag (default: {DEFAULT_RESULTS_DIR})")
+    parser.add_argument("--skip-preflight", action="store_true",
+                        help="Skip run_eval's pre-run endpoint reachability check")
+    parser.add_argument("--preflight-timeout", type=float, metavar="SECONDS",
+                        help="Override the pre-run endpoint check timeout (for a slow cold load)")
     args = parser.parse_args(argv)
 
     try:
@@ -85,7 +100,11 @@ def main(argv: list[str] | None = None) -> int:
         print(f"Error: {exc}", file=sys.stderr)
         return 1
 
-    cmd = build_run_eval_command(args.model, compare_to)
+    cmd = build_run_eval_command(
+        args.model, compare_to,
+        skip_preflight=args.skip_preflight,
+        preflight_timeout=args.preflight_timeout,
+    )
     print("+ " + " ".join(cmd), file=sys.stderr)
     return subprocess.run(cmd).returncode
 

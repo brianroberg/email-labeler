@@ -2,7 +2,12 @@
 
 import pytest
 
+from scripts import eval_model
 from scripts.eval_model import build_run_eval_command, resolve_baseline
+
+
+class _FakeCompleted:
+    returncode = 0
 
 
 class TestBuildRunEvalCommand:
@@ -16,6 +21,22 @@ class TestBuildRunEvalCommand:
     def test_includes_compare_to_when_given(self):
         cmd = build_run_eval_command("qwen/qwen3-14b", compare_to="evals/results/prior.jsonl")
         assert cmd[-2:] == ["--compare-to", "evals/results/prior.jsonl"]
+
+    def test_skip_preflight_appended(self):
+        cmd = build_run_eval_command("qwen/qwen3-14b", compare_to=None, skip_preflight=True)
+        assert "--skip-preflight" in cmd
+
+    def test_preflight_timeout_appended(self):
+        cmd = build_run_eval_command("qwen/qwen3-14b", compare_to=None, preflight_timeout=240)
+        assert "--preflight-timeout" in cmd
+        assert cmd[cmd.index("--preflight-timeout") + 1] == "240"
+
+    def test_compare_to_stays_last_with_preflight_flags(self):
+        cmd = build_run_eval_command(
+            "qwen/qwen3-14b", compare_to="prior.jsonl",
+            skip_preflight=True, preflight_timeout=240,
+        )
+        assert cmd[-2:] == ["--compare-to", "prior.jsonl"]
 
 
 class TestResolveBaseline:
@@ -45,3 +66,28 @@ class TestResolveBaseline:
     def test_no_match_raises(self, tmp_path):
         with pytest.raises(FileNotFoundError, match="nomatch"):
             resolve_baseline("nomatch", tmp_path)
+
+
+class TestMainForwardsPreflightFlags:
+    def _capture(self, monkeypatch):
+        captured = {}
+
+        def fake_run(cmd, *a, **k):
+            captured["cmd"] = cmd
+            return _FakeCompleted()
+
+        monkeypatch.setattr(eval_model.subprocess, "run", fake_run)
+        return captured
+
+    def test_skip_preflight_flag_reaches_run_eval(self, monkeypatch):
+        captured = self._capture(monkeypatch)
+        rc = eval_model.main(["qwen/qwen3-14b", "--skip-preflight"])
+        assert rc == 0
+        assert "--skip-preflight" in captured["cmd"]
+
+    def test_preflight_timeout_flag_reaches_run_eval(self, monkeypatch):
+        captured = self._capture(monkeypatch)
+        eval_model.main(["qwen/qwen3-14b", "--preflight-timeout", "240"])
+        cmd = captured["cmd"]
+        assert "--preflight-timeout" in cmd
+        assert cmd[cmd.index("--preflight-timeout") + 1] == "240.0"
