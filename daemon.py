@@ -193,7 +193,24 @@ async def _give_up_if_stuck(
     try:
         async with (write_sem or nullcontext()):
             await label_manager.mark_attempted(msg_ids)
+    except ProxyUnavailableError as exc:
+        # The proxy is transiently down, so the agent/attempted marker can't be written
+        # right now — expected during an outage, not a bug. The failure count stays
+        # ≥ max_failures (we don't record the give-up), so the thread remains
+        # give-up-eligible and the marker write is retried next cycle once the proxy
+        # recovers. Log a clean warning rather than spamming a traceback for an expected
+        # transient condition. (The thread keeps re-matching the query until it is
+        # actually labeled; skipping the re-classification in that window is a separate
+        # efficiency concern, tracked in #29.)
+        log.warning(
+            "Proxy unavailable marking stuck thread %s attempted — will retry next cycle: %s",
+            thread_id, exc,
+        )
+        return False
     except Exception:
+        # An unexpected, likely-permanent marker-write failure (a real bug, or a
+        # misconfigured label): keep the full traceback so it stays diagnosable rather
+        # than looping silently as if benign.
         log.exception("Could not mark stuck thread %s attempted", thread_id)
         return False
     failure_tracker.record_give_up(thread_id)

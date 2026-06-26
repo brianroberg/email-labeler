@@ -2,6 +2,7 @@
 
 import asyncio
 import base64
+import logging
 from unittest.mock import AsyncMock, MagicMock
 
 import httpx
@@ -390,6 +391,50 @@ class TestProcessSingleThread:
         mock_label_manager.mark_attempted.assert_called_once_with(["msg_1"])
         mock_label_manager.mark_processed.assert_not_called()
         assert tracker.take_given_up() == ["thread_poison"]
+
+    async def test_give_up_write_transient_failure_logs_clean_warning(
+        self, mock_proxy, mock_classifier, mock_label_manager, cloud_sem, local_sem, caplog,
+    ):
+        """A transient proxy outage DURING the give-up marker write is expected, not a
+        bug (issue #32): log a retryable warning (no traceback) and retry next cycle —
+        distinct from an unexpected/permanent marker-write failure. The give-up is not
+        recorded, so the thread stays give-up-eligible until the marker write lands.
+        """
+        mock_proxy.get_thread.side_effect = RuntimeError("classification boom")
+        mock_label_manager.mark_attempted.side_effect = ProxyUnavailableError("proxy 503 on write")
+        tracker = FailureTracker(max_failures=1)  # give up on the first failure
+
+        with caplog.at_level(logging.WARNING):
+            result = await process_single_thread(
+                "thread_x", ["msg_1"], mock_proxy, mock_classifier, mock_label_manager,
+                cloud_sem, local_sem, max_thread_chars=16000, failure_tracker=tracker,
+            )
+
+        assert result is False                # couldn't mark → retry next cycle
+        assert tracker.take_given_up() == []  # not recorded as given up
+        retry_logs = [r for r in caplog.records if "will retry" in r.getMessage()]
+        assert retry_logs, "expected a clean retry warning for the transient marker-write failure"
+        # Transient: a clean WARNING, never an ERROR-with-traceback.
+        assert all(r.levelno == logging.WARNING and r.exc_info is None for r in retry_logs)
+
+    async def test_give_up_write_unexpected_failure_keeps_traceback(
+        self, mock_proxy, mock_classifier, mock_label_manager, cloud_sem, local_sem, caplog,
+    ):
+        """An UNEXPECTED (likely permanent) marker-write failure keeps its full traceback
+        so it stays diagnosable rather than being swallowed as benign (issue #32)."""
+        mock_proxy.get_thread.side_effect = RuntimeError("classification boom")
+        mock_label_manager.mark_attempted.side_effect = ValueError("unexpected marker bug")
+        tracker = FailureTracker(max_failures=1)
+
+        with caplog.at_level(logging.WARNING):
+            result = await process_single_thread(
+                "thread_y", ["msg_1"], mock_proxy, mock_classifier, mock_label_manager,
+                cloud_sem, local_sem, max_thread_chars=16000, failure_tracker=tracker,
+            )
+
+        assert result is False
+        marker_logs = [r for r in caplog.records if "Could not mark" in r.getMessage()]
+        assert marker_logs and any(r.levelno >= logging.ERROR and r.exc_info for r in marker_logs)
 
     async def test_proxy_4xx_is_give_up_eligible(
         self, mock_proxy, mock_classifier, mock_label_manager, cloud_sem, local_sem,
