@@ -34,12 +34,13 @@ class ProxyForbiddenError(Exception):
 
 
 class ProxyError(Exception):
-    """Raised for request-specific proxy errors — a 4xx response (other than 401/403)
-    or a non-JSON success body. These are eligible for the daemon's give-up logic:
-    retrying the same request as-is won't help.
+    """Raised for a request-specific proxy fault — a 4xx response other than 401/403.
+    These are eligible for the daemon's give-up logic: retrying the same request as-is
+    won't help, so a persistent one is bounded by the FailureTracker.
 
-    The transient subset (endpoint unavailable / 5xx) is raised as the more specific
-    ProxyUnavailableError below; catching ProxyError still catches both.
+    The transient subset — endpoint unavailable, a 5xx, an exhausted 429, or a non-empty
+    non-JSON 2xx body — is raised as the more specific ProxyUnavailableError below;
+    catching ProxyError still catches both.
     """
 
     pass
@@ -164,11 +165,18 @@ class GmailProxyClient:
         try:
             return response.json()
         except ValueError:
-            # A 2xx with a non-JSON body — a truncated/garbled response, or an upstream
-            # gateway briefly returning an HTML error page with status 200. Transient
-            # like a 5xx, so raise the transient subclass: the daemon defers and retries
-            # rather than abandoning the thread, and a *persistent* non-JSON 2xx is still
-            # bounded by the FailureTracker give-up path (issue #27, building on #26).
+            if not response.content:
+                # An EMPTY 2xx body (e.g. 204 No Content from a write) is a success with
+                # nothing to parse — return {} rather than misclassifying it as a fault.
+                # (Classifying it transient would defer-and-retry forever, since the
+                # give-up marker write hits the same endpoint and would trip the same
+                # path; classifying it give-up-eligible would abandon a successful write.)
+                return {}
+            # A non-empty, non-JSON 2xx body — a truncated/garbled response, or an
+            # upstream gateway briefly returning an HTML error page with status 200.
+            # Transient like a 5xx, so raise the transient subclass: the daemon defers
+            # and retries rather than abandoning the thread, and a *persistent* one is
+            # still bounded by the FailureTracker give-up path (issue #27, building on #26).
             raise ProxyUnavailableError("Proxy returned non-JSON response for successful request")
 
     async def _send(self, do_request, operation: str) -> dict:

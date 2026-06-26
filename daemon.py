@@ -186,22 +186,19 @@ async def _give_up_if_stuck(
     failure_tracker.record_failure(thread_id)
     if not failure_tracker.should_give_up(thread_id):
         return False
-    log.error(
-        "Thread %s failed %d+ times — marking agent/attempted to break the retry loop",
-        thread_id, failure_tracker.max_failures,
-    )
     try:
         async with (write_sem or nullcontext()):
             await label_manager.mark_attempted(msg_ids)
     except ProxyUnavailableError as exc:
         # The proxy is transiently down, so the agent/attempted marker can't be written
-        # right now — expected during an outage, not a bug. The failure count stays
-        # ≥ max_failures (we don't record the give-up), so the thread remains
-        # give-up-eligible and the marker write is retried next cycle once the proxy
-        # recovers. Log a clean warning rather than spamming a traceback for an expected
-        # transient condition. (The thread keeps re-matching the query until it is
-        # actually labeled; skipping the re-classification in that window is a separate
-        # efficiency concern, tracked in #29.)
+        # right now — expected during an outage, not a bug. We return without recording
+        # the give-up, so the thread stays give-up-eligible: its failure count is left
+        # ≥ max_failures (this arm returns False, so the poll loop's success-only
+        # count-clear never runs), and the marker write is retried next cycle once the
+        # proxy recovers. Log a clean warning rather than spamming a traceback for an
+        # expected transient condition. (The thread keeps re-matching the query until it
+        # is actually labeled; skipping the re-classification in that window is a
+        # separate efficiency concern, tracked in #29.)
         log.warning(
             "Proxy unavailable marking stuck thread %s attempted — will retry next cycle: %s",
             thread_id, exc,
@@ -213,6 +210,13 @@ async def _give_up_if_stuck(
         # than looping silently as if benign.
         log.exception("Could not mark stuck thread %s attempted", thread_id)
         return False
+    # Logged once here — AFTER the marker write actually lands — not before it: a
+    # transient write-outage can retry this for several cycles, and logging on every
+    # attempt would re-spam ERROR for what is an expected, recoverable condition.
+    log.error(
+        "Thread %s failed %d+ times — marked agent/attempted to break the retry loop",
+        thread_id, failure_tracker.max_failures,
+    )
     failure_tracker.record_give_up(thread_id)
     # Note: the poll loop clears the failure count on every True result (which a
     # give-up returns), so the count is reset there — no need to clear it here too.
@@ -473,20 +477,22 @@ async def process_single_thread(
         return False
     except ProxyUnavailableError as exc:
         # api-proxy unavailable for THIS thread's call — connection refused, a timeout,
-        # a dropped connection, or a 5xx / exhausted-429 response.
+        # a dropped connection, a 5xx / exhausted-429 response, or a non-JSON 2xx body.
         #
         # Unlike LLMUnavailableError above, this is give-up-eligible (issue #26). The
-        # asymmetry is deliberate: an endpoint-wide PROXY outage is caught one level up
-        # — list_messages (also a proxy call) fails first, so the whole cycle defers
-        # (see the poll loop) and no thread is ever processed or counted. So reaching
-        # here means the proxy served other calls this cycle and only this thread's
-        # call failed; a fault that PERSISTS across cycles is poison (e.g. a
-        # deterministic 5xx on one unserializable thread) and must be bounded like
-        # Timeout/RuntimeError below, not retried forever. A transient blip clears its
-        # count via the poll-loop success-clear before reaching the threshold.
-        # (An LLM outage, by contrast, is invisible at the cycle level — the proxy is
-        # up — so LLMUnavailableError must never give up, or one MLX outage would
-        # abandon every person thread.)
+        # asymmetry is deliberate: a *fully* endpoint-wide PROXY outage is caught one
+        # level up — list_messages (also a proxy call) fails first, so the whole cycle
+        # defers (see the poll loop) and no thread is ever processed or counted. A fault
+        # that reaches here is therefore either thread-specific (e.g. a deterministic
+        # 5xx on one unserializable thread) or a partial/route-selective degradation
+        # (e.g. get_thread garbles while list_messages stays healthy); if it PERSISTS
+        # across cycles it must be bounded like Timeout/RuntimeError below, not retried
+        # forever. A transient blip clears its count via the poll-loop success-clear
+        # before reaching the threshold. The accepted residual is that a *sustained*
+        # partial outage can abandon the backlog — but to the findable, re-processable
+        # agent/attempted (issue #23), not to lost mail. (An LLM outage, by contrast, is
+        # invisible at the cycle level — the proxy is up — so LLMUnavailableError must
+        # never give up, or one MLX outage would abandon every person thread.)
         log.warning("api-proxy unavailable processing thread %s: %s", thread_id, exc)
         return await _give_up_if_stuck(thread_id, ids_to_mark, failure_tracker, label_manager, write_sem)
     except httpx.ConnectError as exc:
@@ -749,11 +755,12 @@ async def run_daemon() -> None:
             )
             backoff = min(backoff * 2, poll_interval * 10)
         except ProxyError as exc:
-            # A request-specific proxy fault from the cycle-level list_messages call
-            # (a 4xx — e.g. a malformed gmail_query 400 — or a non-JSON 2xx body).
-            # It won't fix itself, but it's a known, named condition: log it as a
-            # warning and back off rather than spewing a full traceback every cycle.
-            # (ProxyUnavailableError is handled above as transient.)
+            # A request-specific proxy fault from the cycle-level list_messages call:
+            # a 4xx, e.g. a malformed gmail_query 400. It won't fix itself, but it's a
+            # known, named condition: log it as a warning and back off rather than
+            # spewing a full traceback every cycle. (The transient faults — 5xx, an
+            # exhausted 429, a non-JSON 2xx body — are ProxyUnavailableError, handled
+            # by the arm above.)
             log.warning(
                 "api-proxy rejected the poll request (%s: %s) — retrying in %ds",
                 type(exc).__name__, exc, backoff,

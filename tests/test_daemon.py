@@ -433,6 +433,9 @@ class TestProcessSingleThread:
             )
 
         assert result is False
+        # A failed marker write must NOT be recorded as a give-up: the thread wasn't
+        # labeled, so reporting it abandoned would be misleading and it keeps re-matching.
+        assert tracker.take_given_up() == []
         marker_logs = [r for r in caplog.records if "Could not mark" in r.getMessage()]
         assert marker_logs and any(r.levelno >= logging.ERROR and r.exc_info for r in marker_logs)
 

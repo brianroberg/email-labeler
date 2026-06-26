@@ -96,6 +96,30 @@ class TestTransientClassification:
         with pytest.raises(ProxyUnavailableError):
             client._handle_response(resp)
 
+    async def test_empty_2xx_body_is_success_not_a_fault(self, client):
+        """An EMPTY 2xx body (e.g. 204 No Content from a write) is a success with nothing
+        to parse — it must return {}, not raise. Distinct from a non-empty non-JSON body:
+        if an empty body were classified transient (#27), a write returning 204 would
+        defer-and-retry forever, since the give-up marker write hits the same endpoint and
+        would trip the same classification (review follow-up to #27)."""
+        resp = httpx.Response(
+            204, content=b"",
+            request=httpx.Request("POST", "http://proxy.test/x"),
+        )
+        assert client._handle_response(resp) == {}
+
+    async def test_list_messages_non_json_2xx_is_unavailable(self, client):
+        """End-to-end through _send: a garbled 200 on the cycle-level list_messages call
+        surfaces as ProxyUnavailableError, so the poll loop defers and backs off rather
+        than crashing or abandoning the cycle (review follow-up to #27)."""
+        resp = httpx.Response(
+            200, text="<html>oops</html>",
+            request=httpx.Request("GET", "http://proxy.test/x"),
+        )
+        _patch_transport(get_return=resp)
+        with pytest.raises(ProxyUnavailableError):
+            await client.list_messages()
+
     async def test_read_timeout_raises_unavailable(self, client):
         """A read timeout to the proxy is infrastructure slowness → transient.
 
