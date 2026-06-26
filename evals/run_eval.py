@@ -85,45 +85,50 @@ def default_tag(stages: str, config: dict) -> str:
 
 
 def required_endpoints(stages: str, sender_type: str | None) -> tuple[bool, bool]:
-    """Return (need_cloud, need_local) for a run configuration.
+    """Return (need_cloud, need_local): the endpoints WITHOUT which the run
+    produces no results at all, so preflight only hard-aborts a doomed run.
 
-    Stage 1 (sender) is always cloud. Stage 2 routes person bodies to the local
-    model and service bodies to the cloud, so a stage2_only run narrowed by
-    --sender-type touches exactly one endpoint; without that filter (or a full
-    run) it may touch both. Used to scope the preflight check to endpoints the
-    run will actually hit.
+    Stage 1 (sender) always uses the cloud; Stage 2 routes person bodies to the
+    local model and service bodies to the cloud. An endpoint is "wholly required"
+    only when every selected thread depends on it:
+      - stage1_only -> cloud (every thread classifies a sender).
+      - stage2_only person -> local; stage2_only service -> cloud.
+      - stage2_only with no filter -> neither (a down endpoint loses only the
+        person *or* service half, leaving partial results).
+      - full -> cloud only: Stage 1 gates every thread, but a down local endpoint
+        merely fails person Stage 2b, leaving Stage 1 + service Stage 2a results.
     """
-    if stages == "stage1_only":
-        return True, False
     if stages == "stage2_only":
         if sender_type == "person":
             return False, True
         if sender_type == "service":
             return True, False
-        return True, True
-    return True, True  # full
+        return False, False
+    return True, False  # stage1_only and full both wholly require only the cloud
 
 
 async def preflight_check(
-    cloud_base, local_base, need_cloud: bool, need_local: bool, timeout: float | None = None,
+    cloud_base, local_base, need_cloud: bool, need_local: bool,
+    cloud_timeout: float | None = None, local_timeout: float | None = None,
 ) -> list[str]:
     """Probe each required endpoint once; return a human-readable error per dead one.
 
     Turns the most common silent failure — a local MLX_MODEL that doesn't match
     the served --model (every request 404s) or an unreachable endpoint — into an
     immediate, clear error instead of a whole run of per-thread errors. Endpoints
-    the run won't touch are never probed.
+    the run won't wholly depend on are never probed.
 
-    *timeout* (seconds) bounds each probe; pass a generous value for a server that
-    loads the requested model on demand, so a cold load is not read as "down".
+    Each endpoint gets its own probe timeout so the cloud probe need not wait out
+    the long local cold-load budget; pass a generous *local_timeout* for a server
+    that loads the requested model on demand, so a cold load is not read as "down".
     """
     errors = []
-    if need_cloud and not await cloud_base.is_available(timeout):
+    if need_cloud and not await cloud_base.is_available(cloud_timeout):
         errors.append(
             f"cloud LLM '{cloud_base.model}' not reachable at "
             f"{cloud_base.base_url or '<unset CLOUD_LLM_URL>'}"
         )
-    if need_local and not await local_base.is_available(timeout):
+    if need_local and not await local_base.is_available(local_timeout):
         errors.append(
             f"local LLM '{local_base.model}' not reachable at "
             f"{local_base.base_url or '<unset MLX_URL>'} "
@@ -466,10 +471,24 @@ def maybe_report(
         if not compare_path.exists():
             print(f"Error: --compare-to file not found: {compare_path}", file=sys.stderr)
             return
-        meta_b, results_b = report.load_results(compare_path)
+        try:
+            meta_b, results_b = report.load_results(compare_path)
+        except (ValueError, OSError) as exc:
+            print(f"Error: could not read --compare-to results from {compare_path}: {exc}",
+                  file=sys.stderr)
+            return
+        if meta_b.stages != meta.stages:
+            print(
+                f"Warning: baseline stages={meta_b.stages} differ from this run's "
+                f"stages={meta.stages}; deltas may span different thread populations.",
+                file=sys.stderr,
+            )
+        # Baseline is Run A and the just-finished run is Run B, so print_comparison's
+        # Delta column reads (this run - baseline) — positive means improvement.
+        # verbose=True surfaces the per-thread regression/improvement list.
         report.print_comparison(
-            meta, metrics, meta_b, report.compute_metrics(results_b),
-            results1=results, results2=results_b,
+            meta_b, report.compute_metrics(results_b), meta, metrics,
+            verbose=True, results1=results_b, results2=results,
         )
 
 
@@ -544,14 +563,20 @@ async def main(args: argparse.Namespace) -> None:
     # errors. (Skipped on --dry-run, which returned above.)
     if not args.skip_preflight:
         need_cloud, need_local = required_endpoints(args.stages, args.sender_type)
-        # Default the probe timeout to the local model's request timeout: generous
-        # enough that a server loading the model on demand isn't read as "down".
-        pf_timeout = (
+        # Each probe defaults to its own endpoint's request timeout (so the local
+        # probe is generous enough for a load-on-demand cold start, while the cloud
+        # probe still fails fast); an explicit --preflight-timeout overrides both.
+        cloud_timeout = (
+            args.preflight_timeout if args.preflight_timeout is not None
+            else config["llm"]["cloud"]["timeout"]
+        )
+        local_timeout = (
             args.preflight_timeout if args.preflight_timeout is not None
             else config["llm"]["local"]["timeout"]
         )
         unreachable = await preflight_check(
-            cloud_llm_base, local_llm_base, need_cloud, need_local, timeout=pf_timeout,
+            cloud_llm_base, local_llm_base, need_cloud, need_local,
+            cloud_timeout=cloud_timeout, local_timeout=local_timeout,
         )
         if unreachable:
             for msg in unreachable:

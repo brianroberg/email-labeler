@@ -38,6 +38,13 @@ class TestBuildRunEvalCommand:
         )
         assert cmd[-2:] == ["--compare-to", "prior.jsonl"]
 
+    def test_output_dir_forwarded_when_given(self):
+        cmd = build_run_eval_command("qwen/qwen3-14b", compare_to=None, output_dir="/data/results")
+        assert cmd[cmd.index("--output-dir") + 1] == "/data/results"
+
+    def test_output_dir_omitted_when_none(self):
+        assert "--output-dir" not in build_run_eval_command("qwen/qwen3-14b", compare_to=None)
+
 
 class TestResolveBaseline:
     def test_none_returns_none(self, tmp_path):
@@ -67,6 +74,33 @@ class TestResolveBaseline:
         with pytest.raises(FileNotFoundError, match="nomatch"):
             resolve_baseline("nomatch", tmp_path)
 
+    def test_glob_metacharacters_are_neutralized_by_sanitize(self, tmp_path):
+        # A glob metachar (here '?') must be sanitized to '-', not interpreted as a
+        # wildcard; 'qwen3?14b' -> 'qwen3-14b', matching the run run_eval wrote.
+        (tmp_path / "20250101_000000_stage2_only_qwen3-14b_aaaa.jsonl").write_text("{}\n")
+        assert resolve_baseline("qwen3?14b", tmp_path).endswith("qwen3-14b_aaaa.jsonl")
+
+    def test_slash_token_matches_sanitized_filename(self, tmp_path):
+        # run_eval writes the '/' as '-'; the lookup must search the same form.
+        (tmp_path / "20250101_000000_stage2_only_qwen-qwen3-14b_aaaa.jsonl").write_text("{}\n")
+        assert resolve_baseline("qwen/qwen3-14b", tmp_path).endswith("qwen-qwen3-14b_aaaa.jsonl")
+
+    def test_token_anchored_to_tag_not_arbitrary_substring(self, tmp_path):
+        # Only a qwen3-14b run exists; the token 'qwen3' must NOT match it (it is a
+        # different tag), rather than silently comparing against the wrong model.
+        (tmp_path / "20250101_000000_stage2_only_qwen3-14b_aaaa.jsonl").write_text("{}\n")
+        with pytest.raises(FileNotFoundError):
+            resolve_baseline("qwen3", tmp_path)
+
+    def test_cwd_name_collision_not_treated_as_path(self, tmp_path, monkeypatch):
+        # A bare tag that coincides with a cwd entry must not be taken as a path.
+        monkeypatch.chdir(tmp_path)
+        (tmp_path / "qwen3").mkdir()  # cwd collision
+        results = tmp_path / "results"
+        results.mkdir()
+        (results / "20250101_000000_stage2_only_qwen3_aaaa.jsonl").write_text("{}\n")
+        assert resolve_baseline("qwen3", results).endswith("qwen3_aaaa.jsonl")
+
 
 class TestMainForwardsPreflightFlags:
     def _capture(self, monkeypatch):
@@ -91,3 +125,10 @@ class TestMainForwardsPreflightFlags:
         cmd = captured["cmd"]
         assert "--preflight-timeout" in cmd
         assert cmd[cmd.index("--preflight-timeout") + 1] == "240.0"
+
+    def test_results_dir_forwarded_as_output_dir(self, monkeypatch, tmp_path):
+        # The run is WRITTEN where baselines are READ, so the two never diverge.
+        captured = self._capture(monkeypatch)
+        eval_model.main(["qwen/qwen3-14b", "--results-dir", str(tmp_path)])
+        cmd = captured["cmd"]
+        assert cmd[cmd.index("--output-dir") + 1] == str(tmp_path)

@@ -278,7 +278,9 @@ class TestDefaultTag:
 
 
 class TestRequiredEndpoints:
-    """Which LLM endpoints a run actually touches, so preflight only checks those."""
+    """Endpoints WITHOUT which a run produces no results at all, so preflight
+    only hard-aborts when the whole run would be useless (not when one endpoint
+    is down but the other half of the work could still succeed)."""
 
     def test_stage1_only_needs_cloud_only(self):
         assert required_endpoints("stage1_only", None) == (True, False)
@@ -289,11 +291,16 @@ class TestRequiredEndpoints:
     def test_stage2_only_service_needs_cloud_only(self):
         assert required_endpoints("stage2_only", "service") == (True, False)
 
-    def test_stage2_only_mixed_needs_both(self):
-        assert required_endpoints("stage2_only", None) == (True, True)
+    def test_stage2_only_mixed_requires_neither(self):
+        # person->local, service->cloud: a down endpoint loses half the work,
+        # not all of it, so neither is wholly required.
+        assert required_endpoints("stage2_only", None) == (False, False)
 
-    def test_full_needs_both(self):
-        assert required_endpoints("full", "person") == (True, True)
+    def test_full_requires_cloud_only(self):
+        # Stage 1 (cloud) gates every thread, so cloud-down means zero results;
+        # local-down only fails person Stage 2b, leaving partial cloud results.
+        assert required_endpoints("full", "person") == (True, False)
+        assert required_endpoints("full", None) == (True, False)
 
 
 class _FakeClient:
@@ -341,12 +348,14 @@ class TestPreflightCheck:
         assert errors == []
         assert cloud.checked is False  # never probed
 
-    def test_forwards_timeout_to_is_available(self):
+    def test_forwards_per_endpoint_timeouts_to_is_available(self):
+        # Cloud and local get their own probe timeouts (cloud need not wait out
+        # the long local cold-load budget).
         cloud = _FakeClient("c", "http://cloud", True)
         local = _FakeClient("m", "http://local", True)
-        _run(preflight_check(cloud, local, True, True, timeout=77))
-        assert local.last_timeout == 77
-        assert cloud.last_timeout == 77
+        _run(preflight_check(cloud, local, True, True, cloud_timeout=30, local_timeout=180))
+        assert cloud.last_timeout == 30
+        assert local.last_timeout == 180
 
 
 def _meta(**overrides):
@@ -387,6 +396,37 @@ class TestMaybeReport:
         maybe_report(_meta(), [_result()], report_enabled=False, compare_to=str(missing))
         err = capsys.readouterr().err
         assert "not found" in err
+
+    def test_baseline_is_run_a_so_delta_reads_new_minus_baseline(self, capsys, tmp_path):
+        prior = tmp_path / "20250101_000000_stage2_only_base_aaaa1111.jsonl"
+        write_results(prior, _meta(run_id="prior999", tag="base"), [_result()])
+        maybe_report(_meta(run_id="new00000", tag="new"), [_result()],
+                     report_enabled=False, compare_to=str(prior))
+        out = capsys.readouterr().out
+        a_line = next(ln for ln in out.splitlines() if ln.strip().startswith("Run A:"))
+        b_line = next(ln for ln in out.splitlines() if ln.strip().startswith("Run B:"))
+        assert "base" in a_line  # baseline is A
+        assert "new" in b_line   # this run is B -> Delta = new - baseline
+
+    def test_compare_shows_per_thread_differences(self, capsys, tmp_path):
+        prior = tmp_path / "20250101_000000_stage2_only_base_aaaa1111.jsonl"
+        write_results(prior, _meta(tag="base"), [_result(predicted_label="fyi")])
+        maybe_report(_meta(tag="new"), [_result(predicted_label="low_priority")],
+                     report_enabled=False, compare_to=str(prior))
+        assert "Prediction Differences" in capsys.readouterr().out
+
+    def test_malformed_compare_file_errors_without_raising(self, capsys, tmp_path):
+        bad = tmp_path / "20250101_000000_stage2_only_base_aaaa1111.jsonl"
+        bad.write_text('{"type": "thinking", "thread_id": "t1"}\n')  # no run_meta line
+        maybe_report(_meta(), [_result()], report_enabled=False, compare_to=str(bad))
+        assert "Error" in capsys.readouterr().err
+
+    def test_population_mismatch_warns(self, capsys, tmp_path):
+        prior = tmp_path / "20250101_000000_full_base_aaaa1111.jsonl"
+        write_results(prior, _meta(tag="base", stages="full"), [_result()])
+        maybe_report(_meta(tag="new", stages="stage2_only"), [_result()],
+                     report_enabled=False, compare_to=str(prior))
+        assert "stages" in capsys.readouterr().err.lower()
 
 
 def _full_args(**kw):
@@ -475,11 +515,13 @@ class TestMainPreflightWiring:
 
 class TestMainPreflightTimeoutWiring:
     def _capture_and_stop(self, monkeypatch):
-        """Patch preflight_check to capture its timeout and run_evaluation to stop main."""
+        """Patch preflight_check to capture its timeouts and run_evaluation to stop main."""
         captured = {}
 
-        async def fake_preflight(cloud, local, need_cloud, need_local, timeout=None):
-            captured["timeout"] = timeout
+        async def fake_preflight(cloud, local, need_cloud, need_local,
+                                 cloud_timeout=None, local_timeout=None):
+            captured["cloud_timeout"] = cloud_timeout
+            captured["local_timeout"] = local_timeout
             return []  # reachable
 
         async def boom(*a, **k):
@@ -489,7 +531,7 @@ class TestMainPreflightTimeoutWiring:
         monkeypatch.setattr(run_eval, "run_evaluation", boom)
         return captured
 
-    def test_explicit_preflight_timeout_is_forwarded(self, tmp_path, monkeypatch):
+    def test_explicit_preflight_timeout_overrides_both(self, tmp_path, monkeypatch):
         captured = self._capture_and_stop(monkeypatch)
         path = tmp_path / "golden.jsonl"
         _write_golden_set(path, [_golden("p", reviewed=True, expected_sender_type="person")])
@@ -497,9 +539,10 @@ class TestMainPreflightTimeoutWiring:
 
         with pytest.raises(RuntimeError, match="reached evaluation"):
             asyncio.run(main(args))
-        assert captured["timeout"] == 99.0
+        assert captured["local_timeout"] == 99.0
+        assert captured["cloud_timeout"] == 99.0
 
-    def test_preflight_timeout_defaults_to_local_request_timeout(self, tmp_path, monkeypatch):
+    def test_preflight_timeouts_default_to_per_endpoint_request_timeouts(self, tmp_path, monkeypatch):
         captured = self._capture_and_stop(monkeypatch)
         path = tmp_path / "golden.jsonl"
         _write_golden_set(path, [_golden("p", reviewed=True, expected_sender_type="person")])
@@ -507,7 +550,9 @@ class TestMainPreflightTimeoutWiring:
 
         with pytest.raises(RuntimeError, match="reached evaluation"):
             asyncio.run(main(args))
-        # Defaults to the local model's configured request timeout (well over 10s),
+        cfg = load_config()
+        # Each endpoint defaults to its own request timeout; local is well over 10s
         # so a cold on-demand model load isn't read as "unreachable".
-        assert captured["timeout"] == load_config()["llm"]["local"]["timeout"]
-        assert captured["timeout"] > 10
+        assert captured["local_timeout"] == cfg["llm"]["local"]["timeout"]
+        assert captured["cloud_timeout"] == cfg["llm"]["cloud"]["timeout"]
+        assert captured["local_timeout"] > 10

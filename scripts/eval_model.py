@@ -24,6 +24,8 @@ import subprocess
 import sys
 from pathlib import Path
 
+from evals.run_eval import sanitize_tag
+
 DEFAULT_RESULTS_DIR = "evals/results/"
 
 
@@ -32,13 +34,16 @@ def build_run_eval_command(
     compare_to: str | None,
     skip_preflight: bool = False,
     preflight_timeout: float | None = None,
+    output_dir: str | None = None,
 ) -> list[str]:
     """Build the `uv run python -m evals.run_eval` argv for a local-only eval.
 
     --local-only restricts the run to the local classifier; --local-model sets
     (and, via run_eval's default-tag behaviour, names) the model; --report prints
     metrics inline. The preflight passthroughs let a caller skip or lengthen the
-    endpoint check for a server that cold-loads a large model on demand.
+    endpoint check for a server that cold-loads a large model on demand. When set,
+    output_dir is forwarded as --output-dir so the run is written where baselines
+    are read from.
     """
     cmd = [
         "uv", "run", "python", "-m", "evals.run_eval",
@@ -48,6 +53,8 @@ def build_run_eval_command(
         cmd.append("--skip-preflight")
     if preflight_timeout is not None:
         cmd += ["--preflight-timeout", str(preflight_timeout)]
+    if output_dir is not None:
+        cmd += ["--output-dir", str(output_dir)]
     if compare_to:
         cmd += ["--compare-to", compare_to]
     return cmd
@@ -56,20 +63,32 @@ def build_run_eval_command(
 def resolve_baseline(token: str | None, results_dir: Path) -> str | None:
     """Resolve a baseline argument to a results file path, or None.
 
-    A token that is an existing path is used as-is. Otherwise it is treated as a
-    tag substring and matched against `*<token>*.jsonl` in *results_dir*, ignoring
-    `.cot.jsonl` chain-of-thought sidecars; the newest match wins (filenames are
-    timestamp-prefixed, so a lexical sort is chronological).
+    A token that is an explicit results file (a `.jsonl` path that exists) is used
+    as-is. Otherwise it is treated as a model tag: it is run through the same
+    sanitize_tag that named the results file, then matched as a whole underscore-
+    delimited segment against `*_<tag>_*.jsonl` in *results_dir* (ignoring
+    `.cot.jsonl` sidecars); the newest match wins, since timestamp-prefixed names
+    sort chronologically.
+
+    Sanitizing first means a tag with glob metacharacters or a '/' (e.g.
+    `qwen/qwen3-14b`) searches the same namespace run_eval wrote, and the segment
+    anchoring keeps `qwen3` from matching an unrelated `qwen3-14b` run.
 
     Raises:
         FileNotFoundError: if a tag token matches no results file.
     """
     if not token:
         return None
-    if Path(token).exists():
+    # Only an explicit results file is a path; a bare tag never is (avoids a cwd
+    # name collision being mistaken for a path).
+    path = Path(token)
+    if path.suffix == ".jsonl" and path.exists():
         return token
+    tag = sanitize_tag(token)
+    if not tag:
+        raise FileNotFoundError(f"Baseline tag '{token}' is empty after sanitizing")
     matches = sorted(
-        p for p in results_dir.glob(f"*{token}*.jsonl")
+        p for p in results_dir.glob(f"*_{tag}_*.jsonl")
         if not p.name.endswith(".cot.jsonl")
     )
     if not matches:
@@ -87,7 +106,8 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("baseline", nargs="?",
                         help="Prior results file path, or a tag to match the newest run of")
     parser.add_argument("--results-dir", default=DEFAULT_RESULTS_DIR,
-                        help=f"Where to look up a baseline tag (default: {DEFAULT_RESULTS_DIR})")
+                        help="Directory the run is written to AND baseline tags are "
+                             f"looked up in (default: {DEFAULT_RESULTS_DIR})")
     parser.add_argument("--skip-preflight", action="store_true",
                         help="Skip run_eval's pre-run endpoint reachability check")
     parser.add_argument("--preflight-timeout", type=float, metavar="SECONDS",
@@ -104,6 +124,7 @@ def main(argv: list[str] | None = None) -> int:
         args.model, compare_to,
         skip_preflight=args.skip_preflight,
         preflight_timeout=args.preflight_timeout,
+        output_dir=args.results_dir,
     )
     print("+ " + " ".join(cmd), file=sys.stderr)
     return subprocess.run(cmd).returncode

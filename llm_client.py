@@ -211,7 +211,10 @@ class LLMClient:
                 response = await client.post(self.base_url, headers=headers, json=body)
 
             return response.status_code == 200
-        except (httpx.ConnectError, httpx.TimeoutException):
+        except httpx.RequestError:
+            # Any failure to obtain a response means "not available": connect /
+            # timeout, but also UnsupportedProtocol (unset/schemeless URL) and
+            # read/protocol errors (e.g. a dropped connection mid cold-load).
             return False
 
     # Matches <think>...</think> and <<think>>...</<think>> (DeepSeek variant)

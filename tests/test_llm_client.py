@@ -436,6 +436,17 @@ class TestIsAvailable:
 
             assert await local_client.is_available() is False
 
+    async def test_unavailable_on_unsupported_protocol(self, local_client):
+        """An unset/schemeless URL makes httpx raise UnsupportedProtocol; the
+        preflight relies on this being caught (returns False), not propagated."""
+        with patch("llm_client.httpx.AsyncClient") as mock_client_cls:
+            mock_client = AsyncMock()
+            mock_client.post.side_effect = httpx.UnsupportedProtocol("missing scheme")
+            mock_client_cls.return_value.__aenter__ = AsyncMock(return_value=mock_client)
+            mock_client_cls.return_value.__aexit__ = AsyncMock(return_value=False)
+
+            assert await local_client.is_available() is False
+
     async def test_default_availability_timeout_is_longer_than_10s(self, local_client):
         """The ping timeout defaults to DEFAULT_AVAILABILITY_TIMEOUT (>10s) so a
         cold on-demand model load is not mistaken for an unreachable server."""
