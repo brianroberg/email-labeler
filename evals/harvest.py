@@ -1,11 +1,15 @@
 """Harvest processed threads from Gmail as golden set data.
 
 Pulls threads labeled agent/processed, infers ground truth from their
-existing classification labels, and exports to JSONL.
+existing classification labels, and appends to JSONL.
+
+Always appends to the output file, deduplicating by thread ID — it never
+overwrites an existing golden set (that file also holds manual review state).
+To start fresh, delete the file manually.
 
 Usage:
     python -m evals.harvest --output evals/golden_set.jsonl --max-threads 200
-    python -m evals.harvest --output evals/golden_set.jsonl --append --sender-type person
+    python -m evals.harvest --output evals/golden_set.jsonl --sender-type person
 """
 
 import argparse
@@ -237,10 +241,14 @@ async def harvest_threads(
     return results
 
 
-def write_golden_set(threads: list[GoldenThread], output_path: Path, append: bool = False) -> None:
-    """Write golden set to JSONL file."""
-    mode = "a" if append else "w"
-    with open(output_path, mode) as f:
+def write_golden_set(threads: list[GoldenThread], output_path: Path) -> None:
+    """Append golden set entries to the JSONL file.
+
+    Always appends — harvest never truncates an existing golden set, since that
+    file also holds manual review state (confirmed labels, exclusions, notes).
+    To start fresh, delete the file manually.
+    """
+    with open(output_path, "a") as f:
         for thread in threads:
             f.write(json.dumps(thread.to_dict()) + "\n")
 
@@ -262,22 +270,20 @@ async def main(args: argparse.Namespace) -> None:
         return
 
     output_path = Path(args.output)
-    if args.append:
-        threads = deduplicate(threads, output_path)
-        if not threads:
-            print("All threads already in golden set.", file=sys.stderr)
-            return
+    threads = deduplicate(threads, output_path)
+    if not threads:
+        print("All threads already in golden set.", file=sys.stderr)
+        return
 
     output_path.parent.mkdir(parents=True, exist_ok=True)
-    write_golden_set(threads, output_path, append=args.append)
-    print(f"Wrote {len(threads)} threads to {output_path}", file=sys.stderr)
+    write_golden_set(threads, output_path)
+    print(f"Appended {len(threads)} threads to {output_path}", file=sys.stderr)
 
 
 def cli():
     parser = argparse.ArgumentParser(description="Harvest processed emails for golden set")
     parser.add_argument("--output", default="evals/golden_set.jsonl", help="Output JSONL path")
     parser.add_argument("--max-threads", type=int, default=200, help="Max threads to fetch")
-    parser.add_argument("--append", action="store_true", help="Append to existing file (deduplicates)")
     parser.add_argument("--sender-type", choices=["person", "service"], help="Filter by sender type")
     parser.add_argument("--label", choices=["needs_response", "fyi", "low_priority"],
                         help="Filter by classification label")
