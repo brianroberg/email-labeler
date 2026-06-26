@@ -1,19 +1,29 @@
 """Tests for eval runner parallelism defaults and extra_body overrides."""
 
 import argparse
+import asyncio
 import json
 
 import pytest
 
 from daemon import DEFAULT_MAX_THREAD_CHARS, load_config
+from evals import run_eval
 from evals.run_eval import (
     apply_config_overrides,
+    default_tag,
     load_golden_set,
+    main,
+    maybe_report,
+    preflight_check,
+    required_endpoints,
     resolve_extra_body,
+    resolve_local_only,
     resolve_max_thread_chars,
     resolve_parallelism,
+    sanitize_tag,
+    write_results,
 )
-from evals.schemas import GoldenThread
+from evals.schemas import GoldenThread, PredictionResult, RunMeta
 
 
 def _golden(thread_id, **kw):
@@ -196,3 +206,353 @@ class TestResolveExtraBody:
         base = {"chat_template_kwargs": {"foo": 1}}
         resolve_extra_body(base, True, None)
         assert base == {"chat_template_kwargs": {"foo": 1}}
+
+
+class TestResolveLocalOnly:
+    """--local-only is shorthand for --stages stage2_only --sender-type person,
+    the only run configuration that exercises ONLY the local classifier."""
+
+    def _args(self, **kw):
+        base = dict(local_only=False, stages="full", sender_type=None)
+        base.update(kw)
+        return argparse.Namespace(**base)
+
+    def test_noop_when_not_set(self):
+        args = self._args(local_only=False, stages="full", sender_type=None)
+        resolve_local_only(args)
+        assert args.stages == "full"
+        assert args.sender_type is None
+
+    def test_sets_stage2_person_when_set(self):
+        args = self._args(local_only=True)
+        resolve_local_only(args)
+        assert args.stages == "stage2_only"
+        assert args.sender_type == "person"
+
+    def test_compatible_explicit_values_allowed(self):
+        args = self._args(local_only=True, stages="stage2_only", sender_type="person")
+        resolve_local_only(args)
+        assert (args.stages, args.sender_type) == ("stage2_only", "person")
+
+    def test_conflicting_stages_raises(self):
+        args = self._args(local_only=True, stages="stage1_only")
+        with pytest.raises(ValueError, match="local-only"):
+            resolve_local_only(args)
+
+    def test_conflicting_sender_type_raises(self):
+        args = self._args(local_only=True, sender_type="service")
+        with pytest.raises(ValueError, match="local-only"):
+            resolve_local_only(args)
+
+
+class TestSanitizeTag:
+    def test_replaces_slashes_in_hf_id(self):
+        assert sanitize_tag("qwen/qwen3-14b") == "qwen-qwen3-14b"
+
+    def test_keeps_dots_dashes_underscores(self):
+        assert sanitize_tag("Qwen3-14B_v2.1") == "Qwen3-14B_v2.1"
+
+    def test_collapses_runs_and_strips_edges(self):
+        assert sanitize_tag("/foo //bar/") == "foo-bar"
+
+    def test_empty_stays_empty(self):
+        assert sanitize_tag("") == ""
+
+
+class TestDefaultTag:
+    def _config(self):
+        return {"llm": {
+            "cloud": {"model": "anthropic/claude-x"},
+            "local": {"model": "qwen/qwen3-14b"},
+        }}
+
+    def test_uses_local_model_for_stage2_only(self):
+        assert default_tag("stage2_only", self._config()) == "qwen-qwen3-14b"
+
+    def test_uses_local_model_for_full(self):
+        assert default_tag("full", self._config()) == "qwen-qwen3-14b"
+
+    def test_uses_cloud_model_for_stage1_only(self):
+        # Stage 1 is the cloud model's job; tagging by local model would mislabel.
+        assert default_tag("stage1_only", self._config()) == "anthropic-claude-x"
+
+
+class TestRequiredEndpoints:
+    """Endpoints WITHOUT which a run produces no results at all, so preflight
+    only hard-aborts when the whole run would be useless (not when one endpoint
+    is down but the other half of the work could still succeed)."""
+
+    def test_stage1_only_needs_cloud_only(self):
+        assert required_endpoints("stage1_only", None) == (True, False)
+
+    def test_stage2_only_person_needs_local_only(self):
+        assert required_endpoints("stage2_only", "person") == (False, True)
+
+    def test_stage2_only_service_needs_cloud_only(self):
+        assert required_endpoints("stage2_only", "service") == (True, False)
+
+    def test_stage2_only_mixed_requires_neither(self):
+        # person->local, service->cloud: a down endpoint loses half the work,
+        # not all of it, so neither is wholly required.
+        assert required_endpoints("stage2_only", None) == (False, False)
+
+    def test_full_requires_cloud_only(self):
+        # Stage 1 (cloud) gates every thread, so cloud-down means zero results;
+        # local-down only fails person Stage 2b, leaving partial cloud results.
+        assert required_endpoints("full", "person") == (True, False)
+        assert required_endpoints("full", None) == (True, False)
+
+
+class _FakeClient:
+    def __init__(self, model, base_url, available):
+        self.model = model
+        self.base_url = base_url
+        self._available = available
+        self.checked = False
+        self.last_timeout = "unset"
+
+    async def is_available(self, timeout=None):
+        self.checked = True
+        self.last_timeout = timeout
+        return self._available
+
+
+def _run(coro):
+    return asyncio.run(coro)
+
+
+class TestPreflightCheck:
+    def test_no_errors_when_required_endpoints_reachable(self):
+        cloud = _FakeClient("c", "http://cloud", True)
+        local = _FakeClient("m", "http://local", True)
+        assert _run(preflight_check(cloud, local, True, True)) == []
+
+    def test_unreachable_required_local_reported(self):
+        cloud = _FakeClient("c", "http://cloud", True)
+        local = _FakeClient("qwen3", "http://local", False)
+        errors = _run(preflight_check(cloud, local, False, True))
+        assert len(errors) == 1
+        assert "qwen3" in errors[0] and "http://local" in errors[0]
+
+    def test_unreachable_required_cloud_reported(self):
+        cloud = _FakeClient("claude", "http://cloud", False)
+        local = _FakeClient("m", "http://local", True)
+        errors = _run(preflight_check(cloud, local, True, True))
+        assert len(errors) == 1
+        assert "claude" in errors[0]
+
+    def test_unneeded_endpoint_not_checked_even_if_down(self):
+        cloud = _FakeClient("c", "http://cloud", False)
+        local = _FakeClient("m", "http://local", True)
+        errors = _run(preflight_check(cloud, local, False, True))
+        assert errors == []
+        assert cloud.checked is False  # never probed
+
+    def test_forwards_per_endpoint_timeouts_to_is_available(self):
+        # Cloud and local get their own probe timeouts (cloud need not wait out
+        # the long local cold-load budget).
+        cloud = _FakeClient("c", "http://cloud", True)
+        local = _FakeClient("m", "http://local", True)
+        _run(preflight_check(cloud, local, True, True, cloud_timeout=30, local_timeout=180))
+        assert cloud.last_timeout == 30
+        assert local.last_timeout == 180
+
+
+def _meta(**overrides):
+    defaults = dict(
+        run_id="abc12345-6789", timestamp="2025-01-01T00:00:00", config_hash="deadbeef",
+        config_path="config.toml", cloud_model="test-cloud", local_model="test-local",
+        golden_set_path="golden.jsonl", golden_set_count=1,
+    )
+    defaults.update(overrides)
+    return RunMeta(**defaults)
+
+
+def _result(predicted_label="fyi"):
+    return PredictionResult(
+        thread_id="t1", expected_sender_type="person", expected_label="fyi",
+        predicted_sender_type="person", predicted_label=predicted_label,
+        sender_type_correct=True, label_correct=(predicted_label == "fyi"),
+    )
+
+
+class TestMaybeReport:
+    def test_prints_nothing_when_neither_flag_set(self, capsys):
+        maybe_report(_meta(), [_result()], report_enabled=False, compare_to=None)
+        assert capsys.readouterr().out == ""
+
+    def test_report_flag_prints_evaluation_report(self, capsys):
+        maybe_report(_meta(), [_result()], report_enabled=True, compare_to=None)
+        assert "Evaluation Report" in capsys.readouterr().out
+
+    def test_compare_to_prints_comparison(self, capsys, tmp_path):
+        prior = tmp_path / "20250101_000000_stage2_only_prior_aaaa1111.jsonl"
+        write_results(prior, _meta(run_id="prior999", tag="prior"), [_result()])
+        maybe_report(_meta(), [_result()], report_enabled=False, compare_to=str(prior))
+        assert "Comparison" in capsys.readouterr().out
+
+    def test_missing_compare_file_errors_without_raising(self, capsys, tmp_path):
+        missing = tmp_path / "nope.jsonl"
+        maybe_report(_meta(), [_result()], report_enabled=False, compare_to=str(missing))
+        err = capsys.readouterr().err
+        assert "not found" in err
+
+    def test_baseline_is_run_a_so_delta_reads_new_minus_baseline(self, capsys, tmp_path):
+        prior = tmp_path / "20250101_000000_stage2_only_base_aaaa1111.jsonl"
+        write_results(prior, _meta(run_id="prior999", tag="base"), [_result()])
+        maybe_report(_meta(run_id="new00000", tag="new"), [_result()],
+                     report_enabled=False, compare_to=str(prior))
+        out = capsys.readouterr().out
+        a_line = next(ln for ln in out.splitlines() if ln.strip().startswith("Run A:"))
+        b_line = next(ln for ln in out.splitlines() if ln.strip().startswith("Run B:"))
+        assert "base" in a_line  # baseline is A
+        assert "new" in b_line   # this run is B -> Delta = new - baseline
+
+    def test_compare_shows_per_thread_differences(self, capsys, tmp_path):
+        prior = tmp_path / "20250101_000000_stage2_only_base_aaaa1111.jsonl"
+        write_results(prior, _meta(tag="base"), [_result(predicted_label="fyi")])
+        maybe_report(_meta(tag="new"), [_result(predicted_label="low_priority")],
+                     report_enabled=False, compare_to=str(prior))
+        assert "Prediction Differences" in capsys.readouterr().out
+
+    def test_malformed_compare_file_errors_without_raising(self, capsys, tmp_path):
+        bad = tmp_path / "20250101_000000_stage2_only_base_aaaa1111.jsonl"
+        bad.write_text('{"type": "thinking", "thread_id": "t1"}\n')  # no run_meta line
+        maybe_report(_meta(), [_result()], report_enabled=False, compare_to=str(bad))
+        assert "Error" in capsys.readouterr().err
+
+    def test_population_mismatch_warns(self, capsys, tmp_path):
+        prior = tmp_path / "20250101_000000_full_base_aaaa1111.jsonl"
+        write_results(prior, _meta(tag="base", stages="full"), [_result()])
+        maybe_report(_meta(tag="new", stages="stage2_only"), [_result()],
+                     report_enabled=False, compare_to=str(prior))
+        assert "stages" in capsys.readouterr().err.lower()
+
+
+def _full_args(**kw):
+    """A complete run_eval argparse.Namespace with CLI defaults, overridable per test."""
+    base = dict(
+        golden_set="evals/golden_set.jsonl", config=None, output_dir="evals/results/",
+        stages="full", parallelism=None, include_unreviewed=False, dry_run=False,
+        tag=None, no_cache=True, sender_type=None, max_threads=None,
+        local_only=False, skip_preflight=False, preflight_timeout=None,
+        report=False, compare_to=None,
+        cloud_model=None, local_model=None,
+        cloud_temperature=None, local_temperature=None,
+        cloud_max_tokens=None, local_max_tokens=None,
+        cloud_timeout=None, local_timeout=None,
+        cloud_extra_body=None, local_extra_body=None,
+        cloud_no_think=False, local_no_think=False,
+    )
+    base.update(kw)
+    return argparse.Namespace(**base)
+
+
+class TestMainLocalOnlyWiring:
+    def test_local_only_dry_run_filters_to_person_and_defaults_tag(
+        self, tmp_path, capsys, monkeypatch
+    ):
+        monkeypatch.setenv("MLX_MODEL", "qwen/qwen3-test")
+        path = tmp_path / "golden.jsonl"
+        _write_golden_set(path, [
+            _golden("person_thread", reviewed=True, expected_sender_type="person"),
+            _golden("service_thread", reviewed=True, expected_sender_type="service"),
+        ])
+        args = _full_args(golden_set=str(path), local_only=True, dry_run=True)
+
+        asyncio.run(main(args))
+
+        # --local-only resolved the run shape in place...
+        assert args.stages == "stage2_only"
+        assert args.sender_type == "person"
+        # ...the tag defaulted to the (sanitized) local model under test...
+        assert args.tag == "qwen-qwen3-test"
+        # ...and the service thread was filtered out of the dry-run preview.
+        err = capsys.readouterr().err
+        assert "person_thread" in err
+        assert "service_thread" not in err
+
+
+class TestMainPreflightWiring:
+    def test_unreachable_local_endpoint_exits_1_before_evaluating(
+        self, tmp_path, monkeypatch
+    ):
+        async def _never_available(self, timeout=None):
+            return False
+
+        monkeypatch.setattr(run_eval.LLMClient, "is_available", _never_available)
+        path = tmp_path / "golden.jsonl"
+        _write_golden_set(path, [
+            _golden("person_thread", reviewed=True, expected_sender_type="person"),
+        ])
+        # local-only -> only the local endpoint is required; it's "down" -> exit 1.
+        args = _full_args(golden_set=str(path), local_only=True)
+
+        with pytest.raises(SystemExit) as excinfo:
+            asyncio.run(main(args))
+        assert excinfo.value.code == 1
+
+    def test_skip_preflight_bypasses_the_check(self, tmp_path, monkeypatch):
+        # With the endpoint "down" but --skip-preflight, main must get PAST preflight
+        # (and then fail later trying to actually classify — proving preflight was skipped).
+        async def _never_available(self, timeout=None):
+            return False
+
+        async def _boom(*a, **k):
+            raise RuntimeError("reached evaluation")
+
+        monkeypatch.setattr(run_eval.LLMClient, "is_available", _never_available)
+        monkeypatch.setattr(run_eval, "run_evaluation", _boom)
+        path = tmp_path / "golden.jsonl"
+        _write_golden_set(path, [
+            _golden("person_thread", reviewed=True, expected_sender_type="person"),
+        ])
+        args = _full_args(golden_set=str(path), local_only=True, skip_preflight=True)
+
+        with pytest.raises(RuntimeError, match="reached evaluation"):
+            asyncio.run(main(args))
+
+
+class TestMainPreflightTimeoutWiring:
+    def _capture_and_stop(self, monkeypatch):
+        """Patch preflight_check to capture its timeouts and run_evaluation to stop main."""
+        captured = {}
+
+        async def fake_preflight(cloud, local, need_cloud, need_local,
+                                 cloud_timeout=None, local_timeout=None):
+            captured["cloud_timeout"] = cloud_timeout
+            captured["local_timeout"] = local_timeout
+            return []  # reachable
+
+        async def boom(*a, **k):
+            raise RuntimeError("reached evaluation")
+
+        monkeypatch.setattr(run_eval, "preflight_check", fake_preflight)
+        monkeypatch.setattr(run_eval, "run_evaluation", boom)
+        return captured
+
+    def test_explicit_preflight_timeout_overrides_both(self, tmp_path, monkeypatch):
+        captured = self._capture_and_stop(monkeypatch)
+        path = tmp_path / "golden.jsonl"
+        _write_golden_set(path, [_golden("p", reviewed=True, expected_sender_type="person")])
+        args = _full_args(golden_set=str(path), local_only=True, preflight_timeout=99.0)
+
+        with pytest.raises(RuntimeError, match="reached evaluation"):
+            asyncio.run(main(args))
+        assert captured["local_timeout"] == 99.0
+        assert captured["cloud_timeout"] == 99.0
+
+    def test_preflight_timeouts_default_to_per_endpoint_request_timeouts(self, tmp_path, monkeypatch):
+        captured = self._capture_and_stop(monkeypatch)
+        path = tmp_path / "golden.jsonl"
+        _write_golden_set(path, [_golden("p", reviewed=True, expected_sender_type="person")])
+        args = _full_args(golden_set=str(path), local_only=True, preflight_timeout=None)
+
+        with pytest.raises(RuntimeError, match="reached evaluation"):
+            asyncio.run(main(args))
+        cfg = load_config()
+        # Each endpoint defaults to its own request timeout; local is well over 10s
+        # so a cold on-demand model load isn't read as "unreachable".
+        assert captured["local_timeout"] == cfg["llm"]["local"]["timeout"]
+        assert captured["cloud_timeout"] == cfg["llm"]["cloud"]["timeout"]
+        assert captured["local_timeout"] > 10
