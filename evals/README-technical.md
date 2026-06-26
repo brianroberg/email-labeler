@@ -47,6 +47,7 @@ Review hotkeys: `p`/`s` sender (person/service); `r`/`f`/`l` label (needs_respon
 | `--max-threads` | Max threads to evaluate (default: all) |
 | `--local-only` | Shortcut for `--stages stage2_only --sender-type person` — evaluate only the local classifier (no cloud creds needed). Errors if combined with a conflicting `--stages`/`--sender-type` |
 | `--skip-preflight` | Skip the endpoint reachability check that runs before evaluation |
+| `--preflight-timeout` | Seconds to wait for the pre-run endpoint check (default: the local model's request timeout). Raise it for a server that cold-loads a large model on demand |
 | `--report` | Print a metrics report (accuracy, confusion matrix, per-class P/R/F1) for this run after it completes |
 | `--compare-to` | After the run, print a side-by-side comparison against this prior results JSONL file |
 | `--cloud-model` | Override cloud LLM model name from config |

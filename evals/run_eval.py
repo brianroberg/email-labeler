@@ -104,21 +104,26 @@ def required_endpoints(stages: str, sender_type: str | None) -> tuple[bool, bool
     return True, True  # full
 
 
-async def preflight_check(cloud_base, local_base, need_cloud: bool, need_local: bool) -> list[str]:
+async def preflight_check(
+    cloud_base, local_base, need_cloud: bool, need_local: bool, timeout: float | None = None,
+) -> list[str]:
     """Probe each required endpoint once; return a human-readable error per dead one.
 
     Turns the most common silent failure — a local MLX_MODEL that doesn't match
     the served --model (every request 404s) or an unreachable endpoint — into an
     immediate, clear error instead of a whole run of per-thread errors. Endpoints
     the run won't touch are never probed.
+
+    *timeout* (seconds) bounds each probe; pass a generous value for a server that
+    loads the requested model on demand, so a cold load is not read as "down".
     """
     errors = []
-    if need_cloud and not await cloud_base.is_available():
+    if need_cloud and not await cloud_base.is_available(timeout):
         errors.append(
             f"cloud LLM '{cloud_base.model}' not reachable at "
             f"{cloud_base.base_url or '<unset CLOUD_LLM_URL>'}"
         )
-    if need_local and not await local_base.is_available():
+    if need_local and not await local_base.is_available(timeout):
         errors.append(
             f"local LLM '{local_base.model}' not reachable at "
             f"{local_base.base_url or '<unset MLX_URL>'} "
@@ -539,7 +544,15 @@ async def main(args: argparse.Namespace) -> None:
     # errors. (Skipped on --dry-run, which returned above.)
     if not args.skip_preflight:
         need_cloud, need_local = required_endpoints(args.stages, args.sender_type)
-        unreachable = await preflight_check(cloud_llm_base, local_llm_base, need_cloud, need_local)
+        # Default the probe timeout to the local model's request timeout: generous
+        # enough that a server loading the model on demand isn't read as "down".
+        pf_timeout = (
+            args.preflight_timeout if args.preflight_timeout is not None
+            else config["llm"]["local"]["timeout"]
+        )
+        unreachable = await preflight_check(
+            cloud_llm_base, local_llm_base, need_cloud, need_local, timeout=pf_timeout,
+        )
         if unreachable:
             for msg in unreachable:
                 print(f"Error: {msg}", file=sys.stderr)
@@ -663,6 +676,9 @@ def cli():
                              "(evaluate only the local classifier; no cloud creds needed)")
     parser.add_argument("--skip-preflight", action="store_true",
                         help="Skip the endpoint reachability check before evaluating")
+    parser.add_argument("--preflight-timeout", type=float, metavar="SECONDS",
+                        help="Timeout for the pre-run endpoint check (default: the local "
+                             "model's request timeout; raise it for a slow cold model load)")
     parser.add_argument("--report", action="store_true",
                         help="Print a metrics report for this run after it completes")
     parser.add_argument("--compare-to", metavar="PATH",

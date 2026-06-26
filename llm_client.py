@@ -10,6 +10,12 @@ import httpx
 
 from retry import retry_with_backoff
 
+# Default timeout (seconds) for the lightweight is_available() ping. Longer than
+# a typical liveness probe because a server that loads models on demand only
+# loads the requested model on the first request — a cold load of a large model
+# routinely exceeds 10s, and timing out would wrongly report it unreachable.
+DEFAULT_AVAILABILITY_TIMEOUT = 60
+
 
 class LLMUnavailableError(Exception):
     """The LLM endpoint is unreachable or dropped the connection (transient).
@@ -172,14 +178,22 @@ class LLMClient:
             return self._strip_thinking(content), thinking
         return self._strip_thinking(content)
 
-    async def is_available(self) -> bool:
+    async def is_available(self, timeout: float | None = None) -> bool:
         """Check if the LLM endpoint is reachable.
 
         Sends a minimal completion request to verify connectivity.
 
+        Args:
+            timeout: Seconds to wait for the ping. Defaults to
+                DEFAULT_AVAILABILITY_TIMEOUT, generous enough to cover a server
+                that loads the requested model on demand (a cold load can take
+                far longer than a normal liveness probe).
+
         Returns:
             True if the endpoint responds successfully, False otherwise.
         """
+        if timeout is None:
+            timeout = DEFAULT_AVAILABILITY_TIMEOUT
         try:
             headers = {"Content-Type": "application/json"}
             if self.api_key:
@@ -193,7 +207,7 @@ class LLMClient:
                 **self.extra_body,
             }
 
-            async with httpx.AsyncClient(timeout=10) as client:
+            async with httpx.AsyncClient(timeout=timeout) as client:
                 response = await client.post(self.base_url, headers=headers, json=body)
 
             return response.status_code == 200

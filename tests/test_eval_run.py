@@ -302,9 +302,11 @@ class _FakeClient:
         self.base_url = base_url
         self._available = available
         self.checked = False
+        self.last_timeout = "unset"
 
-    async def is_available(self):
+    async def is_available(self, timeout=None):
         self.checked = True
+        self.last_timeout = timeout
         return self._available
 
 
@@ -338,6 +340,13 @@ class TestPreflightCheck:
         errors = _run(preflight_check(cloud, local, False, True))
         assert errors == []
         assert cloud.checked is False  # never probed
+
+    def test_forwards_timeout_to_is_available(self):
+        cloud = _FakeClient("c", "http://cloud", True)
+        local = _FakeClient("m", "http://local", True)
+        _run(preflight_check(cloud, local, True, True, timeout=77))
+        assert local.last_timeout == 77
+        assert cloud.last_timeout == 77
 
 
 def _meta(**overrides):
@@ -386,7 +395,8 @@ def _full_args(**kw):
         golden_set="evals/golden_set.jsonl", config=None, output_dir="evals/results/",
         stages="full", parallelism=None, include_unreviewed=False, dry_run=False,
         tag=None, no_cache=True, sender_type=None, max_threads=None,
-        local_only=False, skip_preflight=False, report=False, compare_to=None,
+        local_only=False, skip_preflight=False, preflight_timeout=None,
+        report=False, compare_to=None,
         cloud_model=None, local_model=None,
         cloud_temperature=None, local_temperature=None,
         cloud_max_tokens=None, local_max_tokens=None,
@@ -427,7 +437,7 @@ class TestMainPreflightWiring:
     def test_unreachable_local_endpoint_exits_1_before_evaluating(
         self, tmp_path, monkeypatch
     ):
-        async def _never_available(self):
+        async def _never_available(self, timeout=None):
             return False
 
         monkeypatch.setattr(run_eval.LLMClient, "is_available", _never_available)
@@ -445,7 +455,7 @@ class TestMainPreflightWiring:
     def test_skip_preflight_bypasses_the_check(self, tmp_path, monkeypatch):
         # With the endpoint "down" but --skip-preflight, main must get PAST preflight
         # (and then fail later trying to actually classify — proving preflight was skipped).
-        async def _never_available(self):
+        async def _never_available(self, timeout=None):
             return False
 
         async def _boom(*a, **k):
@@ -461,3 +471,43 @@ class TestMainPreflightWiring:
 
         with pytest.raises(RuntimeError, match="reached evaluation"):
             asyncio.run(main(args))
+
+
+class TestMainPreflightTimeoutWiring:
+    def _capture_and_stop(self, monkeypatch):
+        """Patch preflight_check to capture its timeout and run_evaluation to stop main."""
+        captured = {}
+
+        async def fake_preflight(cloud, local, need_cloud, need_local, timeout=None):
+            captured["timeout"] = timeout
+            return []  # reachable
+
+        async def boom(*a, **k):
+            raise RuntimeError("reached evaluation")
+
+        monkeypatch.setattr(run_eval, "preflight_check", fake_preflight)
+        monkeypatch.setattr(run_eval, "run_evaluation", boom)
+        return captured
+
+    def test_explicit_preflight_timeout_is_forwarded(self, tmp_path, monkeypatch):
+        captured = self._capture_and_stop(monkeypatch)
+        path = tmp_path / "golden.jsonl"
+        _write_golden_set(path, [_golden("p", reviewed=True, expected_sender_type="person")])
+        args = _full_args(golden_set=str(path), local_only=True, preflight_timeout=99.0)
+
+        with pytest.raises(RuntimeError, match="reached evaluation"):
+            asyncio.run(main(args))
+        assert captured["timeout"] == 99.0
+
+    def test_preflight_timeout_defaults_to_local_request_timeout(self, tmp_path, monkeypatch):
+        captured = self._capture_and_stop(monkeypatch)
+        path = tmp_path / "golden.jsonl"
+        _write_golden_set(path, [_golden("p", reviewed=True, expected_sender_type="person")])
+        args = _full_args(golden_set=str(path), local_only=True, preflight_timeout=None)
+
+        with pytest.raises(RuntimeError, match="reached evaluation"):
+            asyncio.run(main(args))
+        # Defaults to the local model's configured request timeout (well over 10s),
+        # so a cold on-demand model load isn't read as "unreachable".
+        assert captured["timeout"] == load_config()["llm"]["local"]["timeout"]
+        assert captured["timeout"] > 10

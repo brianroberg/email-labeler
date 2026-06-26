@@ -5,7 +5,7 @@ from unittest.mock import AsyncMock, patch
 import httpx
 import pytest
 
-from llm_client import LLMClient, LLMUnavailableError
+from llm_client import DEFAULT_AVAILABILITY_TIMEOUT, LLMClient, LLMUnavailableError
 
 
 @pytest.fixture
@@ -435,6 +435,33 @@ class TestIsAvailable:
             mock_client_cls.return_value.__aexit__ = AsyncMock(return_value=False)
 
             assert await local_client.is_available() is False
+
+    async def test_default_availability_timeout_is_longer_than_10s(self, local_client):
+        """The ping timeout defaults to DEFAULT_AVAILABILITY_TIMEOUT (>10s) so a
+        cold on-demand model load is not mistaken for an unreachable server."""
+        assert DEFAULT_AVAILABILITY_TIMEOUT > 10
+        mock_response = _mock_response(json_data={"choices": [{"message": {"content": "ok"}}]})
+        with patch("llm_client.httpx.AsyncClient") as mock_client_cls:
+            mock_client = AsyncMock()
+            mock_client.post.return_value = mock_response
+            mock_client_cls.return_value.__aenter__ = AsyncMock(return_value=mock_client)
+            mock_client_cls.return_value.__aexit__ = AsyncMock(return_value=False)
+
+            await local_client.is_available()
+
+            assert mock_client_cls.call_args.kwargs["timeout"] == DEFAULT_AVAILABILITY_TIMEOUT
+
+    async def test_explicit_timeout_is_honored(self, local_client):
+        mock_response = _mock_response(json_data={"choices": [{"message": {"content": "ok"}}]})
+        with patch("llm_client.httpx.AsyncClient") as mock_client_cls:
+            mock_client = AsyncMock()
+            mock_client.post.return_value = mock_response
+            mock_client_cls.return_value.__aenter__ = AsyncMock(return_value=mock_client)
+            mock_client_cls.return_value.__aexit__ = AsyncMock(return_value=False)
+
+            await local_client.is_available(timeout=123)
+
+            assert mock_client_cls.call_args.kwargs["timeout"] == 123
 
 
 class TestExtraBody:

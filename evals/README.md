@@ -149,7 +149,9 @@ uv run python -m evals.run_eval --local-only --local-model qwen/qwen3-14b --repo
 
 `--local-only` errors if the local endpoint is unreachable or `MLX_MODEL` doesn't
 match the served model (a 404), instead of producing a whole run of per-thread
-errors. Pass `--skip-preflight` to bypass that check.
+errors. The check waits up to the local model's request timeout, so a server that
+loads the model on demand has time to cold-load it; tune with `--preflight-timeout
+SECONDS`, or skip it entirely with `--skip-preflight`.
 
 **Prompt A/B test:**
 
