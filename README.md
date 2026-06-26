@@ -157,6 +157,8 @@ agent/newsletter/theme/disciple-making
 
 Gmail will treat the `/` as a label hierarchy separator, nesting them under an `agent` parent. The daemon verifies all labels exist on startup and exits with an error if any are missing.
 
+> **Upgrading an existing deployment:** because startup validation is strict, a release that adds a new required label will exit (and, under Docker, crash-loop) until you create it. Create any newly-required labels in Gmail **before** deploying the new version. This release adds **`agent/attempted`** (applied to threads abandoned after repeated failures); create it first, then upgrade.
+
 ## Running
 
 ### Local development
