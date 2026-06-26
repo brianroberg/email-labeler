@@ -11,7 +11,7 @@ Complete CLI flag references, cache internals, and chain-of-thought capture deta
 | `--output` | Output JSONL path (default: `evals/golden_set.jsonl`) |
 | `--max-threads` | Max threads to fetch (default: `200`) |
 | `--sender-type` | Filter: `person` or `service` |
-| `--label` | Filter: `needs_response`, `fyi`, `low_priority`. ANDed into the Gmail query (e.g. `label:agent/processed label:agent/needs-response`) so the fetch returns a dense pool of matching threads — useful for boosting a rare class like `needs_response` in the golden set |
+| `--label` | Filter by config **key**: `needs_response`, `fyi`, `low_priority` (not the Gmail label name — the key is mapped via `[labels]` in config.toml, e.g. `needs_response` → `agent/needs-response`). ANDed into the Gmail query (e.g. `label:agent/processed label:agent/needs-response`) so the fetch returns a dense pool of matching threads — useful for boosting a rare class like `needs_response` in the golden set |
 | `--config` | Path to config.toml (default: `./config.toml`) |
 | `--proxy-url` | API proxy URL (overrides `PROXY_URL` env var) |
 

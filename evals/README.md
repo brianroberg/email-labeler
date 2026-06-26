@@ -39,6 +39,8 @@ uv run python -m evals.harvest --proxy-url http://localhost:8000 --sender-type p
 uv run python -m evals.harvest --proxy-url http://localhost:8000 --label needs_response
 ```
 
+`--label` takes the config **key** (`needs_response`, `fyi`, `low_priority`) — not the Gmail label name. Harvest translates the key to the actual Gmail label via the `[labels]` section of `config.toml` (e.g. `needs_response` → `agent/needs-response`), so pass `--label needs_response`, not `--label agent/needs-response`.
+
 `--label` is ANDed into the Gmail query, so the fetch targets matching threads
 directly rather than filtering the recent processed window after the fact. This
 is the way to boost a rare class (e.g. `needs_response`) in the golden set:
