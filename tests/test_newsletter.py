@@ -5,6 +5,7 @@ from unittest.mock import AsyncMock
 
 import pytest
 
+from llm_client import LLMUnavailableError
 from newsletter import (
     NewsletterClassifier,
     NewsletterTier,
@@ -326,6 +327,44 @@ class TestClassifyNewsletter:
         assert results[0].tier == NewsletterTier.EXCELLENT
         assert results[1].tier == NewsletterTier.FAIR
         assert mock_cloud_llm.complete.call_count == 5
+
+
+class TestClassifyNewsletterTransientOutage:
+    """Issue #18: a transient LLM outage mid-newsletter must propagate so the daemon
+    retries the whole thread — not be swallowed into a permanently mis-graded result.
+    Genuinely per-story/permanent failures stay isolated as before."""
+
+    async def test_transient_quality_outage_propagates(self, nl_classifier, mock_cloud_llm):
+        """LLMUnavailableError during quality assessment propagates (not swallowed)."""
+        mock_cloud_llm.complete.side_effect = [
+            ("TITLE: Story\nTEXT: Content", ""),         # extract_stories
+            LLMUnavailableError("cloud endpoint down"),  # assess_quality
+        ]
+        with pytest.raises(LLMUnavailableError):
+            await nl_classifier.classify_newsletter("body")
+
+    async def test_transient_theme_outage_propagates(self, nl_classifier, mock_cloud_llm):
+        """LLMUnavailableError during theme classification propagates too."""
+        mock_cloud_llm.complete.side_effect = [
+            ("TITLE: Story\nTEXT: Content", ""),                       # extract_stories
+            ("SIMPLE: 3\nCONCRETE: 3\nPERSONAL: 3\nDYNAMIC: 3", ""),  # assess_quality
+            LLMUnavailableError("cloud endpoint down"),               # classify_themes
+        ]
+        with pytest.raises(LLMUnavailableError):
+            await nl_classifier.classify_newsletter("body")
+
+    async def test_non_transient_quality_error_stays_isolated(self, nl_classifier, mock_cloud_llm):
+        """A non-transient per-story error (RuntimeError) is still swallowed: the story
+        gets no scores but themes are still classified and the result is returned."""
+        mock_cloud_llm.complete.side_effect = [
+            ("TITLE: Story\nTEXT: Content", ""),  # extract_stories
+            RuntimeError("malformed story crashed scoring"),  # assess_quality
+            ("SCRIPTURE", "theme cot"),  # classify_themes still runs
+        ]
+        results = await nl_classifier.classify_newsletter("body")
+        assert len(results) == 1
+        assert results[0].scores is None
+        assert results[0].themes == ["scripture"]
 
 
 class TestWriteAssessment:

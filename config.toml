@@ -1,7 +1,7 @@
 [daemon]
 poll_interval_seconds = 60
 max_emails_per_cycle = 10       # Override per-run with the MAX_EMAILS_PER_CYCLE env var
-gmail_query = "in:inbox -label:agent/processed"
+gmail_query = "in:inbox -label:agent/processed -label:agent/attempted"
 # Max characters of thread transcript sent to the classifier. Kept modest
 # because the local model prefills the WHOLE transcript before answering:
 # tens-of-thousands-of-char threads take minutes to prefill on consumer
@@ -22,6 +22,12 @@ local_parallel = 1
 # when max_emails_per_cycle is large; the cloud/local semaphores gate only the
 # downstream classify calls, not the fetch.
 fetch_parallel = 4
+# Max concurrent label-application writes (modify_message via apply_classification /
+# mark_processed / mark_attempted / apply_newsletter_classification). Bounds the
+# proxy-WRITE burst when max_emails_per_cycle is large (e.g. draining a backlog).
+# Separate from fetch_parallel because writes may block on human approval
+# (WRITE_TIMEOUT, 300s), so the sizing tradeoff differs. Override: WRITE_PARALLEL.
+write_parallel = 4
 healthcheck_file = "/tmp/healthcheck"
 
 [labels]
@@ -29,6 +35,7 @@ needs_response = "agent/needs-response"
 fyi = "agent/fyi"
 low_priority = "agent/low-priority"
 processed = "agent/processed"
+attempted = "agent/attempted"   # applied on give-up (repeated failures); excluded from gmail_query
 personal = "agent/personal"
 non_personal = "agent/non-personal"
 

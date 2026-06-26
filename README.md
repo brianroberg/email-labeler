@@ -28,7 +28,7 @@ The daemon classifies emails into three categories and applies the corresponding
 | `agent/fyi` | Worth reading, no action needed | Stays in inbox |
 | `agent/low-priority` | Routine notifications, newsletters, spam, unwanted | Archived |
 
-Additional marker labels (`agent/processed`, `agent/personal`, `agent/non-personal`) track processing state and routing decisions. The newsletter pipeline adds its own labels under `agent/newsletter/`.
+Additional marker labels (`agent/processed`, `agent/attempted`, `agent/personal`, `agent/non-personal`) track processing state and routing decisions. The newsletter pipeline adds its own labels under `agent/newsletter/`.
 
 Newsletter labels (see [Newsletter Classification](#newsletter-classification)):
 
@@ -139,6 +139,7 @@ agent/needs-response
 agent/fyi
 agent/low-priority
 agent/processed
+agent/attempted
 agent/personal
 agent/non-personal
 agent/newsletter
@@ -155,6 +156,8 @@ agent/newsletter/theme/disciple-making
 ```
 
 Gmail will treat the `/` as a label hierarchy separator, nesting them under an `agent` parent. The daemon verifies all labels exist on startup and exits with an error if any are missing.
+
+> **Upgrading an existing deployment:** because startup validation is strict, a release that adds a new required label will exit (and, under Docker, crash-loop) until you create it. Create any newly-required labels in Gmail **before** deploying the new version. This release adds **`agent/attempted`** (applied to threads abandoned after repeated failures); create it first, then upgrade.
 
 ## Running
 

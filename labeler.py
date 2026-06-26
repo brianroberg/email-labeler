@@ -61,6 +61,7 @@ class LabelManager:
             "fyi",
             "low_priority",
             "processed",
+            "attempted",
             "personal",
             "non_personal",
         ):
@@ -140,6 +141,22 @@ class LabelManager:
                 kwargs["remove_label_ids"] = remove_label_ids
             await self.proxy.modify_message(**kwargs)
 
+    async def _apply_marker(self, message_ids: str | list[str], config_key: str) -> None:
+        """Apply a single marker label (no INBOX change) to each message.
+
+        Shared by mark_processed/mark_attempted, which differ only in which
+        labels_config key names the marker.
+        """
+        if isinstance(message_ids, str):
+            ids = [message_ids]
+        else:
+            ids = list(message_ids)
+
+        marker_name = self.labels_config[config_key]
+        add_label_ids = [self.label_ids[marker_name]]
+        for msg_id in ids:
+            await self.proxy.modify_message(message_id=msg_id, add_label_ids=add_label_ids)
+
     async def mark_processed(self, message_ids: str | list[str]) -> None:
         """Apply only the agent/processed marker label.
 
@@ -147,15 +164,18 @@ class LabelManager:
         higher priority, so we skip re-classification but still need to
         mark it processed to prevent infinite retry loops.
         """
-        if isinstance(message_ids, str):
-            ids = [message_ids]
-        else:
-            ids = list(message_ids)
+        await self._apply_marker(message_ids, "processed")
 
-        processed_name = self.labels_config["processed"]
-        add_label_ids = [self.label_ids[processed_name]]
-        for msg_id in ids:
-            await self.proxy.modify_message(message_id=msg_id, add_label_ids=add_label_ids)
+    async def mark_attempted(self, message_ids: str | list[str]) -> None:
+        """Apply only the agent/attempted marker label.
+
+        Used when the daemon gives up on a thread after repeated failures. Like
+        agent/processed it stops the thread re-matching the unprocessed query (so
+        the retry loop ends), but it is a *distinct* label so abandoned threads are
+        findable in Gmail for manual cleanup and remain semantically separate from
+        successfully-classified mail.
+        """
+        await self._apply_marker(message_ids, "attempted")
 
     async def apply_newsletter_classification(
         self,

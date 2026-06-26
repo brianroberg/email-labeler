@@ -23,7 +23,12 @@ from gmail_utils import decode_body, get_header
 from labeler import LabelManager, _get_priority
 from llm_client import LLMClient, LLMUnavailableError
 from newsletter import NewsletterClassifier, NewsletterTier, is_newsletter, write_assessment
-from proxy_client import GmailProxyClient, ProxyError
+from proxy_client import (
+    TRANSIENT_TRANSPORT_ERRORS,
+    GmailProxyClient,
+    ProxyError,
+    ProxyUnavailableError,
+)
 
 load_dotenv()
 
@@ -110,11 +115,15 @@ def resolve_newsletter_llm_endpoint() -> tuple[str, str]:
 class FailureTracker:
     """Counts consecutive thread-specific failures to break infinite retry loops.
 
-    Only genuine processing failures are recorded — never transient
-    unavailability (a ConnectError when an LLM endpoint is down) — so an outage
-    doesn't cause threads to be given up. In-memory and session-scoped: counts
-    reset on daemon restart, so a thread that failed for a since-resolved reason
-    gets another chance after a restart.
+    Records only failures the caller deems give-up-eligible. An endpoint-wide
+    outage never lands here: an LLM outage (ConnectError → LLMUnavailableError) is
+    deferred per-thread without counting, and a proxy outage fails the cycle-level
+    list_messages first, so the whole cycle defers before any thread is counted.
+    A *persistent per-thread* fault — a poison thread, including a deterministic
+    per-request proxy 5xx (issue #26) — does accrue here and is given up once it
+    hits max_failures. In-memory and session-scoped: counts reset on daemon
+    restart, so a thread that failed for a since-resolved reason gets another
+    chance after a restart.
     """
 
     def __init__(self, max_failures: int = 5):
@@ -144,7 +153,7 @@ class FailureTracker:
         self._counts = {tid: n for tid, n in self._counts.items() if tid in active}
 
     def record_give_up(self, thread_id: str) -> None:
-        """Record that a thread was abandoned (marked processed without a label),
+        """Record that a thread was abandoned (marked agent/attempted, no classification),
         so the per-cycle summary can report give-ups distinctly from classifications."""
         self._given_up.append(thread_id)
 
@@ -160,27 +169,54 @@ async def _give_up_if_stuck(
     msg_ids: list[str],
     failure_tracker: "FailureTracker | None",
     label_manager: LabelManager,
+    write_sem: asyncio.Semaphore | None = None,
 ) -> bool:
     """Record a thread-specific failure; if it has failed too many times, mark it
-    processed so it stops being retried every cycle.
+    agent/attempted so it stops being retried every cycle.
 
-    Returns True if the thread was given up (marked processed → handled), or False
-    if it should simply be retried next cycle.
+    Uses agent/attempted (not agent/processed): the thread is excluded from the
+    unprocessed query either way, but the distinct label keeps abandoned threads
+    findable and separate from successfully-classified mail.
+
+    Returns True if the thread was given up (marked agent/attempted → handled), or
+    False if it should simply be retried next cycle.
     """
     if failure_tracker is None:
         return False
     failure_tracker.record_failure(thread_id)
     if not failure_tracker.should_give_up(thread_id):
         return False
+    try:
+        async with (write_sem or nullcontext()):
+            await label_manager.mark_attempted(msg_ids)
+    except ProxyUnavailableError as exc:
+        # The proxy is transiently down, so the agent/attempted marker can't be written
+        # right now — expected during an outage, not a bug. We return without recording
+        # the give-up, so the thread stays give-up-eligible: its failure count is left
+        # ≥ max_failures (this arm returns False, so the poll loop's success-only
+        # count-clear never runs), and the marker write is retried next cycle once the
+        # proxy recovers. Log a clean warning rather than spamming a traceback for an
+        # expected transient condition. (The thread keeps re-matching the query until it
+        # is actually labeled; skipping the re-classification in that window is a
+        # separate efficiency concern, tracked in #29.)
+        log.warning(
+            "Proxy unavailable marking stuck thread %s attempted — will retry next cycle: %s",
+            thread_id, exc,
+        )
+        return False
+    except Exception:
+        # An unexpected, likely-permanent marker-write failure (a real bug, or a
+        # misconfigured label): keep the full traceback so it stays diagnosable rather
+        # than looping silently as if benign.
+        log.exception("Could not mark stuck thread %s attempted", thread_id)
+        return False
+    # Logged once here — AFTER the marker write actually lands — not before it: a
+    # transient write-outage can retry this for several cycles, and logging on every
+    # attempt would re-spam ERROR for what is an expected, recoverable condition.
     log.error(
-        "Thread %s failed %d+ times — marking processed to break the retry loop",
+        "Thread %s failed %d+ times — marked agent/attempted to break the retry loop",
         thread_id, failure_tracker.max_failures,
     )
-    try:
-        await label_manager.mark_processed(msg_ids)
-    except Exception:
-        log.exception("Could not mark stuck thread %s processed", thread_id)
-        return False
     failure_tracker.record_give_up(thread_id)
     # Note: the poll loop clears the failure count on every True result (which a
     # give-up returns), so the count is reset there — no need to clear it here too.
@@ -241,6 +277,7 @@ async def process_single_thread(
     newsletter_only: bool = False,
     failure_tracker: "FailureTracker | None" = None,
     fetch_sem: asyncio.Semaphore | None = None,
+    write_sem: asyncio.Semaphore | None = None,
 ) -> bool:
     """Process a single thread through the classification pipeline.
 
@@ -314,11 +351,12 @@ async def process_single_thread(
                     all_themes.extend(sr.themes)
                 all_themes = list(dict.fromkeys(all_themes))  # dedupe, preserve order
 
-                await label_manager.apply_newsletter_classification(
-                    message_ids=all_msg_ids,
-                    tier=best_tier,
-                    themes=all_themes,
-                )
+                async with (write_sem or nullcontext()):
+                    await label_manager.apply_newsletter_classification(
+                        message_ids=all_msg_ids,
+                        tier=best_tier,
+                        themes=all_themes,
+                    )
 
                 # Write structured results
                 if newsletter_output_file:
@@ -411,11 +449,14 @@ async def process_single_thread(
                 new_priority,
             )
             # Still mark as processed so the thread isn't retried every cycle
-            await label_manager.mark_processed(all_msg_ids)
+            async with (write_sem or nullcontext()):
+                await label_manager.mark_processed(all_msg_ids)
             return True
 
-        # Apply labels to ALL messages in thread
-        await label_manager.apply_classification(all_msg_ids, result.label, result.sender_type)
+        # Apply labels to ALL messages in thread (bounded by write_sem so a large
+        # max_emails_per_cycle can't burst one concurrent write per thread).
+        async with (write_sem or nullcontext()):
+            await label_manager.apply_classification(all_msg_ids, result.label, result.sender_type)
         log.info(
             "Classified thread %s (%d msgs): sender=%s label=%s — %s",
             thread_id,
@@ -434,8 +475,29 @@ async def process_single_thread(
         # next cycle (preserves graceful degradation of the privacy invariant).
         log.warning("LLM unavailable processing thread %s: %s", thread_id, exc)
         return False
+    except ProxyUnavailableError as exc:
+        # api-proxy unavailable for THIS thread's call — connection refused, a timeout,
+        # a dropped connection, a 5xx / exhausted-429 response, or a non-JSON 2xx body.
+        #
+        # Unlike LLMUnavailableError above, this is give-up-eligible (issue #26). The
+        # asymmetry is deliberate: a *fully* endpoint-wide PROXY outage is caught one
+        # level up — list_messages (also a proxy call) fails first, so the whole cycle
+        # defers (see the poll loop) and no thread is ever processed or counted. A fault
+        # that reaches here is therefore either thread-specific (e.g. a deterministic
+        # 5xx on one unserializable thread) or a partial/route-selective degradation
+        # (e.g. get_thread garbles while list_messages stays healthy); if it PERSISTS
+        # across cycles it must be bounded like Timeout/RuntimeError below, not retried
+        # forever. A transient blip clears its count via the poll-loop success-clear
+        # before reaching the threshold. The accepted residual is that a *sustained*
+        # partial outage can abandon the backlog — but to the findable, re-processable
+        # agent/attempted (issue #23), not to lost mail. (An LLM outage, by contrast, is
+        # invisible at the cycle level — the proxy is up — so LLMUnavailableError must
+        # never give up, or one MLX outage would abandon every person thread.)
+        log.warning("api-proxy unavailable processing thread %s: %s", thread_id, exc)
+        return await _give_up_if_stuck(thread_id, ids_to_mark, failure_tracker, label_manager, write_sem)
     except httpx.ConnectError as exc:
-        # Proxy/endpoint unreachable — transient. Retry next cycle, don't give up.
+        # Defensive: a raw ConnectError shouldn't escape the wrapped clients, but if
+        # one does it's still a transient outage — retry next cycle, don't give up.
         log.warning("Connection error processing thread %s: %s", thread_id, exc)
         return False
     except TimeoutError as exc:
@@ -443,13 +505,13 @@ async def process_single_thread(
         # the timeout) — eligible for give-up so one huge thread can't be retried
         # forever. (Connect/pool timeouts are LLMUnavailableError, handled above.)
         log.error("Timeout processing thread %s: %s", thread_id, exc)
-        return await _give_up_if_stuck(thread_id, ids_to_mark, failure_tracker, label_manager)
+        return await _give_up_if_stuck(thread_id, ids_to_mark, failure_tracker, label_manager, write_sem)
     except RuntimeError as exc:
         log.error("Thread %s: %s", thread_id, exc)
-        return await _give_up_if_stuck(thread_id, ids_to_mark, failure_tracker, label_manager)
+        return await _give_up_if_stuck(thread_id, ids_to_mark, failure_tracker, label_manager, write_sem)
     except Exception:
         log.exception("Error processing thread %s", thread_id)
-        return await _give_up_if_stuck(thread_id, ids_to_mark, failure_tracker, label_manager)
+        return await _give_up_if_stuck(thread_id, ids_to_mark, failure_tracker, label_manager, write_sem)
 
 
 def summarize_cycle(
@@ -475,19 +537,6 @@ def summarize_cycle(
     return processed, given_up
 
 
-# Transport faults that mean the api-proxy is *transiently* unreachable —
-# connection refused, any timeout, a dropped/garbled connection — so the daemon
-# should wait and retry rather than crash. This is a deliberate subset of
-# httpx.TransportError: httpx.UnsupportedProtocol (a missing/unsupported
-# PROXY_URL scheme) is also a TransportError but is a permanent misconfiguration
-# that must surface immediately instead of being retried forever.
-TRANSIENT_TRANSPORT_ERRORS = (
-    httpx.TimeoutException,
-    httpx.NetworkError,
-    httpx.ProtocolError,
-)
-
-
 async def verify_labels_with_retry(
     label_manager: LabelManager,
     initial_backoff: int = 5,
@@ -501,10 +550,15 @@ async def verify_labels_with_retry(
     under Docker:
 
       * a transport fault — connection refused, a connect/read timeout, a
-        dropped connection (``TRANSIENT_TRANSPORT_ERRORS``); and
+        dropped connection; and
       * a proxy that is reachable but whose Gmail backend is still initializing,
-        which answers 5xx and surfaces as ``proxy_client.ProxyError`` (NOT an
-        ``httpx.TransportError``, so it must be named explicitly).
+        which answers 5xx (or 429).
+
+    ``verify_labels`` reaches the proxy through ``_send``, which already wraps both
+    of those into ``proxy_client.ProxyUnavailableError`` (a ``ProxyError`` subclass),
+    so catching ``ProxyError`` covers them. The ``TRANSIENT_TRANSPORT_ERRORS`` prefix
+    is kept as defence-in-depth in case a future code path reaches a raw transport
+    fault here without going through ``_send``.
 
     Permanent failures propagate immediately so the operator sees an actionable
     error rather than a silent, endless retry: a misconfigured ``PROXY_URL``
@@ -595,9 +649,11 @@ async def run_daemon() -> None:
     local_parallel = resolve_int_env("LOCAL_PARALLEL", daemon_config.get("local_parallel", 1))
     local_sem = asyncio.Semaphore(local_parallel)
     fetch_sem = asyncio.Semaphore(daemon_config.get("fetch_parallel", 4))
+    write_parallel = resolve_int_env("WRITE_PARALLEL", daemon_config.get("write_parallel", 4))
+    write_sem = asyncio.Semaphore(write_parallel)
     log.info(
-        "Concurrency limits: cloud=%d, local=%d, fetch=%d",
-        cloud_sem._value, local_sem._value, fetch_sem._value,
+        "Concurrency limits: cloud=%d, local=%d, fetch=%d, write=%d",
+        cloud_sem._value, local_sem._value, fetch_sem._value, write_sem._value,
     )
     if local_parallel > 8:
         log.warning(
@@ -665,6 +721,7 @@ async def run_daemon() -> None:
                         newsletter_only=newsletter_only,
                         failure_tracker=failure_tracker,
                         fetch_sem=fetch_sem,
+                        write_sem=write_sem,
                     )
                     for tid, msg_ids in thread_items
                 ),
@@ -686,12 +743,27 @@ async def run_daemon() -> None:
             # Reset backoff on success
             backoff = poll_interval
 
-        except TRANSIENT_TRANSPORT_ERRORS as exc:
+        except TRANSIENT_TRANSPORT_ERRORS + (ProxyUnavailableError,) as exc:
+            # A transiently-unreachable proxy (raw transport fault, or a wrapped
+            # ProxyUnavailableError — connection/timeout/5xx — from list_messages):
+            # back off and retry rather than logging a full traceback.
             log.warning(
                 "Lost connection to api-proxy at %s (%s) — retrying in %ds",
                 proxy_client.proxy_url,
                 type(exc).__name__,
                 backoff,
+            )
+            backoff = min(backoff * 2, poll_interval * 10)
+        except ProxyError as exc:
+            # A request-specific proxy fault from the cycle-level list_messages call:
+            # a 4xx, e.g. a malformed gmail_query 400. It won't fix itself, but it's a
+            # known, named condition: log it as a warning and back off rather than
+            # spewing a full traceback every cycle. (The transient faults — 5xx, an
+            # exhausted 429, a non-JSON 2xx body — are ProxyUnavailableError, handled
+            # by the arm above.)
+            log.warning(
+                "api-proxy rejected the poll request (%s: %s) — retrying in %ds",
+                type(exc).__name__, exc, backoff,
             )
             backoff = min(backoff * 2, poll_interval * 10)
         except Exception:

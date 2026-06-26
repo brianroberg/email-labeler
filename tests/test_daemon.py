@@ -2,6 +2,7 @@
 
 import asyncio
 import base64
+import logging
 from unittest.mock import AsyncMock, MagicMock
 
 import httpx
@@ -24,7 +25,7 @@ from daemon import (
 from labeler import _get_priority
 from llm_client import LLMClient, LLMUnavailableError
 from newsletter import NewsletterTier, StoryResult
-from proxy_client import ProxyAuthError, ProxyError
+from proxy_client import ProxyAuthError, ProxyError, ProxyUnavailableError
 
 
 @pytest.fixture
@@ -312,9 +313,11 @@ class TestProcessSingleThread:
         # First two failures: retry next cycle (not handled), nothing marked processed.
         assert results[0] is False
         assert results[1] is False
-        # Third failure hits the threshold: give up — mark processed and report handled.
+        # Third failure hits the threshold: give up — mark agent/attempted (not
+        # agent/processed) so the abandoned thread is findable, and report handled.
         assert results[2] is True
-        mock_label_manager.mark_processed.assert_called_once_with(["msg_1"])
+        mock_label_manager.mark_attempted.assert_called_once_with(["msg_1"])
+        mock_label_manager.mark_processed.assert_not_called()
         # The give-up is recorded so the cycle summary can report it distinctly.
         assert tracker.take_given_up() == ["thread_stuck"]
 
@@ -357,6 +360,108 @@ class TestProcessSingleThread:
 
         mock_label_manager.mark_processed.assert_not_called()
 
+    async def test_proxy_unavailable_is_give_up_eligible_per_thread(
+        self, mock_proxy, mock_classifier, mock_label_manager, cloud_sem, local_sem,
+    ):
+        """A per-thread ProxyUnavailableError is give-up-eligible (issue #26).
+
+        An endpoint-wide proxy outage is caught one level up: list_messages (also a
+        proxy call) fails first, so the whole cycle defers and no thread is processed
+        or counted. Reaching this per-thread handler means the proxy served other
+        calls this cycle but THIS thread's call failed — a fault that persists is
+        poison (e.g. a deterministic 5xx on one unserializable thread) and must be
+        bounded by the FailureTracker, not retried forever.
+
+        Contrast test_llm_unavailable_does_not_count_toward_give_up: an MLX outage is
+        NOT visible at the cycle level (the proxy is up), so it must never give up.
+        """
+        mock_proxy.get_thread.side_effect = ProxyUnavailableError("proxy 500 for one poison thread")
+        tracker = FailureTracker(max_failures=2)
+
+        results = [
+            await process_single_thread(
+                "thread_poison", ["msg_1"], mock_proxy, mock_classifier, mock_label_manager,
+                cloud_sem, local_sem, max_thread_chars=16000, failure_tracker=tracker,
+            )
+            for _ in range(2)
+        ]
+
+        assert results[0] is False  # first failure: retry next cycle
+        assert results[1] is True   # threshold hit: give up
+        mock_label_manager.mark_attempted.assert_called_once_with(["msg_1"])
+        mock_label_manager.mark_processed.assert_not_called()
+        assert tracker.take_given_up() == ["thread_poison"]
+
+    async def test_give_up_write_transient_failure_logs_clean_warning(
+        self, mock_proxy, mock_classifier, mock_label_manager, cloud_sem, local_sem, caplog,
+    ):
+        """A transient proxy outage DURING the give-up marker write is expected, not a
+        bug (issue #32): log a retryable warning (no traceback) and retry next cycle —
+        distinct from an unexpected/permanent marker-write failure. The give-up is not
+        recorded, so the thread stays give-up-eligible until the marker write lands.
+        """
+        mock_proxy.get_thread.side_effect = RuntimeError("classification boom")
+        mock_label_manager.mark_attempted.side_effect = ProxyUnavailableError("proxy 503 on write")
+        tracker = FailureTracker(max_failures=1)  # give up on the first failure
+
+        with caplog.at_level(logging.WARNING):
+            result = await process_single_thread(
+                "thread_x", ["msg_1"], mock_proxy, mock_classifier, mock_label_manager,
+                cloud_sem, local_sem, max_thread_chars=16000, failure_tracker=tracker,
+            )
+
+        assert result is False                # couldn't mark → retry next cycle
+        assert tracker.take_given_up() == []  # not recorded as given up
+        retry_logs = [r for r in caplog.records if "will retry" in r.getMessage()]
+        assert retry_logs, "expected a clean retry warning for the transient marker-write failure"
+        # Transient: a clean WARNING, never an ERROR-with-traceback.
+        assert all(r.levelno == logging.WARNING and r.exc_info is None for r in retry_logs)
+
+    async def test_give_up_write_unexpected_failure_keeps_traceback(
+        self, mock_proxy, mock_classifier, mock_label_manager, cloud_sem, local_sem, caplog,
+    ):
+        """An UNEXPECTED (likely permanent) marker-write failure keeps its full traceback
+        so it stays diagnosable rather than being swallowed as benign (issue #32)."""
+        mock_proxy.get_thread.side_effect = RuntimeError("classification boom")
+        mock_label_manager.mark_attempted.side_effect = ValueError("unexpected marker bug")
+        tracker = FailureTracker(max_failures=1)
+
+        with caplog.at_level(logging.WARNING):
+            result = await process_single_thread(
+                "thread_y", ["msg_1"], mock_proxy, mock_classifier, mock_label_manager,
+                cloud_sem, local_sem, max_thread_chars=16000, failure_tracker=tracker,
+            )
+
+        assert result is False
+        # A failed marker write must NOT be recorded as a give-up: the thread wasn't
+        # labeled, so reporting it abandoned would be misleading and it keeps re-matching.
+        assert tracker.take_given_up() == []
+        marker_logs = [r for r in caplog.records if "Could not mark" in r.getMessage()]
+        assert marker_logs and any(r.levelno >= logging.ERROR and r.exc_info for r in marker_logs)
+
+    async def test_proxy_4xx_is_give_up_eligible(
+        self, mock_proxy, mock_classifier, mock_label_manager, cloud_sem, local_sem,
+    ):
+        """A request-specific proxy 4xx (plain ProxyError) stays give-up-eligible.
+
+        The transient subclass defers; the base ProxyError (e.g. a 404 for a thread
+        deleted between listing and fetching) should still be bounded by the
+        FailureTracker so it isn't retried forever.
+        """
+        mock_proxy.get_thread.side_effect = ProxyError("404 not found")
+        tracker = FailureTracker(max_failures=2)
+
+        results = [
+            await process_single_thread(
+                "thread_gone", ["msg_1"], mock_proxy, mock_classifier, mock_label_manager,
+                cloud_sem, local_sem, max_thread_chars=16000, failure_tracker=tracker,
+            )
+            for _ in range(2)
+        ]
+
+        assert results[0] is False  # first failure: retry
+        assert results[1] is True   # threshold hit: give up
+
     async def test_give_up_marks_all_thread_messages_not_just_query_stubs(
         self, mock_proxy, mock_classifier, mock_label_manager, cloud_sem, local_sem,
         mock_thread_response,
@@ -382,7 +487,7 @@ class TestProcessSingleThread:
 
         assert results[0] is False  # first failure: retry
         assert results[1] is True   # threshold hit: give up
-        mock_label_manager.mark_processed.assert_called_once_with(["msg_001", "msg_002"])
+        mock_label_manager.mark_attempted.assert_called_once_with(["msg_001", "msg_002"])
 
     async def test_get_thread_is_bounded_by_fetch_sem(
         self, mock_proxy, mock_classifier, mock_label_manager, cloud_sem, local_sem,
@@ -422,6 +527,34 @@ class TestProcessSingleThread:
 
         assert result is True
         mock_proxy.get_thread.assert_called_once()
+
+    async def test_label_application_is_bounded_by_write_sem(
+        self, mock_proxy, mock_classifier, mock_label_manager, cloud_sem, local_sem,
+        mock_thread_response,
+    ):
+        """Label-application writes run under write_sem, so they can't fan out unbounded.
+
+        Covers issue #17: the cloud/local/fetch semaphores gate reads + classify, but
+        the label-application phase (modify_message via apply_classification etc.)
+        previously ran with no bound, so a large max_emails_per_cycle could burst many
+        concurrent writes at the api-proxy / Gmail.
+        """
+        mock_proxy.get_thread.return_value = mock_thread_response
+        exhausted = asyncio.Semaphore(0)  # no write permits available
+
+        task = asyncio.create_task(process_single_thread(
+            "thread_001", ["msg_001"], mock_proxy, mock_classifier, mock_label_manager,
+            cloud_sem, local_sem, max_thread_chars=16000,
+            fetch_sem=asyncio.Semaphore(2), write_sem=exhausted,
+        ))
+        await asyncio.sleep(0.05)
+        # Fetch + classify ran, but blocked acquiring write_sem — no label write yet.
+        mock_proxy.get_thread.assert_called_once()
+        mock_label_manager.apply_classification.assert_not_called()
+        mock_label_manager.mark_processed.assert_not_called()
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
 
     async def test_service_thread_classified_via_cloud(
         self,
