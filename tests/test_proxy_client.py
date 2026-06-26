@@ -82,6 +82,20 @@ class TestTransientClassification:
         with pytest.raises(ProxyUnavailableError):
             client._handle_response(_mock_response(429, {"message": "rate limited"}))
 
+    async def test_non_json_2xx_is_unavailable(self, client):
+        """A 2xx whose body isn't JSON — a truncated/garbled response, or an upstream
+        gateway briefly returning an HTML error page with status 200 — is a transient
+        hiccup. It classifies as ProxyUnavailableError (retried next cycle), NOT a
+        give-up-eligible plain ProxyError. With the #26 give-up bound a *persistent*
+        non-JSON 2xx is still bounded by the FailureTracker, so this can't retry forever.
+        Asserted at _handle_response, where the success body is parsed (issue #27)."""
+        resp = httpx.Response(
+            200, text="<html>502 Bad Gateway</html>",
+            request=httpx.Request("GET", "http://proxy.test/x"),
+        )
+        with pytest.raises(ProxyUnavailableError):
+            client._handle_response(resp)
+
     async def test_read_timeout_raises_unavailable(self, client):
         """A read timeout to the proxy is infrastructure slowness → transient.
 

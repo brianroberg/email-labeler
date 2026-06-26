@@ -133,7 +133,9 @@ class GmailProxyClient:
         Raises:
             ProxyAuthError: For 401 responses.
             ProxyForbiddenError: For 403 responses.
-            ProxyError: For 5xx or other error responses.
+            ProxyUnavailableError: For transient faults — 5xx, an exhausted 429, or a
+                non-JSON 2xx body. (Subclass of ProxyError; the daemon defers on it.)
+            ProxyError: For a request-specific 4xx (give-up-eligible).
         """
         if response.status_code == 401:
             message = self._parse_error_message(response, "Unauthorized - invalid or missing API key")
@@ -162,7 +164,12 @@ class GmailProxyClient:
         try:
             return response.json()
         except ValueError:
-            raise ProxyError("Proxy returned non-JSON response for successful request")
+            # A 2xx with a non-JSON body — a truncated/garbled response, or an upstream
+            # gateway briefly returning an HTML error page with status 200. Transient
+            # like a 5xx, so raise the transient subclass: the daemon defers and retries
+            # rather than abandoning the thread, and a *persistent* non-JSON 2xx is still
+            # bounded by the FailureTracker give-up path (issue #27, building on #26).
+            raise ProxyUnavailableError("Proxy returned non-JSON response for successful request")
 
     async def _send(self, do_request, operation: str) -> dict:
         """Run a request (with HTTP-status retries) and classify its outcome.
