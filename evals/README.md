@@ -127,6 +127,30 @@ Navigate to `http://localhost:5000`. Features:
 
 ## Typical Workflows
 
+**Evaluate a new local model (fast path):**
+
+The local model is only used for Stage 2 on person bodies, so `--local-only`
+(= `--stages stage2_only --sender-type person`) isolates it — and needs no cloud
+credentials. The one-command wrapper sets the model, auto-tags the run by the
+model name, preflights the endpoint, prints a report, and optionally compares to
+a prior run:
+
+```bash
+# Prereq: mlx_lm.server is already serving <hf-id>, and MLX_URL points at it.
+python scripts/eval_model.py qwen/qwen3-14b                 # run + report
+python scripts/eval_model.py qwen/qwen3-14b qwen3-8b        # ...also compare vs the newest qwen3-8b run
+```
+
+Equivalent explicit form (the wrapper just chains these):
+
+```bash
+uv run python -m evals.run_eval --local-only --local-model qwen/qwen3-14b --report
+```
+
+`--local-only` errors if the local endpoint is unreachable or `MLX_MODEL` doesn't
+match the served model (a 404), instead of producing a whole run of per-thread
+errors. Pass `--skip-preflight` to bypass that check.
+
 **Prompt A/B test:**
 
 ```bash

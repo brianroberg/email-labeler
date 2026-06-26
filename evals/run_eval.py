@@ -13,6 +13,7 @@ import asyncio
 import hashlib
 import json
 import os
+import re
 import sys
 import time
 import tomllib
@@ -25,13 +26,105 @@ import httpx
 from classifier import EmailClassifier, SenderType, ThreadMetadata
 from config_utils import substitute_env_vars
 from daemon import DEFAULT_MAX_THREAD_CHARS, format_thread_transcript
-from evals import format_network_error
+from evals import format_network_error, report
 from evals.llm_cache import CachedLLMClient
 from evals.schemas import GoldenThread, PredictionResult, RunMeta, ThinkingEntry
 from gmail_utils import get_header
 from llm_client import LLMClient
 
 VALID_STAGES = ("full", "stage1_only", "stage2_only")
+
+
+def resolve_local_only(args: argparse.Namespace) -> None:
+    """Expand --local-only into --stages stage2_only --sender-type person, in place.
+
+    Stage 2b on a person body is the *only* path that exercises solely the local
+    classifier (person bodies never reach the cloud), so this is the canonical
+    "evaluate just the local model" configuration. A no-op unless --local-only is
+    set. The default --stages ("full") is treated as unspecified and overridden.
+
+    Raises:
+        ValueError: if the user also passed an incompatible --stages or
+            --sender-type alongside --local-only.
+    """
+    if not getattr(args, "local_only", False):
+        return
+    if args.stages not in ("full", "stage2_only"):
+        raise ValueError(
+            f"--local-only implies --stages stage2_only, which conflicts with "
+            f"--stages {args.stages}"
+        )
+    if args.sender_type not in (None, "person"):
+        raise ValueError(
+            f"--local-only implies --sender-type person, which conflicts with "
+            f"--sender-type {args.sender_type}"
+        )
+    args.stages = "stage2_only"
+    args.sender_type = "person"
+
+
+def sanitize_tag(name: str) -> str:
+    """Make a model name safe for a results filename.
+
+    Filenames join parts with "_", so any run of characters outside
+    [A-Za-z0-9._-] (notably the "/" in HuggingFace ids like "qwen/qwen3-14b")
+    is collapsed to a single "-", with leading/trailing dashes stripped.
+    """
+    return re.sub(r"[^A-Za-z0-9._-]+", "-", name).strip("-")
+
+
+def default_tag(stages: str, config: dict) -> str:
+    """Derive a default results tag from the model actually under test.
+
+    Stage 1 is the cloud model's job; everything else exercises the local model,
+    so tag by whichever model the run is really measuring. Makes result files
+    self-identifying without the user having to pass --tag.
+    """
+    section = "cloud" if stages == "stage1_only" else "local"
+    return sanitize_tag(config["llm"][section]["model"])
+
+
+def required_endpoints(stages: str, sender_type: str | None) -> tuple[bool, bool]:
+    """Return (need_cloud, need_local) for a run configuration.
+
+    Stage 1 (sender) is always cloud. Stage 2 routes person bodies to the local
+    model and service bodies to the cloud, so a stage2_only run narrowed by
+    --sender-type touches exactly one endpoint; without that filter (or a full
+    run) it may touch both. Used to scope the preflight check to endpoints the
+    run will actually hit.
+    """
+    if stages == "stage1_only":
+        return True, False
+    if stages == "stage2_only":
+        if sender_type == "person":
+            return False, True
+        if sender_type == "service":
+            return True, False
+        return True, True
+    return True, True  # full
+
+
+async def preflight_check(cloud_base, local_base, need_cloud: bool, need_local: bool) -> list[str]:
+    """Probe each required endpoint once; return a human-readable error per dead one.
+
+    Turns the most common silent failure — a local MLX_MODEL that doesn't match
+    the served --model (every request 404s) or an unreachable endpoint — into an
+    immediate, clear error instead of a whole run of per-thread errors. Endpoints
+    the run won't touch are never probed.
+    """
+    errors = []
+    if need_cloud and not await cloud_base.is_available():
+        errors.append(
+            f"cloud LLM '{cloud_base.model}' not reachable at "
+            f"{cloud_base.base_url or '<unset CLOUD_LLM_URL>'}"
+        )
+    if need_local and not await local_base.is_available():
+        errors.append(
+            f"local LLM '{local_base.model}' not reachable at "
+            f"{local_base.base_url or '<unset MLX_URL>'} "
+            "(a model-name mismatch with the served model returns 404)"
+        )
+    return errors
 
 
 def resolve_parallelism(cli_value: int | None, config: dict) -> int:
@@ -346,6 +439,35 @@ def write_thinking_sidecar(
             f.write(json.dumps(entry.to_dict()) + "\n")
 
 
+def maybe_report(
+    meta: RunMeta,
+    results: list[PredictionResult],
+    report_enabled: bool,
+    compare_to: str | None,
+) -> None:
+    """Print a metrics report (and optional comparison) for a just-finished run.
+
+    Saves the find-the-file-then-invoke-report round-trip: run_eval already knows
+    the run it produced. Reuses report.py so all formatting lives in one place.
+    A no-op unless --report or --compare-to was passed.
+    """
+    if not report_enabled and not compare_to:
+        return
+    metrics = report.compute_metrics(results)
+    if report_enabled:
+        report.print_report(meta, metrics)
+    if compare_to:
+        compare_path = Path(compare_to)
+        if not compare_path.exists():
+            print(f"Error: --compare-to file not found: {compare_path}", file=sys.stderr)
+            return
+        meta_b, results_b = report.load_results(compare_path)
+        report.print_comparison(
+            meta, metrics, meta_b, report.compute_metrics(results_b),
+            results1=results, results2=results_b,
+        )
+
+
 async def main(args: argparse.Namespace) -> None:
     # Load config
     config_path = Path(args.config) if args.config else Path(__file__).parent.parent / "config.toml"
@@ -357,12 +479,19 @@ async def main(args: argparse.Namespace) -> None:
     args.parallelism = resolve_parallelism(args.parallelism, config)
 
     # Apply CLI overrides to config (CLI always wins over config file). extra_body
-    # parsing can fail on bad JSON, so surface that as a clean exit.
+    # parsing and --local-only conflict detection can fail, so surface those as a
+    # clean exit.
     try:
+        resolve_local_only(args)
         apply_config_overrides(config, args)
     except ValueError as exc:
         print(f"Error: {exc}", file=sys.stderr)
         sys.exit(2)
+
+    # Default the results tag to the model under test, so result files (and the
+    # report trend table) self-identify without the user having to pass --tag.
+    if args.tag is None:
+        args.tag = default_tag(args.stages, config)
 
     # Load golden set
     golden_path = Path(args.golden_set)
@@ -404,6 +533,17 @@ async def main(args: argparse.Namespace) -> None:
         timeout=config["llm"]["local"]["timeout"],
         extra_body=config["llm"]["local"].get("extra_body"),
     )
+
+    # Preflight: probe the endpoints this run will actually hit and fail fast on
+    # an unreachable / name-mismatched one, instead of a whole run of per-thread
+    # errors. (Skipped on --dry-run, which returned above.)
+    if not args.skip_preflight:
+        need_cloud, need_local = required_endpoints(args.stages, args.sender_type)
+        unreachable = await preflight_check(cloud_llm_base, local_llm_base, need_cloud, need_local)
+        if unreachable:
+            for msg in unreachable:
+                print(f"Error: {msg}", file=sys.stderr)
+            sys.exit(1)
 
     # Wrap with cache unless --no-cache
     if args.no_cache:
@@ -466,6 +606,10 @@ async def main(args: argparse.Namespace) -> None:
         write_results(output_path, meta, results)
         write_thinking_sidecar(output_path, thinking_entries)
 
+        # Optional inline metrics report / comparison (saves a separate
+        # `python -m evals.report` invocation on the file we just wrote).
+        maybe_report(meta, results, args.report, args.compare_to)
+
         # Summary
         errors = sum(1 for r in results if r.error)
         st_correct = sum(1 for r in results if r.sender_type_correct is True)
@@ -514,6 +658,15 @@ def cli():
     parser.add_argument("--sender-type", choices=("person", "service"),
                         help="Only evaluate threads with this expected sender type")
     parser.add_argument("--max-threads", type=int, help="Max threads to evaluate")
+    parser.add_argument("--local-only", action="store_true",
+                        help="Shortcut for --stages stage2_only --sender-type person "
+                             "(evaluate only the local classifier; no cloud creds needed)")
+    parser.add_argument("--skip-preflight", action="store_true",
+                        help="Skip the endpoint reachability check before evaluating")
+    parser.add_argument("--report", action="store_true",
+                        help="Print a metrics report for this run after it completes")
+    parser.add_argument("--compare-to", metavar="PATH",
+                        help="After the run, print a comparison against this prior results file")
     # Config overrides (CLI always wins over config file)
     parser.add_argument("--cloud-model", help="Override cloud LLM model name")
     parser.add_argument("--local-model", help="Override local LLM model name")

@@ -45,6 +45,10 @@ Review hotkeys: `p`/`s` sender (person/service); `r`/`f`/`l` label (needs_respon
 | `--no-cache` | Disable LLM response cache (default: cache enabled) |
 | `--sender-type` | Only evaluate threads with this expected sender type (`person` or `service`) |
 | `--max-threads` | Max threads to evaluate (default: all) |
+| `--local-only` | Shortcut for `--stages stage2_only --sender-type person` — evaluate only the local classifier (no cloud creds needed). Errors if combined with a conflicting `--stages`/`--sender-type` |
+| `--skip-preflight` | Skip the endpoint reachability check that runs before evaluation |
+| `--report` | Print a metrics report (accuracy, confusion matrix, per-class P/R/F1) for this run after it completes |
+| `--compare-to` | After the run, print a side-by-side comparison against this prior results JSONL file |
 | `--cloud-model` | Override cloud LLM model name from config |
 | `--local-model` | Override local LLM model name from config |
 | `--cloud-temperature` | Override cloud LLM temperature (alias: `--cloud-temp`) |
