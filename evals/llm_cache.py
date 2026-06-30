@@ -135,9 +135,9 @@ class CachedLLMClient:
         self._llm_seconds = 0.0
         return elapsed
 
-    async def is_available(self) -> bool:
+    async def is_available(self, timeout: float | None = None) -> bool:
         """Delegate to inner client."""
-        return await self.inner.is_available()
+        return await self.inner.is_available(timeout)
 
     def flush(self) -> None:
         """Append pending cache entries to disk."""
