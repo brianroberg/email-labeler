@@ -2,7 +2,7 @@
 
 import json
 
-from evals.harvest import deduplicate, harvest_threads, infer_ground_truth
+from evals.harvest import deduplicate, harvest_threads, infer_ground_truth, write_golden_set
 from evals.schemas import GoldenThread
 
 # Label config matching the real config.toml structure
@@ -181,3 +181,39 @@ class TestHarvestQuery:
         proxy = FakeProxy()
         await harvest_threads(proxy, self.CONFIG, max_threads=10, label_filter="bogus")
         assert proxy.last_query == "label:agent/processed"
+
+
+class TestWriteGoldenSet:
+    """Harvest must never overwrite an existing golden set — it always appends.
+
+    The golden set also stores manual review state (confirmed labels,
+    exclusions, notes), so a truncating write would silently destroy that work.
+    """
+
+    def _make_golden(self, thread_id: str) -> GoldenThread:
+        return GoldenThread(
+            thread_id=thread_id,
+            messages=[],
+            senders=["test@example.com"],
+            subject="Test",
+            snippet="Test",
+            expected_sender_type="service",
+            expected_label="low_priority",
+        )
+
+    def test_appends_to_existing_file(self, tmp_path):
+        """Existing lines must survive; new threads are added after them."""
+        path = tmp_path / "golden.jsonl"
+        write_golden_set([self._make_golden("t1")], path)
+        write_golden_set([self._make_golden("t2")], path)
+
+        ids = [json.loads(line)["thread_id"] for line in path.read_text().splitlines() if line]
+        assert ids == ["t1", "t2"]
+
+    def test_creates_file_when_absent(self, tmp_path):
+        """First write to a non-existent path creates it."""
+        path = tmp_path / "golden.jsonl"
+        write_golden_set([self._make_golden("t1")], path)
+
+        ids = [json.loads(line)["thread_id"] for line in path.read_text().splitlines() if line]
+        assert ids == ["t1"]
