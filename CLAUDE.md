@@ -115,6 +115,27 @@ Hotkeys: `e/g/f/p` filter by tier, `1-5` filter by theme, `s` filter by sender, 
 
 ## Testing
 
+**Always build using red/green TDD.** Every behavior change — new feature, bug fix,
+or refactor — starts with a failing test:
+
+1. **RED** — Write one minimal test for the new behavior. Run it and *watch it fail
+   for the expected reason* (behavior missing, not a typo/import error). A test you
+   never saw fail proves nothing.
+2. **GREEN** — Write the minimal production code to make it pass. Run the test; confirm
+   it passes and the rest of the suite stays green.
+3. **REFACTOR** — Clean up with the tests green. Add no behavior without a new failing
+   test first.
+
+**No production code without a failing test first.** If you wrote code before the test,
+delete it and start over from the test.
+
+**Proving after-the-fact tests with mutation.** When a test is written *after* the code
+(e.g. covering a fix already applied, or legacy code), it can't be red/green-verified —
+so prove it instead: deliberately break the production behavior it targets (a "mutation")
+and confirm the test fails, then revert. A test that stays green when you break the code
+under it is not testing that code. Prefer the mutation that reproduces the exact bug the
+test guards against.
+
 **Always run the full test suite before declaring any task complete.**
 
 ```bash
