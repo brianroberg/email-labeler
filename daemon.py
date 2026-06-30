@@ -392,8 +392,16 @@ async def process_single_thread(
         # Check priority — skip if already classified at max priority
         existing_priority = label_manager.get_existing_priority(messages)
         if existing_priority is not None and existing_priority >= _get_priority(EmailLabel.NEEDS_RESPONSE):
-            log.info("Thread %s already at max priority, skipping", thread_id)
-            return False
+            # Already at max priority, so there's nothing to classify — but mark it
+            # processed so it drops out of the unprocessed query. Otherwise the thread
+            # has no agent/processed label and re-matches every cycle forever, costing
+            # a full get_thread round-trip per thread per poll (same retry-loop reasoning
+            # as the no-downgrade branch below).
+            all_msg_ids = [msg["id"] for msg in messages]
+            async with (write_sem or nullcontext()):
+                await label_manager.mark_processed(all_msg_ids)
+            log.info("Thread %s already at max priority, marking processed", thread_id)
+            return True
 
         # Collect all message IDs (thread may have more messages than query returned)
         all_msg_ids = [msg["id"] for msg in messages]

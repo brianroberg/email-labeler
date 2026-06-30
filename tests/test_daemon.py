@@ -237,6 +237,47 @@ class TestProcessSingleThread:
         mock_label_manager.apply_classification.assert_not_called()
         mock_label_manager.mark_processed.assert_called_once_with(["msg_001", "msg_002"])
 
+    async def test_already_at_max_priority_marks_processed(
+        self,
+        mock_proxy,
+        mock_classifier,
+        mock_label_manager,
+        cloud_sem,
+        local_sem,
+        mock_thread_response,
+    ):
+        """A thread already at max priority is marked processed (not re-fetched forever).
+
+        Without the mark_processed, the thread keeps no agent/processed label and
+        re-matches the unprocessed query every poll cycle, burning a get_thread
+        round-trip per thread per cycle. It should be skipped from classification but
+        still marked processed so it drops out of the query.
+        """
+        mock_proxy.get_thread.return_value = mock_thread_response
+        # Already at the top priority -> no classification needed.
+        mock_label_manager.get_existing_priority.return_value = _get_priority(
+            EmailLabel.NEEDS_RESPONSE
+        )
+
+        result = await process_single_thread(
+            "thread_001",
+            ["msg_001", "msg_002"],
+            mock_proxy,
+            mock_classifier,
+            mock_label_manager,
+            cloud_sem,
+            local_sem,
+            max_thread_chars=50000,
+        )
+
+        assert result is True
+        # No (re)classification, but the thread is marked processed so it stops
+        # re-matching the unprocessed query.
+        mock_classifier.classify_sender.assert_not_called()
+        mock_classifier.classify.assert_not_called()
+        mock_label_manager.apply_classification.assert_not_called()
+        mock_label_manager.mark_processed.assert_called_once_with(["msg_001", "msg_002"])
+
     async def test_allows_upgrade(
         self,
         mock_proxy,
