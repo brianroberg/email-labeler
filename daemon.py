@@ -328,11 +328,17 @@ async def process_single_thread(
         # Sort chronologically
         messages.sort(key=lambda m: int(m.get("internalDate", "0")))
 
+        # Full message list — the thread may carry more messages than the query
+        # returned. Upgrade the give-up target from the query stubs to every message
+        # id now (see the ids_to_mark note above), so any give-up or skip-and-mark
+        # path below marks the whole thread and it stops re-matching the query.
+        # Every post-fetch branch shares this single computation.
+        all_msg_ids = [msg["id"] for msg in messages]
+        ids_to_mark = all_msg_ids
+
         # Newsletter detection — route to newsletter pipeline if applicable
         if newsletter_classifier and newsletter_recipient:
             if is_newsletter(messages, newsletter_recipient):
-                all_msg_ids = [msg["id"] for msg in messages]
-                ids_to_mark = all_msg_ids
                 first_headers = messages[0]["payload"]["headers"]
                 subject = get_header(first_headers, "Subject")
                 sender = get_header(first_headers, "From")
@@ -392,12 +398,17 @@ async def process_single_thread(
         # Check priority — skip if already classified at max priority
         existing_priority = label_manager.get_existing_priority(messages)
         if existing_priority is not None and existing_priority >= _get_priority(EmailLabel.NEEDS_RESPONSE):
-            log.info("Thread %s already at max priority, skipping", thread_id)
-            return False
-
-        # Collect all message IDs (thread may have more messages than query returned)
-        all_msg_ids = [msg["id"] for msg in messages]
-        ids_to_mark = all_msg_ids
+            # Already at max priority, so there's nothing to classify — but mark it
+            # processed so it drops out of the unprocessed query. Otherwise the thread
+            # has no agent/processed label and re-matches every cycle forever, costing
+            # a full get_thread round-trip per thread per poll (same retry-loop reasoning
+            # as the no-downgrade branch below). ids_to_mark was upgraded to all_msg_ids
+            # above the priority check, so a failed write here gives up on the whole
+            # thread, not just the query stubs.
+            async with (write_sem or nullcontext()):
+                await label_manager.mark_processed(all_msg_ids)
+            log.info("Thread %s already at max priority, marking processed", thread_id)
+            return True
 
         # Extract unique senders (preserve order)
         senders = []

@@ -237,6 +237,54 @@ class TestProcessSingleThread:
         mock_label_manager.apply_classification.assert_not_called()
         mock_label_manager.mark_processed.assert_called_once_with(["msg_001", "msg_002"])
 
+    async def test_already_at_max_priority_marks_processed(
+        self,
+        mock_proxy,
+        mock_classifier,
+        mock_label_manager,
+        cloud_sem,
+        local_sem,
+        mock_thread_response,
+    ):
+        """A thread already at max priority is marked processed (not re-fetched forever).
+
+        Without the mark_processed, the thread keeps no agent/processed label and
+        re-matches the unprocessed query every poll cycle, burning a get_thread
+        round-trip per thread per cycle. It should be skipped from classification but
+        still marked processed so it drops out of the query.
+
+        The query surfaced only msg_001, but the fetched thread holds msg_001 +
+        msg_002. mark_processed must cover the FULL thread (all_msg_ids), not just the
+        query stub — otherwise the unmarked sibling keeps re-matching the query, the
+        exact loop this branch exists to break. Passing a strict subset as the stubs
+        makes the assertion sensitive to that distinction.
+        """
+        mock_proxy.get_thread.return_value = mock_thread_response
+        # Already at the top priority -> no classification needed.
+        mock_label_manager.get_existing_priority.return_value = _get_priority(
+            EmailLabel.NEEDS_RESPONSE
+        )
+
+        result = await process_single_thread(
+            "thread_001",
+            ["msg_001"],  # query stub is a strict subset of the fetched thread
+            mock_proxy,
+            mock_classifier,
+            mock_label_manager,
+            cloud_sem,
+            local_sem,
+            max_thread_chars=50000,
+        )
+
+        assert result is True
+        # No (re)classification, but the thread is marked processed so it stops
+        # re-matching the unprocessed query.
+        mock_classifier.classify_sender.assert_not_called()
+        mock_classifier.classify.assert_not_called()
+        mock_label_manager.apply_classification.assert_not_called()
+        # Full thread, not just the query stub.
+        mock_label_manager.mark_processed.assert_called_once_with(["msg_001", "msg_002"])
+
     async def test_allows_upgrade(
         self,
         mock_proxy,
@@ -487,6 +535,42 @@ class TestProcessSingleThread:
 
         assert results[0] is False  # first failure: retry
         assert results[1] is True   # threshold hit: give up
+        mock_label_manager.mark_attempted.assert_called_once_with(["msg_001", "msg_002"])
+
+    async def test_already_at_max_priority_give_up_marks_all_thread_messages(
+        self, mock_proxy, mock_classifier, mock_label_manager, cloud_sem, local_sem,
+        mock_thread_response,
+    ):
+        """The max-priority skip now writes a marker, so a failed write is give-up-eligible.
+
+        The branch calls mark_processed inside the try; a give-up-eligible failure
+        there routes to _give_up_if_stuck. ids_to_mark must already be the full thread
+        (all_msg_ids), not the query stub — otherwise the abandoned-but-findable marker
+        lands on a subset and the unmarked sibling keeps re-surfacing the thread, the
+        very loop the give-up mechanism exists to break. The query surfaced only
+        msg_001 while the thread holds msg_001 + msg_002.
+        """
+        mock_proxy.get_thread.return_value = mock_thread_response
+        mock_label_manager.get_existing_priority.return_value = _get_priority(
+            EmailLabel.NEEDS_RESPONSE
+        )
+        # The mark_processed write fails deterministically (e.g. a per-thread proxy 5xx).
+        mock_label_manager.mark_processed.side_effect = ProxyUnavailableError("proxy 500 on write")
+        tracker = FailureTracker(max_failures=2)
+
+        results = [
+            await process_single_thread(
+                "thread_001", ["msg_001"], mock_proxy, mock_classifier, mock_label_manager,
+                cloud_sem, local_sem, max_thread_chars=16000, failure_tracker=tracker,
+            )
+            for _ in range(2)
+        ]
+
+        assert results[0] is False  # first failure: retry
+        assert results[1] is True   # threshold hit: give up
+        # No classification was ever attempted (it's the max-priority skip path)...
+        mock_classifier.classify_sender.assert_not_called()
+        # ...and give-up marks the FULL thread, not just the query stub.
         mock_label_manager.mark_attempted.assert_called_once_with(["msg_001", "msg_002"])
 
     async def test_get_thread_is_bounded_by_fetch_sem(
