@@ -26,19 +26,26 @@ uv run python -m evals.harvest --proxy-url http://localhost:8000 --max-threads 2
 
 ## 1. Harvest — Build a golden set from production data
 
-Pulls threads already labeled by the daemon, infers ground truth from their Gmail labels, and exports to JSONL.
+Pulls threads already labeled by the daemon, infers ground truth from their Gmail labels, and appends to JSONL.
+
+Harvest always **appends** to the output file, deduplicating by thread ID. It never overwrites an existing golden set — that file also holds your manual review state (confirmed labels, exclusions, notes). To start fresh, delete the file manually.
 
 ```bash
-# Harvest up to 200 processed threads
+# Harvest up to 200 processed threads (appends new ones, dedupes automatically)
 uv run python -m evals.harvest --proxy-url http://localhost:8000 --max-threads 200
-
-# Append new threads (deduplicates automatically)
-uv run python -m evals.harvest --proxy-url http://localhost:8000 --append
 
 # Filter by sender type or label
 uv run python -m evals.harvest --proxy-url http://localhost:8000 --sender-type person
 uv run python -m evals.harvest --proxy-url http://localhost:8000 --label needs_response
 ```
+
+`--label` takes the config **key** (`needs_response`, `fyi`, `low_priority`) — not the Gmail label name. Harvest translates the key to the actual Gmail label via the `[labels]` section of `config.toml` (e.g. `needs_response` → `agent/needs-response`), so pass `--label needs_response`, not `--label agent/needs-response`.
+
+`--label` is ANDed into the Gmail query, so the fetch targets matching threads
+directly rather than filtering the recent processed window after the fact. This
+is the way to boost a rare class (e.g. `needs_response`) in the golden set:
+harvested threads still carry their inferred labels into `evals.review` for
+manual confirmation, so the manual classification step is not bypassed.
 
 ## 2. Review — Manually verify ground truth labels
 
@@ -173,7 +180,7 @@ uv run python -m evals.report --compare evals/results/*deepseek*.jsonl evals/res
 **Ongoing monitoring:**
 
 ```bash
-uv run python -m evals.harvest --proxy-url http://localhost:8000 --append
+uv run python -m evals.harvest --proxy-url http://localhost:8000
 uv run python -m evals.review --unreviewed-only
 uv run python -m evals.run_eval --tag weekly
 uv run python -m evals.report --results-dir evals/results/

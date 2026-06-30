@@ -1,8 +1,10 @@
 """Tests for evals.harvest — ground truth inference and deduplication."""
 
+import argparse
 import json
 
-from evals.harvest import deduplicate, infer_ground_truth
+import evals.harvest as harvest_mod
+from evals.harvest import deduplicate, harvest_threads, infer_ground_truth, write_golden_set
 from evals.schemas import GoldenThread
 
 # Label config matching the real config.toml structure
@@ -146,3 +148,161 @@ class TestDeduplicate:
     def test_empty_new_threads(self, tmp_path):
         result = deduplicate([], tmp_path / "golden.jsonl")
         assert len(result) == 0
+
+    def test_skips_malformed_line(self, tmp_path):
+        """A corrupt/partial line (e.g. interrupted append) must not crash dedup."""
+        existing_file = tmp_path / "golden.jsonl"
+        existing_file.write_text(
+            json.dumps({"thread_id": "t1"}) + "\n"
+            + '{"thread_id": "t2", "messages":\n'  # truncated, invalid JSON
+        )
+        threads = [self._make_golden("t1"), self._make_golden("t2"), self._make_golden("t3")]
+        # t1 is recognized as existing; the malformed t2 line is skipped (so t2
+        # is treated as new), and dedup completes without raising.
+        result = deduplicate(threads, existing_file)
+        assert {t.thread_id for t in result} == {"t2", "t3"}
+
+    def test_skips_line_missing_thread_id(self, tmp_path):
+        """A row without a thread_id must be ignored, not raise KeyError."""
+        existing_file = tmp_path / "golden.jsonl"
+        existing_file.write_text(
+            json.dumps({"subject": "no id here"}) + "\n"
+            + json.dumps({"thread_id": "t1"}) + "\n"
+        )
+        threads = [self._make_golden("t1"), self._make_golden("t2")]
+        result = deduplicate(threads, existing_file)
+        assert {t.thread_id for t in result} == {"t2"}
+
+
+class FakeProxy:
+    """Records the Gmail query passed to list_messages; returns no messages."""
+
+    def __init__(self):
+        self.last_query = None
+
+    async def list_labels(self, user_id: str = "me"):
+        return {"labels": [{"id": lid, "name": name} for lid, name in LABEL_ID_TO_NAME.items()]}
+
+    # Signature mirrors GmailProxyClient.list_messages so a future positional
+    # call (e.g. list_messages(query, ...)) would bind the same way it does in
+    # production and not silently false-green.
+    async def list_messages(self, user_id="me", max_results=10, q=None, label_ids=None):
+        self.last_query = q
+        return {"messages": []}
+
+
+class TestHarvestQuery:
+    """The Gmail query should AND in the classification label when filtering."""
+
+    CONFIG = {"labels": LABELS_CONFIG}
+
+    async def test_no_label_filter_queries_processed_only(self):
+        proxy = FakeProxy()
+        await harvest_threads(proxy, self.CONFIG, max_threads=10)
+        assert proxy.last_query == "label:agent/processed"
+
+    async def test_label_filter_anded_into_query(self):
+        proxy = FakeProxy()
+        await harvest_threads(proxy, self.CONFIG, max_threads=10, label_filter="needs_response")
+        # The classification label is quoted: its internal hyphen must not be
+        # read by Gmail as the NOT operator.
+        assert proxy.last_query == 'label:agent/processed label:"agent/needs-response"'
+
+    async def test_unknown_label_filter_falls_back_to_processed(self):
+        proxy = FakeProxy()
+        await harvest_threads(proxy, self.CONFIG, max_threads=10, label_filter="bogus")
+        assert proxy.last_query == "label:agent/processed"
+
+
+class TestWriteGoldenSet:
+    """Harvest must never overwrite an existing golden set — it always appends.
+
+    The golden set also stores manual review state (confirmed labels,
+    exclusions, notes), so a truncating write would silently destroy that work.
+    """
+
+    def _make_golden(self, thread_id: str) -> GoldenThread:
+        return GoldenThread(
+            thread_id=thread_id,
+            messages=[],
+            senders=["test@example.com"],
+            subject="Test",
+            snippet="Test",
+            expected_sender_type="service",
+            expected_label="low_priority",
+        )
+
+    def test_appends_to_existing_file(self, tmp_path):
+        """Existing lines must survive; new threads are added after them."""
+        path = tmp_path / "golden.jsonl"
+        write_golden_set([self._make_golden("t1")], path)
+        write_golden_set([self._make_golden("t2")], path)
+
+        ids = [json.loads(line)["thread_id"] for line in path.read_text().splitlines() if line]
+        assert ids == ["t1", "t2"]
+
+    def test_creates_file_when_absent(self, tmp_path):
+        """First write to a non-existent path creates it."""
+        path = tmp_path / "golden.jsonl"
+        write_golden_set([self._make_golden("t1")], path)
+
+        ids = [json.loads(line)["thread_id"] for line in path.read_text().splitlines() if line]
+        assert ids == ["t1"]
+
+
+class _OneThreadProxy:
+    """Fake proxy that always surfaces a single harvestable processed thread."""
+
+    def __init__(self, *args, **kwargs):
+        pass
+
+    async def list_labels(self, user_id="me"):
+        return {"labels": [{"id": lid, "name": name} for lid, name in LABEL_ID_TO_NAME.items()]}
+
+    async def list_messages(self, user_id="me", max_results=10, q=None, label_ids=None):
+        return {"messages": [{"id": "m1", "threadId": "t1"}]}
+
+    async def get_thread(self, thread_id, user_id="me", format="full"):
+        return {
+            "messages": [
+                {
+                    "id": "m1",
+                    "internalDate": "1000",
+                    "snippet": "hello",
+                    # personal + needs-response + processed -> a valid golden thread
+                    "labelIds": ["Label_5", "Label_1", "Label_4"],
+                    "payload": {
+                        "headers": [
+                            {"name": "From", "value": "alice@example.com"},
+                            {"name": "Subject", "value": "Hi"},
+                        ]
+                    },
+                }
+            ]
+        }
+
+
+class TestMainDeduplicates:
+    """main() must dedup on EVERY run, not only under the (removed) --append flag.
+
+    Guards the central behavior flip of this change: a second harvest of an
+    already-present thread must not append a duplicate row.
+    """
+
+    async def test_rerun_does_not_duplicate_thread(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(harvest_mod, "GmailProxyClient", _OneThreadProxy)
+        output = tmp_path / "golden.jsonl"
+        args = argparse.Namespace(
+            output=str(output),
+            max_threads=10,
+            sender_type=None,
+            label=None,
+            config=None,
+            proxy_url="http://x",
+        )
+
+        await harvest_mod.main(args)
+        await harvest_mod.main(args)
+
+        ids = [json.loads(line)["thread_id"] for line in output.read_text().splitlines() if line]
+        assert ids == ["t1"]

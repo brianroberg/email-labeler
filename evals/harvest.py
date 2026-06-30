@@ -1,11 +1,15 @@
 """Harvest processed threads from Gmail as golden set data.
 
 Pulls threads labeled agent/processed, infers ground truth from their
-existing classification labels, and exports to JSONL.
+existing classification labels, and appends to JSONL.
+
+Always appends to the output file, deduplicating by thread ID — it never
+overwrites an existing golden set (that file also holds manual review state).
+To start fresh, delete the file manually.
 
 Usage:
     python -m evals.harvest --output evals/golden_set.jsonl --max-threads 200
-    python -m evals.harvest --output evals/golden_set.jsonl --append --sender-type person
+    python -m evals.harvest --output evals/golden_set.jsonl --sender-type person
 """
 
 import argparse
@@ -101,11 +105,22 @@ def deduplicate(new_threads: list[GoldenThread], existing_path: Path) -> list[Go
     existing_ids: set[str] = set()
     if existing_path.exists():
         with open(existing_path) as f:
-            for line in f:
+            for lineno, line in enumerate(f, 1):
                 line = line.strip()
-                if line:
+                if not line:
+                    continue
+                # Tolerate a corrupt/partial line (e.g. an interrupted append)
+                # so one bad row can't abort every future harvest — the golden
+                # set is hand-editable and append-only.
+                try:
                     entry = json.loads(line)
-                    existing_ids.add(entry["thread_id"])
+                except json.JSONDecodeError:
+                    print(f"Warning: skipping malformed line {lineno} in {existing_path}",
+                          file=sys.stderr)
+                    continue
+                thread_id = entry.get("thread_id")
+                if thread_id:
+                    existing_ids.add(thread_id)
 
     return [t for t in new_threads if t.thread_id not in existing_ids]
 
@@ -140,11 +155,26 @@ async def harvest_threads(
         sys.exit(1)
     label_id_to_name = {lbl["id"]: lbl["name"] for lbl in labels_response["labels"]}
 
-    # Fetch message stubs with agent/processed label
+    # Fetch message stubs with agent/processed label. When a classification
+    # filter is set, AND it into the Gmail query so the fetch returns a dense
+    # pool of matching threads instead of relying on the recent processed
+    # window happening to contain them (label_filter is also re-checked per
+    # thread below, since a thread's messages can carry multiple labels).
     processed_label = labels_config["processed"]
+    query = f"label:{processed_label}"
+    if label_filter:
+        filter_label_name = labels_config.get(label_filter, "")
+        if filter_label_name:
+            # Quote the label name: classification labels contain hyphens
+            # (agent/needs-response, agent/low-priority) and an unquoted '-'
+            # can be read by Gmail as the NOT operator, silently matching nothing.
+            query += f' label:"{filter_label_name}"'
+        else:
+            print(f"Warning: --label '{label_filter}' has no mapping in [labels]; "
+                  "querying processed-only.", file=sys.stderr)
     try:
         response = await proxy.list_messages(
-            q=f"label:{processed_label}",
+            q=query,
             max_results=max_threads * 3,  # Over-fetch since we group by thread
         )
     except _NETWORK_ERRORS as exc:
@@ -153,7 +183,7 @@ async def harvest_threads(
     msg_stubs = response.get("messages", [])
 
     if not msg_stubs:
-        print("No processed messages found.", file=sys.stderr)
+        print(f"No messages found for query: {query}", file=sys.stderr)
         return []
 
     # Group by threadId
@@ -228,10 +258,14 @@ async def harvest_threads(
     return results
 
 
-def write_golden_set(threads: list[GoldenThread], output_path: Path, append: bool = False) -> None:
-    """Write golden set to JSONL file."""
-    mode = "a" if append else "w"
-    with open(output_path, mode) as f:
+def write_golden_set(threads: list[GoldenThread], output_path: Path) -> None:
+    """Append golden set entries to the JSONL file.
+
+    Always appends — harvest never truncates an existing golden set, since that
+    file also holds manual review state (confirmed labels, exclusions, notes).
+    To start fresh, delete the file manually.
+    """
+    with open(output_path, "a") as f:
         for thread in threads:
             f.write(json.dumps(thread.to_dict()) + "\n")
 
@@ -253,28 +287,32 @@ async def main(args: argparse.Namespace) -> None:
         return
 
     output_path = Path(args.output)
-    if args.append:
-        threads = deduplicate(threads, output_path)
-        if not threads:
-            print("All threads already in golden set.", file=sys.stderr)
-            return
+    threads = deduplicate(threads, output_path)
+    if not threads:
+        print("All threads already in golden set.", file=sys.stderr)
+        return
 
     output_path.parent.mkdir(parents=True, exist_ok=True)
-    write_golden_set(threads, output_path, append=args.append)
-    print(f"Wrote {len(threads)} threads to {output_path}", file=sys.stderr)
+    write_golden_set(threads, output_path)
+    print(f"Appended {len(threads)} threads to {output_path}", file=sys.stderr)
 
 
 def cli():
     parser = argparse.ArgumentParser(description="Harvest processed emails for golden set")
     parser.add_argument("--output", default="evals/golden_set.jsonl", help="Output JSONL path")
     parser.add_argument("--max-threads", type=int, default=200, help="Max threads to fetch")
-    parser.add_argument("--append", action="store_true", help="Append to existing file (deduplicates)")
     parser.add_argument("--sender-type", choices=["person", "service"], help="Filter by sender type")
-    parser.add_argument("--label", choices=["needs_response", "fyi", "low_priority"],
+    parser.add_argument("--label", choices=list(_CLASSIFICATION_LABELS),
                         help="Filter by classification label")
     parser.add_argument("--config", help="Path to config.toml (default: ./config.toml)")
     parser.add_argument("--proxy-url", help="API proxy URL (overrides PROXY_URL env var)")
+    # Deprecated no-op: harvest always appends now. Kept so existing automation
+    # that still passes --append doesn't abort with an argparse error.
+    parser.add_argument("--append", action="store_true", help=argparse.SUPPRESS)
     args = parser.parse_args()
+    if args.append:
+        print("Note: --append is deprecated and ignored; harvest always appends now.",
+              file=sys.stderr)
     asyncio.run(main(args))
 
 
