@@ -46,9 +46,16 @@ def _capture_parser(module_name: str) -> argparse.ArgumentParser:
 
 
 def _get_parser_flags(parser: argparse.ArgumentParser) -> set[str]:
-    """Extract all --flag names from a parser (excluding -h/--help)."""
+    """Extract all --flag names from a parser.
+
+    Excludes -h/--help and hidden flags (help=argparse.SUPPRESS), which are
+    intentionally undocumented — e.g. deprecated no-op aliases kept only so old
+    automation doesn't error.
+    """
     flags = set()
     for action in parser._actions:
+        if action.help == argparse.SUPPRESS:
+            continue
         for opt in action.option_strings:
             if opt.startswith("--") and opt not in _ARGPARSE_BUILTINS:
                 flags.add(opt)

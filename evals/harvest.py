@@ -105,11 +105,22 @@ def deduplicate(new_threads: list[GoldenThread], existing_path: Path) -> list[Go
     existing_ids: set[str] = set()
     if existing_path.exists():
         with open(existing_path) as f:
-            for line in f:
+            for lineno, line in enumerate(f, 1):
                 line = line.strip()
-                if line:
+                if not line:
+                    continue
+                # Tolerate a corrupt/partial line (e.g. an interrupted append)
+                # so one bad row can't abort every future harvest — the golden
+                # set is hand-editable and append-only.
+                try:
                     entry = json.loads(line)
-                    existing_ids.add(entry["thread_id"])
+                except json.JSONDecodeError:
+                    print(f"Warning: skipping malformed line {lineno} in {existing_path}",
+                          file=sys.stderr)
+                    continue
+                thread_id = entry.get("thread_id")
+                if thread_id:
+                    existing_ids.add(thread_id)
 
     return [t for t in new_threads if t.thread_id not in existing_ids]
 
@@ -154,7 +165,13 @@ async def harvest_threads(
     if label_filter:
         filter_label_name = labels_config.get(label_filter, "")
         if filter_label_name:
-            query += f" label:{filter_label_name}"
+            # Quote the label name: classification labels contain hyphens
+            # (agent/needs-response, agent/low-priority) and an unquoted '-'
+            # can be read by Gmail as the NOT operator, silently matching nothing.
+            query += f' label:"{filter_label_name}"'
+        else:
+            print(f"Warning: --label '{label_filter}' has no mapping in [labels]; "
+                  "querying processed-only.", file=sys.stderr)
     try:
         response = await proxy.list_messages(
             q=query,
@@ -166,7 +183,7 @@ async def harvest_threads(
     msg_stubs = response.get("messages", [])
 
     if not msg_stubs:
-        print("No processed messages found.", file=sys.stderr)
+        print(f"No messages found for query: {query}", file=sys.stderr)
         return []
 
     # Group by threadId
@@ -285,11 +302,17 @@ def cli():
     parser.add_argument("--output", default="evals/golden_set.jsonl", help="Output JSONL path")
     parser.add_argument("--max-threads", type=int, default=200, help="Max threads to fetch")
     parser.add_argument("--sender-type", choices=["person", "service"], help="Filter by sender type")
-    parser.add_argument("--label", choices=["needs_response", "fyi", "low_priority"],
+    parser.add_argument("--label", choices=list(_CLASSIFICATION_LABELS),
                         help="Filter by classification label")
     parser.add_argument("--config", help="Path to config.toml (default: ./config.toml)")
     parser.add_argument("--proxy-url", help="API proxy URL (overrides PROXY_URL env var)")
+    # Deprecated no-op: harvest always appends now. Kept so existing automation
+    # that still passes --append doesn't abort with an argparse error.
+    parser.add_argument("--append", action="store_true", help=argparse.SUPPRESS)
     args = parser.parse_args()
+    if args.append:
+        print("Note: --append is deprecated and ignored; harvest always appends now.",
+              file=sys.stderr)
     asyncio.run(main(args))
 
 
