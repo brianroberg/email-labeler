@@ -132,6 +132,89 @@ Navigate to `http://localhost:5000`. Features:
 - **Run detail**: Metrics, confusion matrices, per-class P/R/F1, per-thread results with chain-of-thought.
 - **Compare**: Select a baseline and comparison runs to see side-by-side accuracy deltas.
 
+## Newsletter evaluation
+
+The daemon's newsletter pipeline (active under `NEWSLETTER_ONLY=1`) grades
+ministry-newsletter stories: it **extracts** stories from a body, **scores** each
+on 4 quality dimensions (simple/concrete/personal/dynamic, 1–5) → a **tier**
+(excellent/good/fair/poor), and tags **themes** (scripture/christlikeness/church/
+vocation-family/disciple-making). This harness measures whether that grading is any
+good, so you can **iterate on the prompts** and see the effect of each change.
+
+It mirrors the email eval's 4 stages, with newsletter-specific modules prefixed
+`newsletter_` (distinct from the top-level read-only `newsletter_review/` TUI):
+
+```
+newsletter_harvest → newsletter_label → newsletter_run → newsletter_report
+```
+
+- **harvest** — Pull candidate newsletters from Gmail into
+  `evals/newsletter_golden_set.jsonl`. Each is guarded by `is_newsletter(...)` and
+  its `body` is built exactly like production input. **No ground truth is inferred** —
+  newsletters land unlabeled with an empty story list.
+- **label** — A curses/CLI tool to build ground truth by hand (quality is
+  subjective, so there are no auto-labels). Phase A curates the story list
+  (seeded from the production extractor, then confirmed/split/merged); Phase B
+  assigns per-story dimension scores + themes. The tier is auto-derived from scores.
+- **run** — Replay the golden set through the real classifier (LLM-cached) and
+  write timestamped results.
+- **report** — Compute tier/dimension/theme/extraction metrics, compare two runs,
+  or show a trend across runs.
+
+**Fixed golden stories.** Extraction is inherently variable, so quality and theme
+scoring is *decoupled* from it: one golden set holds both. Extraction is scored at
+the newsletter-body level (raw body → predicted stories → matched against the
+newsletter's golden story list). Quality + themes are scored on the **fixed golden
+`(title, text)`** of each reviewed story, independent of what extraction produced —
+so a prompt tweak that only affects scoring is measured cleanly.
+
+```bash
+# 1. Harvest a few newsletters (no ground truth yet)
+uv run python -m evals.newsletter_harvest --proxy-url http://localhost:8000 --max-threads 50
+
+# 2. Label them: curate stories, then score dimensions + themes
+uv run python -m evals.newsletter_label
+uv run python -m evals.newsletter_label --unreviewed-only   # only unlabeled
+uv run python -m evals.newsletter_label --edit              # revisit reviewed ones
+
+# 3. Run the whole pipeline and print a report
+uv run python -m evals.newsletter_run --mode all --tag baseline --report
+
+# 4. Report on a single run, or a trend
+uv run python -m evals.newsletter_report --results evals/newsletter_results/<run>.jsonl
+uv run python -m evals.newsletter_report --results-dir evals/newsletter_results/
+```
+
+**Build a golden set:**
+
+```bash
+uv run python -m evals.newsletter_harvest --proxy-url http://localhost:8000
+uv run python -m evals.newsletter_label --unreviewed-only
+```
+
+**Iterate a prompt variant:**
+
+```bash
+uv run python -m evals.newsletter_run --tag baseline
+# Edit a [newsletter.prompts.*] block in config.toml (or use --prompts alt.toml), then:
+uv run python -m evals.newsletter_run --prompts alt.toml --tag variant
+```
+
+The shared cache (`evals/cache/llm_cache.jsonl`) is keyed by prompt content, so
+unchanged stages are reused and only the changed prompt is re-run. Each run records
+a `prompt_hash`, so variants are self-identifying.
+
+**Compare two runs:**
+
+```bash
+uv run python -m evals.newsletter_report \
+    --compare evals/newsletter_results/*baseline*.jsonl evals/newsletter_results/*variant*.jsonl --verbose
+```
+
+The comparison renders tier/dimension/theme/extraction deltas and prints each run's
+`prompt_hash` + tag; `--verbose` lists per-story flips and per-newsletter extraction
+diffs.
+
 ## Typical Workflows
 
 **Evaluate a new local model (fast path):**

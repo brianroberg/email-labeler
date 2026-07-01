@@ -104,6 +104,110 @@ explicitly, e.g. `--local-extra-body '{"enable_thinking": false}'`.
 | `--host` | Host to bind to (default: `127.0.0.1`) |
 | `--port` | Port to bind to (default: `5000`) |
 
+## Newsletter Evaluation CLI Reference
+
+The newsletter eval harness mirrors the email eval's 4-stage shape
+(`newsletter_harvest → newsletter_label → newsletter_run → newsletter_report`) but
+scores the newsletter grading pipeline (story extraction, per-story quality
+scores/tier, and themes). Its modules live under `evals/` prefixed `newsletter_`
+to avoid colliding with the top-level read-only `newsletter_review/` package.
+
+### newsletter_harvest
+
+| Flag | Description |
+|---|---|
+| `--output` | Output golden-set JSONL path (default: `evals/newsletter_golden_set.jsonl`) |
+| `--max-threads` | Max threads to fetch (default: `50`) |
+| `--recipient` | Newsletter recipient to query (`to:<recipient>`); default from `config["newsletter"]["recipient"]` |
+| `--config` | Path to config.toml (default: `./config.toml`) |
+| `--proxy-url` | API proxy URL (overrides `PROXY_URL` env var) |
+
+Harvest guards each candidate with `is_newsletter(...)`, builds `body` via
+`daemon.format_thread_transcript(...)` (identical to production input), and seeds
+each `GoldenNewsletter` with `stories=[]` and `reviewed=False` — **no ground truth
+is inferred**. It always appends, deduplicating by `thread_id`, and tolerates
+malformed existing lines. To rebuild from scratch, delete the file manually.
+
+### newsletter_label
+
+| Flag | Description |
+|---|---|
+| `--golden-set` | Path to newsletter golden set JSONL (default: `evals/newsletter_golden_set.jsonl`) |
+| `--edit` | Curses TUI for editing already-reviewed newsletters |
+| `--unreviewed-only` | Show only newsletters not yet reviewed |
+| `--config` | Path to config.toml (default: `./config.toml`) |
+
+Two phases per newsletter. **Phase A** curates the story list (extraction truth):
+the list is seeded once by running the production `parse_stories` extractor (a
+cached LLM call), then the reviewer confirms/splits/merges/edits/adds/deletes each
+boundary. Confirming sets `newsletter.reviewed=True` and assigns each story a
+stable `story_id`. **Phase B** labels each story: the 4 dimensions (simple,
+concrete, personal, dynamic; `1`–`5`), multi-select themes, notes, undo;
+`expected_tier` is auto-derived via `compute_tier` on save and `story.reviewed`
+is set. Saves are atomic (temp-file + rename). `excluded` stories are kept as
+extraction truth but skipped from quality/theme scoring.
+
+### newsletter_run
+
+| Flag | Description |
+|---|---|
+| `--golden-set` | Path to newsletter golden set JSONL (default: `evals/newsletter_golden_set.jsonl`) |
+| `--config` | Path to config.toml (default: `./config.toml`) |
+| `--output-dir` | Output directory for results (default: `evals/newsletter_results/`) |
+| `--mode` | Which outputs to evaluate: `extraction`, `quality`, `themes`, or `all` (default: `all`) |
+| `--tag` | Tag for the results filename (e.g. `baseline`) |
+| `--no-cache` | Disable the LLM response cache (default: cache enabled) |
+| `--parallelism` | Concurrent evaluations (default: `1`) |
+| `--include-unreviewed` | Also evaluate newsletters not yet reviewed (default: reviewed only) |
+| `--prompts` | Path to a TOML file whose `[newsletter.prompts.*]` blocks are deep-merged over the base config (changes `prompt_hash`) |
+| `--model` | Override the newsletter LLM model name from config |
+| `--report` | Print a metrics report for this run after it completes |
+| `--compare-to` | After the run, print a comparison against this prior results JSONL file |
+| `--skip-preflight` | Skip the endpoint reachability check before evaluating |
+
+Run replays the golden set through the real `NewsletterClassifier` using the
+`[newsletter.llm]` endpoint (resolved via `resolve_newsletter_llm_endpoint()`).
+Extraction mode feeds each `body` through `extract_stories`; quality/theme mode
+scores the **fixed golden `(title, text)`** of every reviewed, non-excluded story
+(independent of what extraction produced) and derives the predicted tier via
+`compute_tier`. Outputs are timestamped `<ts>_<mode>_<tag>_<runid8>.jsonl`
+(`NewsletterRunMeta` first line, then `NewsletterPrediction` rows) plus a
+non-empty `.cot.jsonl` sidecar.
+
+### newsletter_report
+
+| Flag | Description |
+|---|---|
+| `--results` | Path to a single results JSONL file |
+| `--compare` | Two result file paths for side-by-side comparison |
+| `--results-dir` | Directory of results for trend view |
+| `--verbose` | Show per-story flips and per-newsletter extraction diffs |
+| `--format` | `table` (default) or `json` |
+| `--match-threshold` | `SequenceMatcher` ratio threshold for the extraction one-to-one match (default: `0.6`) |
+
+Report computes tier accuracy + confusion matrix + P/R/F1 (excellent/good/fair/
+poor), per-dimension MAE and exact/within-1 agreement, per-theme + micro/macro
+multi-label F1 + exact-set-match, and extraction precision/recall/F1 from a greedy
+one-to-one `SequenceMatcher` match. `--compare` prints a Run A/Run B/Delta table
+and shows each run's `prompt_hash` + `tag` in the header; `--results-dir` renders a
+trend table. Parse-failure rows (`scores is None`) are counted as errors and
+excluded from the tier matrix.
+
+### Newsletter shared cache & prompt separation
+
+The newsletter runner reuses the **same** disk cache as the email eval —
+`evals/cache/llm_cache.jsonl` via `CachedLLMClient` — with no cache changes. The
+cache key `[model, temperature, max_tokens, extra_body, system_prompt,
+user_content]` already **separates prompt variants by content**: editing a
+`[newsletter.prompts.*]` string changes the `system_prompt` (and thus the key), so
+A/B runs are cached independently and unchanged stages are reused. Each run's
+`NewsletterRunMeta` records a **`prompt_hash`** =
+`sha256(json.dumps(config["newsletter"]["prompts"], sort_keys=True))[:16]` plus the
+model/temperature/max_tokens/extra_body/tag/counts and the three system prompts
+verbatim, so prompt A/Bs are self-identifying and comparable. `--prompts` (and
+`--model`) are applied **before** `prompt_hash` is computed, so an override yields a
+distinct hash.
+
 ## LLM Response Cache
 
 The eval suite includes a disk-backed LLM response cache that avoids redundant LLM calls across repeated evaluation runs. This is especially useful during prompt A/B testing or model swaps — once a thread has been evaluated with a given configuration, re-running produces instant results from cache.
