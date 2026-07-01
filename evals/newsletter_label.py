@@ -7,9 +7,13 @@ Usage:
 
 Phase A (curate stories / extraction truth): seed candidate stories by running
 the production ``newsletter.parse_stories`` over a one-time LLM extraction of
-the body, then split/merge/edit/add/delete candidates. Confirming the list
-sets ``newsletter.reviewed=True`` and assigns each story a stable
-``story_id = f"{thread_id}:{index}"``.
+the body (a deletable starting point), then build the authoritative story list
+by marking body segments — move the cursor over the rendered body, press ``s``/
+``e`` to set the selection start/end line, and ``Enter`` to make a story from
+that inclusive span — plus add/edit/delete candidates. Confirming the list sets
+``newsletter.reviewed=True`` and assigns each story a stable
+``story_id = f"{thread_id}:{index}"``. A newsletter can also be skipped (``k``)
+without marking it reviewed, so it resurfaces in a later pass.
 
 Phase B (per-story labels): assign the 4 dimension scores
 (simple/concrete/personal/dynamic, 1-5) and multi-select themes; on save the
@@ -28,6 +32,7 @@ import json
 import os
 import sys
 import tempfile
+import textwrap
 from pathlib import Path
 
 from evals.newsletter_schemas import GoldenNewsletter, GoldenStory
@@ -128,40 +133,30 @@ def add_story(newsletter, title, text):
     return story
 
 
-def split_story(newsletter, index, split_at):
-    """Split an over-merged candidate into two at the first occurrence of
-    *split_at* within its text.
+def create_story_from_body(newsletter, start_line, end_line, title):
+    """Build a candidate story from an inclusive span of body lines.
 
-    The second story begins at *split_at* (marker kept in the tail). Both
-    halves inherit the original title; ids are reindexed on confirm.
+    *start_line* / *end_line* are indices into ``newsletter.body.splitlines()``;
+    they are normalized (min/max) and clamped to the valid range, so order and
+    out-of-range values are tolerated. The span text is the inclusive
+    ``lo..hi`` slice joined with newlines. A falsy *title* is auto-derived from
+    the first ~8 words of the segment. Appends the story with a stable
+    ``story_id``; ``newsletter.reviewed`` is left untouched.
     """
-    story = newsletter.stories[index]
-    pos = story.text.find(split_at)
-    if pos < 0:
-        return  # marker not found — leave unchanged
-    head = story.text[:pos].strip()
-    tail = story.text[pos:].strip()
-    story.text = head
-    new_story = GoldenStory(
-        story_id=f"{newsletter.thread_id}:{index + 1}",
-        title=story.title,
-        text=tail,
+    body_lines = newsletter.body.splitlines()
+    last = max(0, len(body_lines) - 1)
+    lo = max(0, min(start_line, end_line))
+    hi = min(last, max(start_line, end_line))
+    text = "\n".join(body_lines[lo:hi + 1])
+    if not title:
+        title = " ".join(text.split()[:8]).strip() or "(untitled)"
+    story = GoldenStory(
+        story_id=f"{newsletter.thread_id}:{len(newsletter.stories)}",
+        title=title,
+        text=text,
     )
-    newsletter.stories.insert(index + 1, new_story)
-    return new_story
-
-
-def merge_stories(newsletter, index):
-    """Merge the candidate at *index* with its immediate successor.
-
-    Texts are joined with a newline; the merged story keeps the first story's
-    title. Ids are reindexed on confirm.
-    """
-    if index + 1 >= len(newsletter.stories):
-        return
-    first = newsletter.stories[index]
-    second = newsletter.stories.pop(index + 1)
-    first.text = f"{first.text}\n{second.text}"
+    newsletter.stories.append(story)
+    return story
 
 
 def edit_story(newsletter, index, *, title=None, text=None):
@@ -303,6 +298,71 @@ def build_extractor(config: dict):
 
 
 # ---------------------------------------------------------------------------
+# Pure rendering helpers (no curses; fully testable)
+# ---------------------------------------------------------------------------
+
+def wrap_text(text: str, width: int) -> list[str]:
+    """Wrap *text* to *width*, preserving existing newlines.
+
+    Mirrors ``newsletter_review.tui.wrap_text``: ``width <= 0`` disables
+    wrapping and empty *text* yields ``[""]``.
+    """
+    if not text:
+        return [""]
+    lines = []
+    for paragraph in text.splitlines():
+        if width <= 0:
+            lines.append(paragraph)
+        else:
+            wrapped = textwrap.wrap(paragraph, width) or [""]
+            lines.extend(wrapped)
+    return lines
+
+
+def build_detail_rows(newsletter, index, total, width) -> list[tuple[str, int | None]]:
+    """Build the wrapped detail-view rows with body-line provenance.
+
+    Each returned row is ``(text, body_line_index_or_None)``. Header/metadata/
+    story-list rows carry ``None``. Each logical body line (from
+    ``body.splitlines()``) is wrapped to *width*, and every resulting physical
+    row carries THAT body line's index — the provenance map the view uses for
+    selection and highlighting.
+    """
+    rows: list[tuple[str, int | None]] = []
+
+    def add_header(text: str) -> None:
+        for line in wrap_text(text, width):
+            rows.append((line, None))
+
+    add_header(f"Newsletter {index + 1}/{total}  (id: {newsletter.thread_id})")
+    add_header("=" * 60)
+    add_header(f"Subject:  {newsletter.subject}")
+    add_header(f"Sender:   {newsletter.sender}")
+    add_header(f"Reviewed: {newsletter.reviewed}")
+    add_header(f"Seeded:   {newsletter.seeded_from or '-'}")
+    if newsletter.notes:
+        add_header(f"Notes:    {newsletter.notes}")
+    add_header("")
+    add_header(f"--- Stories ({len(newsletter.stories)}) ---")
+    for i, s in enumerate(newsletter.stories):
+        flags = []
+        if s.excluded:
+            flags.append("EXCLUDED")
+        if s.reviewed:
+            flags.append(s.expected_tier or "reviewed")
+        flag_str = f"  [{', '.join(flags)}]" if flags else ""
+        add_header(f"[{i}] {s.title}{flag_str}")
+        add_header(f"    themes: {', '.join(s.expected_themes) or '-'}")
+    add_header("")
+    add_header("--- Body ---")
+
+    for body_idx, body_line in enumerate(newsletter.body.splitlines()):
+        for physical in wrap_text(body_line, width):
+            rows.append((physical, body_idx))
+    return rows
+
+
+# ---------------------------------------------------------------------------
 # Curses helpers (mirroring evals.edit_tui)
 # ---------------------------------------------------------------------------
 
@@ -330,34 +390,6 @@ def _prompt_line(stdscr, prompt: str) -> str:
         curses.noecho()
         curses.curs_set(0)
     return raw.decode("utf-8", "replace").strip()
-
-
-def _newsletter_lines(newsletter, index, total) -> list[str]:
-    lines = [
-        f"Newsletter {index + 1}/{total}  (id: {newsletter.thread_id})",
-        "=" * 60,
-        f"Subject:  {newsletter.subject}",
-        f"Sender:   {newsletter.sender}",
-        f"Reviewed: {newsletter.reviewed}",
-        f"Seeded:   {newsletter.seeded_from or '-'}",
-    ]
-    if newsletter.notes:
-        lines.append(f"Notes:    {newsletter.notes}")
-    lines.append("")
-    lines.append(f"--- Stories ({len(newsletter.stories)}) ---")
-    for i, s in enumerate(newsletter.stories):
-        flags = []
-        if s.excluded:
-            flags.append("EXCLUDED")
-        if s.reviewed:
-            flags.append(s.expected_tier or "reviewed")
-        flag_str = f"  [{', '.join(flags)}]" if flags else ""
-        lines.append(f"[{i}] {s.title}{flag_str}")
-        lines.append(f"    themes: {', '.join(s.expected_themes) or '-'}")
-    lines.append("")
-    lines.append("--- Body ---")
-    lines.extend(newsletter.body.splitlines())
-    return lines
 
 
 def _prompt_scores(stdscr) -> dict[str, int] | None:
@@ -404,42 +436,76 @@ def _prompt_themes(stdscr) -> list[str]:
 # ---------------------------------------------------------------------------
 
 def _newsletter_detail(stdscr, newsletters, index, all_newsletters, path, *, extract_fn=None):
-    """Curate + label one newsletter. Returns "back" or "quit"."""
+    """Curate + label one newsletter. Returns "back", "skip", or "quit"."""
     newsletter = newsletters[index]
     total = len(newsletters)
     scroll_y = 0
+    cursor = 0  # index into rendered rows
+    sel_start = None  # selected body-line index
+    sel_end = None
     snapshot = None  # one snapshot per newsletter for undo
 
     def save():
         _auto_save(all_newsletters, path, stdscr)
 
+    def hint(msg):
+        max_y, _ = stdscr.getmaxyx()
+        _safe_addstr(stdscr, max_y - 1, 0, msg, curses.A_REVERSE)
+        stdscr.refresh()
+        stdscr.getch()
+
     while True:
-        lines = _newsletter_lines(newsletter, index, total)
         max_y, max_x = stdscr.getmaxyx()
+        rows = build_detail_rows(newsletter, index, total, max_x - 1)
         content_rows = max(1, max_y - 2)
+        cursor = max(0, min(cursor, len(rows) - 1))
+        # Auto-scroll so the cursor row stays visible.
+        if cursor < scroll_y:
+            scroll_y = cursor
+        elif cursor >= scroll_y + content_rows:
+            scroll_y = cursor - content_rows + 1
+        max_scroll = max(0, len(rows) - content_rows)
+
+        lo = hi = None
+        if sel_start is not None and sel_end is not None:
+            lo, hi = min(sel_start, sel_end), max(sel_start, sel_end)
+        elif sel_start is not None:
+            lo = hi = sel_start
+
         stdscr.clear()
         for row_i in range(content_rows):
-            li = scroll_y + row_i
-            if li >= len(lines):
+            ri = scroll_y + row_i
+            if ri >= len(rows):
                 break
-            _safe_addstr(stdscr, row_i, 0, lines[li])
+            text, body_idx = rows[ri]
+            selected = (
+                body_idx is not None and lo is not None and lo <= body_idx <= hi
+            )
+            if ri == cursor:
+                _safe_addstr(stdscr, row_i, 0, text, curses.A_REVERSE)
+            elif selected:
+                _safe_addstr(stdscr, row_i, 0, "*", curses.A_BOLD)
+                _safe_addstr(stdscr, row_i, 1, text, curses.A_BOLD)
+            else:
+                _safe_addstr(stdscr, row_i, 0, text)
         help_text = (
-            "[Space]seed [a]dd [e]dit [x]split [m]erge [d]el [c]onfirm "
-            "[l]abel [u]nexclude/exclude [n]notes [z]undo Esc:Back q:Quit"
+            "↑/↓ move  s/e select  Enter make-story  [a]dd [E]dit [d]el "
+            "[c]onfirm [l]abel [u]exclude [n]notes [z]undo [k]skip Esc:Back q:Quit"
         )
         _safe_addstr(stdscr, max_y - 2, 0, help_text, curses.A_DIM)
-        max_scroll = max(0, len(lines) - content_rows)
         stdscr.refresh()
 
         key = stdscr.getch()
 
-        if key == curses.KEY_UP and scroll_y > 0:
-            scroll_y -= 1
-        elif key == curses.KEY_DOWN and scroll_y < max_scroll:
-            scroll_y += 1
+        if key == curses.KEY_UP and cursor > 0:
+            cursor -= 1
+        elif key == curses.KEY_DOWN and cursor < len(rows) - 1:
+            cursor += 1
         elif key == curses.KEY_NPAGE:
+            cursor = min(len(rows) - 1, cursor + content_rows)
             scroll_y = min(max_scroll, scroll_y + content_rows)
         elif key == curses.KEY_PPAGE:
+            cursor = max(0, cursor - content_rows)
             scroll_y = max(0, scroll_y - content_rows)
 
         elif key == ord(" "):  # seed via extractor
@@ -449,9 +515,33 @@ def _newsletter_detail(stdscr, newsletters, index, all_newsletters, path, *, ext
                     seed_from_extractor(newsletter, extract_fn)
                     save()
                 except Exception as exc:
-                    _safe_addstr(stdscr, max_y - 1, 0, f"Seed failed: {exc}", curses.A_REVERSE)
-                    stdscr.refresh()
-                    stdscr.getch()
+                    hint(f"Seed failed: {exc}")
+
+        elif key == ord("s"):  # set selection start
+            body_idx = rows[cursor][1]
+            if body_idx is None:
+                hint("Move the cursor onto a body line first.")
+            else:
+                sel_start = body_idx
+
+        elif key == ord("e"):  # set selection end
+            body_idx = rows[cursor][1]
+            if body_idx is None:
+                hint("Move the cursor onto a body line first.")
+            else:
+                sel_end = body_idx
+
+        elif key in (curses.KEY_ENTER, ord("\n"), ord("\r")):  # make story
+            if sel_start is None:
+                hint("Set a selection start with 's' first.")
+            else:
+                s_line = sel_start
+                e_line = sel_end if sel_end is not None else sel_start
+                title = _prompt_line(stdscr, "Title (blank=auto):")
+                snapshot = capture_snapshot(newsletter)
+                create_story_from_body(newsletter, s_line, e_line, title)
+                save()
+                sel_start = sel_end = None
 
         elif key == ord("a"):  # add story
             snapshot = capture_snapshot(newsletter)
@@ -461,7 +551,7 @@ def _newsletter_detail(stdscr, newsletters, index, all_newsletters, path, *, ext
                 add_story(newsletter, title, text)
                 save()
 
-        elif key == ord("e"):  # edit story
+        elif key == ord("E"):  # edit story
             snapshot = capture_snapshot(newsletter)
             si = _prompt_index(stdscr, newsletter)
             if si is not None:
@@ -472,22 +562,6 @@ def _newsletter_detail(stdscr, newsletters, index, all_newsletters, path, *, ext
                     title=title or None,
                     text=text or None,
                 )
-                save()
-
-        elif key == ord("x"):  # split
-            snapshot = capture_snapshot(newsletter)
-            si = _prompt_index(stdscr, newsletter)
-            if si is not None:
-                marker = _prompt_line(stdscr, "Split at text:")
-                if marker:
-                    split_story(newsletter, si, marker)
-                    save()
-
-        elif key == ord("m"):  # merge with successor
-            snapshot = capture_snapshot(newsletter)
-            si = _prompt_index(stdscr, newsletter)
-            if si is not None:
-                merge_stories(newsletter, si)
                 save()
 
         elif key == ord("d"):  # delete
@@ -531,6 +605,8 @@ def _newsletter_detail(stdscr, newsletters, index, all_newsletters, path, *, ext
                 snapshot = None
                 save()
 
+        elif key == ord("k"):  # skip this newsletter (never marks reviewed)
+            return "skip"
         elif key == 27:  # Esc
             return "back"
         elif key == ord("q"):
@@ -595,11 +671,21 @@ def _list_view(stdscr, newsletters, all_newsletters, path, *, extract_fn=None):
             if cursor >= scroll_offset + page_size:
                 scroll_offset = cursor - page_size + 1
         elif key in (curses.KEY_ENTER, ord("\n"), ord("\r")):
-            result = _newsletter_detail(
-                stdscr, newsletters, cursor, all_newsletters, path, extract_fn=extract_fn
-            )
-            if result == "quit":
-                return
+            while True:
+                result = _newsletter_detail(
+                    stdscr, newsletters, cursor, all_newsletters, path, extract_fn=extract_fn
+                )
+                if result == "quit":
+                    return
+                if result == "skip" and cursor < len(newsletters) - 1:
+                    # Linear skip-through: advance and immediately open the next
+                    # newsletter. Skipping never marks reviewed, so it resurfaces.
+                    cursor += 1
+                    if cursor >= scroll_offset + page_size:
+                        scroll_offset = cursor - page_size + 1
+                    continue
+                # "back", or "skip" on the last newsletter -> return to list.
+                break
         elif key == ord("q"):
             return
 

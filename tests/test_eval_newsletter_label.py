@@ -10,19 +10,20 @@ import sys
 from evals.newsletter_label import (
     add_story,
     assign_scores_and_themes,
+    build_detail_rows,
     capture_snapshot,
     confirm_story_list,
+    create_story_from_body,
     delete_story,
     edit_story,
     exclude_story,
     load_golden_set,
-    merge_stories,
     restore_snapshot,
     save_golden_set,
     seed_from_extractor,
     seed_stories,
     select_label_newsletters,
-    split_story,
+    wrap_text,
 )
 from evals.newsletter_schemas import GoldenNewsletter, GoldenStory
 from newsletter import NewsletterTier, compute_tier
@@ -210,38 +211,119 @@ class TestEditStory:
         assert nl.stories[0].text == "a"  # unchanged
 
 
-class TestSplitStory:
-    def test_split_replaces_one_candidate_with_two(self):
-        nl = _newsletter("tSp")
-        seed_stories(nl, [("Merged", "part one\npart two")])
+class TestWrapText:
+    def test_long_line_wraps_to_multiple_lines(self):
+        wrapped = wrap_text("aaaa bbbb cccc", 5)
+        assert len(wrapped) >= 2
+        assert all(len(line) <= 5 for line in wrapped)
 
-        split_story(nl, 0, "part two")
+    def test_newlines_preserved(self):
+        wrapped = wrap_text("one\ntwo", 80)
+        assert wrapped == ["one", "two"]
 
-        assert len(nl.stories) == 2
-        assert nl.stories[0].text == "part one"
-        assert nl.stories[1].text == "part two"
+    def test_width_zero_leaves_unchanged(self):
+        wrapped = wrap_text("a very long line here", 0)
+        assert wrapped == ["a very long line here"]
 
-    def test_split_second_half_starts_at_marker(self):
-        nl = _newsletter("tSp")
-        seed_stories(nl, [("M", "aaa BREAK bbb")])
-
-        split_story(nl, 0, "BREAK bbb")
-
-        assert nl.stories[0].text == "aaa"
-        assert nl.stories[1].text == "BREAK bbb"
+    def test_empty_text_yields_single_empty_string(self):
+        assert wrap_text("", 80) == [""]
 
 
-class TestMergeStories:
-    def test_merge_combines_candidate_with_successor(self):
-        nl = _newsletter("tM")
-        seed_stories(nl, [("A", "a"), ("B", "b"), ("C", "c")])
+class TestCreateStoryFromBody:
+    def test_multi_line_inclusive_span_joined_with_newlines(self):
+        nl = _newsletter("tB", body="l0\nl1\nl2\nl3")
 
-        merge_stories(nl, 0)
+        story = create_story_from_body(nl, 1, 2, "Title")
 
-        assert len(nl.stories) == 2
-        assert nl.stories[0].title == "A"
-        assert nl.stories[0].text == "a\nb"
-        assert nl.stories[1].title == "C"
+        assert story.text == "l1\nl2"
+        assert nl.stories[-1] is story
+
+    def test_single_line_span(self):
+        nl = _newsletter("tB", body="l0\nl1\nl2")
+
+        story = create_story_from_body(nl, 1, 1, "T")
+
+        assert story.text == "l1"
+
+    def test_start_greater_than_end_normalized(self):
+        nl = _newsletter("tB", body="l0\nl1\nl2\nl3")
+
+        story = create_story_from_body(nl, 3, 1, "T")
+
+        assert story.text == "l1\nl2\nl3"
+
+    def test_out_of_range_clamped(self):
+        nl = _newsletter("tB", body="l0\nl1\nl2")
+
+        story = create_story_from_body(nl, -5, 99, "T")
+
+        assert story.text == "l0\nl1\nl2"
+
+    def test_small_negative_start_clamps_to_zero_not_from_end(self):
+        # Guards the *lower* clamp specifically: without max(0, ...) a small
+        # negative start would slice from the end (Python slice semantics),
+        # silently dropping the leading body lines.
+        nl = _newsletter("tB", body="l0\nl1\nl2")
+
+        story = create_story_from_body(nl, -1, 1, "T")
+
+        assert story.text == "l0\nl1"
+
+    def test_stable_story_id_and_reviewed_untouched(self):
+        nl = _newsletter("tB", body="l0\nl1")
+        nl.stories = [_story("tB:0")]
+
+        story = create_story_from_body(nl, 0, 0, "T")
+
+        assert story.story_id == "tB:1"
+        assert nl.reviewed is False
+
+    def test_empty_title_auto_derived_from_first_words(self):
+        body = " ".join(f"w{i}" for i in range(20))
+        nl = _newsletter("tB", body=body)
+
+        story = create_story_from_body(nl, 0, 0, "")
+
+        # First ~8 words, single line, trimmed, non-empty.
+        assert story.title
+        assert "\n" not in story.title
+        assert story.title.startswith("w0 w1 w2")
+        assert len(story.title.split()) <= 8
+
+    def test_empty_title_on_whitespace_only_segment_is_non_empty(self):
+        # Selecting blank/whitespace-only body lines (common: blank separator
+        # rows) with a blank title must still yield a usable, non-empty title.
+        nl = _newsletter("tB", body="   \n\t\n  ")
+
+        story = create_story_from_body(nl, 0, 2, "")
+
+        assert story.title.strip()  # non-empty after stripping
+
+
+class TestBuildDetailRows:
+    def test_header_rows_have_none_body_idx(self):
+        nl = _newsletter("tR", body="body line one\nbody line two")
+        rows = build_detail_rows(nl, 0, 1, 80)
+
+        # The first rows (subject/sender/etc.) are header rows.
+        assert rows[0][1] is None
+        assert any(idx is None for _, idx in rows)
+
+    def test_long_body_line_wraps_sharing_body_idx(self):
+        nl = _newsletter("tR", body="aaaa bbbb cccc dddd")
+        rows = build_detail_rows(nl, 0, 1, 6)
+
+        body_rows = [r for r in rows if r[1] == 0]
+        assert len(body_rows) >= 2
+        assert all(len(text) <= 6 for text, _ in body_rows)
+
+    def test_distinct_body_idx_count_matches_body_lines(self):
+        body = "line0\nline1\nline2"
+        nl = _newsletter("tR", body=body)
+        rows = build_detail_rows(nl, 0, 1, 80)
+
+        distinct = {idx for _, idx in rows if idx is not None}
+        assert len(distinct) == len(body.splitlines())
 
 
 class TestConfirmStoryList:

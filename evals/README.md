@@ -154,7 +154,9 @@ newsletter_harvest → newsletter_label → newsletter_run → newsletter_report
   newsletters land unlabeled with an empty story list.
 - **label** — A curses/CLI tool to build ground truth by hand (quality is
   subjective, so there are no auto-labels). Phase A curates the story list
-  (seeded from the production extractor, then confirmed/split/merged); Phase B
+  (seeded from the production extractor as a starting point, then the reviewer
+  marks body segments — `s`/`e` to set the span, `Enter` to make a story — plus
+  add/edit/delete, or `k` to skip the newsletter for a later pass); Phase B
   assigns per-story dimension scores + themes. The tier is auto-derived from scores.
 - **run** — Replay the golden set through the real classifier (LLM-cached) and
   write timestamped results.

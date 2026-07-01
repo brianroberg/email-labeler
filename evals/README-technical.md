@@ -139,9 +139,14 @@ malformed existing lines. To rebuild from scratch, delete the file manually.
 
 Two phases per newsletter. **Phase A** curates the story list (extraction truth):
 the list is seeded once by running the production `parse_stories` extractor (a
-cached LLM call), then the reviewer confirms/splits/merges/edits/adds/deletes each
-boundary. Confirming sets `newsletter.reviewed=True` and assigns each story a
-stable `story_id`. **Phase B** labels each story: the 4 dimensions (simple,
+cached LLM call) as a deletable starting point, then the reviewer builds the
+authoritative list by marking body segments — move the cursor over the rendered
+body, press `s`/`e` to set the selection start/end line and `Enter` to make a
+story from that inclusive span — plus `a`dd/`E`dit/`d`elete. Confirming sets
+`newsletter.reviewed=True` and assigns each story a stable `story_id`. Pressing
+`k` skips the newsletter without marking it reviewed, so it resurfaces in a later
+pass (and the list view jumps straight to the next queued newsletter).
+**Phase B** labels each story: the 4 dimensions (simple,
 concrete, personal, dynamic; `1`–`5`), multi-select themes, notes, undo;
 `expected_tier` is auto-derived via `compute_tier` on save and `story.reviewed`
 is set. Saves are atomic (temp-file + rename). `excluded` stories are kept as
