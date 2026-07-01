@@ -171,8 +171,9 @@ Extraction mode feeds each `body` through `extract_stories`; quality/theme mode
 scores the **fixed golden `(title, text)`** of every reviewed, non-excluded story
 (independent of what extraction produced) and derives the predicted tier via
 `compute_tier`. Outputs are timestamped `<ts>_<mode>_<tag>_<runid8>.jsonl`
-(`NewsletterRunMeta` first line, then `NewsletterPrediction` rows) plus a
-non-empty `.cot.jsonl` sidecar.
+(`NewsletterRunMeta` first line, then `StoryPrediction` rows in quality/theme
+mode and `ExtractionPrediction` rows in extraction mode) plus a non-empty
+`.cot.jsonl` sidecar of `NewsletterThinkingEntry` rows.
 
 ### newsletter_report
 

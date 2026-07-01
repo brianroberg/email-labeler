@@ -167,3 +167,4 @@ All tests use mocks — no external services needed. Test files mirror source fi
 - `test_eval_newsletter_run.py` — `prompt_hash`, cache reuse, extraction vs quality/theme modes
 - `test_eval_newsletter_report.py` — `match_stories`, tier/dimension/theme metrics, comparison deltas
 - `test_eval_newsletter_cli_docs.py` — Every newsletter eval `--flag` documented in `README-technical.md`
+- `test_newsletter_eval_docs.py` — Newsletter eval modules/tests listed in `README-technical.md` structure + coverage
