@@ -352,6 +352,9 @@ def build_detail_rows(newsletter, index, total, width) -> list[tuple[str, int | 
             flags.append(s.expected_tier or "reviewed")
         flag_str = f"  [{', '.join(flags)}]" if flags else ""
         add_header(f"[{i}] {s.title}{flag_str}")
+        # Show the full parsed text inline (indented), wrapped to the width.
+        for text_line in wrap_text(s.text, max(1, width - 6)):
+            add_header(f"      {text_line}")
         add_header(f"    themes: {', '.join(s.expected_themes) or '-'}")
     add_header("")
     add_header("--- Body ---")

@@ -325,6 +325,28 @@ class TestBuildDetailRows:
         distinct = {idx for _, idx in rows if idx is not None}
         assert len(distinct) == len(body.splitlines())
 
+    def test_story_text_shown_inline_wrapped(self):
+        nl = _newsletter("tT", body="b0")
+        nl.stories = [
+            _story(
+                story_id="tT:0",
+                title="Alpha",
+                text="the quick brown fox jumped over the lazy dog",
+            )
+        ]
+        rows = build_detail_rows(nl, 0, 1, 20)
+        header_rows = [text for text, idx in rows if idx is None]
+        joined = " ".join(header_rows)
+
+        # Title still shown, and the FULL parsed text is shown inline (not truncated).
+        assert "Alpha" in joined
+        for word in ("quick", "brown", "fox", "lazy", "dog"):
+            assert word in joined
+        # Wrapped within the width and spanning multiple rows.
+        assert all(len(text) <= 20 for text in header_rows)
+        text_rows = [t for t in header_rows if any(w in t for w in ("quick", "fox", "lazy"))]
+        assert len(text_rows) >= 2
+
 
 class TestConfirmStoryList:
     def test_confirm_marks_newsletter_reviewed(self):
