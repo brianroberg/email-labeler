@@ -162,12 +162,12 @@ exits 1 with a one-line message instead of a traceback.
 | Flag | Description |
 |---|---|
 | `--golden-set` | Path to newsletter golden set JSONL (default: `evals/newsletter_golden_set.jsonl`) |
-| `--edit` | Disable LLM seeding — manual curation only. Same curses TUI, but `Space` is inert and no LLM endpoint is needed |
+| `--edit` | Disable LLM seeding — manual curation only. Same Textual TUI, but `Space` is inert and no LLM endpoint is needed |
 | `--unreviewed-only` | Show only newsletters not yet reviewed |
 | `--include-excluded` | Also queue excluded newsletters, so they can be inspected or restored with the `X` hotkey (default: excluded newsletters are skipped) |
 | `--config` | Path to config.toml (default: the repo-root `config.toml`, regardless of CWD) |
 
-Both modes open the same curses TUI; `--edit` only removes the Phase-A LLM
+Both modes open the same Textual TUI; `--edit` only removes the Phase-A LLM
 seeding (it does **not** filter to reviewed newsletters — combine with
 `--unreviewed-only` or not as needed). Without `--edit`, a missing
 `NEWSLETTER_LLM_URL`/`CLOUD_LLM_URL` exits immediately at startup with an

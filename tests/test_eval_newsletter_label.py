@@ -1,8 +1,9 @@
-"""Tests for evals.newsletter_label — pure state-transition functions.
+"""Tests for evals.newsletter_label — pure state transitions + Pilot UI tests.
 
-The curses UI is untested here by design; every behavior lives in a pure
-function that mutates a GoldenNewsletter / GoldenStory in place, so these
-tests exercise the labeling logic without a terminal.
+Every state transition lives in a pure function that mutates a
+GoldenNewsletter / GoldenStory in place, tested directly without a terminal.
+The Textual UI layer on top is driven with Textual's Pilot: real key presses
+in, widget state / rendered content / on-disk golden-set effects out.
 """
 
 import sys
@@ -746,48 +747,6 @@ class TestFormatThemeLegend:
         assert "Enter" in legend
 
 
-class TestLineBuffer:
-    def _buf(self, initial=""):
-        from evals.newsletter_label import LineBuffer
-        return LineBuffer(initial)
-
-    def test_prefill_places_cursor_at_end_and_keeps_text(self):
-        buf = self._buf("existing note")
-        assert buf.text() == "existing note"
-        buf.insert("!")
-        assert buf.text() == "existing note!"
-
-    def test_insert_backspace_and_cursor_movement(self):
-        buf = self._buf("ab")
-        buf.left()
-        buf.insert("X")
-        assert buf.text() == "aXb"
-        buf.backspace()
-        assert buf.text() == "ab"
-        buf.right()
-        buf.insert("Y")
-        assert buf.text() == "abY"
-
-    def test_control_characters_are_rejected(self):
-        buf = self._buf()
-        buf.insert("\x1b")  # Esc must never end up in the golden set
-        buf.insert("\n")
-        buf.insert("a")
-        assert buf.text() == "a"
-
-    def test_visible_scrolls_horizontally_so_input_is_never_truncated(self):
-        buf = self._buf("abcdefghij")  # 10 chars, window of 4
-        text, cur = buf.visible(4)
-        assert "j" in text  # window follows the cursor at the end
-        assert len(text) <= 4
-        assert 0 <= cur <= 4
-        for _ in range(10):
-            buf.left()
-        text, cur = buf.visible(4)
-        assert text.startswith("a")  # window follows the cursor back to the start
-        assert cur == 0
-
-
 class TestWrapTextDisplayWidth:
     def test_emoji_wrap_respects_display_width(self):
         # Each emoji occupies 2 terminal cells; 4 cells fit only 2 of them.
@@ -879,210 +838,250 @@ class TestBuildExtractorPreflight:
         assert "--edit" in msg
 
 
-class FakeScreen:
-    """Minimal curses-window stand-in: scripted keys, recorded frames.
+# ---------------------------------------------------------------------------
+# Pilot UI tests — drive the real Textual app: key presses in, widget state,
+# rendered content, and on-disk golden-set effects out.
+# ---------------------------------------------------------------------------
 
-    ``clear()`` starts a new frame; every ``addnstr`` is recorded as
-    ``(y, x, text, attr)`` in the current frame, so tests can assert on both
-    transient messages (any frame) and the final rendered state (last frame).
-    """
-
-    def __init__(self, keys, height=30, width=100):
-        self._keys = list(keys)
-        self.height = height
-        self.width = width
-        self.frames = [[]]
-
-    def getmaxyx(self):
-        return (self.height, self.width)
-
-    def clear(self):
-        self.frames.append([])
-
-    def refresh(self):
-        pass
-
-    def keypad(self, flag):
-        pass
-
-    def move(self, y, x):
-        pass
-
-    def addnstr(self, y, x, text, n, attr=0):
-        self.frames[-1].append((y, x, text[:n], attr))
-
-    def _pop(self):
-        if not self._keys:
-            raise AssertionError("key script exhausted — the TUI asked for more input")
-        return self._keys.pop(0)
-
-    def getch(self):
-        key = self._pop()
-        return ord(key) if isinstance(key, str) else key
-
-    def get_wch(self):
-        return self._pop()
-
-    def all_writes(self):
-        return [w for frame in self.frames for w in frame]
-
-    def texts(self):
-        return " | ".join(w[2] for w in self.all_writes())
-
-
-def _run_detail(keys, newsletters, tmp_path, extract_fn=None, index=0):
-    from evals.newsletter_label import _newsletter_detail
-
-    screen = FakeScreen(keys)
-    path = tmp_path / "golden.jsonl"
-    result = _newsletter_detail(
-        screen, newsletters, index, newsletters, path, extract_fn=extract_fn
-    )
-    return screen, result
+SIZE = (100, 30)
 
 
 def _scores(n=4):
     return {"simple": n, "concrete": n, "personal": n, "dynamic": n}
 
 
+def _label_app(newsletters, tmp_path, extract_fn=None):
+    from evals.newsletter_label import LabelApp
+
+    return LabelApp(
+        newsletters, newsletters, tmp_path / "golden.jsonl", extract_fn=extract_fn
+    )
+
+
+def _detail(app):
+    from evals.newsletter_label import DetailScreen
+
+    assert isinstance(app.screen, DetailScreen), f"not on detail: {app.screen!r}"
+    return app.screen
+
+
+def _status(app) -> str:
+    from textual.widgets import Static
+
+    return str(app.screen.query_one("#status", Static).render())
+
+
+def _screen_text(app) -> str:
+    from textual.widgets import Label, Static
+
+    parts = [str(w.render()) for w in app.screen.query(Static)]
+    parts += [str(w.render()) for w in app.screen.query(Label)]
+    return "\n".join(parts)
+
+
+def _cursor_row_text(app) -> str:
+    from textual.widgets import Label
+
+    screen = _detail(app)
+    lv = screen.query_one("#rows")
+    item = lv.children[lv.index]
+    return str(item.query_one(Label).render())
+
+
+async def _drain(app, pilot):
+    """Wait for background workers (e.g. seeding) to finish, then settle."""
+    await app.workers.wait_for_complete()
+    await pilot.pause()
+
+
+# Body rows start after: title, divider, subject, sender, reviewed, seeded,
+# blank, "--- Stories (0) ---", blank, "--- Body ---" = 10 header rows.
+BODY_START = 10
+
+
 class TestDetailSeedGuard:
-    def test_reseed_over_existing_stories_requires_confirmation(self, tmp_path):
+    async def test_reseed_over_existing_stories_requires_confirmation(self, tmp_path):
         nl = _newsletter("tg", body="b0\nb1")
         seed_stories(nl, [("Keep", "b0")])
         assign_scores_and_themes(nl.stories[0], _scores(), ["scripture"])
+        app = _label_app([nl], tmp_path, extract_fn=lambda body: "TITLE: New\nTEXT: b1")
+        async with app.run_test(size=SIZE) as pilot:
+            await pilot.press("enter", "space")
+            await pilot.press("n")  # y/N prompt: keep the curated story
+            await _drain(app, pilot)
+            assert [s.title for s in nl.stories] == ["Keep"]
+            assert nl.stories[0].expected_scores == _scores()
+            assert "Seed cancelled" in _status(app)
 
-        screen, _ = _run_detail(
-            [" ", "n", "q"], [nl], tmp_path, extract_fn=lambda body: "TITLE: New\nTEXT: b1"
-        )
-
-        # 'n' at the y/N prompt keeps the curated story AND its labels.
-        assert [s.title for s in nl.stories] == ["Keep"]
-        assert nl.stories[0].expected_scores == _scores()
-
-    def test_confirmed_reseed_replaces_and_reports_count(self, tmp_path):
+    async def test_confirmed_reseed_replaces_and_reports_count(self, tmp_path):
         nl = _newsletter("tg", body="b0\nb1")
         seed_stories(nl, [("Old", "b0")])
+        app = _label_app([nl], tmp_path, extract_fn=lambda body: "TITLE: New\nTEXT: b1")
+        async with app.run_test(size=SIZE) as pilot:
+            await pilot.press("enter", "space")
+            await pilot.press("y")
+            await _drain(app, pilot)
+            assert [s.title for s in nl.stories] == ["New"]
+            assert "Seeded 1" in _status(app)
 
-        screen, _ = _run_detail(
-            [" ", "y", "q"], [nl], tmp_path, extract_fn=lambda body: "TITLE: New\nTEXT: b1"
-        )
-
-        assert [s.title for s in nl.stories] == ["New"]
-        assert "Seeded 1" in screen.texts()
-
-    def test_empty_story_list_seeds_without_confirmation(self, tmp_path):
+    async def test_empty_story_list_seeds_without_confirmation(self, tmp_path):
         nl = _newsletter("tg", body="b0")
+        app = _label_app([nl], tmp_path, extract_fn=lambda body: "TITLE: A\nTEXT: b0")
+        async with app.run_test(size=SIZE) as pilot:
+            await pilot.press("enter", "space")
+            await _drain(app, pilot)
+            assert [s.title for s in nl.stories] == ["A"]
 
-        _run_detail([" ", "q"], [nl], tmp_path, extract_fn=lambda body: "TITLE: A\nTEXT: b0")
-
-        assert [s.title for s in nl.stories] == ["A"]
-
-    def test_no_stories_verdict_is_reported_distinctly(self, tmp_path):
+    async def test_no_stories_verdict_is_reported_distinctly(self, tmp_path):
         nl = _newsletter("tg", body="admin only")
+        app = _label_app([nl], tmp_path, extract_fn=lambda body: "NO_STORIES")
+        async with app.run_test(size=SIZE) as pilot:
+            await pilot.press("enter", "space")
+            await _drain(app, pilot)
+            assert "NO_STORIES" in _status(app)
 
-        screen, _ = _run_detail([" ", "q"], [nl], tmp_path, extract_fn=lambda body: "NO_STORIES")
-
-        assert "NO_STORIES" in screen.texts()
-
-    def test_edit_mode_space_reports_seeding_disabled(self, tmp_path):
+    async def test_edit_mode_space_reports_seeding_disabled(self, tmp_path):
         nl = _newsletter("tg", body="b0")
         seed_stories(nl, [("Keep", "b0")])
+        app = _label_app([nl], tmp_path, extract_fn=None)
+        async with app.run_test(size=SIZE) as pilot:
+            await pilot.press("enter", "space")
+            await _drain(app, pilot)
+            assert [s.title for s in nl.stories] == ["Keep"]
+            assert "edit mode" in _status(app).lower()
 
-        screen, _ = _run_detail([" ", "q"], [nl], tmp_path, extract_fn=None)
-
-        assert [s.title for s in nl.stories] == ["Keep"]
-        assert "edit mode" in screen.texts().lower()
-
-    def test_seed_failure_keeps_stories_and_undo_clean(self, tmp_path):
+    async def test_seed_failure_keeps_stories_and_undo_clean(self, tmp_path):
         def boom(body):
             raise RuntimeError("connection dropped")
 
         nl = _newsletter("tg", body="b0")
-        # Space (empty list, no confirm) -> failure hint (any key) -> z -> q
-        screen, _ = _run_detail([" ", "x", "z", "q"], [nl], tmp_path, extract_fn=boom)
+        app = _label_app([nl], tmp_path, extract_fn=boom)
+        async with app.run_test(size=SIZE) as pilot:
+            await pilot.press("enter", "space")
+            await _drain(app, pilot)
+            assert "Seed failed" in _screen_text(app)  # blocking hint
+            await pilot.press("x")  # any key dismisses the hint
+            await _drain(app, pilot)
+            assert nl.stories == []
+            await pilot.press("z")
+            assert "Nothing to undo" in _status(app)
 
-        assert nl.stories == []
-        assert "Seed failed" in screen.texts()
-        assert "Nothing to undo" in screen.texts()
+    async def test_second_space_while_seeding_is_ignored(self, tmp_path):
+        import threading
+
+        release = threading.Event()
+        calls = []
+
+        def slow_extract(body):
+            calls.append(1)
+            release.wait(timeout=5)
+            return "TITLE: A\nTEXT: b0"
+
+        nl = _newsletter("tg", body="b0")
+        app = _label_app([nl], tmp_path, extract_fn=slow_extract)
+        async with app.run_test(size=SIZE) as pilot:
+            await pilot.press("enter", "space")
+            await pilot.pause()
+            await pilot.press("space")  # while the first seed is in flight
+            release.set()
+            await _drain(app, pilot)
+            assert len(calls) == 1
+            assert [s.title for s in nl.stories] == ["A"]
 
 
 class TestDetailUndo:
-    def test_undo_stack_restores_multiple_edits(self, tmp_path):
+    async def test_undo_stack_restores_multiple_edits(self, tmp_path):
         nl = _newsletter("tU", body="b0")
         seed_stories(nl, [("A", "a"), ("B", "b"), ("C", "c")])
+        app = _label_app([nl], tmp_path)
+        async with app.run_test(size=SIZE) as pilot:
+            await pilot.press("enter")
+            await pilot.press("d", "0", "enter")
+            await pilot.press("d", "0", "enter")
+            assert [s.title for s in nl.stories] == ["C"]
+            await pilot.press("z", "z")
+            assert [s.title for s in nl.stories] == ["A", "B", "C"]
 
-        keys = ["d", "0", "\n", "d", "0", "\n", "z", "z", "q"]
-        _run_detail(keys, [nl], tmp_path)
-
-        assert [s.title for s in nl.stories] == ["A", "B", "C"]
-
-    def test_cancelled_prompt_does_not_clobber_undo(self, tmp_path):
+    async def test_cancelled_prompt_does_not_clobber_undo(self, tmp_path):
         nl = _newsletter("tU", body="b0")
         seed_stories(nl, [("A", "a"), ("B", "b")])
+        app = _label_app([nl], tmp_path)
+        async with app.run_test(size=SIZE) as pilot:
+            await pilot.press("enter")
+            await pilot.press("d", "1", "enter")  # delete B
+            await pilot.press("E", "escape")  # open edit, cancel at Story #
+            await pilot.press("z")  # undo must restore B
+            assert [s.title for s in nl.stories] == ["A", "B"]
 
-        # Delete B, then open E and cancel it with Esc, then undo.
-        keys = ["d", "1", "\n", "E", "\x1b", "z", "q"]
-        _run_detail(keys, [nl], tmp_path)
-
-        assert [s.title for s in nl.stories] == ["A", "B"]
-
-    def test_undo_with_empty_stack_reports_nothing_to_undo(self, tmp_path):
+    async def test_undo_with_empty_stack_reports_nothing_to_undo(self, tmp_path):
         nl = _newsletter("tU", body="b0")
-        screen, _ = _run_detail(["z", "q"], [nl], tmp_path)
-        assert "Nothing to undo" in screen.texts()
+        app = _label_app([nl], tmp_path)
+        async with app.run_test(size=SIZE) as pilot:
+            await pilot.press("enter", "z")
+            assert "Nothing to undo" in _status(app)
 
 
 class TestDetailDelete:
-    def test_deleting_labeled_story_requires_confirmation(self, tmp_path):
+    async def test_deleting_labeled_story_requires_confirmation(self, tmp_path):
         nl = _newsletter("tD", body="b0")
         seed_stories(nl, [("Labeled", "a")])
         assign_scores_and_themes(nl.stories[0], _scores(), [])
+        app = _label_app([nl], tmp_path)
+        async with app.run_test(size=SIZE) as pilot:
+            await pilot.press("enter")
+            await pilot.press("d", "0", "enter", "n")
+            assert [s.title for s in nl.stories] == ["Labeled"]
 
-        _run_detail(["d", "0", "\n", "n", "q"], [nl], tmp_path)
-
-        assert [s.title for s in nl.stories] == ["Labeled"]
-
-    def test_confirmed_delete_of_labeled_story_reports_what_was_deleted(self, tmp_path):
+    async def test_confirmed_delete_of_labeled_story_reports_what_was_deleted(self, tmp_path):
         nl = _newsletter("tD", body="b0")
         seed_stories(nl, [("Labeled", "a")])
         assign_scores_and_themes(nl.stories[0], _scores(), [])
+        app = _label_app([nl], tmp_path)
+        async with app.run_test(size=SIZE) as pilot:
+            await pilot.press("enter")
+            await pilot.press("d", "0", "enter", "y")
+            assert nl.stories == []
+            assert "Deleted" in _status(app)
+            assert "Labeled" in _status(app)
 
-        screen, _ = _run_detail(["d", "0", "\n", "y", "q"], [nl], tmp_path)
-
-        assert nl.stories == []
-        assert "Labeled" in screen.texts()
-        assert "Deleted" in screen.texts()
-
-    def test_invalid_index_reports_instead_of_silent_noop(self, tmp_path):
+    async def test_invalid_index_reports_instead_of_silent_noop(self, tmp_path):
         nl = _newsletter("tD", body="b0")
         seed_stories(nl, [("A", "a")])
+        app = _label_app([nl], tmp_path)
+        async with app.run_test(size=SIZE) as pilot:
+            await pilot.press("enter")
+            await pilot.press("d", "9", "enter")
+            assert [s.title for s in nl.stories] == ["A"]
+            assert "story #" in _status(app).lower()
 
-        screen, _ = _run_detail(["d", "9", "\n", "q"], [nl], tmp_path)
-
-        assert [s.title for s in nl.stories] == ["A"]
-        assert "story #" in screen.texts().lower()
+    async def test_autosave_persists_mutation_to_disk_before_quit(self, tmp_path):
+        nl = _newsletter("tD", body="b0")
+        seed_stories(nl, [("A", "a"), ("B", "b")])
+        path = tmp_path / "golden.jsonl"
+        save_golden_set([nl], path)
+        app = _label_app([nl], tmp_path)
+        async with app.run_test(size=SIZE) as pilot:
+            await pilot.press("enter")
+            await pilot.press("d", "0", "enter")
+            # Autosave on the mutation itself — the app is still running.
+            on_disk = load_golden_set(path)
+            assert [s.title for s in on_disk[0].stories] == ["B"]
 
 
 class TestDetailCursorAnchor:
-    # Header rows before the body: title, divider, subject, sender, reviewed,
-    # seeded, blank, "--- Stories (0) ---", blank, "--- Body ---" = 10 rows.
-    BODY_START = 10
-
-    def test_cursor_stays_on_its_body_line_after_making_a_story(self, tmp_path):
-        import curses
-
+    async def test_cursor_stays_on_its_body_line_after_making_a_story(self, tmp_path):
         nl = _newsletter("tA", body="para one\npara two\npara three")
-        keys = [curses.KEY_DOWN] * (self.BODY_START + 1) + ["s", 10, "\n", "q"]
-        screen, _ = _run_detail(keys, [nl], tmp_path)
-
-        assert len(nl.stories) == 1
-        assert nl.stories[0].text == "para two"
-        # Final frame: the cursor (reverse video) is still on "para two", even
-        # though the story list above grew and shifted every row down.
-        reversed_rows = [
-            w[2] for w in screen.frames[-1] if w[3] == curses.A_REVERSE and w[1] <= 1
-        ]
-        assert any("para two" in text for text in reversed_rows)
+        app = _label_app([nl], tmp_path)
+        async with app.run_test(size=SIZE) as pilot:
+            await pilot.press("enter")
+            await pilot.press(*["down"] * (BODY_START + 1))  # onto "para two"
+            await pilot.press("s", "enter")  # start selection, make story
+            await pilot.press("enter")  # Title (blank=auto)
+            assert len(nl.stories) == 1
+            assert nl.stories[0].text == "para two"
+            # The story list above the body grew, shifting every row down;
+            # the cursor must still sit on the "para two" BODY line.
+            assert "para two" in _cursor_row_text(app)
 
 
 class TestDetailRowCache:
@@ -1105,165 +1104,290 @@ class TestDetailRowCache:
         monkeypatch.setattr(label, "covered_body_lines", counting_covered)
         return calls
 
-    def test_pure_cursor_movement_reuses_cached_rows(self, tmp_path, monkeypatch):
-        # Rows + covered-lines are expensive (full display-width wrap of the
-        # body); pure navigation keys must reuse the cache, not rebuild.
-        import curses
-
+    async def test_pure_cursor_movement_reuses_cached_rows(self, tmp_path, monkeypatch):
         calls = self._counting(monkeypatch)
         nl = _newsletter("tP", body="b0\nb1\nb2\nb3")
+        app = _label_app([nl], tmp_path)
+        async with app.run_test(size=SIZE) as pilot:
+            await pilot.press("enter")
+            await pilot.press("down", "down", "down", "down", "up", "up")
+            assert calls["rows"] == 1
+            assert calls["covered"] == 1
 
-        keys = [curses.KEY_DOWN] * 4 + [curses.KEY_UP] * 2 + ["q"]
-        _run_detail(keys, [nl], tmp_path)
-
-        assert calls["rows"] == 1
-        assert calls["covered"] == 1
-
-    def test_mutation_rebuilds_rows(self, tmp_path, monkeypatch):
+    async def test_mutation_rebuilds_rows(self, tmp_path, monkeypatch):
         calls = self._counting(monkeypatch)
         nl = _newsletter("tP", body="b0\nb1")
         seed_stories(nl, [("A", "b0")])
+        app = _label_app([nl], tmp_path)
+        async with app.run_test(size=SIZE) as pilot:
+            await pilot.press("enter")
+            await pilot.press("d", "0", "enter")
+            assert calls["rows"] == 2  # initial build + rebuild after the delete
 
-        _run_detail(["d", "0", "\n", "q"], [nl], tmp_path)  # delete story 0
-
-        assert calls["rows"] == 2  # initial build + rebuild after the delete
-
-    def test_resize_rewraps_body(self, tmp_path):
-        # A terminal resize must invalidate the cache: the body is rewrapped
-        # to the new width so no content is lost to addnstr truncation.
-        import curses
-
-        from evals.newsletter_label import _newsletter_detail
-
+    async def test_resize_rewraps_body(self, tmp_path):
+        # A terminal resize must rewrap the body to the new width so no
+        # content is lost to clipping.
         words = [f"word{i:02d}" for i in range(24)]
         nl = _newsletter("tP", body=" ".join(words))
+        app = _label_app([nl], tmp_path)
+        async with app.run_test(size=(100, 30)) as pilot:
+            await pilot.press("enter")
+            await pilot.resize_terminal(40, 30)
+            await pilot.pause()
+            from textual.widgets import Label
 
-        class ResizingScreen(FakeScreen):
-            def getch(self):
-                self.width = 40  # shrink before the next frame renders
-                return super().getch()
-
-        screen = ResizingScreen([curses.KEY_DOWN, "q"], width=100)
-        _newsletter_detail(screen, [nl], 0, [nl], tmp_path / "golden.jsonl")
-
-        final = " ".join(w[2] for w in screen.frames[-1])
-        for word in words:
-            assert word in final
+            lv = _detail(app).query_one("#rows")
+            rendered = " ".join(
+                str(item.query_one(Label).render()) for item in lv.children
+            )
+            for word in words:
+                assert word in rendered
 
 
 class TestDetailSelection:
-    def test_esc_clears_selection_before_leaving(self, tmp_path):
-        import curses
+    async def test_esc_clears_selection_before_leaving(self, tmp_path):
+        from evals.newsletter_label import DetailScreen
 
         nl = _newsletter("tE", body="para one\npara two")
-        keys = [curses.KEY_DOWN] * TestDetailCursorAnchor.BODY_START + ["s", 27, 27]
-        screen, result = _run_detail(keys, [nl], tmp_path)
+        app = _label_app([nl], tmp_path)
+        async with app.run_test(size=SIZE) as pilot:
+            await pilot.press("enter")
+            await pilot.press(*["down"] * BODY_START)
+            await pilot.press("s")
+            await pilot.press("escape")  # first Esc only clears the selection
+            assert isinstance(app.screen, DetailScreen)
+            assert "Selection cleared" in _status(app)
+            await pilot.press("escape")  # second Esc leaves
+            assert not isinstance(app.screen, DetailScreen)
 
-        assert result == "back"  # second Esc leaves; first only cleared
-        assert "election cleared" in screen.texts()
-
-    def test_esc_at_title_prompt_cancels_story_creation(self, tmp_path):
-        import curses
-
+    async def test_esc_at_title_prompt_cancels_story_creation(self, tmp_path):
         nl = _newsletter("tE", body="para one")
-        keys = [curses.KEY_DOWN] * TestDetailCursorAnchor.BODY_START + ["s", 10, "\x1b", "q"]
-        _run_detail(keys, [nl], tmp_path)
+        app = _label_app([nl], tmp_path)
+        async with app.run_test(size=SIZE) as pilot:
+            await pilot.press("enter")
+            await pilot.press(*["down"] * BODY_START)
+            await pilot.press("s", "enter")  # selection + make story
+            await pilot.press("escape")  # cancel at the title prompt
+            assert nl.stories == []  # no story, and certainly no "\x1b" title
 
-        assert nl.stories == []  # no story, and certainly no "\x1b" title
+    async def test_selection_keys_require_a_body_line(self, tmp_path):
+        nl = _newsletter("tE", body="para one")
+        app = _label_app([nl], tmp_path)
+        async with app.run_test(size=SIZE) as pilot:
+            await pilot.press("enter")  # cursor starts on the header row
+            await pilot.press("s")
+            assert "body line" in _status(app)
+
+    async def test_make_story_without_selection_reports_hint(self, tmp_path):
+        nl = _newsletter("tE", body="para one")
+        app = _label_app([nl], tmp_path)
+        async with app.run_test(size=SIZE) as pilot:
+            await pilot.press("enter")
+            await pilot.press("enter")  # make-story with no selection start
+            assert "selection start" in _status(app).lower()
+            assert nl.stories == []
+
+    async def test_span_selection_makes_multiline_story(self, tmp_path):
+        nl = _newsletter("tE", body="para one\npara two\npara three")
+        app = _label_app([nl], tmp_path)
+        async with app.run_test(size=SIZE) as pilot:
+            await pilot.press("enter")
+            await pilot.press(*["down"] * BODY_START)  # "para one"
+            await pilot.press("s")
+            await pilot.press("down", "e")  # end on "para two"
+            await pilot.press("enter")  # make story
+            await pilot.press(*"My Story")
+            await pilot.press("enter")
+            assert len(nl.stories) == 1
+            assert nl.stories[0].title == "My Story"
+            assert nl.stories[0].text == "para one\npara two"
 
 
 class TestDetailNotes:
-    def test_notes_prompt_prefills_existing_note(self, tmp_path):
+    async def test_notes_prompt_prefills_existing_note(self, tmp_path):
         nl = _newsletter("tN", body="b0", notes="important note")
-
-        _run_detail(["n", "\n", "q"], [nl], tmp_path)
-
-        assert nl.notes == "important note"  # Enter keeps, does not wipe
+        app = _label_app([nl], tmp_path)
+        async with app.run_test(size=SIZE) as pilot:
+            await pilot.press("enter")
+            await pilot.press("n", "enter")  # Enter keeps, does not wipe
+            assert nl.notes == "important note"
+            assert "unchanged" in _status(app).lower()
 
 
 class TestDetailLabeling:
-    def test_label_flow_assigns_scores_and_saves(self, tmp_path):
+    async def test_label_flow_assigns_scores_and_saves(self, tmp_path):
         nl = _newsletter("tL", body="b0")
         seed_stories(nl, [("A", "a")])
+        app = _label_app([nl], tmp_path)
+        async with app.run_test(size=SIZE) as pilot:
+            await pilot.press("enter")
+            await pilot.press("l", "0", "enter")  # story index
+            await pilot.press("4", "4", "5", "3")  # four dimension scores
+            await pilot.press("enter")  # finish themes
+            assert nl.stories[0].expected_scores == {
+                "simple": 4, "concrete": 4, "personal": 5, "dynamic": 3,
+            }
+            assert nl.stories[0].reviewed is True
 
-        keys = ["l", "0", "\n", "4", "4", "5", "3", "\n", "q"]
-        _run_detail(keys, [nl], tmp_path)
-
-        assert nl.stories[0].expected_scores == {
-            "simple": 4, "concrete": 4, "personal": 5, "dynamic": 3,
-        }
-        assert nl.stories[0].reviewed is True
-
-    def test_score_entry_echoes_accepted_digits(self):
-        from evals.newsletter_label import _prompt_scores
-
-        screen = FakeScreen(["4", "4", "5", "3"])
-        scores = _prompt_scores(screen)
-
-        assert scores == {"simple": 4, "concrete": 4, "personal": 5, "dynamic": 3}
-        # By the last prompt the three accepted digits are visible.
-        assert any("4/4/5" in w[2] for w in screen.all_writes())
-
-    def test_relabeling_shows_current_scores(self):
-        from evals.newsletter_label import _prompt_scores
-
-        screen = FakeScreen(["x"])  # cancel immediately; only the prompt matters
-        _prompt_scores(screen, current={"simple": 2, "concrete": 3, "personal": 4, "dynamic": 5})
-
-        assert any("now 2" in w[2] for w in screen.all_writes())
-
-    def test_cancelled_score_entry_reports_it(self, tmp_path):
+    async def test_score_entry_echoes_accepted_digits(self, tmp_path):
         nl = _newsletter("tL", body="b0")
         seed_stories(nl, [("A", "a")])
+        app = _label_app([nl], tmp_path)
+        async with app.run_test(size=SIZE) as pilot:
+            await pilot.press("enter")
+            await pilot.press("l", "0", "enter")
+            await pilot.press("4", "4", "5")
+            # By the last prompt the three accepted digits are visible.
+            assert "4/4/5" in _screen_text(app)
+            await pilot.press("3", "enter")
 
-        screen, _ = _run_detail(["l", "0", "\n", "4", "x", "q"], [nl], tmp_path)
+    async def test_relabeling_shows_current_scores(self, tmp_path):
+        nl = _newsletter("tL", body="b0")
+        seed_stories(nl, [("A", "a")])
+        assign_scores_and_themes(
+            nl.stories[0],
+            {"simple": 2, "concrete": 3, "personal": 4, "dynamic": 5},
+            [],
+        )
+        app = _label_app([nl], tmp_path)
+        async with app.run_test(size=SIZE) as pilot:
+            await pilot.press("enter")
+            await pilot.press("l", "0", "enter")
+            assert "now 2" in _screen_text(app)
+            await pilot.press("x")  # cancel
 
-        assert nl.stories[0].expected_scores is None
-        assert "cancelled" in screen.texts().lower()
+    async def test_cancelled_score_entry_reports_it(self, tmp_path):
+        nl = _newsletter("tL", body="b0")
+        seed_stories(nl, [("A", "a")])
+        app = _label_app([nl], tmp_path)
+        async with app.run_test(size=SIZE) as pilot:
+            await pilot.press("enter")
+            await pilot.press("l", "0", "enter")
+            await pilot.press("4", "x")  # any non-digit cancels everything
+            assert nl.stories[0].expected_scores is None
+            assert "cancelled" in _status(app).lower()
 
-    def test_confirm_warns_about_unlabeled_stories(self, tmp_path):
+    async def test_theme_toggle_on_and_off(self, tmp_path):
+        nl = _newsletter("tL", body="b0")
+        seed_stories(nl, [("A", "a")])
+        app = _label_app([nl], tmp_path)
+        async with app.run_test(size=SIZE) as pilot:
+            await pilot.press("enter")
+            await pilot.press("l", "0", "enter")
+            await pilot.press("4", "4", "4", "4")
+            await pilot.press("s", "c", "s")  # scripture on, christlikeness on, scripture off
+            await pilot.press("enter")
+            assert nl.stories[0].expected_themes == ["christlikeness"]
+
+    async def test_confirm_warns_about_unlabeled_stories(self, tmp_path):
         nl = _newsletter("tL", body="b0")
         seed_stories(nl, [("A", "a"), ("B", "b")])
+        app = _label_app([nl], tmp_path)
+        async with app.run_test(size=SIZE) as pilot:
+            await pilot.press("enter")
+            await pilot.press("c")
+            assert nl.reviewed is True
+            assert "2" in _status(app)
+            assert "unlabeled" in _status(app).lower()
 
-        screen, _ = _run_detail(["c", "q"], [nl], tmp_path)
 
-        assert nl.reviewed is True
-        assert "2" in screen.texts() and "unlabeled" in screen.texts().lower()
+class TestDetailStoryExclusion:
+    async def test_u_toggles_story_exclusion(self, tmp_path):
+        nl = _newsletter("tX", body="b0")
+        seed_stories(nl, [("A", "a")])
+        app = _label_app([nl], tmp_path)
+        async with app.run_test(size=SIZE) as pilot:
+            await pilot.press("enter")
+            await pilot.press("u", "0", "enter")
+            assert nl.stories[0].excluded is True
+            assert "excluded from" in _status(app)
+            await pilot.press("u", "0", "enter")
+            assert nl.stories[0].excluded is False
+            assert "included in" in _status(app)
+
+    async def test_shift_x_toggles_newsletter_exclusion(self, tmp_path):
+        nl = _newsletter("tX", body="b0")
+        app = _label_app([nl], tmp_path)
+        async with app.run_test(size=SIZE) as pilot:
+            await pilot.press("enter")
+            await pilot.press("X")
+            assert nl.excluded is True
+            await pilot.press("z")  # exclusion is undoable
+            assert nl.excluded is False
 
 
 class TestDetailHelp:
-    def test_space_seed_hotkey_is_on_screen(self, tmp_path):
+    async def test_space_seed_hotkey_is_on_screen(self, tmp_path):
         nl = _newsletter("tH", body="b0")
-        screen, _ = _run_detail(["q"], [nl], tmp_path)
-        assert "Space:seed" in screen.texts()
+        app = _label_app([nl], tmp_path)
+        async with app.run_test(size=SIZE) as pilot:
+            await pilot.press("enter")
+            assert "Space:seed" in _screen_text(app)
 
 
 class TestListView:
-    def test_page_down_moves_by_a_page(self, tmp_path):
-        import curses
+    async def test_list_shows_newsletters_and_q_quits(self, tmp_path):
+        from textual.widgets import ListView
 
-        from evals.newsletter_label import _list_view
+        nls = [_newsletter(f"t{i}", subject=f"subject-{i}") for i in range(3)]
+        app = _label_app(nls, tmp_path)
+        async with app.run_test(size=SIZE) as pilot:
+            assert len(app.query_one(ListView)) == 3
+            assert "3 newsletters" in _screen_text(app)
+            await pilot.press("q")
+        assert app.return_value == "quit"
+
+    async def test_page_down_moves_cursor_by_a_page(self, tmp_path):
+        from textual.widgets import ListView
 
         nls = [_newsletter(f"t{i}", subject=f"subject-{i}") for i in range(10)]
-        screen = FakeScreen([curses.KEY_NPAGE, "q"], height=8, width=100)
-        _list_view(screen, nls, nls, tmp_path / "golden.jsonl")
+        app = _label_app(nls, tmp_path)
+        async with app.run_test(size=(100, 8)) as pilot:
+            await pilot.press("pagedown")
+            index = app.query_one(ListView).index
+            assert index and index > 1  # moved by a page, not a single row
 
-        final_reversed = [w[2] for w in screen.frames[-1] if w[3] == curses.A_REVERSE]
-        assert any("subject-5" in text for text in final_reversed)
+    async def test_enter_opens_detail_and_esc_returns(self, tmp_path):
+        from evals.newsletter_label import DetailScreen
 
+        nls = [_newsletter("t0", subject="first"), _newsletter("t1", subject="second")]
+        app = _label_app(nls, tmp_path)
+        async with app.run_test(size=SIZE) as pilot:
+            await pilot.press("down", "enter")
+            assert isinstance(app.screen, DetailScreen)
+            assert "Newsletter 2/2" in _screen_text(app)
+            await pilot.press("escape")
+            assert not isinstance(app.screen, DetailScreen)
 
-class TestLabelLoopEnvironment:
-    def test_escdelay_configured_for_snappy_esc(self, monkeypatch):
-        import curses
-        import os
+    async def test_skip_advances_to_next_newsletter(self, tmp_path):
+        from evals.newsletter_label import DetailScreen
 
-        from evals.newsletter_label import label_loop
+        nls = [_newsletter("t0"), _newsletter("t1")]
+        app = _label_app(nls, tmp_path)
+        async with app.run_test(size=SIZE) as pilot:
+            await pilot.press("enter")
+            assert "Newsletter 1/2" in _screen_text(app)
+            await pilot.press("k")  # linear skip-through: straight to the next
+            assert isinstance(app.screen, DetailScreen)
+            assert "Newsletter 2/2" in _screen_text(app)
+            assert nls[0].reviewed is False  # skip never marks reviewed
+            await pilot.press("k")  # skip on the last -> back to the list
+            assert not isinstance(app.screen, DetailScreen)
 
-        monkeypatch.delenv("ESCDELAY", raising=False)
-        monkeypatch.setattr(curses, "wrapper", lambda *a, **kw: None)
-        label_loop([_newsletter("t")], [_newsletter("t")], "unused-path")
+    async def test_q_from_detail_quits_whole_app(self, tmp_path):
+        nls = [_newsletter("t0")]
+        app = _label_app(nls, tmp_path)
+        async with app.run_test(size=SIZE) as pilot:
+            await pilot.press("enter", "q")
+        assert app.return_value == "quit"
 
-        assert os.environ.get("ESCDELAY")
+    async def test_list_flags_refresh_after_confirm_in_detail(self, tmp_path):
+        nls = [_newsletter("t0"), _newsletter("t1")]
+        app = _label_app(nls, tmp_path)
+        async with app.run_test(size=SIZE) as pilot:
+            await pilot.press("enter", "c", "escape")  # confirm, back to list
+            assert nls[0].reviewed is True
+            assert "Y" in _screen_text(app)  # reviewed flag column updated
 
 
 class TestCli:

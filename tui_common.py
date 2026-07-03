@@ -9,10 +9,36 @@ Conventions (issue #43):
 """
 
 from textual.app import ComposeResult
+from textual.binding import Binding
 from textual.screen import ModalScreen
-from textual.widgets import Static
+from textual.widgets import ListView, Static
 
 CANCEL = "cancel"  # dismissal sentinel distinct from None (None = "clear")
+
+
+class PageListView(ListView):
+    """ListView whose PgUp/PgDn move the cursor by a page, not just the scroll.
+
+    Stock ListView inherits the scroll-container page bindings, which scroll
+    the viewport but leave the cursor behind — the curses TUIs this replaces
+    always paged the cursor.
+    """
+
+    BINDINGS = [
+        Binding("pageup", "cursor_page_up", "Page up", show=False),
+        Binding("pagedown", "cursor_page_down", "Page down", show=False),
+    ]
+
+    def _page(self) -> int:
+        return max(1, self.size.height)
+
+    def action_cursor_page_up(self) -> None:
+        if len(self):
+            self.index = max(0, (self.index or 0) - self._page())
+
+    def action_cursor_page_down(self) -> None:
+        if len(self):
+            self.index = min(len(self) - 1, (self.index or 0) + self._page())
 
 
 class KeyMenuScreen(ModalScreen):

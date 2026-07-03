@@ -153,7 +153,7 @@ newsletter_harvest → newsletter_label → newsletter_run → newsletter_report
   its `body` is built exactly like production input. **No ground truth is inferred** —
   newsletters land unlabeled with an empty story list. Re-runs skip
   already-harvested threads instead of re-fetching them.
-- **label** — A curses tool to build ground truth by hand (quality is
+- **label** — A Textual tool to build ground truth by hand (quality is
   subjective, so there are no auto-labels). Phase A curates the story list:
   press `Space` to seed candidates from the production extractor (a fresh LLM
   call each press — re-seeding over an existing list asks for confirmation),

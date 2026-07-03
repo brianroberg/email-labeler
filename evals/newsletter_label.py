@@ -25,13 +25,13 @@ Phase B (per-story labels): assign the 4 dimension scores
 ``story.reviewed`` is set.
 
 The state transitions are factored into PURE functions (below) so they can be
-unit-tested without curses.
+unit-tested without a terminal; the Textual UI layer on top is tested with
+Textual's Pilot driver.
 """
 
 import argparse
 import asyncio
 import copy
-import curses
 import json
 import os
 import sys
@@ -39,9 +39,16 @@ import tempfile
 import unicodedata
 from pathlib import Path
 
+from textual import work
+from textual.app import App, ComposeResult
+from textual.binding import Binding
+from textual.screen import ModalScreen, Screen
+from textual.widgets import Input, Label, ListItem, ListView, Static
+
 from evals import plural
 from evals.newsletter_schemas import GoldenNewsletter, GoldenStory
 from newsletter import compute_tier, parse_stories
+from tui_common import PageListView
 
 _DIMENSIONS = ("simple", "concrete", "personal", "dynamic")
 
@@ -384,45 +391,6 @@ def format_list_row(newsletter) -> str:
     return f"{r:<2} {f'{labeled}/{total}':<6} {sender:<24} {newsletter.subject}"
 
 
-class LineBuffer:
-    """Pure single-line editor state for prompts (no curses).
-
-    Supports prefilling with the current value (so edits are incremental, not
-    blind retyping), horizontal scrolling via ``visible`` (so input longer than
-    the terminal is never silently truncated), and rejects control characters
-    (so a stray Esc can never end up as a literal ``\\x1b`` in the golden set).
-    """
-
-    def __init__(self, initial: str = ""):
-        self._chars = [c for c in str(initial) if c.isprintable()]
-        self._pos = len(self._chars)
-
-    def text(self) -> str:
-        return "".join(self._chars)
-
-    def insert(self, ch: str) -> None:
-        if len(ch) == 1 and ch.isprintable():
-            self._chars.insert(self._pos, ch)
-            self._pos += 1
-
-    def backspace(self) -> None:
-        if self._pos > 0:
-            self._pos -= 1
-            self._chars.pop(self._pos)
-
-    def left(self) -> None:
-        self._pos = max(0, self._pos - 1)
-
-    def right(self) -> None:
-        self._pos = min(len(self._chars), self._pos + 1)
-
-    def visible(self, width: int) -> tuple[str, int]:
-        """(visible slice, cursor column) for a window of *width* cells."""
-        width = max(1, width)
-        start = self._pos - width + 1 if self._pos >= width else 0
-        return "".join(self._chars[start:start + width]), self._pos - start
-
-
 def format_theme_legend(selected, width: int) -> str:
     """Theme-picker prompt line; falls back to a compact form on narrow screens."""
     full_legend = "  ".join(f"[{k}]{v}" for k, v in _THEME_KEYS.items())
@@ -654,529 +622,669 @@ def build_detail_rows(newsletter, index, total, width) -> list[tuple[str, int | 
 
 
 # ---------------------------------------------------------------------------
-# Curses helpers (mirroring evals.edit_tui)
-# ---------------------------------------------------------------------------
-
-def _safe_addstr(win, y, x, text, attr=curses.A_NORMAL):
-    max_y, max_x = win.getmaxyx()
-    if y < 0 or y >= max_y or x >= max_x:
-        return
-    available = max_x - x - 1
-    if available <= 0:
-        return
-    win.addnstr(y, x, text, available, attr)
-
-
-def _set_cursor_visibility(visible: bool) -> None:
-    try:
-        curses.curs_set(1 if visible else 0)
-    except curses.error:
-        pass
-
-
-def _prompt_line(stdscr, prompt: str, initial: str = "") -> str | None:
-    """Line editor at the bottom of the screen. Returns None on Esc (cancel).
-
-    Prefills with *initial* (edit the current value instead of retyping it
-    blind), scrolls horizontally so long input is never silently truncated,
-    and rejects control characters (a stray Esc can't pollute the golden set).
-    """
-    buf = LineBuffer(initial)
-    _set_cursor_visibility(True)
-    try:
-        while True:
-            max_y, max_x = stdscr.getmaxyx()
-            avail = max(1, max_x - len(prompt) - 2)
-            text, cur = buf.visible(avail)
-            _safe_addstr(stdscr, max_y - 1, 0, " " * (max_x - 1))
-            _safe_addstr(stdscr, max_y - 1, 0, prompt, curses.A_REVERSE)
-            _safe_addstr(stdscr, max_y - 1, len(prompt) + 1, text)
-            try:
-                stdscr.move(max_y - 1, min(max_x - 1, len(prompt) + 1 + cur))
-            except curses.error:
-                pass
-            stdscr.refresh()
-            try:
-                key = stdscr.get_wch()
-            except curses.error:
-                continue
-            if isinstance(key, str):
-                if key in ("\n", "\r"):
-                    return buf.text().strip()
-                if key == "\x1b":
-                    return None
-                if key in ("\x7f", "\x08"):
-                    buf.backspace()
-                else:
-                    buf.insert(key)
-            elif key == curses.KEY_ENTER:
-                return buf.text().strip()
-            elif key == curses.KEY_BACKSPACE:
-                buf.backspace()
-            elif key == curses.KEY_LEFT:
-                buf.left()
-            elif key == curses.KEY_RIGHT:
-                buf.right()
-    finally:
-        _set_cursor_visibility(False)
-
-
-def _confirm(stdscr, message: str) -> bool:
-    """Bottom-line y/N confirmation; only y/Y confirms."""
-    max_y, max_x = stdscr.getmaxyx()
-    _safe_addstr(stdscr, max_y - 1, 0, " " * (max_x - 1))
-    _safe_addstr(stdscr, max_y - 1, 0, message, curses.A_REVERSE)
-    stdscr.refresh()
-    return stdscr.getch() in (ord("y"), ord("Y"))
-
-
-def _prompt_scores(stdscr, current=None) -> dict[str, int] | None:
-    """Prompt for the 4 dimension scores 1-5. Returns None on cancel.
-
-    When re-labeling, *current* shows the value already assigned per dimension;
-    accepted digits are echoed in the prompt so entry is verifiable.
-    """
-    scores = {}
-    for dim in _DIMENSIONS:
-        max_y, max_x = stdscr.getmaxyx()
-        now = f" (now {current[dim]})" if current and dim in current else ""
-        entered = "/".join(str(scores[d]) for d in _DIMENSIONS if d in scores)
-        so_far = f"[{entered}] " if entered else ""
-        prompt = f"{so_far}{dim}{now} [1-5] (other cancels): "
-        _safe_addstr(stdscr, max_y - 1, 0, " " * (max_x - 1))
-        _safe_addstr(stdscr, max_y - 1, 0, prompt, curses.A_REVERSE)
-        stdscr.refresh()
-        key = stdscr.getch()
-        ch = chr(key) if 0 <= key < 256 else ""
-        if ch not in "12345":
-            return None
-        scores[dim] = int(ch)
-    return scores
-
-
-def _prompt_themes(stdscr, initial=None) -> list[str]:
-    """Multi-select themes by toggling s/c/h/v/d; Enter to finish.
-
-    Starts from *initial* (the story's current themes) so re-labeling edits
-    rather than restarts. The legend compacts on narrow terminals.
-    """
-    selected: list[str] = list(initial or [])
-    while True:
-        max_y, max_x = stdscr.getmaxyx()
-        prompt = format_theme_legend(selected, max_x - 1)
-        _safe_addstr(stdscr, max_y - 1, 0, " " * (max_x - 1))
-        _safe_addstr(stdscr, max_y - 1, 0, prompt, curses.A_REVERSE)
-        stdscr.refresh()
-        key = stdscr.getch()
-        if key in (curses.KEY_ENTER, ord("\n"), ord("\r")):
-            return selected
-        ch = chr(key).lower() if 0 <= key < 256 else ""
-        if ch in _THEME_KEYS:
-            theme = _THEME_KEYS[ch]
-            if theme in selected:
-                selected.remove(theme)
-            else:
-                selected.append(theme)
-
-
-# ---------------------------------------------------------------------------
-# Detail view — Phase A (curate) then Phase B (label) for one newsletter
+# Textual UI layer
 # ---------------------------------------------------------------------------
 
 _MAX_UNDO = 100  # bound the per-newsletter undo stack
 
 
-def _newsletter_detail(stdscr, newsletters, index, all_newsletters, path, *, extract_fn=None):
-    """Curate + label one newsletter. Returns "back", "skip", or "quit"."""
-    newsletter = newsletters[index]
-    total = len(newsletters)
-    scroll_y = 0
-    cursor = 0  # index into rendered rows
-    sel_start = None  # selected body-line index
-    sel_end = None
-    undo_stack: list[dict] = []  # snapshots, pushed only when a mutation happens
-    status = ""  # one-shot feedback line (cleared on the next keypress)
-    anchor_body = None  # body line to re-anchor the cursor to after a mutation
-    # Rows + covered-lines are expensive (display-width wrap of the whole body,
-    # substring scan per line); cache them and rebuild only when the newsletter
-    # mutated (every mutating branch calls save()) or the terminal was resized.
-    dirty = True
-    cached_size: tuple[int, int] | None = None
-    rows: list[tuple[str, int | None]] = []
-    covered: set[int] = set()
+class _BottomModal(ModalScreen):
+    """Base for the one-line bottom prompts that replace the curses bottom row."""
 
-    def save():
-        nonlocal dirty
-        dirty = True
-        _auto_save(all_newsletters, path, stdscr)
+    DEFAULT_CSS = """
+    _BottomModal {
+        align: left bottom;
+        background: $background 0%;
+    }
+    _BottomModal > Static {
+        width: 100%;
+        background: $accent;
+        color: $text;
+    }
+    """
 
-    def push_undo():
-        undo_stack.append(capture_snapshot(newsletter))
-        del undo_stack[:-_MAX_UNDO]
 
-    def hint(msg):
-        # Blocking notice (used for errors): wrapped so nothing truncates.
-        max_y, max_x = stdscr.getmaxyx()
-        lines = wrap_text(f"{msg}  (press any key)", max_x - 1)
-        start = max(0, max_y - len(lines))
-        for i, line in enumerate(lines[:max_y]):
-            _safe_addstr(stdscr, start + i, 0, " " * (max_x - 1))
-            _safe_addstr(stdscr, start + i, 0, line, curses.A_REVERSE)
-        stdscr.refresh()
-        stdscr.getch()
+class PromptLineScreen(_BottomModal):
+    """One-line text prompt with prefill. Dismisses stripped text, None on Esc.
 
-    while True:
-        max_y, max_x = stdscr.getmaxyx()
-        if dirty or (max_y, max_x) != cached_size:
-            rows = build_detail_rows(newsletter, index, total, max_x - 2)
-            covered = covered_body_lines(newsletter)
-            cached_size = (max_y, max_x)
-            dirty = False
-        if anchor_body is not None:
-            # The story list above the body grew/shrank: keep the cursor on
-            # the same BODY line, not the same physical row.
-            cursor = row_for_body_line(rows, anchor_body)
-            anchor_body = None
-        help_lines = format_help_lines(max_x - 1)
-        content_rows = max(1, max_y - len(help_lines) - 1)
-        cursor = max(0, min(cursor, len(rows) - 1))
-        # Auto-scroll so the cursor row stays visible.
-        if cursor < scroll_y:
-            scroll_y = cursor
-        elif cursor >= scroll_y + content_rows:
-            scroll_y = cursor - content_rows + 1
-        max_scroll = max(0, len(rows) - content_rows)
+    Prefills with *initial* (edit the current value instead of retyping it
+    blind); Input rejects control characters, so a stray Esc can't pollute
+    the golden set.
+    """
+
+    BINDINGS = [Binding("escape", "cancel", "Cancel")]
+
+    def __init__(self, prompt: str, initial: str = "") -> None:
+        super().__init__()
+        self._prompt = prompt
+        self._initial = initial
+
+    def compose(self) -> ComposeResult:
+        yield Static(self._prompt, markup=False)
+        yield Input(value=self._initial, id="prompt-input")
+
+    def on_mount(self) -> None:
+        self.query_one(Input).focus()
+
+    def on_input_submitted(self, event: Input.Submitted) -> None:
+        self.dismiss(event.value.strip())
+
+    def action_cancel(self) -> None:
+        self.dismiss(None)
+
+
+class ConfirmScreen(_BottomModal):
+    """y/N confirmation; only y/Y confirms, any other key is No."""
+
+    def __init__(self, message: str) -> None:
+        super().__init__()
+        self._message = message
+
+    def compose(self) -> ComposeResult:
+        yield Static(self._message, markup=False)
+
+    def on_key(self, event) -> None:
+        event.stop()
+        self.dismiss(event.key.lower() == "y")
+
+
+class ScoreScreen(_BottomModal):
+    """The 4 dimension scores, one keypress each; any non-1-5 key cancels all.
+
+    When re-labeling, *current* shows the value already assigned per dimension;
+    accepted digits are echoed in the prompt so entry is verifiable.
+    """
+
+    def __init__(self, current=None) -> None:
+        super().__init__()
+        self._current = current
+        self._scores: dict[str, int] = {}
+
+    def _prompt_text(self) -> str:
+        dim = _DIMENSIONS[len(self._scores)]
+        now = f" (now {self._current[dim]})" if self._current and dim in self._current else ""
+        entered = "/".join(str(self._scores[d]) for d in _DIMENSIONS if d in self._scores)
+        so_far = f"[{entered}] " if entered else ""
+        return f"{so_far}{dim}{now} [1-5] (other cancels): "
+
+    def compose(self) -> ComposeResult:
+        yield Static(self._prompt_text(), id="score-prompt", markup=False)
+
+    def on_key(self, event) -> None:
+        event.stop()
+        if event.key not in ("1", "2", "3", "4", "5"):
+            self.dismiss(None)
+            return
+        self._scores[_DIMENSIONS[len(self._scores)]] = int(event.key)
+        if len(self._scores) == len(_DIMENSIONS):
+            self.dismiss(dict(self._scores))
+        else:
+            self.query_one("#score-prompt", Static).update(self._prompt_text())
+
+
+class ThemeScreen(_BottomModal):
+    """Multi-select themes by toggling s/c/h/v/d; Enter finishes (no cancel).
+
+    Starts from *initial* (the story's current themes) so re-labeling edits
+    rather than restarts; toggles preserve insertion order.
+    """
+
+    def __init__(self, initial=None) -> None:
+        super().__init__()
+        self._selected: list[str] = list(initial or [])
+
+    def _legend(self) -> str:
+        return format_theme_legend(self._selected, max(10, self.app.size.width - 1))
+
+    def compose(self) -> ComposeResult:
+        yield Static(self._legend(), id="theme-legend", markup=False)
+
+    def on_key(self, event) -> None:
+        event.stop()
+        if event.key == "enter":
+            self.dismiss(list(self._selected))
+            return
+        theme = _THEME_KEYS.get(event.key.lower())
+        if theme is not None:
+            if theme in self._selected:
+                self._selected.remove(theme)
+            else:
+                self._selected.append(theme)
+            self.query_one("#theme-legend", Static).update(self._legend())
+
+
+class HintScreen(_BottomModal):
+    """Blocking notice (used for errors); any key dismisses."""
+
+    def __init__(self, message: str) -> None:
+        super().__init__()
+        self._message = message
+
+    def compose(self) -> ComposeResult:
+        yield Static(f"{self._message}  (press any key)", markup=False)
+
+    def on_key(self, event) -> None:
+        event.stop()
+        self.dismiss(None)
+
+
+class DetailScreen(Screen):
+    """Curate + label one newsletter. Dismisses with "back", "skip", or "quit"."""
+
+    BINDINGS = [
+        Binding("escape", "esc", "Back", show=False),
+        Binding("q", "quit_app", "Quit", show=False),
+        Binding("space", "seed", "Seed", show=False),
+        Binding("s", "sel_start", "Selection start", show=False),
+        Binding("e", "sel_end", "Selection end", show=False),
+        Binding("a", "add_story", "Add story", show=False),
+        Binding("E", "edit_story", "Edit story", show=False),
+        Binding("d", "delete_story", "Delete story", show=False),
+        Binding("c", "confirm_list", "Confirm list", show=False),
+        Binding("l", "label_story", "Label story", show=False),
+        Binding("u", "toggle_story_excluded", "Exclude story", show=False),
+        Binding("n", "notes", "Notes", show=False),
+        Binding("z", "undo", "Undo", show=False),
+        Binding("X", "toggle_newsletter_excluded", "Exclude newsletter", show=False),
+        Binding("k", "skip", "Skip", show=False),
+    ]
+
+    DEFAULT_CSS = """
+    DetailScreen #rows {
+        height: 1fr;
+    }
+    DetailScreen #rows .covered {
+        color: $text-disabled;
+    }
+    DetailScreen #rows .selected {
+        text-style: bold;
+    }
+    DetailScreen #help {
+        color: $text-muted;
+    }
+    """
+
+    def __init__(self, newsletters, index, all_newsletters, path, *, extract_fn=None):
+        super().__init__()
+        self.newsletters = newsletters
+        self.nl_index = index
+        self.newsletter = newsletters[index]
+        self.all_newsletters = all_newsletters
+        self.path = path
+        self.extract_fn = extract_fn
+        self.sel_start = None  # selected body-line index
+        self.sel_end = None
+        self.undo_stack: list[dict] = []  # snapshots, pushed only on real mutations
+        self.anchor_body = None  # body line to re-anchor the cursor to after a mutation
+        self._rows: list[tuple[str, int | None]] | None = None
+        self._covered: set[int] = set()
+        self._status_msg = ""
+        self._busy = False  # a seed is in flight; mutating keys are ignored
+        self._last_size: tuple[int, int] | None = None
+
+    def compose(self) -> ComposeResult:
+        yield PageListView(id="rows")
+        yield Static(id="help", markup=False)
+        yield Static(id="status", markup=False)
+
+    def on_mount(self) -> None:
+        self._refresh(rebuild=True)
+        self.query_one("#rows", ListView).focus()
+        self._set_status("")
+
+    def on_resize(self, event) -> None:
+        size = (event.size.width, event.size.height)
+        prev, self._last_size = self._last_size, size
+        if prev is not None and prev != size and self._rows is not None:
+            # Rewrap to the new width so no body content is lost to clipping.
+            self._refresh(rebuild=True)
+
+    # -- rendering ----------------------------------------------------------
+
+    def _width(self) -> int:
+        return max(20, self.app.size.width)
+
+    def _refresh(self, rebuild: bool = False) -> None:
+        if rebuild or self._rows is None:
+            # Rows + covered-lines are expensive (display-width wrap of the
+            # whole body, substring scan per line); rebuild only on mutation
+            # or resize. Module-global lookups on purpose (test seam).
+            self._rows = build_detail_rows(
+                self.newsletter, self.nl_index, len(self.newsletters), self._width() - 2
+            )
+            self._covered = covered_body_lines(self.newsletter)
 
         lo = hi = None
-        if sel_start is not None and sel_end is not None:
-            lo, hi = min(sel_start, sel_end), max(sel_start, sel_end)
-        elif sel_start is not None:
-            lo = hi = sel_start
+        if self.sel_start is not None and self.sel_end is not None:
+            lo, hi = min(self.sel_start, self.sel_end), max(self.sel_start, self.sel_end)
+        elif self.sel_start is not None:
+            lo = hi = self.sel_start
 
-        stdscr.clear()
-        for row_i in range(content_rows):
-            ri = scroll_y + row_i
-            if ri >= len(rows):
-                break
-            text, body_idx = rows[ri]
-            selected = (
-                body_idx is not None and lo is not None and lo <= body_idx <= hi
-            )
+        listview = self.query_one("#rows", ListView)
+        if self.anchor_body is not None:
+            # The story list above the body grew/shrank: keep the cursor on
+            # the same BODY line, not the same physical row.
+            cursor = row_for_body_line(self._rows, self.anchor_body)
+            self.anchor_body = None
+        else:
+            cursor = listview.index or 0
+        listview.clear()
+        items = []
+        for text, body_idx in self._rows:
+            selected = body_idx is not None and lo is not None and lo <= body_idx <= hi
             # Column 0 is reserved for the selection marker on EVERY row, so
             # text never shifts when a selection appears.
+            marker = "*" if selected else " "
+            label = Label(marker + (text or " "), markup=False)
             if selected:
-                _safe_addstr(stdscr, row_i, 0, "*", curses.A_BOLD)
-            if ri == cursor:
-                # `or " "` keeps the cursor visible on blank body lines.
-                _safe_addstr(stdscr, row_i, 1, text or " ", curses.A_REVERSE)
-            elif selected:
-                _safe_addstr(stdscr, row_i, 1, text, curses.A_BOLD)
-            elif body_idx is not None and body_idx in covered:
+                label.add_class("selected")
+            elif body_idx is not None and body_idx in self._covered:
                 # Dim body lines already captured by a story, so paragraphs
                 # the seed OMITTED stand out at normal brightness.
-                _safe_addstr(stdscr, row_i, 1, text, curses.A_DIM)
-            else:
-                _safe_addstr(stdscr, row_i, 1, text)
-        for i, help_line in enumerate(help_lines):
-            _safe_addstr(stdscr, max_y - 1 - len(help_lines) + i, 0, help_line, curses.A_DIM)
-        if status:
-            _safe_addstr(stdscr, max_y - 1, 0, status, curses.A_REVERSE)
+                label.add_class("covered")
+            items.append(ListItem(label))
+        listview.extend(items)
+        if self._rows:
+            listview.index = max(0, min(cursor, len(self._rows) - 1))
+        self.query_one("#help", Static).update("\n".join(format_help_lines(self._width() - 1)))
+
+    def _set_status(self, msg: str) -> None:
+        self._status_msg = msg
+        if msg:
+            text = msg
         else:
-            _safe_addstr(stdscr, max_y - 1, 0, f"row {cursor + 1}/{len(rows)}", curses.A_DIM)
-        stdscr.refresh()
+            listview = self.query_one("#rows", ListView)
+            text = f"row {(listview.index or 0) + 1}/{len(self._rows or [])}"
+        self.query_one("#status", Static).update(text)
 
-        key = stdscr.getch()
-        status = ""
+    def on_list_view_highlighted(self, event) -> None:
+        if not self._status_msg:
+            self._set_status("")  # keep the row counter current
 
-        if key == curses.KEY_UP and cursor > 0:
-            cursor -= 1
-        elif key == curses.KEY_DOWN and cursor < len(rows) - 1:
-            cursor += 1
-        elif key == curses.KEY_NPAGE:
-            cursor = min(len(rows) - 1, cursor + content_rows)
-            scroll_y = min(max_scroll, scroll_y + content_rows)
-        elif key == curses.KEY_PPAGE:
-            cursor = max(0, cursor - content_rows)
-            scroll_y = max(0, scroll_y - content_rows)
+    # -- persistence / undo ---------------------------------------------------
 
-        elif key == ord(" "):  # seed via extractor
-            if extract_fn is None:
-                status = "Seeding disabled in edit mode (run without --edit to seed)."
-            else:
-                confirm_msg = seed_confirmation_message(newsletter)
-                if confirm_msg is not None and not _confirm(stdscr, confirm_msg):
-                    status = "Seed cancelled — stories kept."
-                else:
-                    _safe_addstr(stdscr, max_y - 1, 0, " " * (max_x - 1))
-                    _safe_addstr(stdscr, max_y - 1, 0, "Seeding…", curses.A_REVERSE)
-                    stdscr.refresh()
-                    push_undo()
-                    try:
-                        stories, raw = seed_from_extractor(newsletter, extract_fn)
-                    except Exception as exc:
-                        undo_stack.pop()  # nothing changed; keep prior undo intact
-                        hint(f"Seed failed: {exc}")
-                    else:
-                        save()
-                        status = seed_outcome_message(raw, len(stories))
+    def _save(self) -> None:
+        try:
+            save_golden_set(self.all_newsletters, self.path)
+        except Exception as exc:
+            # Non-fatal: the in-memory state survives, the next mutation retries.
+            self.app.push_screen(HintScreen(f"Save failed: {exc}"))
+        self._refresh(rebuild=True)
 
-        elif key == ord("s"):  # set selection start
-            body_idx = rows[cursor][1]
-            if body_idx is None:
-                status = "Move the cursor onto a body line first."
-            else:
-                sel_start = body_idx
-                status = f"Selection start = body line {body_idx} (Esc clears)."
+    def _push_undo(self) -> None:
+        self.undo_stack.append(capture_snapshot(self.newsletter))
+        del self.undo_stack[:-_MAX_UNDO]
 
-        elif key == ord("e"):  # set selection end
-            body_idx = rows[cursor][1]
-            if body_idx is None:
-                status = "Move the cursor onto a body line first."
-            else:
-                sel_end = body_idx
-                status = f"Selection end = body line {body_idx} (Esc clears)."
+    def _cursor_body_idx(self):
+        listview = self.query_one("#rows", ListView)
+        if not self._rows or listview.index is None:
+            return None
+        return self._rows[listview.index][1]
 
-        elif key in (curses.KEY_ENTER, ord("\n"), ord("\r")):  # make story
-            if sel_start is None:
-                status = "Set a selection start with 's' first."
-            else:
-                s_line = sel_start
-                e_line = sel_end if sel_end is not None else sel_start
-                title = _prompt_line(stdscr, "Title (blank=auto):")
-                if title is None:
-                    status = "Story creation cancelled."
-                else:
-                    anchor_body = rows[cursor][1]
-                    push_undo()
-                    story = create_story_from_body(newsletter, s_line, e_line, title)
-                    save()
-                    sel_start = sel_end = None
-                    status = f"Story created: {story.title}"
-
-        elif key == ord("a"):  # add story
-            title = _prompt_line(stdscr, "New title:")
-            text = _prompt_line(stdscr, "New text:") if title else None
-            if title and text:
-                push_undo()
-                add_story(newsletter, title, text)
-                save()
-                status = f"Story added: {title}"
-            else:
-                status = "Add cancelled — need a title and text."
-
-        elif key == ord("E"):  # edit story
-            si = _prompt_index(stdscr, newsletter)
-            if si is None:
-                status = "No valid story # — nothing edited."
-            else:
-                story = newsletter.stories[si]
-                new_title = _prompt_line(stdscr, "Title (blank=keep):", initial=story.title)
-                if new_title is None:
-                    status = "Edit cancelled."
-                else:
-                    # Multi-line text can't be edited in a one-line prompt;
-                    # fall back to blank=keep for it (body selection is the
-                    # intended repair path for paragraph-level text).
-                    text_initial = story.text if "\n" not in story.text else ""
-                    new_text = _prompt_line(
-                        stdscr, "Text (blank=keep):", initial=text_initial
-                    )
-                    if new_text is None:
-                        status = "Edit cancelled."
-                    else:
-                        new_title = new_title or story.title
-                        new_text = new_text or story.text
-                        if new_title == story.title and new_text == story.text:
-                            status = "No changes."
-                        else:
-                            push_undo()
-                            edit_story(newsletter, si, title=new_title, text=new_text)
-                            save()
-                            status = f"Story [{si}] updated."
-
-        elif key == ord("d"):  # delete
-            si = _prompt_index(stdscr, newsletter)
-            if si is None:
-                status = "No valid story # — nothing deleted."
-            else:
-                story = newsletter.stories[si]
-                if story.expected_scores is not None and not _confirm(
-                    stdscr, f"[{si}] {story.title} has labels — delete anyway? y/N"
-                ):
-                    status = "Delete cancelled."
-                else:
-                    push_undo()
-                    delete_story(newsletter, si)
-                    save()
-                    status = f"Deleted [{si}] {story.title} (z to undo)."
-
-        elif key == ord("c"):  # confirm story list (Phase A done)
-            push_undo()
-            confirm_story_list(newsletter)
-            save()
-            status = confirm_status_message(newsletter)
-
-        elif key == ord("l"):  # label a story (Phase B)
-            si = _prompt_index(stdscr, newsletter)
-            if si is None:
-                status = "No valid story # — nothing labeled."
-            else:
-                story = newsletter.stories[si]
-                scores = _prompt_scores(stdscr, current=story.expected_scores)
-                if scores is None:
-                    status = "Score entry cancelled — no changes saved."
-                else:
-                    themes = _prompt_themes(stdscr, initial=story.expected_themes)
-                    push_undo()
-                    assign_scores_and_themes(story, scores, themes)
-                    save()
-                    status = f"Labeled [{si}] {story.expected_tier}."
-
-        elif key == ord("u"):  # toggle exclude on a story
-            si = _prompt_index(stdscr, newsletter)
-            if si is None:
-                status = "No valid story # — nothing toggled."
-            else:
-                push_undo()
-                story = newsletter.stories[si]
-                story.excluded = not story.excluded
-                save()
-                status = f"[{si}] {'excluded from' if story.excluded else 'included in'} scoring."
-
-        elif key == ord("n"):  # newsletter notes
-            new_notes = _prompt_line(stdscr, "Notes:", initial=newsletter.notes)
-            if new_notes is None:
-                status = "Notes edit cancelled."
-            elif new_notes == newsletter.notes:
-                status = "Notes unchanged."
-            else:
-                push_undo()
-                newsletter.notes = new_notes
-                save()
-                status = "Notes updated."
-
-        elif key == ord("z"):  # undo the last mutation
-            if undo_stack:
-                restore_snapshot(newsletter, undo_stack.pop())
-                save()
-                status = f"Undone ({len(undo_stack)} more undo levels)."
-            else:
-                status = "Nothing to undo."
-
-        elif key == ord("X"):  # toggle whole-newsletter exclusion
-            push_undo()
-            toggle_newsletter_excluded(newsletter)
-            save()
-            status = newsletter_exclude_status(newsletter)
-
-        elif key == ord("k"):  # skip this newsletter (never marks reviewed)
-            return "skip"
-        elif key == 27:  # Esc: clear an active selection first, then go back
-            if sel_start is not None or sel_end is not None:
-                sel_start = sel_end = None
-                status = "Selection cleared."
-            else:
-                return "back"
-        elif key == ord("q"):
-            return "quit"
-
-
-def _prompt_index(stdscr, newsletter) -> int | None:
-    """Prompt for a story index; None if cancelled, non-numeric or out of range."""
-    raw = _prompt_line(stdscr, "Story #:")
-    if raw is None or not raw.isdigit():
+    async def _prompt_story_index(self):
+        raw = await self.app.push_screen_wait(PromptLineScreen("Story #:"))
+        if raw is None or not raw.isdigit():
+            return None
+        si = int(raw)
+        if 0 <= si < len(self.newsletter.stories):
+            return si
         return None
-    si = int(raw)
-    if 0 <= si < len(newsletter.stories):
-        return si
-    return None
 
+    # -- navigation-ish actions ------------------------------------------------
 
-def _auto_save(all_newsletters, path, stdscr) -> None:
-    try:
-        save_golden_set(all_newsletters, path)
-    except Exception as exc:
-        max_y, _ = stdscr.getmaxyx()
-        _safe_addstr(stdscr, max_y - 1, 0, f"Save failed: {exc}", curses.A_REVERSE)
-        stdscr.refresh()
-        stdscr.getch()
+    def action_esc(self) -> None:
+        if self.sel_start is not None or self.sel_end is not None:
+            self.sel_start = self.sel_end = None
+            self._refresh()
+            self._set_status("Selection cleared.")
+        else:
+            self.dismiss("back")
 
+    def action_skip(self) -> None:
+        self.dismiss("skip")  # never marks reviewed; list opens the next one
 
-# ---------------------------------------------------------------------------
-# List view + loop
-# ---------------------------------------------------------------------------
+    def action_quit_app(self) -> None:
+        self.dismiss("quit")
 
-def _list_view(stdscr, newsletters, all_newsletters, path, *, extract_fn=None):
-    cursor = 0
-    scroll_offset = 0
-    while True:
-        max_y, max_x = stdscr.getmaxyx()
-        page_size = max(1, max_y - 3)
-        stdscr.clear()
-        _safe_addstr(stdscr, 0, 0, f"Newsletter Label — {len(newsletters)} newsletters",
-                     curses.A_BOLD)
-        _safe_addstr(stdscr, 1, 0, format_list_header(), curses.A_UNDERLINE)
-        for vi in range(page_size):
-            ti = scroll_offset + vi
-            if ti >= len(newsletters):
-                break
-            attr = curses.A_REVERSE if ti == cursor else curses.A_NORMAL
-            _safe_addstr(stdscr, 2 + vi, 0, format_list_row(newsletters[ti]), attr)
-        _safe_addstr(stdscr, max_y - 1, 0,
-                     "↑/↓ PgUp/PgDn:Nav  Enter:Open  q:Quit", curses.A_DIM)
-        stdscr.refresh()
+    # -- selection ------------------------------------------------------------
 
-        key = stdscr.getch()
-        if key == curses.KEY_UP and cursor > 0:
-            cursor -= 1
-            if cursor < scroll_offset:
-                scroll_offset = cursor
-        elif key == curses.KEY_DOWN and cursor < len(newsletters) - 1:
-            cursor += 1
-            if cursor >= scroll_offset + page_size:
-                scroll_offset = cursor - page_size + 1
-        elif key == curses.KEY_NPAGE:
-            cursor = min(len(newsletters) - 1, cursor + page_size)
-            if cursor >= scroll_offset + page_size:
-                scroll_offset = cursor - page_size + 1
-        elif key == curses.KEY_PPAGE:
-            cursor = max(0, cursor - page_size)
-            if cursor < scroll_offset:
-                scroll_offset = cursor
-        elif key in (curses.KEY_ENTER, ord("\n"), ord("\r")):
-            while True:
-                result = _newsletter_detail(
-                    stdscr, newsletters, cursor, all_newsletters, path, extract_fn=extract_fn
-                )
-                if result == "quit":
-                    return
-                if result == "skip" and cursor < len(newsletters) - 1:
-                    # Linear skip-through: advance and immediately open the next
-                    # newsletter. Skipping never marks reviewed, so it resurfaces.
-                    cursor += 1
-                    if cursor >= scroll_offset + page_size:
-                        scroll_offset = cursor - page_size + 1
-                    continue
-                # "back", or "skip" on the last newsletter -> return to list.
-                break
-        elif key == ord("q"):
+    def action_sel_start(self) -> None:
+        body_idx = self._cursor_body_idx()
+        if body_idx is None:
+            self._set_status("Move the cursor onto a body line first.")
+        else:
+            self.sel_start = body_idx
+            self._refresh()
+            self._set_status(f"Selection start = body line {body_idx} (Esc clears).")
+
+    def action_sel_end(self) -> None:
+        body_idx = self._cursor_body_idx()
+        if body_idx is None:
+            self._set_status("Move the cursor onto a body line first.")
+        else:
+            self.sel_end = body_idx
+            self._refresh()
+            self._set_status(f"Selection end = body line {body_idx} (Esc clears).")
+
+    def on_list_view_selected(self, event) -> None:
+        event.stop()  # don't bubble to LabelApp's open-detail handler
+        self._make_story()
+
+    @work
+    async def _make_story(self) -> None:
+        if self._busy:
             return
+        if self.sel_start is None:
+            self._set_status("Set a selection start with 's' first.")
+            return
+        s_line = self.sel_start
+        e_line = self.sel_end if self.sel_end is not None else self.sel_start
+        title = await self.app.push_screen_wait(PromptLineScreen("Title (blank=auto):"))
+        if title is None:
+            self._set_status("Story creation cancelled.")
+            return
+        self.anchor_body = self._cursor_body_idx()
+        self._push_undo()
+        story = create_story_from_body(self.newsletter, s_line, e_line, title)
+        self.sel_start = self.sel_end = None
+        self._save()
+        self._set_status(f"Story created: {story.title}")
+
+    # -- seeding ---------------------------------------------------------------
+
+    def action_seed(self) -> None:
+        self._seed()
+
+    @work
+    async def _seed(self) -> None:
+        if self._busy:
+            return
+        if self.extract_fn is None:
+            self._set_status("Seeding disabled in edit mode (run without --edit to seed).")
+            return
+        confirm_msg = seed_confirmation_message(self.newsletter)
+        if confirm_msg is not None and not await self.app.push_screen_wait(
+            ConfirmScreen(confirm_msg)
+        ):
+            self._set_status("Seed cancelled — stories kept.")
+            return
+        self._busy = True
+        self._set_status("Seeding…")
+        self._push_undo()
+        try:
+            # extract_fn is synchronous (it wraps its own asyncio.run); run it
+            # in a thread so the UI stays live instead of blocking the loop.
+            stories, raw = await asyncio.to_thread(
+                seed_from_extractor, self.newsletter, self.extract_fn
+            )
+        except Exception as exc:
+            self.undo_stack.pop()  # nothing changed; keep prior undo intact
+            self._set_status("")
+            self.app.push_screen(HintScreen(f"Seed failed: {exc}"))
+        else:
+            self._save()
+            self._set_status(seed_outcome_message(raw, len(stories)))
+        finally:
+            self._busy = False
+
+    # -- story curation ----------------------------------------------------------
+
+    def action_add_story(self) -> None:
+        self._add_story()
+
+    @work
+    async def _add_story(self) -> None:
+        if self._busy:
+            return
+        title = await self.app.push_screen_wait(PromptLineScreen("New title:"))
+        text = None
+        if title:
+            text = await self.app.push_screen_wait(PromptLineScreen("New text:"))
+        if title and text:
+            self._push_undo()
+            add_story(self.newsletter, title, text)
+            self._save()
+            self._set_status(f"Story added: {title}")
+        else:
+            self._set_status("Add cancelled — need a title and text.")
+
+    def action_edit_story(self) -> None:
+        self._edit_story()
+
+    @work
+    async def _edit_story(self) -> None:
+        if self._busy:
+            return
+        si = await self._prompt_story_index()
+        if si is None:
+            self._set_status("No valid story # — nothing edited.")
+            return
+        story = self.newsletter.stories[si]
+        new_title = await self.app.push_screen_wait(
+            PromptLineScreen("Title (blank=keep):", initial=story.title)
+        )
+        if new_title is None:
+            self._set_status("Edit cancelled.")
+            return
+        # Multi-line text can't be edited in a one-line prompt; fall back to
+        # blank=keep for it (body selection is the intended repair path).
+        text_initial = story.text if "\n" not in story.text else ""
+        new_text = await self.app.push_screen_wait(
+            PromptLineScreen("Text (blank=keep):", initial=text_initial)
+        )
+        if new_text is None:
+            self._set_status("Edit cancelled.")
+            return
+        new_title = new_title or story.title
+        new_text = new_text or story.text
+        if new_title == story.title and new_text == story.text:
+            self._set_status("No changes.")
+            return
+        self._push_undo()
+        edit_story(self.newsletter, si, title=new_title, text=new_text)
+        self._save()
+        self._set_status(f"Story [{si}] updated.")
+
+    def action_delete_story(self) -> None:
+        self._delete_story()
+
+    @work
+    async def _delete_story(self) -> None:
+        if self._busy:
+            return
+        si = await self._prompt_story_index()
+        if si is None:
+            self._set_status("No valid story # — nothing deleted.")
+            return
+        story = self.newsletter.stories[si]
+        if story.expected_scores is not None and not await self.app.push_screen_wait(
+            ConfirmScreen(f"[{si}] {story.title} has labels — delete anyway? y/N")
+        ):
+            self._set_status("Delete cancelled.")
+            return
+        self._push_undo()
+        delete_story(self.newsletter, si)
+        self._save()
+        self._set_status(f"Deleted [{si}] {story.title} (z to undo).")
+
+    def action_confirm_list(self) -> None:
+        if self._busy:
+            return
+        self._push_undo()
+        confirm_story_list(self.newsletter)
+        self._save()
+        self._set_status(confirm_status_message(self.newsletter))
+
+    # -- Phase B: labeling ------------------------------------------------------
+
+    def action_label_story(self) -> None:
+        self._label_story()
+
+    @work
+    async def _label_story(self) -> None:
+        if self._busy:
+            return
+        si = await self._prompt_story_index()
+        if si is None:
+            self._set_status("No valid story # — nothing labeled.")
+            return
+        story = self.newsletter.stories[si]
+        scores = await self.app.push_screen_wait(ScoreScreen(current=story.expected_scores))
+        if scores is None:
+            self._set_status("Score entry cancelled — no changes saved.")
+            return
+        themes = await self.app.push_screen_wait(ThemeScreen(initial=story.expected_themes))
+        self._push_undo()
+        assign_scores_and_themes(story, scores, themes)
+        self._save()
+        self._set_status(f"Labeled [{si}] {story.expected_tier}.")
+
+    def action_toggle_story_excluded(self) -> None:
+        self._toggle_story_excluded()
+
+    @work
+    async def _toggle_story_excluded(self) -> None:
+        if self._busy:
+            return
+        si = await self._prompt_story_index()
+        if si is None:
+            self._set_status("No valid story # — nothing toggled.")
+            return
+        self._push_undo()
+        story = self.newsletter.stories[si]
+        story.excluded = not story.excluded
+        self._save()
+        self._set_status(
+            f"[{si}] {'excluded from' if story.excluded else 'included in'} scoring."
+        )
+
+    def action_notes(self) -> None:
+        self._notes()
+
+    @work
+    async def _notes(self) -> None:
+        if self._busy:
+            return
+        new_notes = await self.app.push_screen_wait(
+            PromptLineScreen("Notes:", initial=self.newsletter.notes)
+        )
+        if new_notes is None:
+            self._set_status("Notes edit cancelled.")
+        elif new_notes == self.newsletter.notes:
+            self._set_status("Notes unchanged.")
+        else:
+            self._push_undo()
+            self.newsletter.notes = new_notes
+            self._save()
+            self._set_status("Notes updated.")
+
+    # -- undo / exclusion ---------------------------------------------------------
+
+    def action_undo(self) -> None:
+        if self._busy:
+            return
+        if self.undo_stack:
+            restore_snapshot(self.newsletter, self.undo_stack.pop())
+            self._save()
+            self._set_status(f"Undone ({len(self.undo_stack)} more undo levels).")
+        else:
+            self._set_status("Nothing to undo.")
+
+    def action_toggle_newsletter_excluded(self) -> None:
+        if self._busy:
+            return
+        self._push_undo()
+        toggle_newsletter_excluded(self.newsletter)
+        self._save()
+        self._set_status(newsletter_exclude_status(self.newsletter))
 
 
-def _curses_main(stdscr, newsletters, all_newsletters, path, extract_fn):
-    curses.curs_set(0)
-    stdscr.keypad(True)
-    _list_view(stdscr, newsletters, all_newsletters, path, extract_fn=extract_fn)
+class LabelApp(App):
+    """Newsletter labeling: list of newsletters, drill into curate+label detail."""
+
+    BINDINGS = [Binding("q", "quit_app", "Quit")]
+
+    DEFAULT_CSS = """
+    LabelApp #newsletters {
+        height: 1fr;
+    }
+    LabelApp #list-header {
+        text-style: underline;
+    }
+    LabelApp #list-help {
+        color: $text-muted;
+    }
+    """
+
+    def __init__(self, newsletters, all_newsletters, path, *, extract_fn=None):
+        super().__init__()
+        self.newsletters = newsletters
+        self.all_newsletters = all_newsletters
+        self.path = Path(path)
+        self.extract_fn = extract_fn
+
+    def compose(self) -> ComposeResult:
+        yield Static(
+            f"Newsletter Label — {len(self.newsletters)} newsletters",
+            id="list-title", markup=False,
+        )
+        yield Static(format_list_header(), id="list-header", markup=False)
+        yield PageListView(id="newsletters")
+        yield Static("↑/↓ PgUp/PgDn:Nav  Enter:Open  q:Quit", id="list-help", markup=False)
+
+    def on_mount(self) -> None:
+        self._refresh_list()
+
+    def _refresh_list(self) -> None:
+        listview = self.query_one("#newsletters", ListView)
+        cursor = listview.index or 0
+        listview.clear()
+        listview.extend(
+            ListItem(Label(format_list_row(n), markup=False)) for n in self.newsletters
+        )
+        if self.newsletters:
+            listview.index = min(cursor, len(self.newsletters) - 1)
+
+    def on_list_view_selected(self, event) -> None:
+        event.stop()
+        index = self.query_one("#newsletters", ListView).index
+        if index is not None:
+            self._open_detail(index)
+
+    def _open_detail(self, index: int) -> None:
+        def on_dismiss(result) -> None:
+            if result == "quit":
+                self.exit("quit")
+                return
+            if result == "skip" and index < len(self.newsletters) - 1:
+                # Linear skip-through: advance and immediately open the next
+                # newsletter. Skipping never marks reviewed, so it resurfaces.
+                self.query_one("#newsletters", ListView).index = index + 1
+                self._open_detail(index + 1)
+                return
+            # "back", or "skip" on the last newsletter -> back to the list;
+            # rebuild rows so reviewed/excluded flags are current.
+            self._refresh_list()
+
+        self.push_screen(
+            DetailScreen(
+                self.newsletters, index, self.all_newsletters, self.path,
+                extract_fn=self.extract_fn,
+            ),
+            on_dismiss,
+        )
+
+    def action_quit_app(self) -> None:
+        self.exit("quit")
 
 
 def label_loop(newsletters, all_newsletters, path, *, extract_fn=None):
-    """Launch the curses labeling TUI. Saving is atomic + auto on each edit."""
+    """Launch the labeling TUI. Saving is atomic + auto on each edit."""
     if not newsletters:
         print("No newsletters to label.")
         return
-    # Esc is the back key; the default ~1s ESCDELAY makes it feel broken.
-    os.environ.setdefault("ESCDELAY", "25")
-    curses.wrapper(_curses_main, newsletters, all_newsletters, path, extract_fn)
+    LabelApp(newsletters, all_newsletters, Path(path), extract_fn=extract_fn).run()
+
 
 
 # ---------------------------------------------------------------------------

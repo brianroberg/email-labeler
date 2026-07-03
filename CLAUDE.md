@@ -164,7 +164,7 @@ All tests use mocks — no external services needed. Test files mirror source fi
 - `test_newsletter_review.py` — TUI data loading, filtering, formatting + Pilot UI tests (navigation, drill-down, filters, quit)
 - `test_eval_newsletter_schemas.py` — Golden-set dataclass round-trip + missing-key tolerance
 - `test_eval_newsletter_harvest.py` — Newsletter harvest filtering, body build, dedup
-- `test_eval_newsletter_label.py` — Story curation + per-story scoring/theme pure functions
+- `test_eval_newsletter_label.py` — Story curation + per-story scoring/theme pure functions + Pilot UI tests (seeding, undo, labeling, skip-through)
 - `test_eval_newsletter_run.py` — `prompt_hash`, cache reuse, extraction vs quality/theme modes
 - `test_eval_newsletter_report.py` — `match_stories`, tier/dimension/theme metrics, comparison deltas
 - `test_eval_newsletter_cli_docs.py` — Every newsletter eval `--flag` documented in `README-technical.md`
