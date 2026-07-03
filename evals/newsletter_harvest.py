@@ -20,15 +20,14 @@ import asyncio
 import json
 import logging
 import sys
-import tomllib
 from datetime import datetime, timezone
 from pathlib import Path
 
 import httpx
 
-from config_utils import substitute_env_vars
 from daemon import DEFAULT_MAX_THREAD_CHARS, format_thread_transcript
 from evals import format_network_error
+from evals.harvest import load_eval_config
 from evals.newsletter_schemas import GoldenNewsletter
 from gmail_utils import get_header
 from newsletter import is_newsletter
@@ -39,26 +38,8 @@ _NETWORK_ERRORS = (
 )
 
 
-def load_eval_config(config_path: str | None = None) -> dict:
-    """Load and preprocess config.toml from the given path."""
-    path = Path(config_path) if config_path else Path(__file__).parent.parent / "config.toml"
-    with open(path, "rb") as f:
-        config = tomllib.load(f)
-    return substitute_env_vars(config)
-
-
-def deduplicate(
-    new_newsletters: list[GoldenNewsletter], existing_path: Path
-) -> list[GoldenNewsletter]:
-    """Remove newsletters already present in the existing golden set file.
-
-    Args:
-        new_newsletters: Newly harvested newsletters.
-        existing_path: Path to existing golden set JSONL file.
-
-    Returns:
-        Newsletters not already in the file.
-    """
+def load_existing_thread_ids(existing_path: Path) -> set[str]:
+    """Collect thread IDs already present in the golden set JSONL file."""
     existing_ids: set[str] = set()
     if existing_path.exists():
         with open(existing_path) as f:
@@ -78,7 +59,22 @@ def deduplicate(
                 thread_id = entry.get("thread_id")
                 if thread_id:
                     existing_ids.add(thread_id)
+    return existing_ids
 
+
+def deduplicate(
+    new_newsletters: list[GoldenNewsletter], existing_path: Path
+) -> list[GoldenNewsletter]:
+    """Remove newsletters already present in the existing golden set file.
+
+    Args:
+        new_newsletters: Newly harvested newsletters.
+        existing_path: Path to existing golden set JSONL file.
+
+    Returns:
+        Newsletters not already in the file.
+    """
+    existing_ids = load_existing_thread_ids(existing_path)
     return [n for n in new_newsletters if n.thread_id not in existing_ids]
 
 
@@ -87,6 +83,7 @@ async def harvest_newsletters(
     config: dict,
     max_threads: int = 50,
     recipient: str | None = None,
+    skip_thread_ids: set[str] | None = None,
 ) -> list[GoldenNewsletter]:
     """Fetch newsletter threads and seed golden-set entries (no ground truth).
 
@@ -95,6 +92,8 @@ async def harvest_newsletters(
         config: Full parsed config dict.
         max_threads: Maximum threads to fetch.
         recipient: Newsletter recipient; defaults to config["newsletter"]["recipient"].
+        skip_thread_ids: Thread IDs already in the golden set — skipped before
+            get_thread so re-runs don't re-download them.
 
     Returns:
         List of seeded GoldenNewsletter objects (empty stories, reviewed=False).
@@ -128,8 +127,12 @@ async def harvest_newsletters(
 
     print(f"Found {len(thread_ids)} unique threads from {len(msg_stubs)} messages", file=sys.stderr)
 
+    skip_thread_ids = skip_thread_ids or set()
     results: list[GoldenNewsletter] = []
     for i, tid in enumerate(list(thread_ids.keys())[:max_threads]):
+        if tid in skip_thread_ids:
+            print(f"  Skipping thread {tid}: already in golden set", file=sys.stderr)
+            continue
         try:
             thread_data = await proxy.get_thread(tid)
             messages = thread_data.get("messages", [])
@@ -217,18 +220,21 @@ async def main(args: argparse.Namespace) -> None:
               "and re-run.", file=sys.stderr)
         sys.exit(1)
 
+    output_path = Path(args.output)
     newsletters = await harvest_newsletters(
         proxy=proxy,
         config=config,
         max_threads=args.max_threads,
         recipient=args.recipient,
+        skip_thread_ids=load_existing_thread_ids(output_path),
     )
 
     if not newsletters:
         print("No newsletters to write.", file=sys.stderr)
         return
 
-    output_path = Path(args.output)
+    # Backstop: the pre-fetch skip already avoids re-downloading known threads,
+    # but re-dedup against the file in case it changed during the harvest.
     newsletters = deduplicate(newsletters, output_path)
     if not newsletters:
         print("All newsletters already in golden set.", file=sys.stderr)

@@ -15,6 +15,7 @@ import re
 import sys
 from pathlib import Path
 
+from evals import plural
 from evals.newsletter_schemas import (
     ExtractionPrediction,
     NewsletterRunMeta,
@@ -28,10 +29,20 @@ from evals.report import (
     format_per_class_table,
     format_table_row,
 )
+from newsletter import _VALID_THEMES
 
 TIERS = ["excellent", "good", "fair", "poor"]
 DIMENSIONS = ["simple", "concrete", "personal", "dynamic"]
-THEMES = ["scripture", "christlikeness", "church", "vocation_family", "disciple_making"]
+
+# Display order for theme tables; the theme SET is single-sourced from
+# newsletter._VALID_THEMES — a theme dropped there disappears here, and any
+# theme added there is appended (sorted) even before this ordering is updated.
+_THEME_DISPLAY_ORDER = [
+    "scripture", "christlikeness", "church", "vocation_family", "disciple_making",
+]
+THEMES = [t for t in _THEME_DISPLAY_ORDER if t.upper() in _VALID_THEMES] + sorted(
+    t.lower() for t in _VALID_THEMES if t.lower() not in _THEME_DISPLAY_ORDER
+)
 
 
 def _dimension_pairs(results: list[StoryPrediction], dim: str) -> list[tuple[int, int]]:
@@ -46,40 +57,31 @@ def _dimension_pairs(results: list[StoryPrediction], dim: str) -> list[tuple[int
     return pairs
 
 
-def compute_dimension_mae(results: list[StoryPrediction]) -> dict[str, float]:
-    """Mean absolute error per dimension over stories with both scores present."""
-    out: dict[str, float] = {}
+def _dimension_mean(
+    results: list[StoryPrediction],
+    per_pair,
+) -> dict[str, float | None]:
+    """Mean of per_pair(expected, predicted) per dimension; None with no pairs."""
+    out: dict[str, float | None] = {}
     for dim in DIMENSIONS:
         pairs = _dimension_pairs(results, dim)
-        if pairs:
-            out[dim] = sum(abs(e - p) for e, p in pairs) / len(pairs)
-        else:
-            out[dim] = None
+        out[dim] = sum(per_pair(e, p) for e, p in pairs) / len(pairs) if pairs else None
     return out
+
+
+def compute_dimension_mae(results: list[StoryPrediction]) -> dict[str, float]:
+    """Mean absolute error per dimension over stories with both scores present."""
+    return _dimension_mean(results, lambda e, p: abs(e - p))
 
 
 def compute_dimension_exact_match(results: list[StoryPrediction]) -> dict[str, float]:
     """Fraction of exact-match predictions per dimension."""
-    out: dict[str, float] = {}
-    for dim in DIMENSIONS:
-        pairs = _dimension_pairs(results, dim)
-        if pairs:
-            out[dim] = sum(1 for e, p in pairs if e == p) / len(pairs)
-        else:
-            out[dim] = None
-    return out
+    return _dimension_mean(results, lambda e, p: e == p)
 
 
 def compute_dimension_within1(results: list[StoryPrediction]) -> dict[str, float]:
     """Fraction of predictions within 1 point of expected per dimension."""
-    out: dict[str, float] = {}
-    for dim in DIMENSIONS:
-        pairs = _dimension_pairs(results, dim)
-        if pairs:
-            out[dim] = sum(1 for e, p in pairs if abs(e - p) <= 1) / len(pairs)
-        else:
-            out[dim] = None
-    return out
+    return _dimension_mean(results, lambda e, p: abs(e - p) <= 1)
 
 
 def format_metric_delta(a: float | None, b: float | None) -> str:
@@ -108,11 +110,16 @@ def compute_all_metrics(
     story_results: list[StoryPrediction],
     extraction_results: list[ExtractionPrediction] | None = None,
     match_threshold: float = 0.6,
+    mode: str = "all",
 ) -> dict:
-    """Bundle every metric section for a single run."""
+    """Bundle every metric section for a single run.
+
+    mode is the run's RunMeta.mode; it tells tier metrics whether errored rows
+    count as quality failures (they don't in a themes-only run).
+    """
     return {
         "story_count": len(story_results),
-        "tier": compute_tier_metrics(story_results),
+        "tier": compute_tier_metrics(story_results, mode),
         "dimension_mae": compute_dimension_mae(story_results),
         "dimension_exact": compute_dimension_exact_match(story_results),
         "dimension_within1": compute_dimension_within1(story_results),
@@ -135,15 +142,19 @@ def compute_extraction_metrics(
     stories is a correct abstention (precision = recall = 1.0). Aggregate as micro
     (pooled counts) and macro (mean of per-newsletter precision/recall). All
     aggregates are None when there are no scored newsletters, so empty sections
-    render as N/A rather than a fake 0.0%.
+    render as N/A rather than a fake 0.0%. Rows with error set are excluded
+    from scoring but counted under "errors"/"error_threads" so a failed run is
+    visible in the report (mirroring the tier section).
     """
     total_matched = total_pred = total_gold = 0
     per_nl_precision: list[float] = []
     per_nl_recall: list[float] = []
     per_newsletter: list[dict] = []
+    error_threads: list[str] = []
 
     for r in results:
         if r.error is not None:
+            error_threads.append(r.thread_id)
             continue
         matched, n_pred, n_gold = match_stories(
             r.predicted_stories, r.golden_stories, threshold=threshold
@@ -175,6 +186,8 @@ def compute_extraction_metrics(
             "macro_recall": None,
             "macro_f1": None,
             "count": 0,
+            "errors": len(error_threads),
+            "error_threads": error_threads,
             "per_newsletter": [],
         }
 
@@ -197,6 +210,8 @@ def compute_extraction_metrics(
         "macro_recall": macro_r,
         "macro_f1": macro_f1,
         "count": len(per_newsletter),
+        "errors": len(error_threads),
+        "error_threads": error_threads,
         "per_newsletter": per_newsletter,
     }
 
@@ -286,14 +301,20 @@ def compute_multilabel_metrics(
     }
 
 
-def _quality_attempted(r: StoryPrediction) -> bool:
+def _quality_attempted(r: StoryPrediction, mode: str = "all") -> bool:
     """Whether the quality call ran (or failed) for this row.
 
     A --mode themes run never fires the quality call: error=None AND
     scores_raw=None AND predicted_scores=None means "never attempted", which
     must be skipped — not counted as a parse failure. scores_raw captured (or
     an error, or parsed scores) means quality was genuinely attempted.
+
+    In a themes-only run (mode="themes", from the run's RunMeta) an error is a
+    *theme* call failure, so it does not count as a quality attempt either —
+    only actual quality evidence (scores_raw / predicted_scores) does.
     """
+    if mode == "themes":
+        return r.scores_raw is not None or r.predicted_scores is not None
     return (
         r.error is not None
         or r.scores_raw is not None
@@ -301,17 +322,18 @@ def _quality_attempted(r: StoryPrediction) -> bool:
     )
 
 
-def compute_tier_metrics(results: list[StoryPrediction]) -> dict:
+def compute_tier_metrics(results: list[StoryPrediction], mode: str = "all") -> dict:
     """Tier metrics over the 4 tier classes.
 
     Rows where quality was attempted but predicted_scores is None are parse/
     network failures: counted as errors and excluded from the confusion matrix
     / accuracy. Their story_ids are returned under "error_stories" so failures
     are identifiable in the report. Rows where quality was never attempted
-    (e.g. a --mode themes run: error=None, scores_raw=None) are skipped
-    entirely — neither scored nor errors.
+    (e.g. a --mode themes run: error=None, scores_raw=None — or, given
+    mode="themes", any errored row) are skipped entirely — neither scored nor
+    errors.
     """
-    attempted = [r for r in results if _quality_attempted(r)]
+    attempted = [r for r in results if _quality_attempted(r, mode)]
     errors = [r for r in attempted if r.predicted_scores is None]
     valid = [r for r in attempted if r.predicted_scores is not None]
 
@@ -416,7 +438,7 @@ def theme_parse_anomalies(results: list[StoryPrediction]) -> list[dict]:
 
     Rows without themes_raw (legacy files, error rows) are skipped.
     """
-    valid_upper = {t.upper() for t in THEMES}
+    valid_upper = _VALID_THEMES
     anomalies: list[dict] = []
     for r in results:
         if r.error is not None or r.themes_raw is None:
@@ -533,13 +555,6 @@ def _format_theme_table(themes: dict) -> str:
     return "\n".join(lines)
 
 
-def _plural(n: int, word: str) -> str:
-    if n == 1:
-        return f"1 {word}"
-    plural = word[:-1] + "ies" if word.endswith("y") else word + "s"
-    return f"{n} {plural}"
-
-
 def print_report(
     meta: NewsletterRunMeta,
     metrics: dict,
@@ -577,7 +592,8 @@ def print_report(
     if tier["count"] or tier["errors"]:
         print("\n--- Tier Classification (4-class) ---")
         print(f"  Accuracy: {format_pct(tier['accuracy'])} "
-              f"({_plural(tier['count'], 'story')}, {_plural(tier['errors'], 'error')})")
+              f"({plural(tier['count'], 'story', 'stories')}, "
+              f"{plural(tier['errors'], 'error')})")
         if tier["error_stories"]:
             print(f"  Failed stories (quality parse/network): "
                   f"{', '.join(tier['error_stories'])}")
@@ -600,16 +616,20 @@ def print_report(
               f"Exact-set match: {format_pct(themes['exact_set_match'])}")
         anomalies = metrics.get("theme_anomalies", [])
         if anomalies:
-            print(f"  Parse anomalies: {_plural(len(anomalies), 'story')} "
+            print(f"  Parse anomalies: {plural(len(anomalies), 'story', 'stories')} "
                   f"(invalid/unparseable theme output; --verbose shows raw)")
         print()
         print(_format_theme_table(themes))
 
     extraction = metrics["extraction"]
-    if extraction["count"]:
+    if extraction["count"] or extraction.get("errors"):
         print("\n--- Extraction ---")
-        print(f"  ({_plural(extraction['count'], 'newsletter')}, "
+        print(f"  ({plural(extraction['count'], 'newsletter')}, "
+              f"{plural(extraction.get('errors', 0), 'error')}, "
               f"match threshold {match_threshold})")
+        if extraction.get("error_threads"):
+            print(f"  Failed newsletters (extraction call): "
+                  f"{', '.join(extraction['error_threads'])}")
         print(f"  Micro:  P={format_pct(extraction['micro_precision'])} "
               f"R={format_pct(extraction['micro_recall'])} "
               f"F1={format_pct(extraction['micro_f1'])}")
@@ -812,22 +832,25 @@ def _print_verbose_compare(
         r2 = r2_by_id.get(r1.story_id)
         if r2 is None:
             continue
-        if r1.predicted_scores is None or r2.predicted_scores is None:
-            continue
         parts = []
-        if r1.predicted_tier != r2.predicted_tier:
-            a_right = r1.predicted_tier == r1.expected_tier
-            b_right = r2.predicted_tier == r2.expected_tier
-            flag = ""
-            if a_right and not b_right:
-                flag = " [regression]"
-            elif b_right and not a_right:
-                flag = " [improvement]"
-            parts.append(f"tier: {r1.predicted_tier}->{r2.predicted_tier} "
-                         f"(expected {r1.expected_tier}){flag}")
-        s1, s2 = set(r1.predicted_themes or []), set(r2.predicted_themes or [])
-        if s1 != s2:
-            parts.append(f"themes: {sorted(s1)}->{sorted(s2)}")
+        # Tier flips are only meaningful when both runs' quality calls parsed;
+        # theme flips only need both rows' theme side attempted (a --mode
+        # themes run never has predicted_scores but can still flip themes).
+        if r1.predicted_scores is not None and r2.predicted_scores is not None:
+            if r1.predicted_tier != r2.predicted_tier:
+                a_right = r1.predicted_tier == r1.expected_tier
+                b_right = r2.predicted_tier == r2.expected_tier
+                flag = ""
+                if a_right and not b_right:
+                    flag = " [regression]"
+                elif b_right and not a_right:
+                    flag = " [improvement]"
+                parts.append(f"tier: {r1.predicted_tier}->{r2.predicted_tier} "
+                             f"(expected {r1.expected_tier}){flag}")
+        if _theme_scored(r1) and _theme_scored(r2):
+            s1, s2 = set(r1.predicted_themes or []), set(r2.predicted_themes or [])
+            if s1 != s2:
+                parts.append(f"themes: {sorted(s1)}->{sorted(s2)}")
         if parts:
             flips.append((r1.story_id, parts))
     if not flips:
@@ -866,7 +889,8 @@ def build_trend_rows(
     for f in files:
         try:
             meta, story_preds, extraction_preds = load_results(f)
-            metrics = compute_all_metrics(story_preds, extraction_preds, match_threshold)
+            metrics = compute_all_metrics(story_preds, extraction_preds,
+                                          match_threshold, mode=meta.mode)
             rows.append({
                 "file": f.name,
                 "run_id": meta.run_id,
@@ -934,7 +958,9 @@ def _load_results_or_exit(
         return load_results(path)
     except FileNotFoundError:
         print(f"Error: results file not found: {path}", file=sys.stderr)
-    except (ValueError, json.JSONDecodeError) as exc:
+    # OSError covers IsADirectoryError, PermissionError, etc.; JSONDecodeError
+    # is a ValueError subclass but is listed for clarity.
+    except (OSError, ValueError, json.JSONDecodeError) as exc:
         print(f"Error: could not read results file {path}: {exc}", file=sys.stderr)
         if path.name.endswith(".cot.jsonl"):
             print(
@@ -965,7 +991,8 @@ def cli():
 
     if args.results:
         meta, story_preds, extraction_preds = _load_results_or_exit(args.results)
-        metrics = compute_all_metrics(story_preds, extraction_preds, args.match_threshold)
+        metrics = compute_all_metrics(story_preds, extraction_preds,
+                                      args.match_threshold, mode=meta.mode)
         if args.format == "json":
             report_as_json(meta, metrics)
         else:
@@ -992,8 +1019,8 @@ def cli():
             )
         meta1, s1, e1 = _load_results_or_exit(compare_paths[0])
         meta2, s2, e2 = _load_results_or_exit(compare_paths[1])
-        m1 = compute_all_metrics(s1, e1, args.match_threshold)
-        m2 = compute_all_metrics(s2, e2, args.match_threshold)
+        m1 = compute_all_metrics(s1, e1, args.match_threshold, mode=meta1.mode)
+        m2 = compute_all_metrics(s2, e2, args.match_threshold, mode=meta2.mode)
         if args.format == "json":
             comparison_as_json(meta1, m1, meta2, m2)
         else:

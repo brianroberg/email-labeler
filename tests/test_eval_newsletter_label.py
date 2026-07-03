@@ -74,6 +74,16 @@ class TestSeedStories:
         assert nl.reviewed is False  # seeding is not confirmation
         assert all(not s.reviewed for s in nl.stories)
 
+    def test_seeding_a_reviewed_newsletter_clears_reviewed(self):
+        # Re-seeding replaces the confirmed story list with an uncurated
+        # machine seed — it must NOT stay authoritative extraction truth for
+        # reviewed-only runs. Undo still restores via the snapshot.
+        nl = _newsletter("tS", reviewed=True)
+
+        seed_stories(nl, [("A", "text a")])
+
+        assert nl.reviewed is False
+
     def test_seeding_replaces_prior_candidates(self):
         nl = _newsletter("tS")
         nl.stories = [_story("tS:0", title="old")]
@@ -408,18 +418,64 @@ class TestConfirmStoryList:
 
         assert nl.reviewed is True
 
-    def test_confirm_reindexes_story_ids_after_edits(self):
-        # Delete leaves a gap in ids; confirming makes them contiguous.
+    def test_confirm_preserves_existing_ids_after_delete(self):
+        # Confirm must NOT positionally renumber: deleting a story and
+        # re-confirming would rename all later stories, breaking the stable
+        # story_id contract that cross-run comparisons key on.
         nl = _newsletter("tC")
         seed_stories(nl, [("A", "a"), ("B", "b"), ("C", "c")])
-        delete_story(nl, 1)  # remove B -> ids may be stale
+        delete_story(nl, 1)  # remove B -> gap in ids is fine
 
         confirm_story_list(nl)
 
-        assert [s.story_id for s in nl.stories] == ["tC:0", "tC:1"]
+        assert [s.story_id for s in nl.stories] == ["tC:0", "tC:2"]
+
+    def test_confirm_repairs_duplicate_ids_with_fresh_unique_ones(self):
+        # Only duplicates/collisions get a fresh id; the first holder keeps its.
+        nl = _newsletter("tC")
+        nl.stories = [
+            _story("tC:0", title="A"),
+            _story("tC:0", title="A-dup"),
+            _story("tC:1", title="B"),
+        ]
+
+        confirm_story_list(nl)
+
+        ids = [s.story_id for s in nl.stories]
+        assert len(set(ids)) == len(ids)  # unique
+        assert ids[0] == "tC:0"  # first holder kept
+        assert ids[2] == "tC:1"  # untouched non-duplicate kept
+        assert ids[1] == "tC:2"  # dup repaired via the next-id helper
 
 
 class TestAddStory:
+    def test_add_after_delete_never_duplicates_an_existing_id(self):
+        # Deleting story 0 of [t1:0, t1:1, t1:2] then adding must NOT mint a
+        # second "t1:2" — downstream dicts keyed by story_id would silently
+        # collapse two stories. The next id comes from max(suffix)+1.
+        nl = _newsletter("t1")
+        seed_stories(nl, [("A", "a"), ("B", "b"), ("C", "c")])
+        delete_story(nl, 0)
+
+        added = add_story(nl, "D", "d")
+
+        ids = [s.story_id for s in nl.stories]
+        assert len(set(ids)) == len(ids)  # all unique
+        assert added.story_id == "t1:3"
+
+    def test_create_from_body_after_delete_never_duplicates_an_existing_id(self):
+        # Same defect via the body-span path: it must share add_story's id
+        # derivation instead of re-deriving from len(stories).
+        nl = _newsletter("t1", body="l0\nl1")
+        seed_stories(nl, [("A", "a"), ("B", "b"), ("C", "c")])
+        delete_story(nl, 0)
+
+        story = create_story_from_body(nl, 0, 0, "T")
+
+        ids = [s.story_id for s in nl.stories]
+        assert len(set(ids)) == len(ids)
+        assert story.story_id == "t1:3"
+
     def test_appends_story_with_stable_id_and_leaves_unreviewed(self):
         nl = _newsletter("tXY")
         nl.stories = [_story("tXY:0")]
@@ -773,6 +829,42 @@ class TestSeedFromExtractorRaw:
         assert [s.title for s in stories] == ["One"]
 
 
+class TestBuildExtractorClientConfig:
+    def test_passes_config_timeout_and_1024_max_tokens_default(self, monkeypatch):
+        # Must match daemon.run_daemon / newsletter_run.build_classifier:
+        # timeout=nl_llm.get("timeout", 60) and max_tokens default 1024.
+        import llm_client as llm_client_module
+        from evals.newsletter_label import build_extractor
+
+        captured = {}
+        real_client = llm_client_module.LLMClient
+
+        def spy(*args, **kwargs):
+            captured.update(kwargs)
+            return real_client(*args, **kwargs)
+
+        monkeypatch.setattr(llm_client_module, "LLMClient", spy)
+        monkeypatch.setenv("NEWSLETTER_LLM_URL", "http://llm.example")
+        monkeypatch.setenv("NEWSLETTER_LLM_API_KEY", "k")
+        prompt = {"system": "s", "user_template": "{body}"}
+        quality = {"system": "s", "user_template": "{title}{text}"}
+        config = {
+            "newsletter": {
+                "llm": {"model": "m", "timeout": 123},  # no max_tokens
+                "prompts": {
+                    "story_extraction": prompt,
+                    "quality_assessment": quality,
+                    "theme_classification": quality,
+                },
+            }
+        }
+
+        build_extractor(config)
+
+        assert captured["timeout"] == 123
+        assert captured["max_tokens"] == 1024
+
+
 class TestBuildExtractorPreflight:
     def test_missing_endpoint_fails_fast_naming_env_vars(self, monkeypatch):
         from evals.newsletter_label import build_extractor
@@ -991,6 +1083,72 @@ class TestDetailCursorAnchor:
             w[2] for w in screen.frames[-1] if w[3] == curses.A_REVERSE and w[1] <= 1
         ]
         assert any("para two" in text for text in reversed_rows)
+
+
+class TestDetailRowCache:
+    def _counting(self, monkeypatch):
+        import evals.newsletter_label as label
+
+        calls = {"rows": 0, "covered": 0}
+        real_rows = label.build_detail_rows
+        real_covered = label.covered_body_lines
+
+        def counting_rows(*args, **kwargs):
+            calls["rows"] += 1
+            return real_rows(*args, **kwargs)
+
+        def counting_covered(*args, **kwargs):
+            calls["covered"] += 1
+            return real_covered(*args, **kwargs)
+
+        monkeypatch.setattr(label, "build_detail_rows", counting_rows)
+        monkeypatch.setattr(label, "covered_body_lines", counting_covered)
+        return calls
+
+    def test_pure_cursor_movement_reuses_cached_rows(self, tmp_path, monkeypatch):
+        # Rows + covered-lines are expensive (full display-width wrap of the
+        # body); pure navigation keys must reuse the cache, not rebuild.
+        import curses
+
+        calls = self._counting(monkeypatch)
+        nl = _newsletter("tP", body="b0\nb1\nb2\nb3")
+
+        keys = [curses.KEY_DOWN] * 4 + [curses.KEY_UP] * 2 + ["q"]
+        _run_detail(keys, [nl], tmp_path)
+
+        assert calls["rows"] == 1
+        assert calls["covered"] == 1
+
+    def test_mutation_rebuilds_rows(self, tmp_path, monkeypatch):
+        calls = self._counting(monkeypatch)
+        nl = _newsletter("tP", body="b0\nb1")
+        seed_stories(nl, [("A", "b0")])
+
+        _run_detail(["d", "0", "\n", "q"], [nl], tmp_path)  # delete story 0
+
+        assert calls["rows"] == 2  # initial build + rebuild after the delete
+
+    def test_resize_rewraps_body(self, tmp_path):
+        # A terminal resize must invalidate the cache: the body is rewrapped
+        # to the new width so no content is lost to addnstr truncation.
+        import curses
+
+        from evals.newsletter_label import _newsletter_detail
+
+        words = [f"word{i:02d}" for i in range(24)]
+        nl = _newsletter("tP", body=" ".join(words))
+
+        class ResizingScreen(FakeScreen):
+            def getch(self):
+                self.width = 40  # shrink before the next frame renders
+                return super().getch()
+
+        screen = ResizingScreen([curses.KEY_DOWN, "q"], width=100)
+        _newsletter_detail(screen, [nl], 0, [nl], tmp_path / "golden.jsonl")
+
+        final = " ".join(w[2] for w in screen.frames[-1])
+        for word in words:
+            assert word in final
 
 
 class TestDetailSelection:

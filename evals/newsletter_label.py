@@ -14,8 +14,9 @@ by marking body segments — move the cursor over the rendered body, press ``s``
 ``e`` to set the selection start/end line, and ``Enter`` to make a story from
 that inclusive span — plus add/edit/delete candidates. Body lines already
 covered by a story are dimmed, so paragraphs the seed omitted stand out.
-Confirming the list sets ``newsletter.reviewed=True`` and assigns each story a
-stable ``story_id = f"{thread_id}:{index}"``. A newsletter can also be skipped
+Confirming the list sets ``newsletter.reviewed=True``; every story keeps its
+stable ``story_id`` (``f"{thread_id}:{n}"``) and only missing/duplicate ids are
+repaired with fresh unique ones. A newsletter can also be skipped
 (``k``) without marking it reviewed, so it resurfaces in a later pass.
 
 Phase B (per-story labels): assign the 4 dimension scores
@@ -38,6 +39,7 @@ import tempfile
 import unicodedata
 from pathlib import Path
 
+from evals import plural
 from evals.newsletter_schemas import GoldenNewsletter, GoldenStory
 from newsletter import compute_tier, parse_stories
 
@@ -89,12 +91,6 @@ def save_golden_set(newsletters: list[GoldenNewsletter], path: Path) -> None:
 # Pure state transitions (Phase A — curate stories)
 # ---------------------------------------------------------------------------
 
-def _reindex_story_ids(newsletter):
-    """Reassign every story's id to f"{thread_id}:{index}" for its position."""
-    for i, story in enumerate(newsletter.stories):
-        story.story_id = f"{newsletter.thread_id}:{i}"
-
-
 def seed_from_extractor(newsletter, extract_fn):
     """Seed candidates by running *extract_fn* over the body, then parse_stories.
 
@@ -112,25 +108,46 @@ def seed_stories(newsletter, story_pairs):
     """Populate candidate stories from ``parse_stories`` (title, text) pairs.
 
     Replaces any existing story list, assigns stable ids, and records the seed
-    provenance. Does not confirm the list.
+    provenance. Replacing the list invalidates any prior confirmation, so
+    ``newsletter.reviewed`` is reset to False — the uncurated machine seed must
+    be re-confirmed before it counts as extraction truth (undo still restores
+    the prior state, ``reviewed`` included, via the snapshot).
     """
     newsletter.stories = [
         GoldenStory(story_id=f"{newsletter.thread_id}:{i}", title=title, text=text)
         for i, (title, text) in enumerate(story_pairs)
     ]
     newsletter.seeded_from = "parse_stories"
+    newsletter.reviewed = False
     return newsletter.stories
 
 
+def _next_story_id(newsletter) -> str:
+    """Next unique story id: ``max(existing numeric suffixes) + 1``.
+
+    Deriving from the max — not ``len(stories)`` — means a delete followed by
+    an add can never mint a duplicate id (downstream dicts key on story_id).
+    Falls back to ``len(stories)`` when no story carries a numeric suffix.
+    """
+    prefix = f"{newsletter.thread_id}:"
+    max_suffix = -1
+    for story in newsletter.stories:
+        sid = story.story_id or ""
+        if sid.startswith(prefix) and sid[len(prefix):].isdigit():
+            max_suffix = max(max_suffix, int(sid[len(prefix):]))
+    if max_suffix < 0:
+        return f"{prefix}{len(newsletter.stories)}"
+    return f"{prefix}{max_suffix + 1}"
+
+
 def add_story(newsletter, title, text):
-    """Append a new candidate story with a stable story_id.
+    """Append a new candidate story with a stable, unique story_id.
 
     Does not confirm the list — ``newsletter.reviewed`` is untouched and the
     new story starts unreviewed.
     """
-    index = len(newsletter.stories)
     story = GoldenStory(
-        story_id=f"{newsletter.thread_id}:{index}",
+        story_id=_next_story_id(newsletter),
         title=title,
         text=text,
     )
@@ -145,8 +162,8 @@ def create_story_from_body(newsletter, start_line, end_line, title):
     they are normalized (min/max) and clamped to the valid range, so order and
     out-of-range values are tolerated. The span text is the inclusive
     ``lo..hi`` slice joined with newlines. A falsy *title* is auto-derived from
-    the first ~8 words of the segment. Appends the story with a stable
-    ``story_id``; ``newsletter.reviewed`` is left untouched.
+    the first ~8 words of the segment. Appends via ``add_story`` (stable,
+    unique ``story_id``); ``newsletter.reviewed`` is left untouched.
     """
     body_lines = newsletter.body.splitlines()
     last = max(0, len(body_lines) - 1)
@@ -155,13 +172,7 @@ def create_story_from_body(newsletter, start_line, end_line, title):
     text = "\n".join(body_lines[lo:hi + 1])
     if not title:
         title = " ".join(text.split()[:8]).strip() or "(untitled)"
-    story = GoldenStory(
-        story_id=f"{newsletter.thread_id}:{len(newsletter.stories)}",
-        title=title,
-        text=text,
-    )
-    newsletter.stories.append(story)
-    return story
+    return add_story(newsletter, title, text)
 
 
 def edit_story(newsletter, index, *, title=None, text=None):
@@ -176,7 +187,8 @@ def edit_story(newsletter, index, *, title=None, text=None):
 def delete_story(newsletter, index):
     """Remove a wrongly-extracted candidate entirely (not the same as exclude).
 
-    Leaves ``newsletter.reviewed`` untouched; ids are reindexed on confirm.
+    Leaves ``newsletter.reviewed`` untouched; the remaining stories keep their
+    ids (gaps are fine — ids are stable, never positional).
     """
     newsletter.stories.pop(index)
 
@@ -184,9 +196,15 @@ def delete_story(newsletter, index):
 def confirm_story_list(newsletter):
     """Confirm the curated story list as authoritative extraction truth.
 
-    Reindexes story ids to be contiguous and marks the newsletter reviewed.
+    Existing story ids are PRESERVED (cross-run comparisons key on them); only
+    missing or duplicate ids are repaired with a fresh unique id from
+    ``_next_story_id``. Marks the newsletter reviewed.
     """
-    _reindex_story_ids(newsletter)
+    seen = set()
+    for story in newsletter.stories:
+        if not story.story_id or story.story_id in seen:
+            story.story_id = _next_story_id(newsletter)
+        seen.add(story.story_id)
     newsletter.reviewed = True
 
 
@@ -280,18 +298,13 @@ def seed_confirmation_message(newsletter) -> str | None:
         return None
     labeled = sum(1 for s in newsletter.stories if s.expected_scores is not None)
     detail = f" ({labeled} labeled)" if labeled else ""
-    return f"Replace {_stories(n)}{detail} with a fresh seed? y/N"
-
-
-def _stories(n: int) -> str:
-    """'1 story' / 'N stories' — mirror the run/report modules' _plural."""
-    return "1 story" if n == 1 else f"{n} stories"
+    return f"Replace {plural(n, 'story', 'stories')}{detail} with a fresh seed? y/N"
 
 
 def seed_outcome_message(raw: str, story_count: int) -> str:
     """Status line after a seed: distinguishes NO_STORIES from a parse washout."""
     if story_count:
-        return f"Seeded {_stories(story_count)}."
+        return f"Seeded {plural(story_count, 'story', 'stories')}."
     if raw.strip().upper() == "NO_STORIES":
         return "Extractor returned NO_STORIES."
     return "Extractor output had no parseable story blocks."
@@ -307,7 +320,8 @@ def confirm_status_message(newsletter) -> str:
     status = "Story list confirmed."
     if unlabeled:
         status += (
-            f" {_stories(unlabeled)} still unlabeled — press l to score them."
+            f" {plural(unlabeled, 'story', 'stories')} still unlabeled"
+            " — press l to score them."
         )
     return status
 
@@ -494,12 +508,14 @@ def build_extractor(config: dict):
             "or CLOUD_LLM_URL, or run with --edit to curate without seeding."
         )
     nl_llm = config["newsletter"]["llm"]
+    # Mirror daemon.run_daemon / newsletter_run.build_classifier defaults.
     client = LLMClient(
         base_url=base_url,
         api_key=api_key,
         model=nl_llm["model"],
         temperature=nl_llm.get("temperature", 0.0),
-        max_tokens=nl_llm.get("max_tokens", 2048),
+        max_tokens=nl_llm.get("max_tokens", 1024),
+        timeout=nl_llm.get("timeout", 60),
         extra_body=nl_llm.get("extra_body"),
     )
     classifier = NewsletterClassifier(client, config)
@@ -781,8 +797,17 @@ def _newsletter_detail(stdscr, newsletters, index, all_newsletters, path, *, ext
     undo_stack: list[dict] = []  # snapshots, pushed only when a mutation happens
     status = ""  # one-shot feedback line (cleared on the next keypress)
     anchor_body = None  # body line to re-anchor the cursor to after a mutation
+    # Rows + covered-lines are expensive (display-width wrap of the whole body,
+    # substring scan per line); cache them and rebuild only when the newsletter
+    # mutated (every mutating branch calls save()) or the terminal was resized.
+    dirty = True
+    cached_size: tuple[int, int] | None = None
+    rows: list[tuple[str, int | None]] = []
+    covered: set[int] = set()
 
     def save():
+        nonlocal dirty
+        dirty = True
         _auto_save(all_newsletters, path, stdscr)
 
     def push_undo():
@@ -802,7 +827,11 @@ def _newsletter_detail(stdscr, newsletters, index, all_newsletters, path, *, ext
 
     while True:
         max_y, max_x = stdscr.getmaxyx()
-        rows = build_detail_rows(newsletter, index, total, max_x - 2)
+        if dirty or (max_y, max_x) != cached_size:
+            rows = build_detail_rows(newsletter, index, total, max_x - 2)
+            covered = covered_body_lines(newsletter)
+            cached_size = (max_y, max_x)
+            dirty = False
         if anchor_body is not None:
             # The story list above the body grew/shrank: keep the cursor on
             # the same BODY line, not the same physical row.
@@ -823,7 +852,6 @@ def _newsletter_detail(stdscr, newsletters, index, all_newsletters, path, *, ext
             lo, hi = min(sel_start, sel_end), max(sel_start, sel_end)
         elif sel_start is not None:
             lo = hi = sel_start
-        covered = covered_body_lines(newsletter)
 
         stdscr.clear()
         for row_i in range(content_rows):

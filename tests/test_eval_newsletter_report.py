@@ -11,6 +11,7 @@ from evals.newsletter_report import (
     _format_dim_table,
     build_trend_rows,
     cli,
+    comparison_as_json,
     compute_all_metrics,
     compute_dimension_exact_match,
     compute_dimension_mae,
@@ -26,6 +27,7 @@ from evals.newsletter_report import (
     print_comparison,
     print_report,
     print_trend,
+    report_as_json,
     theme_parse_anomalies,
 )
 from evals.newsletter_schemas import (
@@ -418,6 +420,25 @@ class TestExtractionAbstention:
                     "macro_precision", "macro_recall", "macro_f1"):
             assert m[key] is None
 
+    def test_fully_errored_run_surfaces_errors_in_report(self, capsys):
+        # Every extraction call failed: the metrics must count the errors and
+        # the report must still render an Extraction section naming them,
+        # mirroring the tier section — not silently vanish.
+        errored = ExtractionPrediction(thread_id="A", golden_stories=[],
+                                       predicted_stories=[],
+                                       error="connection refused")
+        m = compute_extraction_metrics([errored])
+        assert m["count"] == 0
+        assert m["errors"] == 1
+        assert m["error_threads"] == ["A"]
+        metrics = compute_all_metrics([], [errored])
+        print_report(_meta(mode="extraction"), metrics,
+                     extraction_results=[errored])
+        out = capsys.readouterr().out
+        assert "--- Extraction ---" in out
+        assert "1 error" in out
+        assert "A" in out.split("--- Extraction ---")[1]
+
 
 class TestThemeMetricsGating:
     def test_quality_parse_failure_does_not_drop_theme_row(self):
@@ -485,6 +506,23 @@ class TestTierQualityNotAttempted:
         assert m["errors"] == 1
         assert m["error_stories"] == ["down"]
 
+    def test_themes_mode_error_row_does_not_resurrect_tier_section(
+        self, tmp_path, monkeypatch, capsys,
+    ):
+        # In a --mode themes run the quality call is never in play, so a theme
+        # call's network error must not render a misleading tier section
+        # ("0 stories, 1 error"). The run's mode comes from RunMeta.
+        errored = _pred(story_id="down", expected_themes=["church"],
+                        error="connection refused")
+        path = tmp_path / "themes_run.jsonl"
+        _write_results(path, _meta(mode="themes"), [errored])
+        monkeypatch.setattr(sys, "argv", [
+            "newsletter_report", "--results", str(path),
+        ])
+        cli()
+        out = capsys.readouterr().out
+        assert "Tier Classification" not in out
+
     def test_verbose_failures_section_excludes_not_attempted(self, capsys):
         row = _pred(story_id="t:0", expected_themes=["church"],
                     predicted_themes=["church"])
@@ -521,6 +559,15 @@ class TestThemeParseAnomalies:
         # Legacy rows / error rows carry no themes_raw -> no anomaly.
         anomalies = theme_parse_anomalies([_pred(story_id="x", predicted_themes=[])])
         assert anomalies == []
+
+
+class TestThemeListSingleSource:
+    def test_report_themes_match_newsletter_valid_themes(self):
+        # The report's theme list is derived from the pipeline's canonical set
+        # so the two can never drift.
+        from newsletter import _VALID_THEMES
+        assert set(THEMES) == {t.lower() for t in _VALID_THEMES}
+        assert len(THEMES) == len(set(THEMES))
 
 
 class TestComputeAllMetricsBundleKeys:
@@ -788,6 +835,27 @@ class TestPrintComparisonModes:
         assert "N/A" in good_row
 
 
+class TestVerboseCompareThemesMode:
+    def test_theme_flip_shown_when_quality_never_ran(self, capsys):
+        # --mode themes rows never have predicted_scores; a theme flip between
+        # runs must still be listed (not "None!") under Per-story Flips.
+        def row(themes):
+            r = _pred(story_id="s", expected_themes=["church"],
+                      predicted_themes=themes)
+            r.themes_raw = "\n".join(t.upper() for t in themes) or "NONE"
+            return r
+
+        story1, story2 = [row(["church"])], [row(["scripture"])]
+        m1 = compute_all_metrics(story1)
+        m2 = compute_all_metrics(story2)
+        print_comparison(_meta(mode="themes"), m1, _meta(mode="themes"), m2,
+                         verbose=True, story1=story1, story2=story2)
+        out = capsys.readouterr().out
+        flips = out.split("Per-story Flips")[1]
+        assert "None!" not in flips
+        assert "church" in flips and "scripture" in flips
+
+
 class TestTrendRows:
     def _write_two_runs(self, tmp_path):
         story = _pred(story_id="s", predicted_scores={"simple": 3},
@@ -824,6 +892,71 @@ class TestTrendRows:
         out = capsys.readouterr().out
         assert "Timestamp" in out
         assert out.index("older") < out.index("newer")
+
+
+class TestJsonOutput:
+    def _story_and_extraction(self):
+        story = _pred(story_id="s", predicted_scores={"simple": 3},
+                      expected_tier="good", predicted_tier="good",
+                      expected_themes=["church"], predicted_themes=["church"])
+        extraction = ExtractionPrediction(
+            thread_id="A",
+            golden_stories=[{"story_id": "A:0", "title": "", "text": "alpha faith"}],
+            predicted_stories=[{"title": "", "text": "alpha faith"}],
+        )
+        return [story], [extraction]
+
+    def test_report_as_json_emits_valid_json_with_expected_keys(self, capsys):
+        stories, extraction = self._story_and_extraction()
+        metrics = compute_all_metrics(stories, extraction)
+        report_as_json(_meta(), metrics)
+        data = json.loads(capsys.readouterr().out)
+        assert set(data) == {"meta", "metrics"}
+        assert data["meta"]["run_id"] == "abcdef0123456789"
+        for key in ("story_count", "tier", "dimension_mae", "dimension_exact",
+                    "dimension_within1", "themes", "theme_anomalies", "extraction"):
+            assert key in data["metrics"]
+        assert data["metrics"]["tier"]["accuracy"] == 1.0
+        assert data["metrics"]["extraction"]["micro_f1"] == 1.0
+
+    def test_comparison_as_json_emits_valid_json_with_expected_keys(self, capsys):
+        stories, extraction = self._story_and_extraction()
+        metrics = compute_all_metrics(stories, extraction)
+        comparison_as_json(_meta(run_id="a" * 16), metrics,
+                           _meta(run_id="b" * 16), metrics)
+        data = json.loads(capsys.readouterr().out)
+        assert set(data) == {"run_a", "run_b"}
+        assert data["run_a"]["meta"]["run_id"] == "a" * 16
+        assert data["run_b"]["meta"]["run_id"] == "b" * 16
+        assert data["run_b"]["metrics"]["themes"]["micro_f1"] == 1.0
+
+    def test_cli_single_run_format_json_emits_json(self, tmp_path, monkeypatch, capsys):
+        stories, _ = self._story_and_extraction()
+        path = tmp_path / "run.jsonl"
+        _write_results(path, _meta(), stories)
+        monkeypatch.setattr(sys, "argv", [
+            "newsletter_report", "--results", str(path), "--format", "json",
+        ])
+        cli()
+        data = json.loads(capsys.readouterr().out)
+        assert data["meta"]["run_id"] == "abcdef0123456789"
+        assert data["metrics"]["tier"]["accuracy"] == 1.0
+
+    def test_cli_trend_format_json_rows_have_expected_keys(
+        self, tmp_path, monkeypatch, capsys,
+    ):
+        stories, _ = self._story_and_extraction()
+        _write_results(tmp_path / "run.jsonl", _meta(), stories)
+        monkeypatch.setattr(sys, "argv", [
+            "newsletter_report", "--results-dir", str(tmp_path), "--format", "json",
+        ])
+        cli()
+        data = json.loads(capsys.readouterr().out)
+        assert isinstance(data, list) and len(data) == 1
+        for key in ("file", "run_id", "timestamp", "mode", "tag", "prompt_hash",
+                    "tier_accuracy", "theme_micro_f1", "mae_simple",
+                    "extraction_micro_f1"):
+            assert key in data[0]
 
 
 class TestCliJsonAndErrors:
@@ -872,6 +1005,19 @@ class TestCliJsonAndErrors:
         assert excinfo.value.code == 1
         err = capsys.readouterr().err
         assert "missing.jsonl" in err
+        assert "Traceback" not in err
+
+    def test_results_on_directory_exits_cleanly(self, tmp_path, monkeypatch, capsys):
+        # --results pointed at a directory raises IsADirectoryError from open();
+        # the friendly-errors path must catch it (OSError), not traceback.
+        monkeypatch.setattr(sys, "argv", [
+            "newsletter_report", "--results", str(tmp_path),
+        ])
+        with pytest.raises(SystemExit) as excinfo:
+            cli()
+        assert excinfo.value.code == 1
+        err = capsys.readouterr().err
+        assert str(tmp_path) in err
         assert "Traceback" not in err
 
     def test_compare_ignores_cot_sidecars_from_globs(self, tmp_path, monkeypatch, capsys):

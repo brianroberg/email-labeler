@@ -50,6 +50,15 @@ class TestIsNewsletterGuard:
         assert is_newsletter(messages, RECIPIENT) is False
 
 
+class TestLoadEvalConfigReuse:
+    def test_reuses_email_harvest_helper(self):
+        """newsletter_harvest must reuse evals.harvest.load_eval_config, not
+        carry a byte-for-byte copy of it."""
+        import evals.harvest as email_harvest_mod
+
+        assert harvest_mod.load_eval_config is email_harvest_mod.load_eval_config
+
+
 class TestDeduplicate:
     def _make_golden(self, thread_id: str) -> GoldenNewsletter:
         return GoldenNewsletter(
@@ -199,6 +208,23 @@ class TestMainDeduplicates:
         ids = [json.loads(line)["thread_id"] for line in output.read_text().splitlines() if line]
         assert ids == ["t1"]
 
+    async def test_rerun_skips_fetching_existing_threads(self, tmp_path, monkeypatch):
+        """Threads already in the golden set must be skipped BEFORE get_thread,
+        so re-runs don't re-download every thread in the file."""
+        fetched: list[str] = []
+
+        class CountingProxy(_OneNewsletterProxy):
+            async def get_thread(self, thread_id, user_id="me", format="full"):
+                fetched.append(thread_id)
+                return await super().get_thread(thread_id, user_id=user_id, format=format)
+
+        monkeypatch.setattr(harvest_mod, "GmailProxyClient", CountingProxy)
+        monkeypatch.setattr(harvest_mod, "load_eval_config", lambda config_path=None: CONFIG)
+        args = _main_args(tmp_path / "golden.jsonl")
+        await harvest_mod.main(args)
+        await harvest_mod.main(args)
+        assert fetched == ["t1"]  # second run must not re-fetch t1
+
 
 class TestCliUx:
     """Help text shows defaults; the run is quiet and ends with a next-step hint."""
@@ -237,6 +263,15 @@ class TestCliUx:
         err = capsys.readouterr().err
         assert "PROXY_API_KEY" in err
         assert "Traceback" not in err
+
+    def test_quiet_http_logging_raises_httpx_loggers_to_warning(self, monkeypatch):
+        """quiet_http_logging() itself must set the httpx AND httpcore logger
+        levels to WARNING so per-request INFO lines are suppressed."""
+        for name in ("httpx", "httpcore"):
+            monkeypatch.setattr(logging.getLogger(name), "level", logging.NOTSET)
+        harvest_mod.quiet_http_logging()
+        assert logging.getLogger("httpx").level == logging.WARNING
+        assert logging.getLogger("httpcore").level == logging.WARNING
 
     async def test_main_silences_httpx_request_logs(self, tmp_path, monkeypatch):
         """daemon's import-time basicConfig(INFO) lets httpx spam 'HTTP Request'

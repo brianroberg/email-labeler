@@ -552,6 +552,25 @@ class TestBuildMeta:
         )
         assert meta.story_count == 1
 
+    def test_extraction_mode_counts_all_golden_stories(self):
+        """An extraction-only run matches predictions against EVERY golden
+        story (evaluate_extraction does not filter on story.reviewed), so an
+        --include-unreviewed extraction run must not record story_count=0 —
+        the header would disagree with what the run actually evaluated."""
+        golden = [_newsletter(
+            "nl1", reviewed=False,
+            stories=[
+                _story("nl1:0", reviewed=False),
+                _story("nl1:1", reviewed=False),
+            ],
+        )]
+        meta = build_meta(
+            config=_full_config(), config_path="config.toml", golden_path="g.jsonl",
+            golden_set=golden, mode="extraction", tag="", parallelism=1,
+        )
+        assert meta.golden_set_count == 1
+        assert meta.story_count == 2
+
 
 class TestBuildOutputPath:
     def test_filename_has_mode_tag_and_runid(self):
@@ -924,6 +943,27 @@ class TestReportForwarding:
         logging.getLogger("httpx").setLevel(logging.NOTSET)
         newsletter_run.cli()
         assert logging.getLogger("httpx").level == logging.WARNING
+
+
+class TestCliParallelismValidation:
+    def test_cli_rejects_non_positive_parallelism(self, monkeypatch, capsys):
+        """--parallelism 0 would build asyncio.Semaphore(0): every task blocks
+        forever and the run hangs silently after preflight. The parser must
+        reject it up front instead."""
+        import sys as _sys
+        called = {}
+
+        async def fake_main(args):
+            called["ran"] = True
+
+        monkeypatch.setattr(newsletter_run, "main", fake_main)
+        for bad in ("0", "-2"):
+            monkeypatch.setattr(_sys, "argv", ["prog", "--parallelism", bad])
+            with pytest.raises(SystemExit) as excinfo:
+                newsletter_run.cli()
+            assert excinfo.value.code == 2  # argparse usage error
+            assert "parallelism" in capsys.readouterr().err
+        assert "ran" not in called
 
 
 class TestProgress:

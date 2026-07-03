@@ -30,7 +30,7 @@ import httpx
 
 from config_utils import substitute_env_vars
 from daemon import resolve_newsletter_llm_endpoint
-from evals import format_network_error
+from evals import format_network_error, plural
 from evals.llm_cache import CachedLLMClient
 from evals.newsletter_schemas import (
     ExtractionPrediction,
@@ -401,15 +401,20 @@ def build_meta(
     mode so prompt A/Bs are self-identifying and comparable. seeded_from is pulled
     from the golden set (first newsletter that carries it) so the report can flag
     extraction-recall bias from Phase-A seeding.
+
+    story_count reflects what the run actually evaluated: story modes count only
+    Phase-B-labeled, non-excluded stories (the metric denominators), while an
+    extraction-only run counts every golden story — evaluate_extraction matches
+    predictions against the full story list, so an --include-unreviewed
+    extraction run must not record 0.
     """
     llm_cfg = config["newsletter"]["llm"]
     prompts = config["newsletter"]["prompts"]
     config_bytes = json.dumps(config, sort_keys=True).encode()
-    # Count only stories a story-mode run would actually evaluate (Phase-B
-    # labeled, non-excluded) so the report header matches metric denominators.
-    story_count = sum(
-        1 for nl in golden_set for s in nl.stories if not s.excluded and s.reviewed
-    )
+    if mode == "extraction":
+        story_count = sum(len(nl.stories) for nl in golden_set)
+    else:
+        story_count = len(select_stories(golden_set)[0])
     seeded_from = next((nl.seeded_from for nl in golden_set if nl.seeded_from), "")
     return NewsletterRunMeta(
         run_id=uuid.uuid4().hex,
@@ -473,13 +478,6 @@ def write_thinking_sidecar(
         for entry in entries:
             f.write(json.dumps(entry.to_dict()) + "\n")
     return sidecar_path
-
-
-def _plural(n: int, word: str) -> str:
-    if n == 1:
-        return f"1 {word}"
-    plural = word[:-1] + "ies" if word.endswith("y") else word + "s"
-    return f"{n} {plural}"
 
 
 def clamped_dimensions(scores_raw: str) -> list[str]:
@@ -577,11 +575,11 @@ def format_run_summary(rows: list) -> str:
     counts = summarize_rows(rows)
     problems = []
     if counts["errors"]:
-        problems.append(_plural(counts["errors"], "error"))
+        problems.append(plural(counts["errors"], "error"))
     if counts["quality_parse_failures"]:
-        problems.append(_plural(counts["quality_parse_failures"], "quality parse failure"))
+        problems.append(plural(counts["quality_parse_failures"], "quality parse failure"))
     if counts["theme_parse_failures"]:
-        problems.append(_plural(counts["theme_parse_failures"], "theme parse failure"))
+        problems.append(plural(counts["theme_parse_failures"], "theme parse failure"))
     lines = [f"  Rows: {counts['rows']} ({', '.join(problems) if problems else 'no errors'})"]
     if counts["clamped"]:
         detail = "; ".join(
@@ -589,7 +587,7 @@ def format_run_summary(rows: list) -> str:
         )
         lines.append(
             f"  Out-of-range scores clamped to 1-5 in "
-            f"{_plural(len(counts['clamped']), 'story')} ({detail})"
+            f"{plural(len(counts['clamped']), 'story', 'stories')} ({detail})"
         )
     if counts["dropped_theme_tokens"]:
         detail = ", ".join(
@@ -773,7 +771,7 @@ async def main(args: argparse.Namespace) -> None:
             _pairs, _n_excluded, n_unlabeled = select_stories(golden_set)
             if n_unlabeled:
                 print(
-                    f"Skipping {_plural(n_unlabeled, 'story')} never labeled in the "
+                    f"Skipping {plural(n_unlabeled, 'story', 'stories')} never labeled in the "
                     "TUI (no expected scores/themes — label with "
                     "python -m evals.newsletter_label)",
                     file=sys.stderr,
@@ -855,6 +853,10 @@ def cli():
     parser.add_argument("--skip-preflight", action="store_true",
                         help="Skip the endpoint reachability check before evaluating")
     args = parser.parse_args()
+    if args.parallelism is not None and args.parallelism < 1:
+        # Semaphore(0) would make every task block forever: the run hangs
+        # silently after preflight. Reject up front.
+        parser.error(f"--parallelism must be >= 1 (got {args.parallelism})")
     # httpx logs one INFO line per request; at eval volume that drowns the
     # run's own progress output.
     logging.getLogger("httpx").setLevel(logging.WARNING)

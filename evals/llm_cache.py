@@ -30,7 +30,9 @@ class CachedLLMClient:
         self._pending: list[dict] = []  # new entries to flush to disk
         self.hits = 0
         self.misses = 0
-        self._llm_seconds = 0.0  # accumulated LLM call time (misses only)
+        # per-task accumulated LLM call time (misses only), keyed like
+        # _thinking_buffers so concurrent rows don't absorb each other's time
+        self._llm_seconds: dict[int, float] = {}
         self._thinking_buffers: dict[int, list[str]] = {}  # per-task thinking buffers
         self._load()
 
@@ -92,7 +94,9 @@ class CachedLLMClient:
                 _, thinking = await self.inner.complete(
                     system_prompt, user_content, include_thinking=True,
                 )
-                self._llm_seconds += time.monotonic() - start
+                self._llm_seconds[tk] = (
+                    self._llm_seconds.get(tk, 0.0) + time.monotonic() - start
+                )
                 self._cache[key] = (response, thinking)
                 self._pending.append({
                     "key": key,
@@ -113,7 +117,7 @@ class CachedLLMClient:
         response, thinking = await self.inner.complete(
             system_prompt, user_content, include_thinking=True,
         )
-        self._llm_seconds += time.monotonic() - start
+        self._llm_seconds[tk] = self._llm_seconds.get(tk, 0.0) + time.monotonic() - start
 
         if thinking:
             self._thinking_buffers.setdefault(tk, []).append(thinking)
@@ -139,10 +143,13 @@ class CachedLLMClient:
         return "\n\n".join(t for t in buf if t)
 
     def take_llm_seconds(self) -> float:
-        """Return accumulated LLM call time and reset to zero."""
-        elapsed = self._llm_seconds
-        self._llm_seconds = 0.0
-        return elapsed
+        """Return the current task's accumulated LLM call time and reset its bucket.
+
+        Keyed per asyncio task (like take_thinking) so that under
+        parallelism > 1 each row drains only its own miss time instead of
+        absorbing every concurrent row's.
+        """
+        return self._llm_seconds.pop(self._task_key(), 0.0)
 
     async def is_available(self, timeout: float | None = None) -> bool:
         """Delegate to inner client."""

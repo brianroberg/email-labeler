@@ -1,5 +1,6 @@
 """Tests for evals.llm_cache — CachedLLMClient wrapper."""
 
+import asyncio
 import json
 from pathlib import Path
 from unittest.mock import AsyncMock
@@ -379,10 +380,9 @@ class TestLlmSeconds:
 
         await cached.complete("sys", "usr")
 
-        assert cached._llm_seconds > 0
         elapsed = cached.take_llm_seconds()
         assert elapsed > 0
-        assert cached._llm_seconds == 0.0  # reset after take
+        assert cached.take_llm_seconds() == 0.0  # reset after take
 
     async def test_hit_does_not_accumulate_time(self, tmp_path: Path):
         inner = _make_inner()
@@ -395,6 +395,54 @@ class TestLlmSeconds:
         await cached.complete("sys", "usr")  # cache hit
 
         assert cached.take_llm_seconds() == 0.0
+
+    async def test_llm_seconds_isolated_per_task(self, tmp_path: Path, monkeypatch):
+        """Each concurrent task must drain only ITS OWN miss time.
+
+        Under parallelism > 1, a shared accumulator lets the first row to
+        finish absorb every concurrent row's LLM time into its
+        duration_seconds while the others record ~0 — skewing the persisted
+        results JSONL and the web UI averages."""
+        import evals.llm_cache as llm_cache_mod
+
+        class _FakeTime:
+            def __init__(self):
+                self.t = 0.0
+
+            def monotonic(self):
+                return self.t
+
+        fake_time = _FakeTime()
+        monkeypatch.setattr(llm_cache_mod, "time", fake_time)
+
+        durations = {"usr-A": 5.0, "usr-B": 7.0}
+        inner = _make_inner()
+
+        async def fake_complete(system_prompt, user_content, include_thinking=False):
+            fake_time.t += durations[user_content]
+            return ("R", "")
+
+        inner.complete.side_effect = fake_complete
+        cached = CachedLLMClient(inner, tmp_path / "cache.jsonl")
+
+        both_done = asyncio.Event()
+        done = {"count": 0}
+        drained = {}
+
+        async def worker(user_content):
+            await cached.complete("sys", user_content)
+            done["count"] += 1
+            if done["count"] == 2:
+                both_done.set()
+            # Wait until BOTH tasks have accumulated before either drains, so a
+            # shared accumulator would hand everything to whichever drains first.
+            await both_done.wait()
+            drained[user_content] = cached.take_llm_seconds()
+
+        await asyncio.gather(worker("usr-A"), worker("usr-B"))
+
+        assert drained["usr-A"] == pytest.approx(5.0)
+        assert drained["usr-B"] == pytest.approx(7.0)
 
 
 class TestThinking:

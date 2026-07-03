@@ -145,8 +145,11 @@ resolved URL and which env var supplied it.
 Harvest guards each candidate with `is_newsletter(...)`, builds `body` via
 `daemon.format_thread_transcript(...)` (identical to production input), and seeds
 each `GoldenNewsletter` with `stories=[]` and `reviewed=False` — **no ground truth
-is inferred**. It always appends, deduplicating by `thread_id`, and tolerates
-malformed existing lines. To rebuild from scratch, delete the file manually.
+is inferred**. It always appends, deduplicating by `thread_id` — threads already
+present in `--output` are skipped **before** fetching (no `get_thread` call), with
+a post-fetch dedup as backstop, so re-runs don't re-download known threads. It
+tolerates malformed existing lines. To rebuild from scratch, delete the file
+manually.
 
 A successful run ends with a next-step hint pointing at
 `uv run python -m evals.newsletter_label --golden-set <output>`. Per-request
@@ -185,8 +188,14 @@ rendered body (body lines already covered by a story are **dimmed**, so omitted
 paragraphs stand out), press `s`/`e` to set the selection start/end line and
 `Enter` to make a story from that inclusive span — plus `a`dd/`E`dit/`d`elete.
 Deleting a story that carries labels asks `y/N` confirmation, and deletes echo
-what was removed. Confirming (`c`) sets `newsletter.reviewed=True`, assigns each
-story a stable `story_id`, and warns how many stories are still unlabeled.
+what was removed. Confirming (`c`) sets `newsletter.reviewed=True` and warns how
+many stories are still unlabeled. Story ids are **stable**: they are assigned at
+creation (max existing numeric suffix + 1, so delete-then-add never collides) and
+confirm preserves them, only repairing duplicates — deleting a story leaves an id
+gap by design, so cross-run comparisons keyed on `story_id` stay valid.
+Re-seeding with `Space` resets `newsletter.reviewed=False` — a reseeded
+newsletter must be re-confirmed before it counts for reviewed-only runs (undo
+restores the prior state).
 Pressing `k` skips the newsletter without marking it reviewed, so it resurfaces
 in a later pass (and the list view jumps straight to the next queued newsletter).
 **Phase B** labels each story: the 4 dimensions (simple, concrete, personal,
@@ -254,8 +263,11 @@ Extraction mode feeds each `body` through `extract_stories`; quality/theme mode
 scores the **fixed golden `(title, text)`** of every reviewed, non-excluded story
 (independent of what extraction produced) and derives the predicted tier via
 `compute_tier`. Story modes skip stories with `reviewed=False` (Phase-A-confirmed
-but never Phase-B-labeled) and print a skip count; `meta.story_count` counts only
-labeled, non-excluded stories. In a results row, `scores_raw`/`themes_raw = null`
+but never Phase-B-labeled) and print a skip count; `meta.story_count` counts what
+the run actually evaluated — labeled, non-excluded stories in story modes, but
+**all** golden stories of the evaluated newsletters in `--mode extraction`
+(extraction matches against the full confirmed story list). `--parallelism`
+must be ≥ 1 (validated at the CLI). In a results row, `scores_raw`/`themes_raw = null`
 means that call was **never attempted** (mode skipped it), while a captured raw
 string with a `null` parsed field means **attempted but unparsed**. Outputs are
 timestamped `<ts>_<mode>_<tag>_<runid8>.jsonl` (`NewsletterRunMeta` first line,
@@ -307,9 +319,12 @@ Metric semantics:
   from theme P/R/F1 or exact-set match.
 - **Tier metrics** count a row as a parse error only when quality was actually
   attempted (an error, or `scores_raw` captured) and `predicted_scores` is
-  `None`. Rows where quality was never attempted (`--mode themes`:
-  `error=None, scores_raw=None`) are skipped entirely — a themes-only results
-  file does not render a tier section full of fake errors.
+  `None`. The run's `RunMeta.mode` disambiguates errored rows: in a
+  `--mode themes` results file an errored row is a *theme*-call failure, so it
+  never counts as a quality/tier error and no tier section is rendered — a
+  themes-only results file cannot resurrect a tier section full of fake errors.
+- The report's theme list is derived from `newsletter._VALID_THEMES` (single
+  source) — themes added or removed upstream propagate automatically.
 - Aggregates (theme micro/macro F1, exact-set match, extraction micro/macro
   P/R/F1) are `None`/`N/A` when a run has zero scored rows, never a fake `0.0%`.
   Single-run reports omit the Quality Dimensions and Themes sections entirely
@@ -320,9 +335,16 @@ Single-run report output: the header shows `Golden set:`; the tier section
 pluralizes correctly and lists `Failed stories (quality parse/network): <ids>`;
 the themes section shows a `Parse anomalies: N` line when theme responses
 contained invalid tokens or unparseable output; the extraction section shows
-`(<N> newsletters, match threshold <t>)`.
+`(<N> newsletters, <M> errors, match threshold <t>)` and renders even when every
+extraction call errored (count 0), listing the failed newsletters — extraction
+metrics carry `errors`/`error_threads` alongside the scored counts. Bad
+`--results`/`--compare` paths (missing file, a directory, permission denied —
+any `OSError`) exit with a one-line error instead of a traceback.
 
-`--verbose` detail: Story Disagreements lines append story titles (best-effort
+`--verbose` detail: per-story flips in `--compare` gate the tier diff on both
+runs having quality scores but compare theme sets whenever both rows' theme call
+succeeded — two `--mode themes` runs show their theme flips. Story
+Disagreements lines append story titles (best-effort
 lookup from the run's recorded `golden_set_path`; degrades to bare ids if the
 file moved) and include stories whose quality parse failed but whose themes
 disagree; a `Parse/Network Failures` section prints each failed story with its

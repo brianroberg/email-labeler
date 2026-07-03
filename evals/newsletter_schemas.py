@@ -232,7 +232,10 @@ class NewsletterRunMeta:
     newsletter_model: str
     golden_set_path: str
     golden_set_count: int  # number of newsletters evaluated
-    story_count: int  # number of golden stories evaluated
+    # Stories the run evaluated: Phase-B-labeled, non-excluded stories for story
+    # modes (quality/themes/all); ALL golden stories for extraction-only runs,
+    # since extraction matches against the full confirmed story list.
+    story_count: int
     mode: str = "all"  # "extraction" / "quality" / "themes" / "all"
     prompt_hash: str = ""
     temperature: float = 0.0
