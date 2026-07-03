@@ -41,24 +41,43 @@ class PageListView(ListView):
             self.index = min(len(self) - 1, (self.index or 0) + self._page())
 
 
-class KeyMenuScreen(ModalScreen):
+class BottomModal(ModalScreen):
+    """Base for one-line bottom prompts that replace the curses bottom row."""
+
+    DEFAULT_CSS = """
+    BottomModal {
+        align: left bottom;
+        background: $background 0%;
+    }
+    BottomModal > Static {
+        width: 100%;
+        background: $accent;
+        color: $text;
+    }
+    """
+
+
+class HintScreen(BottomModal):
+    """Blocking notice (used for errors); any key dismisses."""
+
+    def __init__(self, message: str) -> None:
+        super().__init__()
+        self._message = message
+
+    def compose(self) -> ComposeResult:
+        yield Static(f"{self._message}  (press any key)", markup=False)
+
+    def on_key(self, event) -> None:
+        event.stop()
+        self.dismiss(None)
+
+
+class KeyMenuScreen(BottomModal):
     """Single-keypress menu rendered as a one-line prompt at the bottom.
 
     Dismisses with ``keymap[key]`` for a mapped key (case-insensitive),
     or with :data:`CANCEL` for any other key — mirroring the curses
     "press one key, anything else cancels" prompt idiom.
-    """
-
-    DEFAULT_CSS = """
-    KeyMenuScreen {
-        align: left bottom;
-        background: $background 0%;
-    }
-    KeyMenuScreen > Static {
-        width: 100%;
-        background: $accent;
-        color: $text;
-    }
     """
 
     def __init__(self, prompt: str, keymap: dict) -> None:

@@ -1,14 +1,18 @@
-"""Tests for evals.edit_tui — detail rendering and the un-exclude action.
+"""Tests for evals.edit_tui — pure rendering helpers + Pilot UI tests.
 
-The curses loop is driven through a minimal fake screen that replays a queued
-sequence of keypresses, so the real key handlers run without a terminal.
+The Textual UI layer is driven with Textual's Pilot: real key presses in,
+widget state / rendered content / on-disk golden-set effects out.
 """
 
-from pathlib import Path
+import base64
 
-from evals.edit_tui import _build_detail_lines, _detail_view, _format_list_row
+from textual.widgets import Label, ListView, Static
+
+from evals.edit_tui import DetailScreen, EditApp, _build_detail_lines, _format_list_row, run_edit_tui
 from evals.review import load_golden_set
 from evals.schemas import GoldenThread
+
+SIZE = (100, 30)
 
 
 def _golden(thread_id, **kw):
@@ -20,29 +24,23 @@ def _golden(thread_id, **kw):
     return GoldenThread(**base)
 
 
-class FakeStdscr:
-    """Replay a queued list of getch() return values; no-op rendering."""
+def _body_message(text: str) -> dict:
+    data = base64.urlsafe_b64encode(text.encode()).decode()
+    return {"payload": {"mimeType": "text/plain", "body": {"data": data}}}
 
-    def __init__(self, keys):
-        self._keys = list(keys)
 
-    def getmaxyx(self):
-        return (24, 80)
+def _edit_app(threads, tmp_path, all_threads=None):
+    return EditApp(
+        threads,
+        all_threads if all_threads is not None else threads,
+        tmp_path / "golden.jsonl",
+    )
 
-    def getch(self):
-        return self._keys.pop(0)
 
-    def clear(self):
-        pass
-
-    def refresh(self):
-        pass
-
-    def addstr(self, *args, **kwargs):
-        pass
-
-    def addnstr(self, *args, **kwargs):
-        pass
+def _screen_text(app) -> str:
+    parts = [str(w.render()) for w in app.screen.query(Static)]
+    parts += [str(w.render()) for w in app.screen.query(Label)]
+    return "\n".join(parts)
 
 
 class TestBuildDetailLines:
@@ -68,20 +66,145 @@ class TestListRowExcludedMarker:
         assert not row.lstrip().startswith("X")
 
 
-class TestUnexclude:
-    def test_e_key_unexcludes_and_saves(self, tmp_path):
-        path: Path = tmp_path / "golden.jsonl"
+class TestEditAppList:
+    async def test_list_shows_threads_and_q_quits(self, tmp_path):
+        threads = [_golden("t1", subject="first"), _golden("t2", subject="second")]
+        app = _edit_app(threads, tmp_path)
+        async with app.run_test(size=SIZE) as pilot:
+            assert len(app.query_one(ListView)) == 2
+            assert "Edit Mode — 2 threads" in _screen_text(app)
+            await pilot.press("q")
+        assert app.return_value == "quit"
+
+    async def test_enter_opens_detail_with_content_and_status(self, tmp_path):
+        threads = [_golden("t1"), _golden("t2", subject="The second thread")]
+        app = _edit_app(threads, tmp_path)
+        async with app.run_test(size=SIZE) as pilot:
+            await pilot.press("down", "enter")
+            assert isinstance(app.screen, DetailScreen)
+            text = _screen_text(app)
+            assert "Thread 2/2" in text
+            assert "The second thread" in text
+            assert "Sender: person  Label: fyi" in text
+
+    async def test_escape_returns_to_list_preserving_cursor(self, tmp_path):
+        threads = [_golden("t1"), _golden("t2")]
+        app = _edit_app(threads, tmp_path)
+        async with app.run_test(size=SIZE) as pilot:
+            await pilot.press("down", "enter")
+            assert isinstance(app.screen, DetailScreen)
+            await pilot.press("escape")
+            assert not isinstance(app.screen, DetailScreen)
+            assert app.query_one(ListView).index == 1
+
+    async def test_q_from_detail_quits_whole_app(self, tmp_path):
+        app = _edit_app([_golden("t1")], tmp_path)
+        async with app.run_test(size=SIZE) as pilot:
+            await pilot.press("enter", "q")
+        assert app.return_value == "quit"
+
+
+class TestEditActions:
+    async def test_s_then_s_sets_service_and_saves(self, tmp_path):
+        thread = _golden("t1")
+        app = _edit_app([thread], tmp_path)
+        async with app.run_test(size=SIZE) as pilot:
+            await pilot.press("enter")
+            await pilot.press("s", "s")  # sender prompt -> service
+            assert thread.expected_sender_type == "service"
+            assert "Sender: service" in _screen_text(app)
+            saved = load_golden_set(tmp_path / "golden.jsonl")
+            assert saved[0].expected_sender_type == "service"
+
+    async def test_s_then_other_key_cancels(self, tmp_path):
+        thread = _golden("t1")
+        app = _edit_app([thread], tmp_path)
+        async with app.run_test(size=SIZE) as pilot:
+            await pilot.press("enter")
+            await pilot.press("s", "z")  # z is not a sender key -> cancel
+            assert thread.expected_sender_type == "person"
+            assert not (tmp_path / "golden.jsonl").exists()  # nothing saved
+
+    async def test_l_then_r_sets_needs_response(self, tmp_path):
+        thread = _golden("t1")
+        app = _edit_app([thread], tmp_path)
+        async with app.run_test(size=SIZE) as pilot:
+            await pilot.press("enter")
+            await pilot.press("l", "r")
+            assert thread.expected_label == "needs_response"
+            saved = load_golden_set(tmp_path / "golden.jsonl")
+            assert saved[0].expected_label == "needs_response"
+
+    async def test_l_then_l_sets_low_priority(self, tmp_path):
+        # 'l' opens the prompt where 'l' then means low_priority — the key
+        # collision the modal must not double-fire on.
+        thread = _golden("t1")
+        app = _edit_app([thread], tmp_path)
+        async with app.run_test(size=SIZE) as pilot:
+            await pilot.press("enter")
+            await pilot.press("l", "l")
+            assert thread.expected_label == "low_priority"
+
+    async def test_e_unexcludes_and_saves(self, tmp_path):
         thread = _golden("t1", excluded=True)
-        threads = [thread]
-        all_threads = [thread]
-        # Press 'e' (un-exclude), then Esc to leave the detail view.
-        stdscr = FakeStdscr([ord("e"), 27])
+        app = _edit_app([thread], tmp_path)
+        async with app.run_test(size=SIZE) as pilot:
+            await pilot.press("enter")
+            assert "[e]unexclude" in _screen_text(app)
+            await pilot.press("e")
+            assert thread.excluded is False
+            assert "[e]unexclude" not in _screen_text(app)
+            saved = load_golden_set(tmp_path / "golden.jsonl")
+            assert saved[0].excluded is False
+            await pilot.press("escape")
+            assert "X" not in str(app.query_one(ListView).children[0].query_one(Label).render())
 
-        result = _detail_view(stdscr, threads, 0, all_threads, path)
+    async def test_e_is_ignored_when_not_excluded(self, tmp_path):
+        thread = _golden("t1", excluded=False)
+        app = _edit_app([thread], tmp_path)
+        async with app.run_test(size=SIZE) as pilot:
+            await pilot.press("enter")
+            assert "[e]unexclude" not in _screen_text(app)
+            await pilot.press("e")
+            assert thread.excluded is False
+            assert not (tmp_path / "golden.jsonl").exists()  # no spurious save
 
-        assert result == "back"
-        assert thread.excluded is False
-        # The change was persisted atomically.
-        saved = load_golden_set(path)
-        assert len(saved) == 1
-        assert saved[0].excluded is False
+    async def test_saves_all_threads_not_filtered_view(self, tmp_path):
+        hidden = _golden("hidden", expected_label="low_priority")
+        shown = _golden("shown")
+        app = _edit_app([shown], tmp_path, all_threads=[hidden, shown])
+        async with app.run_test(size=SIZE) as pilot:
+            await pilot.press("enter")
+            await pilot.press("l", "r")
+            saved = load_golden_set(tmp_path / "golden.jsonl")
+            assert [t.thread_id for t in saved] == ["hidden", "shown"]
+            assert saved[0].expected_label == "low_priority"
+            assert saved[1].expected_label == "needs_response"
+
+
+class TestDetailScroll:
+    async def test_detail_scrolls_with_arrow_keys(self, tmp_path):
+        body = "\n".join(f"line {i}" for i in range(60))
+        thread = _golden("t1", messages=[_body_message(body)])
+        app = _edit_app([thread], tmp_path)
+        async with app.run_test(size=SIZE) as pilot:
+            await pilot.press("enter")
+            scroll = app.screen.query_one("#detail-scroll")
+            assert scroll.scroll_offset.y == 0
+            await pilot.press("down", "down", "down")
+            assert scroll.scroll_offset.y == 3
+
+    async def test_detail_shows_decoded_body(self, tmp_path):
+        thread = _golden("t1", messages=[_body_message("Hello from the body")])
+        app = _edit_app([thread], tmp_path)
+        async with app.run_test(size=SIZE) as pilot:
+            await pilot.press("enter")
+            text = _screen_text(app)
+            assert "[Message 1]" in text
+            assert "Hello from the body" in text
+
+
+class TestRunEditTui:
+    def test_empty_threads_prints_and_returns(self, capsys):
+        run_edit_tui([], [], "unused-path")
+        assert "No threads to edit." in capsys.readouterr().out

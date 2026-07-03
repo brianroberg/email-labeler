@@ -42,13 +42,13 @@ from pathlib import Path
 from textual import work
 from textual.app import App, ComposeResult
 from textual.binding import Binding
-from textual.screen import ModalScreen, Screen
+from textual.screen import Screen
 from textual.widgets import Input, Label, ListItem, ListView, Static
 
 from evals import plural
 from evals.newsletter_schemas import GoldenNewsletter, GoldenStory
 from newsletter import compute_tier, parse_stories
-from tui_common import PageListView
+from tui_common import BottomModal, HintScreen, PageListView
 
 _DIMENSIONS = ("simple", "concrete", "personal", "dynamic")
 
@@ -628,23 +628,7 @@ def build_detail_rows(newsletter, index, total, width) -> list[tuple[str, int | 
 _MAX_UNDO = 100  # bound the per-newsletter undo stack
 
 
-class _BottomModal(ModalScreen):
-    """Base for the one-line bottom prompts that replace the curses bottom row."""
-
-    DEFAULT_CSS = """
-    _BottomModal {
-        align: left bottom;
-        background: $background 0%;
-    }
-    _BottomModal > Static {
-        width: 100%;
-        background: $accent;
-        color: $text;
-    }
-    """
-
-
-class PromptLineScreen(_BottomModal):
+class PromptLineScreen(BottomModal):
     """One-line text prompt with prefill. Dismisses stripped text, None on Esc.
 
     Prefills with *initial* (edit the current value instead of retyping it
@@ -673,7 +657,7 @@ class PromptLineScreen(_BottomModal):
         self.dismiss(None)
 
 
-class ConfirmScreen(_BottomModal):
+class ConfirmScreen(BottomModal):
     """y/N confirmation; only y/Y confirms, any other key is No."""
 
     def __init__(self, message: str) -> None:
@@ -688,7 +672,7 @@ class ConfirmScreen(_BottomModal):
         self.dismiss(event.key.lower() == "y")
 
 
-class ScoreScreen(_BottomModal):
+class ScoreScreen(BottomModal):
     """The 4 dimension scores, one keypress each; any non-1-5 key cancels all.
 
     When re-labeling, *current* shows the value already assigned per dimension;
@@ -722,7 +706,7 @@ class ScoreScreen(_BottomModal):
             self.query_one("#score-prompt", Static).update(self._prompt_text())
 
 
-class ThemeScreen(_BottomModal):
+class ThemeScreen(BottomModal):
     """Multi-select themes by toggling s/c/h/v/d; Enter finishes (no cancel).
 
     Starts from *initial* (the story's current themes) so re-labeling edits
@@ -751,21 +735,6 @@ class ThemeScreen(_BottomModal):
             else:
                 self._selected.append(theme)
             self.query_one("#theme-legend", Static).update(self._legend())
-
-
-class HintScreen(_BottomModal):
-    """Blocking notice (used for errors); any key dismisses."""
-
-    def __init__(self, message: str) -> None:
-        super().__init__()
-        self._message = message
-
-    def compose(self) -> ComposeResult:
-        yield Static(f"{self._message}  (press any key)", markup=False)
-
-    def on_key(self, event) -> None:
-        event.stop()
-        self.dismiss(None)
 
 
 class DetailScreen(Screen):

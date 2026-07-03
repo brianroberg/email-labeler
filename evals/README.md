@@ -65,7 +65,7 @@ uv run python -m evals.review
 # Show existing labels while reviewing
 uv run python -m evals.review --show-labels
 
-# Curses TUI for editing reviewed threads (also where you un-exclude)
+# Textual TUI for editing reviewed threads (also where you un-exclude)
 uv run python -m evals.review --edit
 
 # Review only sender classification (stage 1) or label classification (stage 2)

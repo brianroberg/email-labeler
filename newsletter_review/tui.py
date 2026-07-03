@@ -11,10 +11,10 @@ from pathlib import Path
 from textual.app import App, ComposeResult
 from textual.binding import Binding
 from textual.containers import VerticalScroll
-from textual.screen import ModalScreen, Screen
+from textual.screen import Screen
 from textual.widgets import Input, Label, ListItem, ListView, Static
 
-from tui_common import CANCEL, KeyMenuScreen
+from tui_common import CANCEL, BottomModal, KeyMenuScreen
 
 # ---------------------------------------------------------------------------
 # Column widths for list view
@@ -221,22 +221,10 @@ _TIER_PROMPT = "[e]xcellent  [g]ood  [f]air  [p]oor  [c]lear  (other cancels)"
 _THEME_PROMPT = "[s]cripture [c]hristlikeness [h]urch [v]ocation_family [d]isciple_making [x]clear"
 
 
-class SenderFilterScreen(ModalScreen):
+class SenderFilterScreen(BottomModal):
     """Text input for the sender filter. Enter confirms (empty clears), Esc cancels."""
 
     BINDINGS = [Binding("escape", "cancel", "Cancel")]
-
-    DEFAULT_CSS = """
-    SenderFilterScreen {
-        align: left bottom;
-        background: $background 0%;
-    }
-    SenderFilterScreen > Static {
-        width: 100%;
-        background: $accent;
-        color: $text;
-    }
-    """
 
     def compose(self) -> ComposeResult:
         yield Static("Sender filter  (Enter=confirm, empty=clear, Esc=cancel)", markup=False)

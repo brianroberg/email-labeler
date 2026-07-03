@@ -1,23 +1,29 @@
-"""Curses-based TUI for editing already-reviewed golden set threads.
+"""Textual TUI for editing already-reviewed golden set threads.
 
-Launched via ``python -m evals.review --edit``.  Provides a paginated list
-view of threads with keyboard navigation and a detail view for editing
-stage 1 (sender type) and stage 2 (label) decisions.
+Launched via ``python -m evals.review --edit``.  Provides a list view of
+threads with keyboard navigation and a detail view for editing stage 1
+(sender type) and stage 2 (label) decisions. Every accepted edit is
+auto-saved atomically to the golden-set file.
 """
 
-import curses
 from pathlib import Path
 
+from textual.app import App, ComposeResult
+from textual.binding import Binding
+from textual.containers import VerticalScroll
+from textual.screen import Screen
+from textual.widgets import Label, ListItem, ListView, Static
+
+# Hotkey maps come from evals.review so the two tools stay in lock-step
+# (needs_response is `r`, not `n`). No cycle: review imports edit_tui lazily.
+from evals.review import _LABEL_KEY_MAP, _SENDER_KEY_MAP, save_golden_set
 from evals.schemas import GoldenThread
 from gmail_utils import decode_body
+from tui_common import CANCEL, HintScreen, KeyMenuScreen, PageListView
 
 # Abbreviation maps for compact list display
 _SENDER_ABBREV = {"person": "PER", "service": "SVC"}
 _LABEL_ABBREV = {"needs_response": "NR", "fyi": "FYI", "low_priority": "LP"}
-
-# Hotkey maps (kept in lock-step with evals.review: needs_response is `r`, not `n`)
-_SENDER_KEY_MAP = {"p": "person", "s": "service"}
-_LABEL_KEY_MAP = {"r": "needs_response", "f": "fyi", "l": "low_priority"}
 
 # Column widths for list view
 _COL_FLAG = 1     # "X" for excluded threads, else blank
@@ -28,7 +34,7 @@ _COL_GAP = 2      # space between columns
 
 
 # ---------------------------------------------------------------------------
-# Helpers
+# Pure helpers
 # ---------------------------------------------------------------------------
 
 def _truncate(text: str, width: int) -> str:
@@ -36,17 +42,6 @@ def _truncate(text: str, width: int) -> str:
     if len(text) <= width:
         return text
     return text[: width - 3] + "..."
-
-
-def _safe_addstr(win, y: int, x: int, text: str, attr: int = curses.A_NORMAL) -> None:
-    """Write *text* to *win* at (*y*, *x*), clipping to avoid curses errors."""
-    max_y, max_x = win.getmaxyx()
-    if y < 0 or y >= max_y or x >= max_x:
-        return
-    available = max_x - x - 1  # -1 avoids writing to last cell of last row
-    if available <= 0:
-        return
-    win.addnstr(y, x, text, available, attr)
 
 
 def _format_list_row(thread: GoldenThread, max_x: int) -> str:
@@ -104,166 +99,159 @@ def _build_detail_lines(thread: GoldenThread, index: int, total: int) -> list[st
 
 
 # ---------------------------------------------------------------------------
-# Curses input prompts
+# Textual UI layer
 # ---------------------------------------------------------------------------
 
-def _prompt_sender_type_curses(stdscr) -> str | None:
-    """Show sender-type menu on the bottom line; return value or ``None``."""
-    max_y, max_x = stdscr.getmaxyx()
-    prompt = "[p]erson  [s]ervice  (other key cancels)"
-    _safe_addstr(stdscr, max_y - 1, 0, " " * (max_x - 1))
-    _safe_addstr(stdscr, max_y - 1, 0, prompt, curses.A_REVERSE)
-    stdscr.refresh()
-    key = stdscr.getch()
-    ch = chr(key) if 0 <= key < 256 else ""
-    return _SENDER_KEY_MAP.get(ch.lower())
+_SENDER_PROMPT = "[p]erson  [s]ervice  (other key cancels)"
+_LABEL_PROMPT = "[r] needs_response  [f]yi  [l]ow_priority  (other key cancels)"
 
 
-def _prompt_label_curses(stdscr) -> str | None:
-    """Show label menu on the bottom line; return value or ``None``."""
-    max_y, max_x = stdscr.getmaxyx()
-    prompt = "[r] needs_response  [f]yi  [l]ow_priority  (other key cancels)"
-    _safe_addstr(stdscr, max_y - 1, 0, " " * (max_x - 1))
-    _safe_addstr(stdscr, max_y - 1, 0, prompt, curses.A_REVERSE)
-    stdscr.refresh()
-    key = stdscr.getch()
-    ch = chr(key) if 0 <= key < 256 else ""
-    return _LABEL_KEY_MAP.get(ch.lower())
+class DetailScreen(Screen):
+    """One thread: scrollable detail + s/l/e edit actions with auto-save."""
 
+    AUTO_FOCUS = None  # keys go to the screen bindings, not the scroll container
 
-# ---------------------------------------------------------------------------
-# Auto-save
-# ---------------------------------------------------------------------------
+    BINDINGS = [
+        Binding("escape", "back", "Back", show=False),
+        Binding("q", "quit_app", "Quit", show=False),
+        Binding("s", "edit_sender", "Sender", show=False),
+        Binding("l", "edit_label", "Label", show=False),
+        Binding("e", "unexclude", "Unexclude", show=False),
+        Binding("up", "scroll_up", "Scroll up", show=False),
+        Binding("down", "scroll_down", "Scroll down", show=False),
+        Binding("pageup", "page_up", "Page up", show=False),
+        Binding("pagedown", "page_down", "Page down", show=False),
+        Binding("home", "scroll_home", "Top", show=False),
+        Binding("end", "scroll_end", "Bottom", show=False),
+    ]
 
-def _auto_save(all_threads: list[GoldenThread], path: Path, stdscr) -> None:
-    """Atomically save the full golden set, showing status on failure."""
-    from evals.review import save_golden_set
-
-    try:
-        save_golden_set(all_threads, path)
-    except Exception as exc:
-        max_y, max_x = stdscr.getmaxyx()
-        _safe_addstr(stdscr, max_y - 1, 0, f"Save failed: {exc}", curses.A_REVERSE)
-        stdscr.refresh()
-        stdscr.getch()
-
-
-# ---------------------------------------------------------------------------
-# Detail view
-# ---------------------------------------------------------------------------
-
-def _detail_view(
-    stdscr,
-    threads: list[GoldenThread],
-    index: int,
-    all_threads: list[GoldenThread],
-    path: Path,
-) -> str:
-    """Render the detail screen for ``threads[index]``.
-
-    Returns ``"back"`` or ``"quit"``.
+    DEFAULT_CSS = """
+    DetailScreen > #detail-scroll {
+        height: 1fr;
+    }
+    DetailScreen #detail-help {
+        color: $text-muted;
+    }
+    DetailScreen #detail-status {
+        text-style: bold;
+    }
     """
-    thread = threads[index]
-    total = len(threads)
-    scroll_y = 0
 
-    while True:
-        lines = _build_detail_lines(thread, index, total)
-        max_y, max_x = stdscr.getmaxyx()
-        content_rows = max(1, max_y - 2)  # reserve 2 lines for help + status
+    def __init__(self, threads, index, all_threads, path):
+        super().__init__()
+        self.thread = threads[index]
+        self.index = index
+        self.total = len(threads)
+        self.all_threads = all_threads
+        self.path = path
 
-        stdscr.clear()
-        for row_i in range(content_rows):
-            line_i = scroll_y + row_i
-            if line_i >= len(lines):
-                break
-            _safe_addstr(stdscr, row_i, 0, lines[line_i])
+    def compose(self) -> ComposeResult:
+        yield VerticalScroll(Static(id="detail-content", markup=False), id="detail-scroll")
+        yield Static(id="detail-help", markup=False)
+        yield Static(id="detail-status", markup=False)
 
-        # Help bar
-        unexclude = "  [e]unexclude" if thread.excluded else ""
+    def on_mount(self) -> None:
+        self._refresh()
+
+    def _refresh(self) -> None:
+        lines = _build_detail_lines(self.thread, self.index, self.total)
+        self.query_one("#detail-content", Static).update("\n".join(lines))
+        unexclude = "  [e]unexclude" if self.thread.excluded else ""
         help_text = f"\u2191/\u2193:Scroll  [s]ender  [l]abel{unexclude}  Esc:Back  q:Quit"
-        _safe_addstr(stdscr, max_y - 2, 0, help_text, curses.A_DIM)
+        self.query_one("#detail-help", Static).update(help_text)
+        status = f"Sender: {self.thread.expected_sender_type}  Label: {self.thread.expected_label}"
+        self.query_one("#detail-status", Static).update(status)
 
-        # Status bar
-        scroll_pct = ""
-        max_scroll = max(0, len(lines) - content_rows)
-        if max_scroll > 0:
-            pct = int(scroll_y / max_scroll * 100)
-            scroll_pct = f"  ({pct}%)"
-        status = f"Sender: {thread.expected_sender_type}  Label: {thread.expected_label}{scroll_pct}"
-        _safe_addstr(stdscr, max_y - 1, 0, status, curses.A_BOLD)
+    def _auto_save(self) -> None:
+        """Atomically save the FULL golden set, notifying on failure."""
+        try:
+            save_golden_set(self.all_threads, self.path)
+        except Exception as exc:
+            # Non-fatal: the in-memory edit survives, the next edit retries.
+            self.app.push_screen(HintScreen(f"Save failed: {exc}"))
 
-        stdscr.refresh()
+    # -- edit actions --------------------------------------------------------
 
-        key = stdscr.getch()
+    def action_edit_sender(self) -> None:
+        def apply(result) -> None:
+            if result != CANCEL:
+                self.thread.expected_sender_type = result
+                self._auto_save()
+                self._refresh()
 
-        # Navigation
-        if key == curses.KEY_UP and scroll_y > 0:
-            scroll_y -= 1
-        elif key == curses.KEY_DOWN and scroll_y < max_scroll:
-            scroll_y += 1
-        elif key == curses.KEY_PPAGE:
-            scroll_y = max(0, scroll_y - content_rows)
-        elif key == curses.KEY_NPAGE:
-            scroll_y = min(max_scroll, scroll_y + content_rows)
-        elif key == curses.KEY_HOME:
-            scroll_y = 0
-        elif key == curses.KEY_END:
-            scroll_y = max_scroll
+        self.app.push_screen(KeyMenuScreen(_SENDER_PROMPT, _SENDER_KEY_MAP), apply)
 
-        # Edit actions
-        elif key == ord("s"):
-            new_val = _prompt_sender_type_curses(stdscr)
-            if new_val:
-                thread.expected_sender_type = new_val
-                _auto_save(all_threads, path, stdscr)
-        elif key == ord("l"):
-            new_val = _prompt_label_curses(stdscr)
-            if new_val:
-                thread.expected_label = new_val
-                _auto_save(all_threads, path, stdscr)
-        elif key == ord("e") and thread.excluded:
-            thread.excluded = False
-            _auto_save(all_threads, path, stdscr)
+    def action_edit_label(self) -> None:
+        def apply(result) -> None:
+            if result != CANCEL:
+                self.thread.expected_label = result
+                self._auto_save()
+                self._refresh()
 
-        # Exit
-        elif key == 27:  # Esc
-            return "back"
-        elif key == ord("q"):
-            return "quit"
+        self.app.push_screen(KeyMenuScreen(_LABEL_PROMPT, _LABEL_KEY_MAP), apply)
 
-        # Resize
-        elif key == curses.KEY_RESIZE:
-            pass  # max_y/max_x refreshed at top of loop
+    def action_unexclude(self) -> None:
+        # Un-exclude only; excluding happens in the review loop.
+        if self.thread.excluded:
+            self.thread.excluded = False
+            self._auto_save()
+            self._refresh()
+
+    # -- navigation ----------------------------------------------------------
+
+    def action_back(self) -> None:
+        self.dismiss("back")
+
+    def action_quit_app(self) -> None:
+        self.dismiss("quit")
+
+    def _scroll(self) -> VerticalScroll:
+        return self.query_one("#detail-scroll", VerticalScroll)
+
+    def action_scroll_up(self) -> None:
+        self._scroll().scroll_relative(y=-1, animate=False)
+
+    def action_scroll_down(self) -> None:
+        self._scroll().scroll_relative(y=1, animate=False)
+
+    def action_page_up(self) -> None:
+        self._scroll().scroll_page_up(animate=False)
+
+    def action_page_down(self) -> None:
+        self._scroll().scroll_page_down(animate=False)
+
+    def action_scroll_home(self) -> None:
+        self._scroll().scroll_home(animate=False)
+
+    def action_scroll_end(self) -> None:
+        self._scroll().scroll_end(animate=False)
 
 
-# ---------------------------------------------------------------------------
-# List view
-# ---------------------------------------------------------------------------
+class EditApp(App):
+    """Golden-set editor: list of threads, drill into an editable detail view."""
 
-def _list_view(
-    stdscr,
-    threads: list[GoldenThread],
-    all_threads: list[GoldenThread],
-    path: Path,
-) -> None:
-    """Render the list screen and handle navigation + drill-down."""
-    cursor = 0
-    scroll_offset = 0
+    BINDINGS = [Binding("q", "quit_app", "Quit")]
 
-    while True:
-        max_y, max_x = stdscr.getmaxyx()
-        header_rows = 2  # title + column header
-        footer_rows = 1  # help line
-        page_size = max(1, max_y - header_rows - footer_rows)
+    DEFAULT_CSS = """
+    EditApp #threads {
+        height: 1fr;
+    }
+    EditApp #list-header {
+        text-style: underline;
+    }
+    EditApp #list-help {
+        color: $text-muted;
+    }
+    """
 
-        stdscr.clear()
+    def __init__(self, threads, all_threads, path):
+        super().__init__()
+        self.threads = threads
+        self.all_threads = all_threads
+        self.path = Path(path)
 
-        # Title
-        title = f"Edit Mode \u2014 {len(threads)} threads"
-        _safe_addstr(stdscr, 0, 0, title, curses.A_BOLD)
-
-        # Column headers ("X" column flags excluded threads)
+    def compose(self) -> ComposeResult:
+        yield Static(f"Edit Mode \u2014 {len(self.threads)} threads", id="list-title", markup=False)
         hdr = (
             f"{'X':<{_COL_FLAG}}"
             f"  {'S1':<{_COL_S1}}"
@@ -271,75 +259,49 @@ def _list_view(
             f"  {'Sender':<{_COL_SENDER}}"
             f"  Subject"
         )
-        _safe_addstr(stdscr, 1, 0, hdr, curses.A_UNDERLINE)
-
-        # Rows
-        for vi in range(page_size):
-            ti = scroll_offset + vi  # thread index
-            if ti >= len(threads):
-                break
-            row_text = _format_list_row(threads[ti], max_x)
-            attr = curses.A_REVERSE if ti == cursor else curses.A_NORMAL
-            _safe_addstr(stdscr, header_rows + vi, 0, row_text, attr)
-
-        # Help / footer
+        yield Static(hdr, id="list-header", markup=False)
+        yield PageListView(id="threads")
         help_text = "\u2191/\u2193:Nav  PgUp/PgDn:Page  Enter:Detail  q:Quit  (X = excluded)"
-        _safe_addstr(stdscr, max_y - 1, 0, help_text, curses.A_DIM)
+        yield Static(help_text, id="list-help", markup=False)
 
-        stdscr.refresh()
+    def on_mount(self) -> None:
+        self._refresh_list()
 
-        key = stdscr.getch()
+    def _refresh_list(self) -> None:
+        width = max(40, self.size.width)
+        listview = self.query_one("#threads", ListView)
+        cursor = listview.index or 0
+        listview.clear()
+        listview.extend(
+            ListItem(Label(_format_list_row(t, width), markup=False)) for t in self.threads
+        )
+        if self.threads:
+            listview.index = min(cursor, len(self.threads) - 1)
 
-        # Navigation
-        if key == curses.KEY_UP and cursor > 0:
-            cursor -= 1
-            if cursor < scroll_offset:
-                scroll_offset = cursor
-        elif key == curses.KEY_DOWN and cursor < len(threads) - 1:
-            cursor += 1
-            if cursor >= scroll_offset + page_size:
-                scroll_offset = cursor - page_size + 1
-        elif key == curses.KEY_PPAGE:
-            cursor = max(0, cursor - page_size)
-            scroll_offset = max(0, scroll_offset - page_size)
-        elif key == curses.KEY_NPAGE:
-            cursor = min(len(threads) - 1, cursor + page_size)
-            scroll_offset = min(max(0, len(threads) - page_size), scroll_offset + page_size)
-        elif key == curses.KEY_HOME:
-            cursor = 0
-            scroll_offset = 0
-        elif key == curses.KEY_END:
-            cursor = len(threads) - 1
-            scroll_offset = max(0, len(threads) - page_size)
-
-        # Drill down
-        elif key in (curses.KEY_ENTER, ord("\n"), ord("\r")):
-            result = _detail_view(stdscr, threads, cursor, all_threads, path)
-            if result == "quit":
-                return
-
-        # Quit
-        elif key == ord("q"):
+    def on_list_view_selected(self, event) -> None:
+        event.stop()
+        index = self.query_one("#threads", ListView).index
+        if index is None:
             return
 
-        # Resize
-        elif key == curses.KEY_RESIZE:
-            pass  # recalculated at top of loop
+        def on_dismiss(result) -> None:
+            if result == "quit":
+                self.exit("quit")
+            else:
+                self._refresh_list()  # X/S1/S2 flags may have changed
+
+        self.push_screen(DetailScreen(self.threads, index, self.all_threads, self.path), on_dismiss)
+
+    def action_quit_app(self) -> None:
+        self.exit("quit")
 
 
 # ---------------------------------------------------------------------------
 # Public entry point
 # ---------------------------------------------------------------------------
 
-def _curses_main(stdscr, threads: list[GoldenThread], all_threads: list[GoldenThread], path: Path) -> None:
-    """Curses wrapper target."""
-    curses.curs_set(0)
-    stdscr.keypad(True)
-    _list_view(stdscr, threads, all_threads, path)
-
-
 def run_edit_tui(threads: list[GoldenThread], all_threads: list[GoldenThread], path: Path) -> None:
-    """Launch the curses edit TUI.
+    """Launch the edit TUI.
 
     *threads* is the (possibly filtered) list displayed in the TUI.
     *all_threads* is the full golden set used for saving.
@@ -348,4 +310,4 @@ def run_edit_tui(threads: list[GoldenThread], all_threads: list[GoldenThread], p
     if not threads:
         print("No threads to edit.")
         return
-    curses.wrapper(_curses_main, threads, all_threads, path)
+    EditApp(threads, all_threads, Path(path)).run()
