@@ -216,6 +216,28 @@ def exclude_story(story):
     story.excluded = True
 
 
+def toggle_newsletter_excluded(newsletter) -> bool:
+    """Toggle whole-newsletter exclusion; returns the new state.
+
+    An excluded newsletter is dropped from the labeling queue (unless
+    ``--include-excluded``) and from eval runs entirely. ``reviewed`` is left
+    untouched — it records that the story list is confirmed extraction truth,
+    which stays valid if the newsletter is later restored.
+    """
+    newsletter.excluded = not newsletter.excluded
+    return newsletter.excluded
+
+
+def newsletter_exclude_status(newsletter) -> str:
+    """Status line after ``X`` toggles newsletter-level exclusion."""
+    if newsletter.excluded:
+        return (
+            "Newsletter excluded from the queue and eval runs "
+            "(X to restore; relaunch with --include-excluded to see it again)."
+        )
+    return "Newsletter restored to the queue and eval runs."
+
+
 # ---------------------------------------------------------------------------
 # Pure helpers for the TUI (no curses; fully testable)
 # ---------------------------------------------------------------------------
@@ -223,7 +245,7 @@ def exclude_story(story):
 _HELP_ITEMS = (
     "↑/↓:move", "PgUp/PgDn:page", "s/e:select", "Enter:make-story", "Space:seed",
     "[a]dd", "[E]dit", "[d]el", "[c]onfirm", "[l]abel", "[u]exclude", "[n]otes",
-    "[z]undo", "[k]skip", "Esc:back", "q:quit",
+    "[z]undo", "[k]skip", "[X]exclude-nl", "Esc:back", "q:quit",
 )
 
 
@@ -336,8 +358,13 @@ def format_list_header() -> str:
 
 
 def format_list_row(newsletter) -> str:
-    """One list-view row: reviewed flag, labeled/total, sender, subject."""
-    r = "Y" if newsletter.reviewed else " "
+    """One list-view row: reviewed/excluded flag, labeled/total, sender, subject.
+
+    ``X`` (excluded) takes precedence over ``Y`` (reviewed) in the flag column
+    so an excluded newsletter is unmistakable when queued via
+    ``--include-excluded``.
+    """
+    r = "X" if newsletter.excluded else ("Y" if newsletter.reviewed else " ")
     labeled, total = label_progress(newsletter)
     sender = (newsletter.sender or "")[:24]
     return f"{r:<2} {f'{labeled}/{total}':<6} {sender:<24} {newsletter.subject}"
@@ -427,13 +454,16 @@ def restore_snapshot(newsletter, snapshot):
 # Queue selection
 # ---------------------------------------------------------------------------
 
-def select_label_newsletters(newsletters, *, unreviewed_only=False):
+def select_label_newsletters(newsletters, *, unreviewed_only=False, include_excluded=False):
     """Newsletters to queue for labeling.
 
-    Excluded newsletters are permanently set aside and never queued, regardless
-    of *unreviewed_only*.
+    Excluded newsletters are set aside and not queued, regardless of
+    *unreviewed_only* — unless *include_excluded*, which queues them so they
+    can be inspected and restored (``X`` toggles exclusion in the detail view).
     """
-    result = [n for n in newsletters if not n.excluded]
+    result = list(newsletters)
+    if not include_excluded:
+        result = [n for n in result if not n.excluded]
     if unreviewed_only:
         result = [n for n in result if not n.reviewed]
     return result
@@ -574,6 +604,8 @@ def build_detail_rows(newsletter, index, total, width) -> list[tuple[str, int | 
     add_header(f"Subject:  {newsletter.subject}")
     add_header(f"Sender:   {newsletter.sender}")
     add_header(f"Reviewed: {newsletter.reviewed}")
+    if newsletter.excluded:
+        add_header("Excluded: True — skipped by the queue and eval runs (X to restore)")
     add_header(f"Seeded:   {newsletter.seeded_from or '-'}")
     if newsletter.notes:
         add_header(f"Notes:    {newsletter.notes}")
@@ -1003,6 +1035,12 @@ def _newsletter_detail(stdscr, newsletters, index, all_newsletters, path, *, ext
             else:
                 status = "Nothing to undo."
 
+        elif key == ord("X"):  # toggle whole-newsletter exclusion
+            push_undo()
+            toggle_newsletter_excluded(newsletter)
+            save()
+            status = newsletter_exclude_status(newsletter)
+
         elif key == ord("k"):  # skip this newsletter (never marks reviewed)
             return "skip"
         elif key == 27:  # Esc: clear an active selection first, then go back
@@ -1127,6 +1165,9 @@ def cli():
                         help="Edit mode: no LLM seeding (curate/label existing stories)")
     parser.add_argument("--unreviewed-only", action="store_true",
                         help="Queue only unreviewed newsletters")
+    parser.add_argument("--include-excluded", action="store_true",
+                        help="Also queue excluded newsletters (to inspect or restore "
+                             "them with the X hotkey; default: excluded are skipped)")
     parser.add_argument("--config",
                         help="Path to config.toml (default: the repo-root config.toml, "
                              "regardless of CWD)")
@@ -1147,7 +1188,11 @@ def cli():
         print("Golden set is empty.", file=sys.stderr)
         sys.exit(1)
 
-    newsletters = select_label_newsletters(all_newsletters, unreviewed_only=args.unreviewed_only)
+    newsletters = select_label_newsletters(
+        all_newsletters,
+        unreviewed_only=args.unreviewed_only,
+        include_excluded=args.include_excluded,
+    )
     if not newsletters:
         print("No newsletters match the filters.", file=sys.stderr)
         sys.exit(0)

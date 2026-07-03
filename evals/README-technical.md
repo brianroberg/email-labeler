@@ -161,6 +161,7 @@ exits 1 with a one-line message instead of a traceback.
 | `--golden-set` | Path to newsletter golden set JSONL (default: `evals/newsletter_golden_set.jsonl`) |
 | `--edit` | Disable LLM seeding — manual curation only. Same curses TUI, but `Space` is inert and no LLM endpoint is needed |
 | `--unreviewed-only` | Show only newsletters not yet reviewed |
+| `--include-excluded` | Also queue excluded newsletters, so they can be inspected or restored with the `X` hotkey (default: excluded newsletters are skipped) |
 | `--config` | Path to config.toml (default: the repo-root `config.toml`, regardless of CWD) |
 
 Both modes open the same curses TUI; `--edit` only removes the Phase-A LLM
@@ -194,6 +195,14 @@ auto-derived via `compute_tier` on save and `story.reviewed` is set. Saves are
 atomic (temp-file + rename). `excluded` stories are kept as extraction truth but
 skipped from quality/theme scoring.
 
+A **whole newsletter** can be excluded with `X` in the detail view: it is
+dropped from the labeling queue and from eval runs entirely (the run's load
+summary counts it under "excluded"). `X` toggles, the change is undoable (`z`),
+and `reviewed` is left untouched — a confirmed story list stays valid if the
+newsletter is later restored. Excluded newsletters vanish from the default
+queue on the next launch; relaunch with `--include-excluded` to see them
+(marked `X` in the list's flag column) and press `X` again to restore.
+
 TUI details:
 
 - **Undo** (`z`) is a multi-level stack (up to 100 snapshots per newsletter). A
@@ -212,7 +221,8 @@ TUI details:
   indicator sits on the status line; the help footer wraps on narrow terminals
   and lists `Space:seed` and `PgUp/PgDn`.
 - **List view**: columns are `R Lbl Sender Subject` where `Lbl` is
-  labeled/total stories; the list supports `PgUp`/`PgDn`.
+  labeled/total stories and the flag column shows `Y` (reviewed) or `X`
+  (excluded, which takes precedence); the list supports `PgUp`/`PgDn`.
 
 `seed_from_extractor()` returns `(stories, raw)` — the raw extractor output is
 kept so the caller can distinguish a `NO_STORIES` verdict from unparseable

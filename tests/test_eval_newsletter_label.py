@@ -26,6 +26,7 @@ from evals.newsletter_label import (
     format_theme_legend,
     label_progress,
     load_golden_set,
+    newsletter_exclude_status,
     restore_snapshot,
     row_for_body_line,
     save_golden_set,
@@ -34,6 +35,7 @@ from evals.newsletter_label import (
     seed_outcome_message,
     seed_stories,
     select_label_newsletters,
+    toggle_newsletter_excluded,
     unlabeled_story_count,
     wrap_text,
 )
@@ -136,6 +138,42 @@ class TestSelectLabelNewsletters:
         ]
         selected = select_label_newsletters(nls, unreviewed_only=True)
         assert [n.thread_id for n in selected] == ["keep"]
+
+    def test_include_excluded_queues_excluded_newsletters(self):
+        nls = [_newsletter("a"), _newsletter("b", excluded=True)]
+        selected = select_label_newsletters(nls, include_excluded=True)
+        assert [n.thread_id for n in selected] == ["a", "b"]
+
+    def test_include_excluded_still_honors_unreviewed_only(self):
+        nls = [
+            _newsletter("a", reviewed=True),
+            _newsletter("b", excluded=True, reviewed=False),
+        ]
+        selected = select_label_newsletters(
+            nls, unreviewed_only=True, include_excluded=True,
+        )
+        assert [n.thread_id for n in selected] == ["b"]
+
+
+class TestToggleNewsletterExcluded:
+    def test_toggles_on_and_off(self):
+        nl = _newsletter("t")
+        assert toggle_newsletter_excluded(nl) is True
+        assert nl.excluded is True
+        assert toggle_newsletter_excluded(nl) is False
+        assert nl.excluded is False
+
+    def test_leaves_reviewed_untouched(self):
+        nl = _newsletter("t", reviewed=True)
+        toggle_newsletter_excluded(nl)
+        assert nl.reviewed is True
+
+    def test_status_messages(self):
+        nl = _newsletter("t", excluded=True)
+        assert "restore" in newsletter_exclude_status(nl).lower()  # X to restore
+        assert "excluded" in newsletter_exclude_status(nl).lower()
+        nl.excluded = False
+        assert "restored" in newsletter_exclude_status(nl).lower()
 
 
 class TestUndo:
@@ -613,6 +651,28 @@ class TestFormatListRow:
     def test_reviewed_flag_leads_the_row(self):
         nl = _newsletter("t", reviewed=True)
         assert format_list_row(nl).startswith("Y")
+
+    def test_excluded_marker_takes_precedence(self):
+        nl = _newsletter("t", reviewed=True, excluded=True)
+        assert format_list_row(nl).startswith("X")
+
+
+class TestNewsletterExclusionVisibility:
+    def test_detail_rows_flag_excluded_newsletter(self):
+        nl = _newsletter("t", body="b0", excluded=True)
+        rows = build_detail_rows(nl, 0, 1, 80)
+        joined = " ".join(text for text, _ in rows)
+        assert "Excluded:" in joined
+
+    def test_detail_rows_omit_excluded_line_when_not_excluded(self):
+        nl = _newsletter("t", body="b0")
+        rows = build_detail_rows(nl, 0, 1, 80)
+        joined = " ".join(text for text, _ in rows)
+        assert "Excluded:" not in joined
+
+    def test_help_mentions_newsletter_exclude_hotkey(self):
+        joined = "  ".join(format_help_lines(500))
+        assert "[X]" in joined
 
 
 class TestFormatThemeLegend:

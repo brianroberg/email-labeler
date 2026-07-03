@@ -160,8 +160,10 @@ newsletter_harvest → newsletter_label → newsletter_run → newsletter_report
   make a story (already-covered body lines are dimmed so gaps stand out) — plus
   add/edit/delete, multi-level undo (`z`), or `k` to skip the newsletter for a
   later pass. Phase B assigns per-story dimension scores + themes. The tier is
-  auto-derived from scores. `--edit` disables the LLM seeding for manual-only
-  curation (no LLM endpoint needed).
+  auto-derived from scores. `X` excludes a whole newsletter from the queue and
+  eval runs (toggle; relaunch with `--include-excluded` to see and restore
+  excluded ones). `--edit` disables the LLM seeding for manual-only curation
+  (no LLM endpoint needed).
 - **run** — Replay the golden set through the real classifier (LLM-cached) and
   write timestamped results.
 - **report** — Compute tier/dimension/theme/extraction metrics, compare two runs,
