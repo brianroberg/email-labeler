@@ -24,6 +24,11 @@ email-labeler/
 │   ├── review.py       Interactive CLI for label review and correction
 │   ├── run_eval.py     Replay golden set through real classifier
 │   ├── report.py       Metrics: accuracy, confusion matrix, P/R/F1, privacy
+│   ├── newsletter_schemas.py  Newsletter golden-set and result dataclasses
+│   ├── newsletter_harvest.py  Pull candidate newsletters → golden set (unlabeled)
+│   ├── newsletter_label.py    Hand-label story quality scores and themes
+│   ├── newsletter_run.py      Replay golden stories through the newsletter classifier
+│   ├── newsletter_report.py   Newsletter tier/dimension/theme/extraction metrics
 │   └── results/        Timestamped result files from evaluation runs
 └── tests/
     ├── conftest.py          Shared fixtures and sample Gmail data
@@ -225,3 +230,8 @@ docker inspect --format='{{.State.Health.Status}}' agent-stack-email-labeler-1
 | `test_eval_schemas.py` | `evals/schemas.py` | GoldenThread/PredictionResult/RunMeta serialization round-trips |
 | `test_eval_harvest.py` | `evals/harvest.py` | Ground truth inference from labels, deduplication |
 | `test_eval_report.py` | `evals/report.py` | Confusion matrix, precision/recall/F1, accuracy, privacy violation metrics |
+| `test_eval_newsletter_schemas.py` | `evals/newsletter_schemas.py` | Golden-set/result dataclass round-trips, missing-key tolerance |
+| `test_eval_newsletter_harvest.py` | `evals/newsletter_harvest.py` | Newsletter filtering, body build, dedup, no ground-truth inference |
+| `test_eval_newsletter_label.py` | `evals/newsletter_label.py` | Story curation + per-story scoring/theme pure functions, tier derivation, undo |
+| `test_eval_newsletter_run.py` | `evals/newsletter_run.py` | `prompt_hash`, cache reuse, extraction vs quality/theme modes |
+| `test_eval_newsletter_report.py` | `evals/newsletter_report.py` | `match_stories`, tier/dimension/theme metrics, comparison deltas |

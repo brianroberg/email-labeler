@@ -79,6 +79,19 @@ python -m newsletter_review --file path/to/file.jsonl  # Custom JSONL path
 
 Hotkeys: `e/g/f/p` filter by tier, `1-5` filter by theme, `s` filter by sender, `c` clear filters, `q` quit.
 
+### Newsletter evaluation
+
+Distinct from the read-only `newsletter_review/` package (which only *browses*
+production assessments), the newsletter eval harness under `evals/` *measures* the
+grading pipeline against hand-labeled ground truth so the prompts can be iterated.
+It mirrors the email eval's 4 stages with `newsletter_`-prefixed modules:
+`newsletter_harvest → newsletter_label → newsletter_run → newsletter_report`
+(schemas in `evals/newsletter_schemas.py`). Quality/theme scoring uses **fixed
+golden stories** so it is decoupled from extraction variability; the shared cache
+(`evals/cache/llm_cache.jsonl`) and each run's `prompt_hash` make prompt A/Bs
+cheap and self-identifying. See `evals/README.md` (workflows) and
+`evals/README-technical.md` (every CLI flag, cache/prompt_hash details).
+
 ## Key Design Decisions
 
 1. **Two-tier classification**: Stage 1 (cloud) determines person vs service. Stage 2 routes person bodies to local LLM only.
@@ -148,3 +161,10 @@ All tests use mocks — no external services needed. Test files mirror source fi
 - `test_labeler.py` — Label verification + application actions
 - `test_daemon.py` — Processing pipeline + config loading
 - `test_newsletter_review.py` — TUI data loading, filtering, formatting, detail view
+- `test_eval_newsletter_schemas.py` — Golden-set dataclass round-trip + missing-key tolerance
+- `test_eval_newsletter_harvest.py` — Newsletter harvest filtering, body build, dedup
+- `test_eval_newsletter_label.py` — Story curation + per-story scoring/theme pure functions
+- `test_eval_newsletter_run.py` — `prompt_hash`, cache reuse, extraction vs quality/theme modes
+- `test_eval_newsletter_report.py` — `match_stories`, tier/dimension/theme metrics, comparison deltas
+- `test_eval_newsletter_cli_docs.py` — Every newsletter eval `--flag` documented in `README-technical.md`
+- `test_newsletter_eval_docs.py` — Newsletter eval modules/tests listed in `README-technical.md` structure + coverage

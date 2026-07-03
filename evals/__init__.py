@@ -5,6 +5,17 @@ import httpx
 from proxy_client import ProxyAuthError, ProxyError, ProxyForbiddenError
 
 
+def plural(n: int, singular: str, plural_form: str | None = None) -> str:
+    """'1 story' / 'N stories' — the one pluralizer for eval status lines.
+
+    Defaults the plural form to ``singular + "s"``; pass *plural_form* for
+    irregulars ("story"/"stories").
+    """
+    if n == 1:
+        return f"1 {singular}"
+    return f"{n} {plural_form or singular + 's'}"
+
+
 def format_network_error(exc: Exception, service: str = "service") -> str:
     """Format a network exception into a human-readable error message.
 

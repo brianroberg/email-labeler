@@ -23,11 +23,16 @@ class CachedLLMClient:
     def __init__(self, inner: LLMClient, cache_path: Path):
         self.inner = inner
         self.cache_path = cache_path
-        self._cache: dict[str, tuple[str, str]] = {}  # key -> (response, thinking)
+        # key -> (response, thinking). thinking is None for legacy entries
+        # written before thinking capture (unknown, backfillable); "" means the
+        # model was called and legitimately emitted no thinking (do NOT re-fetch).
+        self._cache: dict[str, tuple[str, str | None]] = {}
         self._pending: list[dict] = []  # new entries to flush to disk
         self.hits = 0
         self.misses = 0
-        self._llm_seconds = 0.0  # accumulated LLM call time (misses only)
+        # per-task accumulated LLM call time (misses only), keyed like
+        # _thinking_buffers so concurrent rows don't absorb each other's time
+        self._llm_seconds: dict[int, float] = {}
         self._thinking_buffers: dict[int, list[str]] = {}  # per-task thinking buffers
         self._load()
 
@@ -43,7 +48,11 @@ class CachedLLMClient:
                 try:
                     entry = json.loads(line)
                     response = entry["response"]
-                    thinking = entry.get("thinking", "")
+                    # A present "thinking" key (even "") means the entry was
+                    # written by thinking-aware code: "" is a real "no thinking
+                    # emitted", not a gap to backfill. Only entries missing the
+                    # key entirely are legacy (thinking unknown -> None).
+                    thinking = entry["thinking"] if "thinking" in entry else None
                     # Normalize old entries that may contain unstripped think tags
                     extra_thinking = LLMClient._extract_thinking(response)
                     response = LLMClient._strip_thinking(response)
@@ -76,14 +85,18 @@ class CachedLLMClient:
 
         if key in self._cache:
             response, thinking = self._cache[key]
-            # Backfill thinking for old cache entries that lack it
-            if include_thinking and not thinking:
+            # Backfill thinking only for legacy entries where it is unknown
+            # (None). An empty string means the model emitted no thinking —
+            # re-fetching those would re-bill every terse response forever.
+            if include_thinking and thinking is None:
                 self.misses += 1
                 start = time.monotonic()
                 _, thinking = await self.inner.complete(
                     system_prompt, user_content, include_thinking=True,
                 )
-                self._llm_seconds += time.monotonic() - start
+                self._llm_seconds[tk] = (
+                    self._llm_seconds.get(tk, 0.0) + time.monotonic() - start
+                )
                 self._cache[key] = (response, thinking)
                 self._pending.append({
                     "key": key,
@@ -96,7 +109,7 @@ class CachedLLMClient:
             if thinking:
                 self._thinking_buffers.setdefault(tk, []).append(thinking)
             if include_thinking:
-                return response, thinking
+                return response, thinking or ""
             return response
 
         self.misses += 1
@@ -104,7 +117,7 @@ class CachedLLMClient:
         response, thinking = await self.inner.complete(
             system_prompt, user_content, include_thinking=True,
         )
-        self._llm_seconds += time.monotonic() - start
+        self._llm_seconds[tk] = self._llm_seconds.get(tk, 0.0) + time.monotonic() - start
 
         if thinking:
             self._thinking_buffers.setdefault(tk, []).append(thinking)
@@ -130,10 +143,13 @@ class CachedLLMClient:
         return "\n\n".join(t for t in buf if t)
 
     def take_llm_seconds(self) -> float:
-        """Return accumulated LLM call time and reset to zero."""
-        elapsed = self._llm_seconds
-        self._llm_seconds = 0.0
-        return elapsed
+        """Return the current task's accumulated LLM call time and reset its bucket.
+
+        Keyed per asyncio task (like take_thinking) so that under
+        parallelism > 1 each row drains only its own miss time instead of
+        absorbing every concurrent row's.
+        """
+        return self._llm_seconds.pop(self._task_key(), 0.0)
 
     async def is_available(self, timeout: float | None = None) -> bool:
         """Delegate to inner client."""

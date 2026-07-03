@@ -1,5 +1,6 @@
 """Tests for evals.llm_cache — CachedLLMClient wrapper."""
 
+import asyncio
 import json
 from pathlib import Path
 from unittest.mock import AsyncMock
@@ -292,6 +293,45 @@ class TestCorruptCacheFile:
         inner2.complete.assert_not_awaited()
 
 
+    async def test_current_entry_with_empty_thinking_is_a_hit(self, tmp_path: Path):
+        """An entry written by current code with thinking='' (model emitted no
+        <think> block) must be a cache hit under include_thinking=True — not a
+        legacy entry to re-fetch. Otherwise every terse response (NO_STORIES,
+        'NONE' themes) is re-billed on every run and re-appended to disk."""
+        cache_path = tmp_path / "cache.jsonl"
+
+        inner1 = _make_inner()
+        _set_return(inner1, "NO_STORIES", "")  # legitimately no thinking
+        cached1 = CachedLLMClient(inner1, cache_path)
+        await cached1.complete("sys", "usr", include_thinking=True)
+        cached1.flush()
+
+        inner2 = _make_inner()
+        cached2 = CachedLLMClient(inner2, cache_path)
+        response, thinking = await cached2.complete("sys", "usr", include_thinking=True)
+
+        assert response == "NO_STORIES"
+        assert thinking == ""
+        assert cached2.hits == 1
+        assert cached2.misses == 0
+        inner2.complete.assert_not_awaited()
+        # No duplicate entry appended to the cache file
+        cached2.flush()
+        assert len(cache_path.read_text().strip().splitlines()) == 1
+
+    async def test_same_session_empty_thinking_is_a_hit(self, tmp_path: Path):
+        """Within one session, a miss that returned no thinking must not
+        re-fire the LLM on the next include_thinking=True call."""
+        inner = _make_inner()
+        _set_return(inner, "NONE", "")
+        cached = CachedLLMClient(inner, tmp_path / "cache.jsonl")
+
+        await cached.complete("sys", "usr", include_thinking=True)  # miss
+        await cached.complete("sys", "usr", include_thinking=True)  # must hit
+
+        assert inner.complete.await_count == 1
+        assert cached.hits == 1
+
     async def test_old_cache_with_unstripped_double_bracket_think(self, tmp_path: Path):
         """Cache entries with <<think>> blocks in response are normalized on load."""
         cache_path = tmp_path / "cache.jsonl"
@@ -340,10 +380,9 @@ class TestLlmSeconds:
 
         await cached.complete("sys", "usr")
 
-        assert cached._llm_seconds > 0
         elapsed = cached.take_llm_seconds()
         assert elapsed > 0
-        assert cached._llm_seconds == 0.0  # reset after take
+        assert cached.take_llm_seconds() == 0.0  # reset after take
 
     async def test_hit_does_not_accumulate_time(self, tmp_path: Path):
         inner = _make_inner()
@@ -356,6 +395,54 @@ class TestLlmSeconds:
         await cached.complete("sys", "usr")  # cache hit
 
         assert cached.take_llm_seconds() == 0.0
+
+    async def test_llm_seconds_isolated_per_task(self, tmp_path: Path, monkeypatch):
+        """Each concurrent task must drain only ITS OWN miss time.
+
+        Under parallelism > 1, a shared accumulator lets the first row to
+        finish absorb every concurrent row's LLM time into its
+        duration_seconds while the others record ~0 — skewing the persisted
+        results JSONL and the web UI averages."""
+        import evals.llm_cache as llm_cache_mod
+
+        class _FakeTime:
+            def __init__(self):
+                self.t = 0.0
+
+            def monotonic(self):
+                return self.t
+
+        fake_time = _FakeTime()
+        monkeypatch.setattr(llm_cache_mod, "time", fake_time)
+
+        durations = {"usr-A": 5.0, "usr-B": 7.0}
+        inner = _make_inner()
+
+        async def fake_complete(system_prompt, user_content, include_thinking=False):
+            fake_time.t += durations[user_content]
+            return ("R", "")
+
+        inner.complete.side_effect = fake_complete
+        cached = CachedLLMClient(inner, tmp_path / "cache.jsonl")
+
+        both_done = asyncio.Event()
+        done = {"count": 0}
+        drained = {}
+
+        async def worker(user_content):
+            await cached.complete("sys", user_content)
+            done["count"] += 1
+            if done["count"] == 2:
+                both_done.set()
+            # Wait until BOTH tasks have accumulated before either drains, so a
+            # shared accumulator would hand everything to whichever drains first.
+            await both_done.wait()
+            drained[user_content] = cached.take_llm_seconds()
+
+        await asyncio.gather(worker("usr-A"), worker("usr-B"))
+
+        assert drained["usr-A"] == pytest.approx(5.0)
+        assert drained["usr-B"] == pytest.approx(7.0)
 
 
 class TestThinking:
