@@ -1,15 +1,19 @@
-"""Tests for newsletter_review TUI — pure data functions only."""
+"""Tests for newsletter_review TUI — pure data functions + Pilot UI tests."""
 
 import json
 
 import pytest
+from textual.widgets import ListView, Static
 
 from newsletter_review.tui import (
+    DetailScreen,
+    ReviewApp,
     apply_filters,
     build_detail_lines,
     format_filter_summary,
     format_list_row,
     load_assessments,
+    run_review_tui,
     wrap_text,
 )
 
@@ -336,3 +340,222 @@ class TestWrapText:
     def test_empty_string(self):
         lines = wrap_text("", 80)
         assert lines == [] or lines == [""]
+
+
+# ---------------------------------------------------------------------------
+# Pilot UI tests — drive the real Textual app: key presses in, widget state
+# and rendered content out.
+# ---------------------------------------------------------------------------
+
+SIZE = (100, 30)
+
+
+def _ui_records():
+    return [
+        _make_record(subject="Subject zero", overall_tier="good", sender="alice@dm.org"),
+        _make_record(subject="Subject one", overall_tier="poor", sender="bob@other.org"),
+        _make_record(subject="Subject two", overall_tier="good", sender="carol@dm.org"),
+        _make_record(
+            subject="Subject three",
+            overall_tier="excellent",
+            sender="dave@dm.org",
+            stories=[{
+                "title": "Vocation Story", "text": "T", "scores": None,
+                "average_score": None, "tier": None,
+                "themes": ["vocation_family"], "quality_cot": "", "theme_cot": "",
+            }],
+        ),
+        _make_record(subject="Subject four", overall_tier="fair", sender="erin@other.org"),
+        _make_record(subject="Subject five", overall_tier="good", sender="frank@dm.org"),
+    ]
+
+
+def _title(app) -> str:
+    return str(app.query_one("#title", Static).render())
+
+
+class TestReviewAppList:
+    async def test_list_shows_all_records(self):
+        app = ReviewApp(_ui_records())
+        async with app.run_test(size=SIZE):
+            assert len(app.query_one(ListView)) == 6
+            assert "6 records" in _title(app)
+
+    async def test_down_arrow_moves_cursor(self):
+        app = ReviewApp(_ui_records())
+        async with app.run_test(size=SIZE) as pilot:
+            assert app.query_one(ListView).index == 0
+            await pilot.press("down")
+            assert app.query_one(ListView).index == 1
+
+    async def test_q_quits(self):
+        app = ReviewApp(_ui_records())
+        async with app.run_test(size=SIZE) as pilot:
+            await pilot.press("q")
+        assert app.return_value == "quit"
+
+
+class TestReviewAppDetail:
+    async def test_enter_opens_detail_with_content(self):
+        app = ReviewApp(_ui_records())
+        async with app.run_test(size=SIZE) as pilot:
+            await pilot.press("down", "enter")
+            assert isinstance(app.screen, DetailScreen)
+            text = "\n".join(str(w.render()) for w in app.screen.query(Static))
+            assert "Subject one" in text
+            assert "Overall: poor" in text
+            assert "A Great Story" in text
+
+    async def test_detail_status_shows_position(self):
+        app = ReviewApp(_ui_records())
+        async with app.run_test(size=SIZE) as pilot:
+            await pilot.press("down", "enter")
+            text = "\n".join(str(w.render()) for w in app.screen.query(Static))
+            assert "Newsletter 2/6" in text
+
+    async def test_escape_returns_to_list_preserving_cursor(self):
+        app = ReviewApp(_ui_records())
+        async with app.run_test(size=SIZE) as pilot:
+            await pilot.press("down", "down", "enter")
+            assert isinstance(app.screen, DetailScreen)
+            await pilot.press("escape")
+            assert not isinstance(app.screen, DetailScreen)
+            assert app.query_one(ListView).index == 2
+
+    async def test_q_quits_from_detail(self):
+        app = ReviewApp(_ui_records())
+        async with app.run_test(size=SIZE) as pilot:
+            await pilot.press("enter")
+            assert isinstance(app.screen, DetailScreen)
+            await pilot.press("q")
+        assert app.return_value == "quit"
+
+    async def test_detail_scrolls_with_arrow_keys(self):
+        long_record = _make_record(subject="Long one")
+        long_record["stories"][0]["text"] = "A very long story that needs scrolling. " * 40
+        app = ReviewApp([long_record])
+        async with app.run_test(size=SIZE) as pilot:
+            await pilot.press("enter")
+            scroll = app.screen.query_one("#detail-scroll")
+            assert scroll.scroll_offset.y == 0
+            await pilot.press("down", "down", "down")
+            assert scroll.scroll_offset.y == 3
+
+    async def test_enter_on_empty_filtered_list_is_noop(self):
+        app = ReviewApp(_ui_records(), init_sender="nobody@nowhere")
+        async with app.run_test(size=SIZE) as pilot:
+            await pilot.press("enter")
+            assert not isinstance(app.screen, DetailScreen)
+
+
+class TestReviewAppTierFilter:
+    async def test_tier_filter_narrows_list(self):
+        app = ReviewApp(_ui_records())
+        async with app.run_test(size=SIZE) as pilot:
+            await pilot.press("f", "t", "g")
+            assert len(app.query_one(ListView)) == 3
+            assert "tier:good" in _title(app)
+            assert "3/6 records" in _title(app)
+
+    async def test_clear_tier_filter_restores_all(self):
+        app = ReviewApp(_ui_records())
+        async with app.run_test(size=SIZE) as pilot:
+            await pilot.press("f", "t", "g")
+            assert len(app.query_one(ListView)) == 3
+            await pilot.press("f", "t", "c")
+            assert len(app.query_one(ListView)) == 6
+
+    async def test_cancel_at_filter_type_menu(self):
+        app = ReviewApp(_ui_records())
+        async with app.run_test(size=SIZE) as pilot:
+            await pilot.press("f", "z")  # z is not a filter type -> cancel
+            assert len(app.query_one(ListView)) == 6
+            assert "tier:" not in _title(app)
+
+    async def test_cancel_at_tier_menu_keeps_existing_filter(self):
+        app = ReviewApp(_ui_records())
+        async with app.run_test(size=SIZE) as pilot:
+            await pilot.press("f", "t", "g")
+            await pilot.press("f", "t", "z")  # z is not a tier key -> cancel
+            assert len(app.query_one(ListView)) == 3
+            assert "tier:good" in _title(app)
+
+    async def test_filter_change_resets_cursor(self):
+        app = ReviewApp(_ui_records())
+        async with app.run_test(size=SIZE) as pilot:
+            await pilot.press("down", "down")
+            await pilot.press("f", "t", "g")
+            assert app.query_one(ListView).index == 0
+
+
+class TestReviewAppThemeFilter:
+    async def test_theme_filter_narrows_list(self):
+        app = ReviewApp(_ui_records())
+        async with app.run_test(size=SIZE) as pilot:
+            await pilot.press("f", "h", "v")  # filter -> theme -> vocation_family
+            assert len(app.query_one(ListView)) == 1
+            assert "theme:vocation_family" in _title(app)
+            assert "1/6 records" in _title(app)
+
+    async def test_clear_theme_filter_restores_all(self):
+        app = ReviewApp(_ui_records())
+        async with app.run_test(size=SIZE) as pilot:
+            await pilot.press("f", "h", "s")  # theme -> scripture (5 records)
+            assert len(app.query_one(ListView)) == 5
+            await pilot.press("f", "h", "x")  # x clears the theme filter
+            assert len(app.query_one(ListView)) == 6
+
+    async def test_cancel_at_theme_menu(self):
+        app = ReviewApp(_ui_records())
+        async with app.run_test(size=SIZE) as pilot:
+            await pilot.press("f", "h", "z")  # z is not a theme key -> cancel
+            assert len(app.query_one(ListView)) == 6
+
+
+class TestReviewAppSenderFilter:
+    async def test_sender_filter_narrows_list(self):
+        app = ReviewApp(_ui_records())
+        async with app.run_test(size=SIZE) as pilot:
+            await pilot.press("f", "s")
+            await pilot.press(*"dm.org")
+            await pilot.press("enter")
+            assert len(app.query_one(ListView)) == 4
+            assert "sender:dm.org" in _title(app)
+            assert "4/6 records" in _title(app)
+
+    async def test_sender_escape_cancels(self):
+        app = ReviewApp(_ui_records())
+        async with app.run_test(size=SIZE) as pilot:
+            await pilot.press("f", "s")
+            await pilot.press(*"dm.org")
+            await pilot.press("escape")
+            assert len(app.query_one(ListView)) == 6
+            assert "sender:" not in _title(app)
+
+    async def test_sender_empty_submit_clears_filter(self):
+        app = ReviewApp(_ui_records(), init_sender="dm.org")
+        async with app.run_test(size=SIZE) as pilot:
+            assert len(app.query_one(ListView)) == 4
+            await pilot.press("f", "s", "enter")
+            assert len(app.query_one(ListView)) == 6
+
+
+class TestReviewAppInitFilters:
+    async def test_init_tier_pre_applied(self):
+        app = ReviewApp(_ui_records(), init_tier="good")
+        async with app.run_test(size=SIZE):
+            assert len(app.query_one(ListView)) == 3
+            assert "tier:good" in _title(app)
+
+    async def test_init_filters_combine(self):
+        app = ReviewApp(_ui_records(), init_tier="good", init_sender="dm.org")
+        async with app.run_test(size=SIZE):
+            assert len(app.query_one(ListView)) == 3
+            assert "tier:good" in _title(app)
+            assert "sender:dm.org" in _title(app)
+
+
+class TestRunReviewTui:
+    def test_empty_records_prints_and_returns(self, capsys):
+        run_review_tui([])
+        assert "No assessment records" in capsys.readouterr().out
