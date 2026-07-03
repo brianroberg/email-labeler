@@ -16,6 +16,9 @@ import asyncio
 import copy
 import hashlib
 import json
+import logging
+import os
+import re
 import sys
 import time
 import tomllib
@@ -38,28 +41,69 @@ from evals.newsletter_schemas import (
     StoryPrediction,
 )
 from llm_client import LLMClient
-from newsletter import NewsletterClassifier, compute_tier
+from newsletter import _VALID_THEMES, NewsletterClassifier, compute_tier
 
 
-def load_golden_set(path: Path, reviewed_only: bool = True) -> list[GoldenNewsletter]:
+def load_golden_set(
+    path: Path, reviewed_only: bool = True,
+) -> tuple[list[GoldenNewsletter], dict]:
     """Load newsletters from the golden set JSONL.
 
     Drops ``excluded`` newsletters unconditionally; drops unreviewed ones unless
     ``reviewed_only`` is False. Blank lines are skipped.
+
+    Returns (kept newsletters, stats) where stats counts what the file held and
+    what filtering dropped: {"total", "excluded", "unreviewed"} — so the CLI can
+    explain an empty result instead of dead-ending.
     """
     newsletters = []
+    stats = {"total": 0, "excluded": 0, "unreviewed": 0}
     with open(path) as f:
         for line in f:
             line = line.strip()
             if not line:
                 continue
             gn = GoldenNewsletter.from_dict(json.loads(line))
+            stats["total"] += 1
             if gn.excluded:
+                stats["excluded"] += 1
                 continue
-            if reviewed_only and not gn.reviewed:
-                continue
+            if not gn.reviewed:
+                stats["unreviewed"] += 1
+                if reviewed_only:
+                    continue
             newsletters.append(gn)
-    return newsletters
+    return newsletters, stats
+
+
+def format_load_summary(kept: int, stats: dict, path) -> str:
+    """Human-readable summary of what the golden-set load kept vs dropped.
+
+    Covers the three UX dead-ends: an empty file (points at harvest), an
+    all-filtered file (points at the labeling TUI and --include-unreviewed),
+    and a partial load (reports the unreviewed/excluded breakdown).
+    """
+    total = stats["total"]
+    if kept == 0:
+        if total == 0:
+            return (
+                f"No newsletters to evaluate: golden set {path} is empty.\n"
+                "Harvest newsletters first with: python -m evals.newsletter_harvest"
+            )
+        return (
+            f"No newsletters to evaluate: {total} loaded from {path}, "
+            f"but {stats['unreviewed']} unreviewed and {stats['excluded']} excluded.\n"
+            "Label them with: python -m evals.newsletter_label\n"
+            "(or pass --include-unreviewed to run extraction on uncurated newsletters)"
+        )
+    dropped = []
+    if total - stats["excluded"] - kept > 0:
+        dropped.append(f"{stats['unreviewed']} unreviewed skipped")
+    if stats["excluded"]:
+        dropped.append(f"{stats['excluded']} excluded")
+    if dropped:
+        return f"Loaded {kept} of {total} newsletters from {path} ({', '.join(dropped)})"
+    return f"Loaded {kept} newsletters from {path}"
 
 
 def compute_prompt_hash(config: dict) -> str:
@@ -72,6 +116,28 @@ def compute_prompt_hash(config: dict) -> str:
     prompts = config["newsletter"]["prompts"]
     raw = json.dumps(prompts, sort_keys=True)
     return hashlib.sha256(raw.encode()).hexdigest()[:16]
+
+
+def describe_endpoint() -> str:
+    """The resolved newsletter LLM URL + which env var supplied it.
+
+    Mirrors daemon.resolve_newsletter_llm_endpoint()'s precedence so error
+    messages can say WHICH endpoint was probed — the NEWSLETTER_LLM_URL vs
+    CLOUD_LLM_URL fallback is a documented source of confusion.
+    """
+    url = os.environ.get("NEWSLETTER_LLM_URL")
+    if url:
+        return f"{url} (from NEWSLETTER_LLM_URL)"
+    return f"{os.environ.get('CLOUD_LLM_URL') or '(unset)'} (from CLOUD_LLM_URL)"
+
+
+def _endpoint_url(llm) -> str | None:
+    """Best-effort base_url of a (possibly cache-wrapped) LLM client."""
+    url = getattr(llm, "base_url", None)
+    if url:
+        return url
+    inner = getattr(llm, "inner", None)
+    return getattr(inner, "base_url", None) if inner is not None else None
 
 
 class _RawCapture:
@@ -87,6 +153,7 @@ class _RawCapture:
     def __init__(self, inner):
         self.inner = inner
         self.last_raw = None
+        self.last_thinking = None
 
     def __getattr__(self, name):
         return getattr(self.inner, name)
@@ -95,6 +162,7 @@ class _RawCapture:
         result = await self.inner.complete(system_prompt, user_content, include_thinking=True)
         response, thinking = result
         self.last_raw = response
+        self.last_thinking = thinking
         if include_thinking:
             return response, thinking
         return response
@@ -113,12 +181,15 @@ def _elapsed(llm, start: float) -> float:
 
 async def evaluate_extraction(
     newsletter: GoldenNewsletter, classifier: NewsletterClassifier,
-) -> ExtractionPrediction:
+) -> tuple[ExtractionPrediction, NewsletterThinkingEntry]:
     """Run extract_stories on the raw body; compare predicted vs golden story list.
 
     Extraction is scored at the newsletter-body level: the raw body goes in, and
     the predicted [{title,text}] list is matched (in the report) against the
-    newsletter's confirmed golden stories.
+    newsletter's confirmed golden stories. The extraction chain-of-thought is
+    captured into a newsletter-level ``NewsletterThinkingEntry`` (thread_id +
+    extraction_cot) so segmentation mangles can be prompt-debugged from the
+    ``.cot.jsonl`` sidecar, just like quality/theme scoring.
     """
     pred = ExtractionPrediction(
         thread_id=newsletter.thread_id,
@@ -127,27 +198,43 @@ async def evaluate_extraction(
             for s in newsletter.stories
         ],
     )
+    thinking = NewsletterThinkingEntry(thread_id=newsletter.thread_id)
+
+    real_client = classifier.cloud_llm
+    capture = _RawCapture(real_client)
+    # Shallow-copy for the same concurrency reason as evaluate_story: swapping
+    # the shared classifier's client would race under parallelism > 1.
+    local_classifier = copy.copy(classifier)
+    local_classifier.cloud_llm = capture
     start = time.monotonic()
     try:
-        stories = await classifier.extract_stories(newsletter.body)
+        stories = await local_classifier.extract_stories(newsletter.body)
         pred.predicted_stories = [{"title": t, "text": x} for t, x in stories]
+        thinking.extraction_cot = capture.last_thinking or ""
     except (httpx.ConnectError, httpx.TimeoutException) as exc:
         pred.error = format_network_error(exc, "newsletter LLM")
     except Exception as exc:
         pred.error = str(exc)
-    pred.duration_seconds = _elapsed(classifier.cloud_llm, start)
-    return pred
+    if pred.error:
+        url = _endpoint_url(real_client)
+        if url:
+            pred.error += f" (endpoint: {url})"
+    pred.duration_seconds = _elapsed(real_client, start)
+    return pred, thinking
 
 
 async def evaluate_story(
     story: GoldenStory, thread_id: str, classifier: NewsletterClassifier,
+    do_quality: bool = True, do_themes: bool = True,
 ) -> tuple[StoryPrediction, NewsletterThinkingEntry]:
-    """Score one fixed golden story on quality + themes; derive tier from scores.
+    """Score one fixed golden story on quality and/or themes; derive tier from scores.
 
     Quality and themes are evaluated on the fixed golden (title, text), decoupled
     from extraction variability. predicted_tier is derived via compute_tier only
     when the scores parsed; a parse failure leaves scores/tier None (an error in
-    the report, not a mis-tier).
+    the report, not a mis-tier). *do_quality*/*do_themes* let quality/themes modes
+    skip the other LLM call entirely (skipped fields stay None/[], with raw=None
+    marking "never attempted" as distinct from a parse failure).
     """
     pred = StoryPrediction(
         story_id=story.story_id,
@@ -167,23 +254,29 @@ async def evaluate_story(
     local_classifier.cloud_llm = capture
     start = time.monotonic()
     try:
-        capture.last_raw = None
-        scores, quality_cot = await local_classifier.assess_quality(story.title, story.text)
-        pred.scores_raw = capture.last_raw
-        pred.predicted_scores = scores
-        thinking.quality_cot = quality_cot
-        if scores:
-            pred.predicted_tier = compute_tier(scores).value
+        if do_quality:
+            capture.last_raw = None
+            scores, quality_cot = await local_classifier.assess_quality(story.title, story.text)
+            pred.scores_raw = capture.last_raw
+            pred.predicted_scores = scores
+            thinking.quality_cot = quality_cot
+            if scores:
+                pred.predicted_tier = compute_tier(scores).value
 
-        capture.last_raw = None
-        themes, theme_cot = await local_classifier.classify_themes(story.title, story.text)
-        pred.themes_raw = capture.last_raw
-        pred.predicted_themes = themes
-        thinking.theme_cot = theme_cot
+        if do_themes:
+            capture.last_raw = None
+            themes, theme_cot = await local_classifier.classify_themes(story.title, story.text)
+            pred.themes_raw = capture.last_raw
+            pred.predicted_themes = themes
+            thinking.theme_cot = theme_cot
     except (httpx.ConnectError, httpx.TimeoutException) as exc:
         pred.error = format_network_error(exc, "newsletter LLM")
     except Exception as exc:
         pred.error = str(exc)
+    if pred.error:
+        url = _endpoint_url(real_client)
+        if url:
+            pred.error += f" (endpoint: {url})"
     pred.duration_seconds = _elapsed(real_client, start)
     return pred, thinking
 
@@ -191,11 +284,36 @@ async def evaluate_story(
 VALID_MODES = ("extraction", "quality", "themes", "all")
 
 
+def select_stories(
+    golden_set: list[GoldenNewsletter],
+) -> tuple[list[tuple[GoldenStory, str]], int, int]:
+    """Pick the (story, thread_id) pairs story modes evaluate + skip counts.
+
+    A story is evaluated only when it is Phase-B labeled (``story.reviewed``)
+    and not ``excluded`` — an unlabeled story has no ground truth, so scoring
+    it would burn LLM calls and pollute metrics with expected=None/[] rows.
+
+    Returns (pairs, n_excluded, n_unlabeled).
+    """
+    pairs: list[tuple[GoldenStory, str]] = []
+    n_excluded = n_unlabeled = 0
+    for nl in golden_set:
+        for story in nl.stories:
+            if story.excluded:
+                n_excluded += 1
+            elif not story.reviewed:
+                n_unlabeled += 1
+            else:
+                pairs.append((story, nl.thread_id))
+    return pairs, n_excluded, n_unlabeled
+
+
 async def run_evaluation(
     golden_set: list[GoldenNewsletter],
     classifier: NewsletterClassifier,
     mode: str,
     parallelism: int = 1,
+    progress: bool = False,
 ) -> tuple[list, list[NewsletterThinkingEntry]]:
     """Replay the golden set through the classifier under *mode*.
 
@@ -204,36 +322,54 @@ async def run_evaluation(
     reviewed, non-excluded golden story, quality/themes/all modes). Concurrency is
     bounded by an asyncio.Semaphore(parallelism); the shared classifier's client is
     never mutated (evaluate_story shallow-copies it), so tasks don't race.
+    With *progress*, a "[k/N] <what>" line is printed to stderr as each task
+    finishes, so long runs show signs of life.
     """
     semaphore = asyncio.Semaphore(parallelism)
     do_extraction = mode in ("extraction", "all")
-    do_stories = mode in ("quality", "themes", "all")
+    do_quality = mode in ("quality", "all")
+    do_themes = mode in ("themes", "all")
+    ticker = {"done": 0, "total": 0}
+
+    def _tick(label: str) -> None:
+        ticker["done"] += 1
+        if progress:
+            print(f"  [{ticker['done']}/{ticker['total']}] {label}", file=sys.stderr)
 
     async def run_extraction(nl: GoldenNewsletter):
         async with semaphore:
-            return await evaluate_extraction(nl, classifier)
+            result = await evaluate_extraction(nl, classifier)
+        _tick(f"extraction {nl.thread_id}")
+        return result  # (ExtractionPrediction, NewsletterThinkingEntry)
 
     async def run_story(story: GoldenStory, thread_id: str):
         async with semaphore:
-            return await evaluate_story(story, thread_id, classifier)
+            result = await evaluate_story(
+                story, thread_id, classifier,
+                do_quality=do_quality, do_themes=do_themes,
+            )
+        _tick(f"story {story.story_id}")
+        return result
 
     extraction_tasks = []
     if do_extraction:
         extraction_tasks = [run_extraction(nl) for nl in golden_set]
 
     story_tasks = []
-    if do_stories:
-        for nl in golden_set:
-            for story in nl.stories:
-                if story.excluded:
-                    continue
-                story_tasks.append(run_story(story, nl.thread_id))
+    if do_quality or do_themes:
+        story_pairs_in, _n_excluded, _n_unlabeled = select_stories(golden_set)
+        story_tasks = [run_story(story, tid) for story, tid in story_pairs_in]
 
-    extraction_rows = await asyncio.gather(*extraction_tasks)
+    ticker["total"] = len(extraction_tasks) + len(story_tasks)
+
+    extraction_pairs = await asyncio.gather(*extraction_tasks)
     story_pairs = await asyncio.gather(*story_tasks)
 
-    rows = list(extraction_rows)
+    rows = []
     thinking = []
+    for pred, entry in extraction_pairs:
+        rows.append(pred)
+        thinking.append(entry)
     for pred, entry in story_pairs:
         rows.append(pred)
         thinking.append(entry)
@@ -269,8 +405,10 @@ def build_meta(
     llm_cfg = config["newsletter"]["llm"]
     prompts = config["newsletter"]["prompts"]
     config_bytes = json.dumps(config, sort_keys=True).encode()
+    # Count only stories a story-mode run would actually evaluate (Phase-B
+    # labeled, non-excluded) so the report header matches metric denominators.
     story_count = sum(
-        1 for nl in golden_set for s in nl.stories if not s.excluded
+        1 for nl in golden_set for s in nl.stories if not s.excluded and s.reviewed
     )
     seeded_from = next((nl.seeded_from for nl in golden_set if nl.seeded_from), "")
     return NewsletterRunMeta(
@@ -317,19 +455,148 @@ def write_results(path: Path, meta: "NewsletterRunMeta", rows: list) -> None:
 
 def write_thinking_sidecar(
     results_path: Path, thinking_entries: list[NewsletterThinkingEntry],
-) -> None:
+) -> Path | None:
     """Write non-empty chain-of-thought entries to the .cot.jsonl sidecar.
 
     Only entries with at least one non-empty cot field are written; if none
-    qualify, no sidecar file is created.
+    qualify, no sidecar file is created. Returns the sidecar path when one was
+    written (so the run summary can mention it), else None.
     """
-    entries = [t for t in thinking_entries if t.quality_cot or t.theme_cot]
+    entries = [
+        t for t in thinking_entries
+        if t.quality_cot or t.theme_cot or t.extraction_cot
+    ]
     if not entries:
-        return
+        return None
     sidecar_path = results_path.with_suffix(".cot.jsonl")
     with open(sidecar_path, "w") as f:
         for entry in entries:
             f.write(json.dumps(entry.to_dict()) + "\n")
+    return sidecar_path
+
+
+def _plural(n: int, word: str) -> str:
+    if n == 1:
+        return f"1 {word}"
+    plural = word[:-1] + "ies" if word.endswith("y") else word + "s"
+    return f"{n} {plural}"
+
+
+def clamped_dimensions(scores_raw: str) -> list[str]:
+    """Dimensions whose raw model score was outside 1-5 (silently clamped).
+
+    Re-reads the raw quality response with parse_quality_scores' own pattern:
+    an out-of-range score is strong evidence the model misread the rubric, so
+    the run summary must surface it rather than leave it buried in scores_raw.
+    """
+    clamped = []
+    for dim in ("simple", "concrete", "personal", "dynamic"):
+        match = re.search(rf"{dim.upper()}\s*:\s*(\d+)", scores_raw, flags=re.IGNORECASE)
+        if match and not 1 <= int(match.group(1)) <= 5:
+            clamped.append(dim.upper())
+    return clamped
+
+
+def summarize_rows(rows: list) -> dict:
+    """Count the silent-failure modes in a run's prediction rows.
+
+    - errors: rows with .error set (network/exception failures)
+    - quality_parse_failures: quality was attempted (scores_raw captured) but
+      parse_quality_scores returned None
+    - theme_parse_failures: theme response was neither NONE nor parseable —
+      garbage output masquerading as a confident "no themes"
+    - clamped: {story_id: [DIMS]} where raw scores were out of 1-5
+    - dropped_theme_tokens: {token: count} of off-taxonomy labels parse_themes
+      silently dropped from otherwise-parsed responses
+    """
+    counts = {
+        "rows": len(rows),
+        "errors": 0,
+        "quality_parse_failures": 0,
+        "theme_parse_failures": 0,
+        "clamped": {},
+        "dropped_theme_tokens": {},
+    }
+    for r in rows:
+        if getattr(r, "error", None):
+            counts["errors"] += 1
+            continue
+        scores_raw = getattr(r, "scores_raw", None)
+        if scores_raw is not None:
+            if getattr(r, "predicted_scores", None) is None:
+                counts["quality_parse_failures"] += 1
+            else:
+                dims = clamped_dimensions(scores_raw)
+                if dims:
+                    counts["clamped"][r.story_id] = dims
+        themes_raw = getattr(r, "themes_raw", None)
+        if themes_raw is not None:
+            stripped = themes_raw.strip()
+            if stripped and stripped.upper() != "NONE":
+                invalid = [
+                    line.strip() for line in stripped.splitlines()
+                    if line.strip() and line.strip().upper() not in _VALID_THEMES
+                ]
+                if not r.predicted_themes:
+                    counts["theme_parse_failures"] += 1
+                elif invalid:
+                    for token in invalid:
+                        counts["dropped_theme_tokens"][token] = (
+                            counts["dropped_theme_tokens"].get(token, 0) + 1
+                        )
+    return counts
+
+
+def format_unreviewed_note(golden_set: list[GoldenNewsletter], mode: str) -> str | None:
+    """Warn when extraction metrics will score unreviewed newsletters.
+
+    An unreviewed (harvested-but-uncurated) newsletter has an empty golden
+    story list, so every correct prediction on it counts as a false positive.
+    Returns None outside extraction modes or when everything is reviewed.
+    """
+    if mode not in ("extraction", "all"):
+        return None
+    n_unreviewed = sum(1 for nl in golden_set if not nl.reviewed)
+    if not n_unreviewed:
+        return None
+    return (
+        f"Note: {n_unreviewed} of {len(golden_set)} evaluated newsletters are "
+        "unreviewed (no curated story list) — extraction metrics count every "
+        "predicted story on them as a false positive; treat precision as "
+        "smoke-test only."
+    )
+
+
+def format_run_summary(rows: list) -> str:
+    """Multi-line run summary: row count plus every silent-failure signal.
+
+    A catastrophic parse failure (e.g. a --prompts variant that broke the
+    response format for every story) must be visible here, not just via
+    --report or grepping the results JSONL.
+    """
+    counts = summarize_rows(rows)
+    problems = []
+    if counts["errors"]:
+        problems.append(_plural(counts["errors"], "error"))
+    if counts["quality_parse_failures"]:
+        problems.append(_plural(counts["quality_parse_failures"], "quality parse failure"))
+    if counts["theme_parse_failures"]:
+        problems.append(_plural(counts["theme_parse_failures"], "theme parse failure"))
+    lines = [f"  Rows: {counts['rows']} ({', '.join(problems) if problems else 'no errors'})"]
+    if counts["clamped"]:
+        detail = "; ".join(
+            f"{sid}: {', '.join(dims)}" for sid, dims in counts["clamped"].items()
+        )
+        lines.append(
+            f"  Out-of-range scores clamped to 1-5 in "
+            f"{_plural(len(counts['clamped']), 'story')} ({detail})"
+        )
+    if counts["dropped_theme_tokens"]:
+        detail = ", ".join(
+            f"{tok} x{n}" for tok, n in sorted(counts["dropped_theme_tokens"].items())
+        )
+        lines.append(f"  Unrecognized theme labels dropped by the parser: {detail}")
+    return "\n".join(lines)
 
 
 def merge_prompts_override(config: dict, override: dict) -> None:
@@ -382,12 +649,17 @@ def _split_rows(rows: list) -> tuple[list[StoryPrediction], list[ExtractionPredi
     return story, extraction
 
 
-def maybe_report(meta, rows, report_enabled: bool, compare_to: str | None) -> None:
+def maybe_report(
+    meta, rows, report_enabled: bool, compare_to: str | None,
+    verbose: bool = False, match_threshold: float = 0.6,
+) -> None:
     """Print a metrics report (and optional comparison) for a just-finished run.
 
     A no-op unless --report or --compare-to was passed. Defers to
     evals.newsletter_report; prints a hint if it isn't importable so a missing
-    report module never crashes a completed run.
+    report module never crashes a completed run. *verbose* and *match_threshold*
+    forward the standalone report's knobs so run --report doesn't require a
+    second newsletter_report invocation.
     """
     if not report_enabled and not compare_to:
         return
@@ -399,24 +671,48 @@ def maybe_report(meta, rows, report_enabled: bool, compare_to: str | None) -> No
         return
 
     story_preds, extraction_preds = _split_rows(rows)
-    metrics = newsletter_report.compute_all_metrics(story_preds, extraction_preds)
+    metrics = newsletter_report.compute_all_metrics(
+        story_preds, extraction_preds, match_threshold=match_threshold
+    )
     if report_enabled:
         newsletter_report.print_report(
-            meta, metrics,
+            meta, metrics, verbose=verbose,
             story_results=story_preds, extraction_results=extraction_preds,
+            match_threshold=match_threshold,
         )
     if compare_to:
         compare_path = Path(compare_to)
         if not compare_path.exists():
             print(f"Error: --compare-to file not found: {compare_path}", file=sys.stderr)
             return
-        meta_b, story_b, extraction_b = newsletter_report.load_results(compare_path)
-        metrics_b = newsletter_report.compute_all_metrics(story_b, extraction_b)
+        try:
+            meta_b, story_b, extraction_b = newsletter_report.load_results(compare_path)
+        except (OSError, ValueError, json.JSONDecodeError) as exc:
+            # Never crash a completed (paid) run over a bad comparison file —
+            # e.g. --compare-to pointed at a .cot.jsonl sidecar by mistake.
+            print(f"Error: could not read --compare-to file {compare_path}: {exc}",
+                  file=sys.stderr)
+            return
+        metrics_b = newsletter_report.compute_all_metrics(
+            story_b, extraction_b, match_threshold=match_threshold
+        )
         # Prior run is Run A, the just-finished run is Run B (chronological order).
         newsletter_report.print_comparison(
             meta_b, metrics_b, meta, metrics,
-            verbose=True, story1=story_b, story2=story_preds,
+            verbose=verbose, story1=story_b, story2=story_preds,
         )
+
+
+def _load_toml_or_exit(path: Path, description: str) -> dict:
+    """tomllib.load with a one-line error + exit 1 instead of a traceback."""
+    try:
+        with open(path, "rb") as f:
+            return tomllib.load(f)
+    except FileNotFoundError:
+        print(f"Error: {description} not found: {path}", file=sys.stderr)
+    except tomllib.TOMLDecodeError as exc:
+        print(f"Error: could not parse {description} {path}: {exc}", file=sys.stderr)
+    sys.exit(1)
 
 
 async def main(args: argparse.Namespace) -> None:
@@ -425,17 +721,15 @@ async def main(args: argparse.Namespace) -> None:
         Path(args.config) if args.config
         else Path(__file__).parent.parent / "config.toml"
     )
-    with open(config_path, "rb") as f:
-        config = tomllib.load(f)
-    config = substitute_env_vars(config)
+    config = substitute_env_vars(_load_toml_or_exit(config_path, "config file"))
 
     # --prompts deep-merges alternate [newsletter.prompts.*] BEFORE prompt_hash and
     # classifier are computed, so the run measures (and records the hash of) the
     # merged prompts. --model overrides the newsletter model.
     if args.prompts:
-        with open(args.prompts, "rb") as f:
-            override = tomllib.load(f)
-        override = substitute_env_vars(override)
+        override = substitute_env_vars(
+            _load_toml_or_exit(Path(args.prompts), "--prompts file")
+        )
         merge_prompts_override(config, override)
     if args.model:
         config["newsletter"]["llm"]["model"] = args.model
@@ -444,11 +738,19 @@ async def main(args: argparse.Namespace) -> None:
 
     # Load golden set
     golden_path = Path(args.golden_set)
-    golden_set = load_golden_set(golden_path, reviewed_only=not args.include_unreviewed)
-    if not golden_set:
-        print("No newsletters to evaluate.", file=sys.stderr)
+    try:
+        golden_set, load_stats = load_golden_set(
+            golden_path, reviewed_only=not args.include_unreviewed
+        )
+    except FileNotFoundError:
+        print(f"Error: golden set file not found: {golden_path}", file=sys.stderr)
         sys.exit(1)
-    print(f"Loaded {len(golden_set)} newsletters from {golden_path}", file=sys.stderr)
+    print(format_load_summary(len(golden_set), load_stats, golden_path), file=sys.stderr)
+    if not golden_set:
+        sys.exit(1)
+    unreviewed_note = format_unreviewed_note(golden_set, args.mode)
+    if unreviewed_note:
+        print(unreviewed_note, file=sys.stderr)
 
     classifier, llm = build_classifier(config, args.no_cache)
 
@@ -458,13 +760,24 @@ async def main(args: argparse.Namespace) -> None:
         if not await llm.is_available():
             base = config["newsletter"]["llm"]
             print(
-                f"Error: newsletter LLM '{base['model']}' not reachable "
-                "(a model-name mismatch with the served model returns 404)",
+                f"Error: newsletter LLM '{base['model']}' not reachable at "
+                f"{describe_endpoint()}.\n"
+                "Check that the endpoint is up; a 404 can also mean the model "
+                "name does not match the served model.",
                 file=sys.stderr,
             )
             sys.exit(1)
 
     try:
+        if args.mode != "extraction":
+            _pairs, _n_excluded, n_unlabeled = select_stories(golden_set)
+            if n_unlabeled:
+                print(
+                    f"Skipping {_plural(n_unlabeled, 'story')} never labeled in the "
+                    "TUI (no expected scores/themes — label with "
+                    "python -m evals.newsletter_label)",
+                    file=sys.stderr,
+                )
         print(f"Running newsletter evaluation (mode={args.mode}, "
               f"parallelism={parallelism})...", file=sys.stderr)
         rows, thinking_entries = await run_evaluation(
@@ -472,6 +785,7 @@ async def main(args: argparse.Namespace) -> None:
             classifier=classifier,
             mode=args.mode,
             parallelism=parallelism,
+            progress=True,
         )
 
         meta = build_meta(
@@ -487,13 +801,18 @@ async def main(args: argparse.Namespace) -> None:
         output_dir = Path(args.output_dir)
         output_path = build_output_path(output_dir, args.mode, args.tag or "", meta.run_id)
         write_results(output_path, meta, rows)
-        write_thinking_sidecar(output_path, thinking_entries)
+        sidecar_path = write_thinking_sidecar(output_path, thinking_entries)
 
-        maybe_report(meta, rows, args.report, args.compare_to)
+        maybe_report(
+            meta, rows, args.report, args.compare_to,
+            verbose=getattr(args, "verbose", False),
+            match_threshold=getattr(args, "match_threshold", 0.6),
+        )
 
-        errors = sum(1 for r in rows if getattr(r, "error", None))
         print(f"\nResults written to {output_path}", file=sys.stderr)
-        print(f"  Rows: {len(rows)} ({errors} errors)", file=sys.stderr)
+        if sidecar_path:
+            print(f"Chain-of-thought written to {sidecar_path}", file=sys.stderr)
+        print(format_run_summary(rows), file=sys.stderr)
         if not args.no_cache and hasattr(llm, "hits"):
             total = llm.hits + llm.misses
             if total:
@@ -508,7 +827,9 @@ def cli():
     parser = argparse.ArgumentParser(description="Run newsletter classification evaluation")
     parser.add_argument("--golden-set", default="evals/newsletter_golden_set.jsonl",
                         help="Path to newsletter golden set JSONL")
-    parser.add_argument("--config", help="Path to config.toml (default: ./config.toml)")
+    parser.add_argument("--config",
+                        help="Path to config.toml (default: the repo-root config.toml, "
+                             "regardless of CWD)")
     parser.add_argument("--output-dir", default="evals/newsletter_results/",
                         help="Output directory for results")
     parser.add_argument("--mode", choices=VALID_MODES, default="all",
@@ -526,9 +847,17 @@ def cli():
                         help="Print a metrics report for this run after it completes")
     parser.add_argument("--compare-to", metavar="PATH",
                         help="After the run, print a comparison against this prior results file")
+    parser.add_argument("--verbose", action="store_true",
+                        help="With --report/--compare-to: per-story diffs and extraction detail")
+    parser.add_argument("--match-threshold", type=float, default=0.6,
+                        help="With --report/--compare-to: SequenceMatcher ratio threshold "
+                             "for extraction matching (default 0.6)")
     parser.add_argument("--skip-preflight", action="store_true",
                         help="Skip the endpoint reachability check before evaluating")
     args = parser.parse_args()
+    # httpx logs one INFO line per request; at eval volume that drowns the
+    # run's own progress output.
+    logging.getLogger("httpx").setLevel(logging.WARNING)
     asyncio.run(main(args))
 
 

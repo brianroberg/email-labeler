@@ -187,14 +187,18 @@ class ExtractionPrediction:
 
 @dataclass
 class NewsletterThinkingEntry:
-    """Chain-of-thought content for one story in an eval run.
+    """Chain-of-thought content for one eval-run unit of work.
 
+    Story-level entries (quality/theme scoring) set story_id; newsletter-level
+    entries (extraction segmentation) set thread_id + extraction_cot instead.
     Stored in sidecar .cot.jsonl files alongside main results.
     """
 
-    story_id: str
+    story_id: str = ""
     quality_cot: str = ""
     theme_cot: str = ""
+    thread_id: str = ""
+    extraction_cot: str = ""
 
     def to_dict(self) -> dict:
         return {
@@ -202,14 +206,18 @@ class NewsletterThinkingEntry:
             "story_id": self.story_id,
             "quality_cot": self.quality_cot,
             "theme_cot": self.theme_cot,
+            "thread_id": self.thread_id,
+            "extraction_cot": self.extraction_cot,
         }
 
     @classmethod
     def from_dict(cls, d: dict) -> "NewsletterThinkingEntry":
         return cls(
-            story_id=d["story_id"],
+            story_id=d.get("story_id", ""),
             quality_cot=d.get("quality_cot", ""),
             theme_cot=d.get("theme_cot", ""),
+            thread_id=d.get("thread_id", ""),
+            extraction_cot=d.get("extraction_cot", ""),
         )
 
 

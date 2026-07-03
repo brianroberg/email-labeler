@@ -221,6 +221,32 @@ class TestNewsletterThinkingEntry:
         t = NewsletterThinkingEntry.from_dict({"story_id": "x:0"})
         assert t.quality_cot == ""
         assert t.theme_cot == ""
+        assert t.thread_id == ""
+        assert t.extraction_cot == ""
+
+    def test_extraction_entry_round_trip_keyed_by_thread(self):
+        """An extraction cot entry is per-newsletter: thread_id set, no story_id."""
+        t = NewsletterThinkingEntry(
+            thread_id="t_001",
+            extraction_cot="reasoning about how to segment the newsletter",
+        )
+        d = t.to_dict()
+        assert d["type"] == "thinking"
+        restored = NewsletterThinkingEntry.from_dict(json.loads(json.dumps(d)))
+        assert restored.thread_id == "t_001"
+        assert restored.extraction_cot == "reasoning about how to segment the newsletter"
+        assert restored.story_id == ""
+        assert restored.quality_cot == ""
+        assert restored.theme_cot == ""
+
+    def test_from_dict_tolerates_missing_story_id(self):
+        """Older/extraction-only rows have no story_id key at all."""
+        t = NewsletterThinkingEntry.from_dict(
+            {"thread_id": "t_001", "extraction_cot": "seg cot"}
+        )
+        assert t.story_id == ""
+        assert t.thread_id == "t_001"
+        assert t.extraction_cot == "seg cot"
 
 
 class TestNewsletterRunMeta:

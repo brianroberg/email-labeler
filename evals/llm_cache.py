@@ -23,7 +23,10 @@ class CachedLLMClient:
     def __init__(self, inner: LLMClient, cache_path: Path):
         self.inner = inner
         self.cache_path = cache_path
-        self._cache: dict[str, tuple[str, str]] = {}  # key -> (response, thinking)
+        # key -> (response, thinking). thinking is None for legacy entries
+        # written before thinking capture (unknown, backfillable); "" means the
+        # model was called and legitimately emitted no thinking (do NOT re-fetch).
+        self._cache: dict[str, tuple[str, str | None]] = {}
         self._pending: list[dict] = []  # new entries to flush to disk
         self.hits = 0
         self.misses = 0
@@ -43,7 +46,11 @@ class CachedLLMClient:
                 try:
                     entry = json.loads(line)
                     response = entry["response"]
-                    thinking = entry.get("thinking", "")
+                    # A present "thinking" key (even "") means the entry was
+                    # written by thinking-aware code: "" is a real "no thinking
+                    # emitted", not a gap to backfill. Only entries missing the
+                    # key entirely are legacy (thinking unknown -> None).
+                    thinking = entry["thinking"] if "thinking" in entry else None
                     # Normalize old entries that may contain unstripped think tags
                     extra_thinking = LLMClient._extract_thinking(response)
                     response = LLMClient._strip_thinking(response)
@@ -76,8 +83,10 @@ class CachedLLMClient:
 
         if key in self._cache:
             response, thinking = self._cache[key]
-            # Backfill thinking for old cache entries that lack it
-            if include_thinking and not thinking:
+            # Backfill thinking only for legacy entries where it is unknown
+            # (None). An empty string means the model emitted no thinking —
+            # re-fetching those would re-bill every terse response forever.
+            if include_thinking and thinking is None:
                 self.misses += 1
                 start = time.monotonic()
                 _, thinking = await self.inner.complete(
@@ -96,7 +105,7 @@ class CachedLLMClient:
             if thinking:
                 self._thinking_buffers.setdefault(tk, []).append(thinking)
             if include_thinking:
-                return response, thinking
+                return response, thinking or ""
             return response
 
         self.misses += 1

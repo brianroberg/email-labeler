@@ -2,6 +2,9 @@
 
 import argparse
 import json
+import logging
+
+import pytest
 
 import evals.newsletter_harvest as harvest_mod
 from daemon import format_thread_transcript
@@ -175,19 +178,73 @@ class TestWriteGoldenSet:
         assert ids == ["t1", "t2"]
 
 
+def _main_args(output):
+    return argparse.Namespace(
+        output=str(output),
+        max_threads=10,
+        recipient=None,
+        config=None,
+        proxy_url="http://x",
+    )
+
+
 class TestMainDeduplicates:
     async def test_rerun_does_not_duplicate_thread(self, tmp_path, monkeypatch):
         monkeypatch.setattr(harvest_mod, "GmailProxyClient", _OneNewsletterProxy)
         monkeypatch.setattr(harvest_mod, "load_eval_config", lambda config_path=None: CONFIG)
         output = tmp_path / "golden.jsonl"
-        args = argparse.Namespace(
-            output=str(output),
-            max_threads=10,
-            recipient=None,
-            config=None,
-            proxy_url="http://x",
-        )
+        args = _main_args(output)
         await harvest_mod.main(args)
         await harvest_mod.main(args)
         ids = [json.loads(line)["thread_id"] for line in output.read_text().splitlines() if line]
         assert ids == ["t1"]
+
+
+class TestCliUx:
+    """Help text shows defaults; the run is quiet and ends with a next-step hint."""
+
+    def test_help_shows_output_and_max_threads_defaults(self):
+        help_text = harvest_mod.build_parser().format_help()
+        assert "evals/newsletter_golden_set.jsonl" in help_text
+        assert "default: 50" in help_text
+
+    async def test_main_prints_next_step_hint(self, tmp_path, monkeypatch, capsys):
+        monkeypatch.setattr(harvest_mod, "GmailProxyClient", _OneNewsletterProxy)
+        monkeypatch.setattr(harvest_mod, "load_eval_config", lambda config_path=None: CONFIG)
+        output = tmp_path / "golden.jsonl"
+        await harvest_mod.main(_main_args(output))
+        err = capsys.readouterr().err
+        assert "evals.newsletter_label" in err
+        assert f"--golden-set {output}" in err
+
+    async def test_missing_proxy_api_key_exits_with_one_line_error(
+        self, tmp_path, monkeypatch, capsys,
+    ):
+        """GmailProxyClient raises ProxyAuthError at construction when
+        PROXY_API_KEY is unset; main() must print one actionable line and
+        exit 1 instead of a 20-line traceback."""
+        from proxy_client import ProxyAuthError
+
+        class _NoKeyProxy:
+            def __init__(self, *a, **kw):
+                raise ProxyAuthError("PROXY_API_KEY environment variable is not set")
+
+        monkeypatch.setattr(harvest_mod, "GmailProxyClient", _NoKeyProxy)
+        monkeypatch.setattr(harvest_mod, "load_eval_config", lambda config_path=None: CONFIG)
+        with pytest.raises(SystemExit) as excinfo:
+            await harvest_mod.main(_main_args(tmp_path / "golden.jsonl"))
+        assert excinfo.value.code == 1
+        err = capsys.readouterr().err
+        assert "PROXY_API_KEY" in err
+        assert "Traceback" not in err
+
+    async def test_main_silences_httpx_request_logs(self, tmp_path, monkeypatch):
+        """daemon's import-time basicConfig(INFO) lets httpx spam 'HTTP Request'
+        lines; main() must raise the httpx/httpcore loggers to WARNING."""
+        for name in ("httpx", "httpcore"):
+            monkeypatch.setattr(logging.getLogger(name), "level", logging.NOTSET)
+        monkeypatch.setattr(harvest_mod, "GmailProxyClient", _OneNewsletterProxy)
+        monkeypatch.setattr(harvest_mod, "load_eval_config", lambda config_path=None: CONFIG)
+        await harvest_mod.main(_main_args(tmp_path / "golden.jsonl"))
+        assert logging.getLogger("httpx").level == logging.WARNING
+        assert logging.getLogger("httpcore").level == logging.WARNING

@@ -152,16 +152,28 @@ newsletter_harvest → newsletter_label → newsletter_run → newsletter_report
   `evals/newsletter_golden_set.jsonl`. Each is guarded by `is_newsletter(...)` and
   its `body` is built exactly like production input. **No ground truth is inferred** —
   newsletters land unlabeled with an empty story list.
-- **label** — A curses/CLI tool to build ground truth by hand (quality is
-  subjective, so there are no auto-labels). Phase A curates the story list
-  (seeded from the production extractor as a starting point, then the reviewer
-  marks body segments — `s`/`e` to set the span, `Enter` to make a story — plus
-  add/edit/delete, or `k` to skip the newsletter for a later pass); Phase B
-  assigns per-story dimension scores + themes. The tier is auto-derived from scores.
+- **label** — A curses tool to build ground truth by hand (quality is
+  subjective, so there are no auto-labels). Phase A curates the story list:
+  press `Space` to seed candidates from the production extractor (a fresh LLM
+  call each press — re-seeding over an existing list asks for confirmation),
+  then the reviewer marks body segments — `s`/`e` to set the span, `Enter` to
+  make a story (already-covered body lines are dimmed so gaps stand out) — plus
+  add/edit/delete, multi-level undo (`z`), or `k` to skip the newsletter for a
+  later pass. Phase B assigns per-story dimension scores + themes. The tier is
+  auto-derived from scores. `--edit` disables the LLM seeding for manual-only
+  curation (no LLM endpoint needed).
 - **run** — Replay the golden set through the real classifier (LLM-cached) and
   write timestamped results.
 - **report** — Compute tier/dimension/theme/extraction metrics, compare two runs,
   or show a trend across runs.
+
+**Environment.** `newsletter_label` (Phase-A seeding) and `newsletter_run` call
+the `[newsletter.llm]` endpoint resolved from `NEWSLETTER_LLM_URL` /
+`NEWSLETTER_LLM_API_KEY`, falling back to `CLOUD_LLM_URL` / `CLOUD_LLM_API_KEY`;
+`newsletter_harvest` needs `PROXY_API_KEY` (and `PROXY_URL` or `--proxy-url`).
+Both tools fail fast with a message naming the missing variable. Default data
+paths are CWD-relative, so run the tools from the repo root (only `--config`
+defaults to the repo-root `config.toml` regardless of CWD).
 
 **Fixed golden stories.** Extraction is inherently variable, so quality and theme
 scoring is *decoupled* from it: one golden set holds both. Extraction is scored at
@@ -177,7 +189,7 @@ uv run python -m evals.newsletter_harvest --proxy-url http://localhost:8000 --ma
 # 2. Label them: curate stories, then score dimensions + themes
 uv run python -m evals.newsletter_label
 uv run python -m evals.newsletter_label --unreviewed-only   # only unlabeled
-uv run python -m evals.newsletter_label --edit              # revisit reviewed ones
+uv run python -m evals.newsletter_label --edit              # manual-only (no LLM seeding)
 
 # 3. Run the whole pipeline and print a report
 uv run python -m evals.newsletter_run --mode all --tag baseline --report
@@ -213,9 +225,12 @@ uv run python -m evals.newsletter_report \
     --compare evals/newsletter_results/*baseline*.jsonl evals/newsletter_results/*variant*.jsonl --verbose
 ```
 
-The comparison renders tier/dimension/theme/extraction deltas and prints each run's
-`prompt_hash` + tag; `--verbose` lists per-story flips and per-newsletter extraction
-diffs.
+The globs may also match each run's `.cot.jsonl` chain-of-thought sidecar —
+`--compare` ignores sidecars (with a stderr note), so this works as long as each
+glob matches exactly one real results file. The comparison renders
+tier/dimension/theme/extraction deltas and prints each run's `prompt_hash` + tag
++ mode (warning when the modes differ); `--verbose` lists per-story flips and
+per-newsletter extraction diffs.
 
 ## Typical Workflows
 

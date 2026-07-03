@@ -111,11 +111,13 @@ def compute_all_metrics(
 ) -> dict:
     """Bundle every metric section for a single run."""
     return {
+        "story_count": len(story_results),
         "tier": compute_tier_metrics(story_results),
         "dimension_mae": compute_dimension_mae(story_results),
         "dimension_exact": compute_dimension_exact_match(story_results),
         "dimension_within1": compute_dimension_within1(story_results),
         "themes": compute_multilabel_metrics(story_results, THEMES),
+        "theme_anomalies": theme_parse_anomalies(story_results),
         "extraction": compute_extraction_metrics(
             extraction_results or [], threshold=match_threshold
         ),
@@ -129,8 +131,11 @@ def compute_extraction_metrics(
     """Extraction metrics aggregated over newsletters.
 
     Per newsletter: precision = matched/predicted, recall = matched/golden via
-    greedy one-to-one match_stories. Aggregate as micro (pooled counts) and macro
-    (mean of per-newsletter precision/recall).
+    greedy one-to-one match_stories. A newsletter with 0 predicted and 0 golden
+    stories is a correct abstention (precision = recall = 1.0). Aggregate as micro
+    (pooled counts) and macro (mean of per-newsletter precision/recall). All
+    aggregates are None when there are no scored newsletters, so empty sections
+    render as N/A rather than a fake 0.0%.
     """
     total_matched = total_pred = total_gold = 0
     per_nl_precision: list[float] = []
@@ -146,8 +151,10 @@ def compute_extraction_metrics(
         total_matched += matched
         total_pred += n_pred
         total_gold += n_gold
-        p = matched / n_pred if n_pred > 0 else 0.0
-        rec = matched / n_gold if n_gold > 0 else 0.0
+        # 0/0 = correct abstention, not a zero: the model was right to predict
+        # nothing for a story-less newsletter.
+        p = matched / n_pred if n_pred > 0 else (1.0 if n_gold == 0 else 0.0)
+        rec = matched / n_gold if n_gold > 0 else (1.0 if n_pred == 0 else 0.0)
         per_nl_precision.append(p)
         per_nl_recall.append(rec)
         per_newsletter.append({
@@ -159,13 +166,25 @@ def compute_extraction_metrics(
             "recall": rec,
         })
 
-    micro_p = total_matched / total_pred if total_pred > 0 else 0.0
-    micro_r = total_matched / total_gold if total_gold > 0 else 0.0
+    if not per_newsletter:
+        return {
+            "micro_precision": None,
+            "micro_recall": None,
+            "micro_f1": None,
+            "macro_precision": None,
+            "macro_recall": None,
+            "macro_f1": None,
+            "count": 0,
+            "per_newsletter": [],
+        }
+
+    micro_p = total_matched / total_pred if total_pred > 0 else 1.0
+    micro_r = total_matched / total_gold if total_gold > 0 else 1.0
     micro_f1 = (
         2 * micro_p * micro_r / (micro_p + micro_r) if (micro_p + micro_r) > 0 else 0.0
     )
-    macro_p = sum(per_nl_precision) / len(per_nl_precision) if per_nl_precision else 0.0
-    macro_r = sum(per_nl_recall) / len(per_nl_recall) if per_nl_recall else 0.0
+    macro_p = sum(per_nl_precision) / len(per_nl_precision)
+    macro_r = sum(per_nl_recall) / len(per_nl_recall)
     macro_f1 = (
         2 * macro_p * macro_r / (macro_p + macro_r) if (macro_p + macro_r) > 0 else 0.0
     )
@@ -182,6 +201,19 @@ def compute_extraction_metrics(
     }
 
 
+def _theme_scored(r: StoryPrediction) -> bool:
+    """Whether a row's own theme call succeeded (independent of quality parsing).
+
+    A row participates in theme metrics iff it has no error and the theme
+    response exists (themes_raw recorded, or — for legacy rows without
+    themes_raw — a non-empty parsed prediction). A quality-parse failure must
+    NOT drop a story whose themes parsed fine.
+    """
+    if r.error is not None:
+        return False
+    return r.themes_raw is not None or bool(r.predicted_themes)
+
+
 def compute_multilabel_metrics(
     results: list[StoryPrediction],
     themes: list[str],
@@ -189,11 +221,26 @@ def compute_multilabel_metrics(
     """Multi-label theme metrics.
 
     Each theme is an independent binary label (present/absent) derived from the
-    expected_themes vs predicted_themes sets. Parse-failure rows (predicted_scores
-    is None) are excluded. Returns per-theme P/R/F1, micro-F1, macro-F1, and
-    exact-set-match (fraction where set(expected) == set(predicted)).
+    expected_themes vs predicted_themes sets. Rows whose own theme call failed
+    (see _theme_scored) are excluded; a quality-parse failure alone is not.
+    Returns per-theme P/R/F1, micro-F1, macro-F1, and exact-set-match (fraction
+    where set(expected) == set(predicted)). Aggregates are None when no rows
+    were scored, so empty sections render as N/A rather than a fake 0.0%.
     """
-    scored = [r for r in results if r.predicted_scores is not None]
+    scored = [r for r in results if _theme_scored(r)]
+
+    if not scored:
+        return {
+            "per_theme": {
+                t: {"precision": None, "recall": None, "f1": None} for t in themes
+            },
+            "micro_precision": None,
+            "micro_recall": None,
+            "micro_f1": None,
+            "macro_f1": None,
+            "exact_set_match": None,
+            "count": 0,
+        }
 
     per_theme: dict[str, dict[str, float]] = {}
     total_tp = total_fp = total_fn = 0
@@ -239,14 +286,34 @@ def compute_multilabel_metrics(
     }
 
 
+def _quality_attempted(r: StoryPrediction) -> bool:
+    """Whether the quality call ran (or failed) for this row.
+
+    A --mode themes run never fires the quality call: error=None AND
+    scores_raw=None AND predicted_scores=None means "never attempted", which
+    must be skipped — not counted as a parse failure. scores_raw captured (or
+    an error, or parsed scores) means quality was genuinely attempted.
+    """
+    return (
+        r.error is not None
+        or r.scores_raw is not None
+        or r.predicted_scores is not None
+    )
+
+
 def compute_tier_metrics(results: list[StoryPrediction]) -> dict:
     """Tier metrics over the 4 tier classes.
 
-    Rows whose predicted_scores is None are parse failures: counted as errors
-    and excluded from the confusion matrix / accuracy.
+    Rows where quality was attempted but predicted_scores is None are parse/
+    network failures: counted as errors and excluded from the confusion matrix
+    / accuracy. Their story_ids are returned under "error_stories" so failures
+    are identifiable in the report. Rows where quality was never attempted
+    (e.g. a --mode themes run: error=None, scores_raw=None) are skipped
+    entirely — neither scored nor errors.
     """
-    errors = [r for r in results if r.predicted_scores is None]
-    valid = [r for r in results if r.predicted_scores is not None]
+    attempted = [r for r in results if _quality_attempted(r)]
+    errors = [r for r in attempted if r.predicted_scores is None]
+    valid = [r for r in attempted if r.predicted_scores is not None]
 
     matrix = compute_confusion_matrix(valid, "expected_tier", "predicted_tier", TIERS)
     prf = compute_precision_recall_f1(matrix, TIERS)
@@ -261,28 +328,36 @@ def compute_tier_metrics(results: list[StoryPrediction]) -> dict:
         "per_class": prf,
         "count": len(scored),
         "errors": len(errors),
+        "error_stories": [r.story_id for r in errors],
     }
 
 
 def _normalize(story: dict) -> str:
-    """Lowercase, whitespace-collapse the story's title-or-text for matching."""
-    raw = story.get("title") or story.get("text") or ""
+    """Lowercase, whitespace-collapse the story's text-or-title for matching.
+
+    Text is the ground truth curated in the labeling TUI; titles are model-
+    invented wording. Matching must be on the extracted spans (text), falling
+    back to title only when a story has no text.
+    """
+    raw = story.get("text") or story.get("title") or ""
     return re.sub(r"\s+", " ", raw).strip().lower()
 
 
-def match_stories(
+def match_stories_detailed(
     predicted: list[dict],
     golden: list[dict],
     threshold: float = 0.6,
-) -> tuple[int, int, int]:
-    """Greedy one-to-one match of predicted stories to golden stories.
+) -> dict:
+    """Greedy one-to-one matching with full pair/unmatched detail.
 
     Uses difflib.SequenceMatcher ratio on normalized (lowercased,
-    whitespace-collapsed) title-or-text. Highest-ratio candidate pairs are
+    whitespace-collapsed) text-or-title. Highest-ratio candidate pairs are
     assigned first; each predicted and each golden story matches at most once.
 
     Returns:
-        (matched, n_predicted, n_golden)
+        {"matched": [{"pred_index", "gold_index", "ratio"}, ...],
+         "unmatched_predicted": [pred indices],
+         "unmatched_golden": [gold indices]}
     """
     pred_norm = [_normalize(p) for p in predicted]
     gold_norm = [_normalize(g) for g in golden]
@@ -299,15 +374,75 @@ def match_stories(
 
     used_pred: set[int] = set()
     used_gold: set[int] = set()
-    matched = 0
-    for _ratio, pi, gi in pairs:
+    matched: list[dict] = []
+    for ratio, pi, gi in pairs:
         if pi in used_pred or gi in used_gold:
             continue
         used_pred.add(pi)
         used_gold.add(gi)
-        matched += 1
+        matched.append({"pred_index": pi, "gold_index": gi, "ratio": ratio})
 
-    return matched, len(predicted), len(golden)
+    return {
+        "matched": matched,
+        "unmatched_predicted": [i for i in range(len(predicted)) if i not in used_pred],
+        "unmatched_golden": [i for i in range(len(golden)) if i not in used_gold],
+    }
+
+
+def match_stories(
+    predicted: list[dict],
+    golden: list[dict],
+    threshold: float = 0.6,
+) -> tuple[int, int, int]:
+    """Greedy one-to-one match count (see match_stories_detailed).
+
+    Returns:
+        (matched, n_predicted, n_golden)
+    """
+    detail = match_stories_detailed(predicted, golden, threshold=threshold)
+    return len(detail["matched"]), len(predicted), len(golden)
+
+
+def theme_parse_anomalies(results: list[StoryPrediction]) -> list[dict]:
+    """Detect theme responses that parse_themes silently normalized.
+
+    Two kinds, mirroring newsletter.parse_themes (one uppercase token per line,
+    unrecognized lines dropped, NONE -> []):
+
+    - "empty_parse": themes_raw is non-empty and not NONE, yet nothing parsed —
+      the model's output was unusable prose, not a genuine NONE.
+    - "invalid_tokens": some lines were not valid theme names and were silently
+      dropped (e.g. FELLOWSHIP) even though other lines parsed.
+
+    Rows without themes_raw (legacy files, error rows) are skipped.
+    """
+    valid_upper = {t.upper() for t in THEMES}
+    anomalies: list[dict] = []
+    for r in results:
+        if r.error is not None or r.themes_raw is None:
+            continue
+        raw = r.themes_raw.strip()
+        if not raw or raw.upper() == "NONE":
+            continue
+        invalid = [
+            line.strip() for line in raw.splitlines()
+            if line.strip() and line.strip().upper() not in valid_upper
+        ]
+        if not r.predicted_themes:
+            anomalies.append({
+                "story_id": r.story_id,
+                "kind": "empty_parse",
+                "invalid_tokens": invalid,
+                "themes_raw": r.themes_raw,
+            })
+        elif invalid:
+            anomalies.append({
+                "story_id": r.story_id,
+                "kind": "invalid_tokens",
+                "invalid_tokens": invalid,
+                "themes_raw": r.themes_raw,
+            })
+    return anomalies
 
 
 # --- Loading ---
@@ -340,6 +475,29 @@ def load_results(
     return meta, story_preds, extraction_preds
 
 
+def load_story_titles(golden_set_path: str) -> dict[str, str]:
+    """Best-effort story_id -> title map from the run's golden set file.
+
+    Results rows carry only story_ids; titles live in the golden set. Any
+    failure (moved/deleted file, malformed line) degrades to {} so verbose
+    output falls back to bare story_ids.
+    """
+    titles: dict[str, str] = {}
+    try:
+        with open(golden_set_path) as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                d = json.loads(line)
+                for s in d.get("stories", []):
+                    if s.get("story_id") and s.get("title"):
+                        titles[s["story_id"]] = s["title"]
+    except (OSError, json.JSONDecodeError):
+        return {}
+    return titles
+
+
 # --- Formatters ---
 
 def _format_dim_table(
@@ -347,7 +505,7 @@ def _format_dim_table(
     exact: dict[str, float | None],
     within1: dict[str, float | None],
 ) -> str:
-    widths = [max(len(d) for d in DIMENSIONS), 10, 12, 12]
+    widths = [max(len("Dimension"), *(len(d) for d in DIMENSIONS)), 10, 12, 12]
     lines = []
     lines.append("  " + format_table_row(["Dimension", "MAE", "Exact", "Within-1"], widths))
     lines.append("  " + "-" * sum(w + 2 for w in widths))
@@ -375,14 +533,26 @@ def _format_theme_table(themes: dict) -> str:
     return "\n".join(lines)
 
 
+def _plural(n: int, word: str) -> str:
+    if n == 1:
+        return f"1 {word}"
+    plural = word[:-1] + "ies" if word.endswith("y") else word + "s"
+    return f"{n} {plural}"
+
+
 def print_report(
     meta: NewsletterRunMeta,
     metrics: dict,
     verbose: bool = False,
     story_results: list[StoryPrediction] | None = None,
     extraction_results: list[ExtractionPrediction] | None = None,
+    match_threshold: float = 0.6,
 ) -> None:
-    """Print a formatted single-run report to stdout."""
+    """Print a formatted single-run report to stdout.
+
+    match_threshold must be the same threshold the metrics were computed with,
+    so verbose extraction diffs agree with the headline numbers.
+    """
     print(f"\n{'=' * 60}")
     print(f"Newsletter Evaluation Report: {meta.run_id[:8]}")
     print(f"{'=' * 60}")
@@ -395,35 +565,51 @@ def print_report(
         print(f"  Tag:          {meta.tag}")
     if meta.seeded_from:
         print(f"  Seeded from:  {meta.seeded_from}")
+    print(f"  Golden set:   {meta.golden_set_path}")
     print(f"  Newsletters:  {meta.golden_set_count}")
     print(f"  Stories:      {meta.story_count}")
+
+    # Sections with zero underlying predictions are omitted (mirroring the tier
+    # section) instead of rendering as a fake 0.0%.
+    has_story_rows = bool(metrics.get("story_count", len(story_results or [])))
 
     tier = metrics["tier"]
     if tier["count"] or tier["errors"]:
         print("\n--- Tier Classification (4-class) ---")
         print(f"  Accuracy: {format_pct(tier['accuracy'])} "
-              f"({tier['count']} stories, {tier['errors']} errors)")
+              f"({_plural(tier['count'], 'story')}, {_plural(tier['errors'], 'error')})")
+        if tier["error_stories"]:
+            print(f"  Failed stories (quality parse/network): "
+                  f"{', '.join(tier['error_stories'])}")
         print("\n  Confusion matrix:")
         print(format_confusion_matrix(tier["confusion_matrix"], TIERS))
         print("\n  Per-class metrics:")
         print(format_per_class_table(tier["per_class"], TIERS))
 
-    print("\n--- Quality Dimensions ---")
-    print(_format_dim_table(
-        metrics["dimension_mae"], metrics["dimension_exact"], metrics["dimension_within1"]
-    ))
+    if has_story_rows:
+        print("\n--- Quality Dimensions ---")
+        print(_format_dim_table(
+            metrics["dimension_mae"], metrics["dimension_exact"],
+            metrics["dimension_within1"],
+        ))
 
-    themes = metrics["themes"]
-    print("\n--- Themes (multi-label) ---")
-    print(f"  Micro-F1: {format_pct(themes['micro_f1'])}   "
-          f"Macro-F1: {format_pct(themes['macro_f1'])}   "
-          f"Exact-set match: {format_pct(themes['exact_set_match'])}")
-    print()
-    print(_format_theme_table(themes))
+        themes = metrics["themes"]
+        print("\n--- Themes (multi-label) ---")
+        print(f"  Micro-F1: {format_pct(themes['micro_f1'])}   "
+              f"Macro-F1: {format_pct(themes['macro_f1'])}   "
+              f"Exact-set match: {format_pct(themes['exact_set_match'])}")
+        anomalies = metrics.get("theme_anomalies", [])
+        if anomalies:
+            print(f"  Parse anomalies: {_plural(len(anomalies), 'story')} "
+                  f"(invalid/unparseable theme output; --verbose shows raw)")
+        print()
+        print(_format_theme_table(themes))
 
     extraction = metrics["extraction"]
     if extraction["count"]:
         print("\n--- Extraction ---")
+        print(f"  ({_plural(extraction['count'], 'newsletter')}, "
+              f"match threshold {match_threshold})")
         print(f"  Micro:  P={format_pct(extraction['micro_precision'])} "
               f"R={format_pct(extraction['micro_recall'])} "
               f"F1={format_pct(extraction['micro_f1'])}")
@@ -432,42 +618,116 @@ def print_report(
               f"F1={format_pct(extraction['macro_f1'])}")
 
     if verbose:
-        _print_verbose_single(story_results or [], extraction_results or [])
+        _print_verbose_single(
+            story_results or [],
+            extraction_results or [],
+            match_threshold=match_threshold,
+            titles=load_story_titles(meta.golden_set_path),
+            anomalies=metrics.get("theme_anomalies", []),
+        )
 
     print()
+
+
+def _story_label(story: dict) -> str:
+    """Human-readable story identifier: the title, else a text excerpt."""
+    title = (story.get("title") or "").strip()
+    if title:
+        return title
+    text = re.sub(r"\s+", " ", story.get("text") or "").strip()
+    return text[:57] + "..." if len(text) > 60 else text
 
 
 def _print_verbose_single(
     story_results: list[StoryPrediction],
     extraction_results: list[ExtractionPrediction],
+    match_threshold: float = 0.6,
+    titles: dict[str, str] | None = None,
+    anomalies: list[dict] | None = None,
 ) -> None:
+    titles = titles or {}
+
+    def label(story_id: str) -> str:
+        title = titles.get(story_id)
+        return f"{story_id} ({title})" if title else story_id
+
     print("\n--- Story Disagreements ---")
-    disagreements = [
-        r for r in story_results
-        if r.predicted_scores is not None
-        and (r.expected_tier != r.predicted_tier
-             or set(r.expected_themes or []) != set(r.predicted_themes or []))
-    ]
+    # A row is compared field-by-field on whatever DID parse: tiers only when
+    # quality parsed, themes only when the theme call succeeded — so a quality
+    # parse failure can't hide a theme disagreement.
+    disagreements = []
+    for r in story_results:
+        if r.error is not None:
+            continue
+        tier_diff = r.predicted_scores is not None and r.expected_tier != r.predicted_tier
+        theme_diff = _theme_scored(r) and (
+            set(r.expected_themes or []) != set(r.predicted_themes or [])
+        )
+        if tier_diff or theme_diff:
+            disagreements.append((r, tier_diff, theme_diff))
     if not disagreements:
         print("  None!")
-    for r in disagreements:
-        parts = [f"  {r.story_id}:"]
-        if r.expected_tier != r.predicted_tier:
+    for r, tier_diff, theme_diff in disagreements:
+        parts = [f"  {label(r.story_id)}:"]
+        if tier_diff:
             parts.append(f"tier={r.expected_tier}->{r.predicted_tier}")
-        exp_th = set(r.expected_themes or [])
-        pred_th = set(r.predicted_themes or [])
-        if exp_th != pred_th:
-            parts.append(f"themes={sorted(exp_th)}->{sorted(pred_th)}")
+        if theme_diff:
+            parts.append(f"themes={sorted(set(r.expected_themes or []))}"
+                         f"->{sorted(set(r.predicted_themes or []))}")
         print(" ".join(parts))
 
+    # "Never attempted" rows (e.g. --mode themes: no error, no scores_raw) are
+    # not failures — only attempted-but-unparsed or errored rows are listed.
+    failures = [
+        r for r in story_results
+        if _quality_attempted(r) and r.predicted_scores is None
+    ]
+    if failures:
+        print("\n--- Parse/Network Failures ---")
+        for r in failures:
+            print(f"  {label(r.story_id)}:")
+            if r.error is not None:
+                print(f"    error: {r.error}")
+            elif r.scores_raw is not None:
+                raw = "\n".join(f"    | {ln}" for ln in r.scores_raw.splitlines())
+                print("    quality response failed to parse; raw:")
+                print(raw)
+            else:
+                print("    quality response missing (no raw captured)")
+
+    if anomalies:
+        print("\n--- Theme Parse Anomalies ---")
+        for a in anomalies:
+            what = ("unparseable output (parsed to [])" if a["kind"] == "empty_parse"
+                    else f"invalid tokens dropped: {', '.join(a['invalid_tokens'])}")
+            print(f"  {label(a['story_id'])}: {what}")
+            raw = "\n".join(f"    | {ln}" for ln in a["themes_raw"].splitlines())
+            print(raw)
+
     if extraction_results:
-        print("\n--- Extraction Diffs (per newsletter) ---")
+        print(f"\n--- Extraction Diffs (per newsletter, threshold {match_threshold}) ---")
         for r in extraction_results:
             if r.error is not None:
                 print(f"  {r.thread_id}: ERROR {r.error}")
                 continue
-            matched, n_pred, n_gold = match_stories(r.predicted_stories, r.golden_stories)
-            print(f"  {r.thread_id}: matched={matched} predicted={n_pred} golden={n_gold}")
+            detail = match_stories_detailed(
+                r.predicted_stories, r.golden_stories, threshold=match_threshold
+            )
+            matched = detail["matched"]
+            n_pred, n_gold = len(r.predicted_stories), len(r.golden_stories)
+            print(f"  {r.thread_id}: matched={len(matched)} "
+                  f"predicted={n_pred} golden={n_gold}")
+            if len(matched) == n_pred == n_gold:
+                continue  # perfect match: counts line is enough
+            for pair in matched:
+                p = r.predicted_stories[pair["pred_index"]]
+                g = r.golden_stories[pair["gold_index"]]
+                print(f"    matched ({pair['ratio']:.2f}): "
+                      f"'{_story_label(p)}' ~ '{_story_label(g)}'")
+            for i in detail["unmatched_predicted"]:
+                print(f"    unmatched predicted: '{_story_label(r.predicted_stories[i])}'")
+            for i in detail["unmatched_golden"]:
+                print(f"    unmatched golden:    '{_story_label(r.golden_stories[i])}'")
 
 
 def print_comparison(
@@ -477,14 +737,21 @@ def print_comparison(
     story1: list[StoryPrediction] | None = None,
     story2: list[StoryPrediction] | None = None,
 ) -> None:
-    """Print a side-by-side comparison of two newsletter runs."""
+    """Print a side-by-side comparison of two newsletter runs.
+
+    Sections where a run has zero scored items render as N/A (not 0.0%), so a
+    mode-mismatched comparison can't fake a -100% regression.
+    """
     print(f"\n{'=' * 60}")
     print("Newsletter Comparison Report")
     print(f"{'=' * 60}")
-    print(f"  Run A: {meta1.run_id[:8]}  prompt_hash={meta1.prompt_hash or 'n/a'}  "
-          f"tag={meta1.tag or '-'}")
-    print(f"  Run B: {meta2.run_id[:8]}  prompt_hash={meta2.prompt_hash or 'n/a'}  "
-          f"tag={meta2.tag or '-'}")
+    print(f"  Run A: {meta1.run_id[:8]}  mode={meta1.mode}  "
+          f"prompt_hash={meta1.prompt_hash or 'n/a'}  tag={meta1.tag or '-'}")
+    print(f"  Run B: {meta2.run_id[:8]}  mode={meta2.mode}  "
+          f"prompt_hash={meta2.prompt_hash or 'n/a'}  tag={meta2.tag or '-'}")
+    if meta1.mode != meta2.mode:
+        print(f"\n  WARNING: run modes differ ({meta1.mode} vs {meta2.mode}); "
+              "sections absent from one run show N/A and deltas are not comparable.")
 
     widths = [22, 12, 12, 16]
 
@@ -498,12 +765,14 @@ def print_comparison(
             [label, format_pct(a), format_pct(b), format_metric_delta(a, b)], widths
         ))
 
-    # Tier
+    # Tier — per-class F1 is only meaningful when the run scored tier rows.
     ta, tb = metrics1["tier"], metrics2["tier"]
     header("Tier")
     pct_row("Accuracy", ta["accuracy"], tb["accuracy"])
     for cls in TIERS:
-        pct_row(f"  {cls} F1", ta["per_class"][cls]["f1"], tb["per_class"][cls]["f1"])
+        a_f1 = ta["per_class"][cls]["f1"] if ta["count"] else None
+        b_f1 = tb["per_class"][cls]["f1"] if tb["count"] else None
+        pct_row(f"  {cls} F1", a_f1, b_f1)
 
     # Dimensions (MAE, lower is better)
     header("Dimension MAE (lower=better)")
@@ -571,50 +840,117 @@ def report_as_json(meta: NewsletterRunMeta, metrics: dict) -> None:
     print(json.dumps({"meta": meta.to_dict(), "metrics": metrics}, indent=2))
 
 
-def print_trend(results_dir: Path, match_threshold: float = 0.6) -> None:
-    """Print a trend table across all result files in a directory."""
+def comparison_as_json(
+    meta1: NewsletterRunMeta, metrics1: dict,
+    meta2: NewsletterRunMeta, metrics2: dict,
+) -> None:
+    print(json.dumps({
+        "run_a": {"meta": meta1.to_dict(), "metrics": metrics1},
+        "run_b": {"meta": meta2.to_dict(), "metrics": metrics2},
+    }, indent=2))
+
+
+def build_trend_rows(
+    results_dir: Path, match_threshold: float = 0.6,
+) -> tuple[list[dict], list[str]]:
+    """Summary row per results file, sorted chronologically by run timestamp.
+
+    Returns (rows, errors): unreadable files land in errors as one-line
+    strings instead of aborting the whole trend.
+    """
     files = sorted(results_dir.glob("*.jsonl"))
     files = [f for f in files if not f.name.endswith(".cot.jsonl")]
-    if not files:
-        print(f"No result files found in {results_dir}", file=sys.stderr)
-        return
 
-    print(f"\n{'=' * 60}")
-    print(f"Newsletter Trend Report ({len(files)} runs)")
-    print(f"{'=' * 60}")
-
-    widths = [10, 10, 12, 10, 10, 12, 10]
-    print("  " + format_table_row(
-        ["Run ID", "Mode", "Tag", "TierAcc", "ThemeF1", "MAE(simple)", "ExtractF1"],
-        widths,
-    ))
-    print("  " + "-" * sum(w + 2 for w in widths))
-
+    rows: list[dict] = []
+    errors: list[str] = []
     for f in files:
         try:
             meta, story_preds, extraction_preds = load_results(f)
             metrics = compute_all_metrics(story_preds, extraction_preds, match_threshold)
-            mae_simple = metrics["dimension_mae"].get("simple")
-            mae_s = "N/A" if mae_simple is None else f"{mae_simple:.2f}"
-            print("  " + format_table_row([
-                meta.run_id[:8],
-                meta.mode,
-                meta.tag or meta.prompt_hash[:10],
-                format_pct(metrics["tier"]["accuracy"]),
-                format_pct(metrics["themes"]["micro_f1"]),
-                mae_s,
-                format_pct(metrics["extraction"]["micro_f1"]),
-            ], widths))
+            rows.append({
+                "file": f.name,
+                "run_id": meta.run_id,
+                "timestamp": meta.timestamp,
+                "mode": meta.mode,
+                "tag": meta.tag,
+                "prompt_hash": meta.prompt_hash,
+                "tier_accuracy": metrics["tier"]["accuracy"],
+                "theme_micro_f1": metrics["themes"]["micro_f1"],
+                "mae_simple": metrics["dimension_mae"].get("simple"),
+                "extraction_micro_f1": metrics["extraction"]["micro_f1"],
+            })
         except Exception as exc:
-            print(f"  Error reading {f.name}: {exc}", file=sys.stderr)
+            errors.append(f"Error reading {f.name}: {exc}")
+
+    rows.sort(key=lambda r: r["timestamp"])
+    return rows, errors
+
+
+def print_trend(results_dir: Path, match_threshold: float = 0.6) -> None:
+    """Print a trend table across all result files in a directory."""
+    rows, errors = build_trend_rows(results_dir, match_threshold)
+    for err in errors:
+        print(f"  {err}", file=sys.stderr)
+    if not rows:
+        print(f"No result files found in {results_dir}", file=sys.stderr)
+        return
+
+    print(f"\n{'=' * 60}")
+    print(f"Newsletter Trend Report ({len(rows)} runs)")
+    print(f"{'=' * 60}")
+
+    widths = [10, 16, 10, 12, 10, 10, 10, 12, 10]
+    print("  " + format_table_row(
+        ["Run ID", "Timestamp", "Mode", "Tag", "Prompt", "TierAcc", "ThemeF1",
+         "MAE(simple)", "ExtractF1"],
+        widths,
+    ))
+    print("  " + "-" * sum(w + 2 for w in widths))
+
+    for r in rows:
+        mae_simple = r["mae_simple"]
+        mae_s = "N/A" if mae_simple is None else f"{mae_simple:.2f}"
+        print("  " + format_table_row([
+            r["run_id"][:8],
+            r["timestamp"][:16],
+            r["mode"],
+            r["tag"] or "-",
+            r["prompt_hash"][:8],
+            format_pct(r["tier_accuracy"]),
+            format_pct(r["theme_micro_f1"]),
+            mae_s,
+            format_pct(r["extraction_micro_f1"]),
+        ], widths))
 
     print()
+
+
+def _load_results_or_exit(
+    path_str: str,
+) -> tuple[NewsletterRunMeta, list[StoryPrediction], list[ExtractionPrediction]]:
+    """load_results with a friendly one-line error + exit 1 instead of a traceback."""
+    path = Path(path_str)
+    try:
+        return load_results(path)
+    except FileNotFoundError:
+        print(f"Error: results file not found: {path}", file=sys.stderr)
+    except (ValueError, json.JSONDecodeError) as exc:
+        print(f"Error: could not read results file {path}: {exc}", file=sys.stderr)
+        if path.name.endswith(".cot.jsonl"):
+            print(
+                f"Hint: {path.name} looks like a chain-of-thought sidecar — "
+                f"pass the main results file ({path.name[:-len('.cot.jsonl')]}.jsonl).",
+                file=sys.stderr,
+            )
+    sys.exit(1)
 
 
 def cli():
     parser = argparse.ArgumentParser(description="Generate newsletter evaluation reports")
     parser.add_argument("--results", help="Path to results JSONL file")
-    parser.add_argument("--compare", nargs=2, metavar="PATH", help="Compare two result files")
+    parser.add_argument("--compare", nargs="+", metavar="PATH",
+                        help="Compare two result files (.cot.jsonl sidecars matched "
+                             "by a glob are ignored)")
     parser.add_argument("--results-dir", help="Directory of results for trend view")
     parser.add_argument("--verbose", action="store_true",
                         help="Show per-story flips and per-newsletter extraction diffs")
@@ -628,23 +964,53 @@ def cli():
         parser.error("Provide --results, --compare, or --results-dir")
 
     if args.results:
-        meta, story_preds, extraction_preds = load_results(Path(args.results))
+        meta, story_preds, extraction_preds = _load_results_or_exit(args.results)
         metrics = compute_all_metrics(story_preds, extraction_preds, args.match_threshold)
         if args.format == "json":
             report_as_json(meta, metrics)
         else:
             print_report(meta, metrics, verbose=args.verbose,
-                         story_results=story_preds, extraction_results=extraction_preds)
+                         story_results=story_preds, extraction_results=extraction_preds,
+                         match_threshold=args.match_threshold)
 
     elif args.compare:
-        meta1, s1, e1 = load_results(Path(args.compare[0]))
-        meta2, s2, e2 = load_results(Path(args.compare[1]))
+        # A glob like *baseline*.jsonl also matches the run's .cot.jsonl
+        # sidecar; drop sidecars so the documented glob workflow works.
+        sidecars = [p for p in args.compare if p.endswith(".cot.jsonl")]
+        compare_paths = [p for p in args.compare if not p.endswith(".cot.jsonl")]
+        if sidecars:
+            print(
+                "Note: ignoring chain-of-thought sidecar file(s): "
+                + ", ".join(sidecars),
+                file=sys.stderr,
+            )
+        if len(compare_paths) != 2:
+            parser.error(
+                f"--compare needs exactly two results files, got "
+                f"{len(compare_paths)} after ignoring .cot.jsonl sidecars: "
+                f"{', '.join(compare_paths) or '(none)'}"
+            )
+        meta1, s1, e1 = _load_results_or_exit(compare_paths[0])
+        meta2, s2, e2 = _load_results_or_exit(compare_paths[1])
         m1 = compute_all_metrics(s1, e1, args.match_threshold)
         m2 = compute_all_metrics(s2, e2, args.match_threshold)
-        print_comparison(meta1, m1, meta2, m2, verbose=args.verbose, story1=s1, story2=s2)
+        if args.format == "json":
+            comparison_as_json(meta1, m1, meta2, m2)
+        else:
+            print_comparison(meta1, m1, meta2, m2, verbose=args.verbose,
+                             story1=s1, story2=s2)
 
     elif args.results_dir:
-        print_trend(Path(args.results_dir), args.match_threshold)
+        if args.verbose:
+            print("Note: --verbose has no effect with --results-dir (trend view).",
+                  file=sys.stderr)
+        if args.format == "json":
+            rows, errors = build_trend_rows(Path(args.results_dir), args.match_threshold)
+            for err in errors:
+                print(f"  {err}", file=sys.stderr)
+            print(json.dumps(rows, indent=2))
+        else:
+            print_trend(Path(args.results_dir), args.match_threshold)
 
 
 if __name__ == "__main__":

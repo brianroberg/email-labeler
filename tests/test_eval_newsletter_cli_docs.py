@@ -72,6 +72,23 @@ def _get_documented_flags(section_text: str) -> set[str]:
     return set(re.findall(r"`(--[\w-]+)`", section_text))
 
 
+def test_config_flag_help_states_repo_root_default(subtests):
+    """The --config default is resolved against the repo root
+    (Path(__file__).parent.parent / "config.toml"), not the CWD — the help
+    text must not claim './config.toml'."""
+    for module_name in ("evals.newsletter_harvest", "evals.newsletter_label",
+                        "evals.newsletter_run"):
+        parser = _capture_parser(module_name)
+        config_actions = [
+            a for a in parser._actions if "--config" in a.option_strings
+        ]
+        assert config_actions, f"{module_name} has no --config flag"
+        with subtests.test(module=module_name):
+            help_text = config_actions[0].help or ""
+            assert "./config.toml" not in help_text
+            assert "repo-root" in help_text
+
+
 def test_all_newsletter_eval_cli_options_documented(subtests):
     readme_text = README_PATH.read_text()
 

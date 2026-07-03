@@ -72,7 +72,9 @@ def _newsletter(thread_id, stories=None, **kw):
 
 
 def _story(story_id, **kw):
-    base = dict(story_id=story_id, title="t", text="x")
+    # Tests model Phase-B-labeled stories by default; pass reviewed=False for
+    # a Phase-A-only (confirmed but never labeled) story.
+    base = dict(story_id=story_id, title="t", text="x", reviewed=True)
     base.update(kw)
     return GoldenStory(**base)
 
@@ -142,7 +144,7 @@ class TestLoadGoldenSet:
             _newsletter("keep", reviewed=True),
             _newsletter("drop", reviewed=False),
         ])
-        loaded = load_golden_set(path, reviewed_only=True)
+        loaded, _stats = load_golden_set(path, reviewed_only=True)
         assert [n.thread_id for n in loaded] == ["keep"]
 
     def test_excluded_dropped_even_when_unreviewed_included(self, tmp_path):
@@ -151,15 +153,62 @@ class TestLoadGoldenSet:
             _newsletter("keep", reviewed=False),
             _newsletter("drop", reviewed=False, excluded=True),
         ])
-        loaded = load_golden_set(path, reviewed_only=False)
+        loaded, _stats = load_golden_set(path, reviewed_only=False)
         assert [n.thread_id for n in loaded] == ["keep"]
 
     def test_tolerates_blank_lines(self, tmp_path):
         path = tmp_path / "g.jsonl"
         content = json.dumps(_newsletter("keep", reviewed=True).to_dict()) + "\n\n"
         path.write_text(content)
-        loaded = load_golden_set(path, reviewed_only=True)
+        loaded, _stats = load_golden_set(path, reviewed_only=True)
         assert [n.thread_id for n in loaded] == ["keep"]
+
+    def test_returns_filter_breakdown_stats(self, tmp_path):
+        path = tmp_path / "g.jsonl"
+        _write_golden(path, [
+            _newsletter("a", reviewed=True),
+            _newsletter("b", reviewed=False),
+            _newsletter("c", reviewed=False, excluded=True),
+        ])
+        loaded, stats = load_golden_set(path, reviewed_only=True)
+        assert [n.thread_id for n in loaded] == ["a"]
+        assert stats == {"total": 3, "excluded": 1, "unreviewed": 1}
+
+
+class TestFormatLoadSummary:
+    """The load message must explain WHY newsletters were dropped, not dead-end."""
+
+    def test_all_unreviewed_names_the_fix(self):
+        from evals.newsletter_run import format_load_summary
+        msg = format_load_summary(
+            0, {"total": 6, "excluded": 0, "unreviewed": 6}, "gs.jsonl")
+        assert "No newsletters to evaluate" in msg
+        assert "6 unreviewed" in msg
+        assert "newsletter_label" in msg
+        assert "--include-unreviewed" in msg
+
+    def test_empty_file_points_at_harvest(self):
+        from evals.newsletter_run import format_load_summary
+        msg = format_load_summary(
+            0, {"total": 0, "excluded": 0, "unreviewed": 0}, "gs.jsonl")
+        assert "No newsletters to evaluate" in msg
+        assert "empty" in msg
+        assert "newsletter_harvest" in msg
+
+    def test_success_reports_skip_breakdown(self):
+        from evals.newsletter_run import format_load_summary
+        msg = format_load_summary(
+            5, {"total": 7, "excluded": 1, "unreviewed": 1}, "gs.jsonl")
+        assert "5 of 7" in msg
+        assert "1 unreviewed" in msg
+        assert "1 excluded" in msg
+
+    def test_success_with_no_skips_is_terse(self):
+        from evals.newsletter_run import format_load_summary
+        msg = format_load_summary(
+            3, {"total": 3, "excluded": 0, "unreviewed": 0}, "gs.jsonl")
+        assert "Loaded 3 newsletters" in msg
+        assert "unreviewed" not in msg
 
 
 class TestEvaluateExtraction:
@@ -173,7 +222,7 @@ class TestEvaluateExtraction:
                 _story("nl1:1", title="Gold Two", text="gold body two"),
             ],
         )
-        pred = _run(evaluate_extraction(newsletter, _classifier(llm)))
+        pred, _thinking = _run(evaluate_extraction(newsletter, _classifier(llm)))
 
         assert pred.thread_id == "nl1"
         assert pred.predicted_stories == [
@@ -264,7 +313,10 @@ class TestRunEvaluation:
         assert len(extractions) == 1
         assert len(stories) == 1
         assert stories[0].predicted_tier == "good"  # avg 3.0
-        assert thinking[0].quality_cot == "qcot"
+        story_entries = [t for t in thinking if t.story_id]
+        assert story_entries[0].quality_cot == "qcot"
+        # all-mode also carries a newsletter-level extraction thinking entry
+        assert [t.thread_id for t in thinking if t.extraction_cot or not t.story_id]
 
     def test_second_identical_run_records_cache_hits(self, tmp_path):
         cache = tmp_path / "cache.jsonl"
@@ -300,6 +352,60 @@ class TestRunEvaluation:
         assert all(isinstance(r, StoryPrediction) for r in rows)
         assert not any(isinstance(r, ExtractionPrediction) for r in rows)
 
+    def test_quality_mode_fires_no_theme_llm_calls(self):
+        """--mode quality must not pay for theme calls (and vice versa)."""
+        llm = _full_llm()
+        rows, _thinking = _run(run_evaluation(
+            self._golden(), _classifier(llm), mode="quality", parallelism=1,
+        ))
+        assert not any("THEME" in user for _sys, user in llm.calls)
+        assert rows[0].predicted_scores is not None
+        assert rows[0].predicted_themes == []
+        assert rows[0].themes_raw is None
+
+    def test_themes_mode_fires_no_quality_llm_calls(self):
+        llm = _full_llm()
+        rows, _thinking = _run(run_evaluation(
+            self._golden(), _classifier(llm), mode="themes", parallelism=1,
+        ))
+        assert not any("QUALITY" in user for _sys, user in llm.calls)
+        assert rows[0].predicted_themes == ["scripture"]
+        assert rows[0].predicted_scores is None
+        assert rows[0].predicted_tier is None
+        assert rows[0].scores_raw is None
+
+    def test_unlabeled_story_skipped_in_story_modes(self):
+        """A Phase-A-only story (reviewed=False) has no ground truth: don't
+        spend LLM calls on it or score its empty expected_themes."""
+        golden = [_newsletter(
+            "nl1", reviewed=True,
+            stories=[
+                _story("nl1:0", title="S", text="body", reviewed=True),
+                _story("nl1:1", title="U", text="v", reviewed=False),
+            ],
+        )]
+        rows, _thinking = _run(run_evaluation(
+            golden, _classifier(_full_llm()), mode="quality", parallelism=1,
+        ))
+        assert [r.story_id for r in rows] == ["nl1:0"]
+
+
+class TestSelectStories:
+    def test_counts_excluded_and_unlabeled_skips(self):
+        from evals.newsletter_run import select_stories
+        golden = [_newsletter(
+            "nl1", reviewed=True,
+            stories=[
+                _story("nl1:0", reviewed=True),
+                _story("nl1:1", reviewed=False),
+                _story("nl1:2", excluded=True),
+            ],
+        )]
+        pairs, n_excluded, n_unlabeled = select_stories(golden)
+        assert [(s.story_id, tid) for s, tid in pairs] == [("nl1:0", "nl1")]
+        assert n_excluded == 1
+        assert n_unlabeled == 1
+
     def test_excluded_story_skipped_in_quality_mode(self, tmp_path):
         cache = tmp_path / "cache.jsonl"
         cached = CachedLLMClient(_full_llm(), cache)
@@ -314,6 +420,87 @@ class TestRunEvaluation:
             golden, _classifier(cached), mode="quality", parallelism=1,
         ))
         assert [r.story_id for r in rows] == ["nl1:0"]
+
+
+class TestFormatRunSummary:
+    """The run summary must surface silent failures, not just .error rows."""
+
+    def _story_row(self, **kw):
+        from evals.newsletter_schemas import StoryPrediction
+        base = dict(story_id="nl1:0", thread_id="nl1")
+        base.update(kw)
+        return StoryPrediction(**base)
+
+    def test_quality_parse_failure_counted(self):
+        from evals.newsletter_run import format_run_summary
+        rows = [self._story_row(scores_raw="garbage output", predicted_scores=None,
+                                themes_raw="NONE")]
+        summary = format_run_summary(rows)
+        assert "1 quality parse failure" in summary
+        assert "no errors" not in summary
+
+    def test_skipped_quality_is_not_a_parse_failure(self):
+        from evals.newsletter_run import format_run_summary
+        # themes-mode row: quality never attempted (scores_raw None)
+        rows = [self._story_row(scores_raw=None, predicted_scores=None,
+                                themes_raw="NONE")]
+        assert "quality parse failure" not in format_run_summary(rows)
+
+    def test_garbage_theme_response_is_a_parse_failure(self):
+        from evals.newsletter_run import format_run_summary
+        rows = [self._story_row(
+            scores_raw="SIMPLE: 3\nCONCRETE: 3\nPERSONAL: 3\nDYNAMIC: 3",
+            predicted_scores={"simple": 3, "concrete": 3, "personal": 3, "dynamic": 3},
+            themes_raw="just some prose, no labels", predicted_themes=[],
+        )]
+        assert "1 theme parse failure" in format_run_summary(rows)
+
+    def test_none_theme_response_is_not_a_failure(self):
+        from evals.newsletter_run import format_run_summary
+        rows = [self._story_row(
+            scores_raw="SIMPLE: 3\nCONCRETE: 3\nPERSONAL: 3\nDYNAMIC: 3",
+            predicted_scores={"simple": 3, "concrete": 3, "personal": 3, "dynamic": 3},
+            themes_raw="NONE", predicted_themes=[],
+        )]
+        assert "theme parse failure" not in format_run_summary(rows)
+
+    def test_clamped_scores_surfaced(self):
+        from evals.newsletter_run import format_run_summary
+        rows = [self._story_row(
+            scores_raw="SIMPLE: 9\nCONCRETE: 4\nPERSONAL: 3\nDYNAMIC: 2",
+            predicted_scores={"simple": 5, "concrete": 4, "personal": 3, "dynamic": 2},
+            themes_raw="NONE",
+        )]
+        summary = format_run_summary(rows)
+        assert "clamped" in summary
+        assert "SIMPLE" in summary
+
+    def test_dropped_theme_tokens_surfaced(self):
+        from evals.newsletter_run import format_run_summary
+        rows = [self._story_row(
+            scores_raw="SIMPLE: 3\nCONCRETE: 3\nPERSONAL: 3\nDYNAMIC: 3",
+            predicted_scores={"simple": 3, "concrete": 3, "personal": 3, "dynamic": 3},
+            themes_raw="FELLOWSHIP\nCHURCH", predicted_themes=["church"],
+        )]
+        assert "FELLOWSHIP" in format_run_summary(rows)
+
+    def test_error_grammar_is_singular(self):
+        from evals.newsletter_run import format_run_summary
+        rows = [self._story_row(error="boom")]
+        summary = format_run_summary(rows)
+        assert "1 error" in summary
+        assert "1 errors" not in summary
+
+    def test_clean_run_reports_no_errors(self):
+        from evals.newsletter_run import format_run_summary
+        rows = [self._story_row(
+            scores_raw="SIMPLE: 3\nCONCRETE: 3\nPERSONAL: 3\nDYNAMIC: 3",
+            predicted_scores={"simple": 3, "concrete": 3, "personal": 3, "dynamic": 3},
+            themes_raw="SCRIPTURE", predicted_themes=["scripture"],
+        )]
+        summary = format_run_summary(rows)
+        assert "Rows: 1" in summary
+        assert "no errors" in summary
 
 
 def _full_config():
@@ -347,6 +534,23 @@ class TestBuildMeta:
         assert meta.max_tokens == 1024
         # seeded_from pulled from the golden set
         assert meta.seeded_from == "parse_stories"
+
+    def test_story_count_counts_only_labeled_stories(self):
+        """story_count must match what a story-mode run actually evaluates,
+        so the report header can't disagree with metric denominators."""
+        golden = [_newsletter(
+            "nl1", reviewed=True,
+            stories=[
+                _story("nl1:0", reviewed=True),
+                _story("nl1:1", reviewed=False),
+                _story("nl1:2", excluded=True),
+            ],
+        )]
+        meta = build_meta(
+            config=_full_config(), config_path="config.toml", golden_path="g.jsonl",
+            golden_set=golden, mode="all", tag="", parallelism=1,
+        )
+        assert meta.story_count == 1
 
 
 class TestBuildOutputPath:
@@ -406,6 +610,50 @@ class TestWriteThinkingSidecar:
         path = tmp_path / "out.jsonl"
         write_thinking_sidecar(path, [NewsletterThinkingEntry(story_id="a")])
         assert not path.with_suffix(".cot.jsonl").exists()
+
+    def test_returns_sidecar_path_when_written_else_none(self, tmp_path):
+        """main() needs the path back so the run summary can mention the sidecar."""
+        from evals.newsletter_schemas import NewsletterThinkingEntry
+        path = tmp_path / "out.jsonl"
+        written = write_thinking_sidecar(
+            path, [NewsletterThinkingEntry(story_id="a", quality_cot="q")])
+        assert written == path.with_suffix(".cot.jsonl")
+        assert write_thinking_sidecar(
+            tmp_path / "empty.jsonl", [NewsletterThinkingEntry(story_id="b")]) is None
+
+    def test_sidecar_written_for_extraction_only_entry(self, tmp_path):
+        """Extraction CoT alone must qualify an entry for the sidecar."""
+        from evals.newsletter_schemas import NewsletterThinkingEntry
+        path = tmp_path / "out.jsonl"
+        entry = NewsletterThinkingEntry(thread_id="t1", extraction_cot="why I split it so")
+        assert write_thinking_sidecar(path, [entry]) == path.with_suffix(".cot.jsonl")
+        line = json.loads(path.with_suffix(".cot.jsonl").read_text().splitlines()[0])
+        assert line["thread_id"] == "t1"
+        assert line["extraction_cot"] == "why I split it so"
+
+
+class TestExtractionThinking:
+    def test_evaluate_extraction_returns_thinking_entry(self):
+        llm = FakeLLM([("body text", "TITLE: A\nTEXT: a", "extraction reasoning")])
+        newsletter = _newsletter(
+            "nl1", reviewed=True, stories=[_story("nl1:0")],
+        )
+        pred, entry = _run(evaluate_extraction(newsletter, _classifier(llm)))
+        assert pred.thread_id == "nl1"
+        assert pred.predicted_stories == [{"title": "A", "text": "a"}]
+        assert entry.thread_id == "nl1"
+        assert entry.extraction_cot == "extraction reasoning"
+        assert entry.story_id == ""
+
+    def test_run_evaluation_collects_extraction_thinking(self):
+        llm = FakeLLM([("body text", "TITLE: A\nTEXT: a", "xcot")])
+        golden = [_newsletter("nl1", reviewed=True, stories=[_story("nl1:0")])]
+        rows, thinking = _run(run_evaluation(
+            golden, _classifier(llm), mode="extraction", parallelism=1,
+        ))
+        assert any(
+            t.extraction_cot == "xcot" and t.thread_id == "nl1" for t in thinking
+        )
 
 
 def _main_args(**kw):
@@ -486,6 +734,219 @@ class TestMainPromptsOverride:
                 golden_set=str(golden), output_dir=str(tmp_path / "r"),
             )))
         assert excinfo.value.code == 1
+
+
+class TestUnreviewedExtractionNote:
+    """--include-unreviewed extraction must warn that uncurated newsletters'
+    empty story lists are not real ground truth."""
+
+    def test_note_when_unreviewed_newsletters_in_extraction_mode(self):
+        from evals.newsletter_run import format_unreviewed_note
+        golden = [_newsletter("a", reviewed=True), _newsletter("b", reviewed=False)]
+        note = format_unreviewed_note(golden, "extraction")
+        assert note is not None
+        assert "1" in note
+        assert "false positive" in note
+
+    def test_no_note_when_all_reviewed_or_story_mode(self):
+        from evals.newsletter_run import format_unreviewed_note
+        golden = [_newsletter("a", reviewed=True)]
+        assert format_unreviewed_note(golden, "extraction") is None
+        unrev = [_newsletter("b", reviewed=False)]
+        assert format_unreviewed_note(unrev, "quality") is None
+
+    def test_main_prints_note_with_include_unreviewed(
+        self, tmp_path, monkeypatch, capsys
+    ):
+        def fake_build(config, no_cache):
+            llm = _full_llm()
+            return NewsletterClassifier(cloud_llm=llm, config=config), llm
+        monkeypatch.setattr(newsletter_run, "build_classifier", fake_build)
+        golden = tmp_path / "g.jsonl"
+        _write_golden(golden, [_newsletter("nl1", reviewed=False)])
+        asyncio.run(newsletter_run.main(_main_args(
+            golden_set=str(golden), output_dir=str(tmp_path / "r"),
+            mode="extraction", include_unreviewed=True,
+        )))
+        assert "false positive" in capsys.readouterr().err
+
+
+class TestMainArgErrors:
+    """Typo-class mistakes must print one-line errors, not tracebacks."""
+
+    def test_missing_prompts_file_exits_cleanly(self, tmp_path, capsys):
+        golden = tmp_path / "g.jsonl"
+        _write_golden(golden, [_newsletter("nl1", reviewed=True)])
+        with pytest.raises(SystemExit) as excinfo:
+            asyncio.run(newsletter_run.main(_main_args(
+                golden_set=str(golden), output_dir=str(tmp_path / "r"),
+                prompts=str(tmp_path / "nonexistent.toml"),
+            )))
+        assert excinfo.value.code == 1
+        assert "Error" in capsys.readouterr().err
+
+    def test_malformed_prompts_toml_exits_cleanly(self, tmp_path, capsys):
+        golden = tmp_path / "g.jsonl"
+        _write_golden(golden, [_newsletter("nl1", reviewed=True)])
+        bad = tmp_path / "bad.toml"
+        bad.write_text("[newsletter\nnot toml")
+        with pytest.raises(SystemExit) as excinfo:
+            asyncio.run(newsletter_run.main(_main_args(
+                golden_set=str(golden), output_dir=str(tmp_path / "r"),
+                prompts=str(bad),
+            )))
+        assert excinfo.value.code == 1
+        assert "Error" in capsys.readouterr().err
+
+    def test_missing_golden_set_exits_cleanly(self, tmp_path, capsys):
+        with pytest.raises(SystemExit) as excinfo:
+            asyncio.run(newsletter_run.main(_main_args(
+                golden_set=str(tmp_path / "nonexistent.jsonl"),
+                output_dir=str(tmp_path / "r"),
+            )))
+        assert excinfo.value.code == 1
+        assert "Error" in capsys.readouterr().err
+
+
+class TestEndpointNaming:
+    def test_describe_endpoint_prefers_newsletter_var(self, monkeypatch):
+        from evals.newsletter_run import describe_endpoint
+        monkeypatch.setenv("NEWSLETTER_LLM_URL", "http://nl:1/v1")
+        assert describe_endpoint() == "http://nl:1/v1 (from NEWSLETTER_LLM_URL)"
+        monkeypatch.delenv("NEWSLETTER_LLM_URL")
+        monkeypatch.setenv("CLOUD_LLM_URL", "http://cloud:2/v1")
+        assert describe_endpoint() == "http://cloud:2/v1 (from CLOUD_LLM_URL)"
+
+    def test_per_row_error_names_endpoint(self):
+        class BoomLLM(FakeLLM):
+            base_url = "http://127.0.0.1:8499/v1/chat/completions"
+
+            async def complete(self, *a, **kw):
+                raise RuntimeError("LLM endpoint model-x unavailable")
+
+        story = _story("nl1:0", title="T", text="x")
+        pred, _thinking = _run(evaluate_story(story, "nl1", _classifier(BoomLLM([]))))
+        assert pred.error is not None
+        assert "http://127.0.0.1:8499" in pred.error
+
+    def test_preflight_error_names_url_and_env_var(
+        self, tmp_path, monkeypatch, capsys
+    ):
+        class DeadLLM(FakeLLM):
+            async def is_available(self, timeout=None):
+                return False
+
+        def fake_build(config, no_cache):
+            llm = DeadLLM([])
+            return NewsletterClassifier(cloud_llm=llm, config=config), llm
+        monkeypatch.setattr(newsletter_run, "build_classifier", fake_build)
+        monkeypatch.setenv("NEWSLETTER_LLM_URL", "http://127.0.0.1:8499/v1")
+        golden = tmp_path / "g.jsonl"
+        _write_golden(golden, [_newsletter(
+            "nl1", reviewed=True, stories=[_story("nl1:0", title="S", text="body")],
+        )])
+        with pytest.raises(SystemExit):
+            asyncio.run(newsletter_run.main(_main_args(
+                golden_set=str(golden), output_dir=str(tmp_path / "r"),
+                skip_preflight=False,
+            )))
+        err = capsys.readouterr().err
+        assert "http://127.0.0.1:8499/v1" in err
+        assert "NEWSLETTER_LLM_URL" in err
+
+
+class TestReportForwarding:
+    def _meta(self):
+        from evals.newsletter_schemas import NewsletterRunMeta
+        return NewsletterRunMeta(
+            run_id="r", timestamp="t", config_hash="c", config_path="p",
+            newsletter_model="m", golden_set_path="g", golden_set_count=0,
+            story_count=0,
+        )
+
+    def test_maybe_report_forwards_verbose_and_threshold(self, monkeypatch):
+        from evals import newsletter_report
+        from evals.newsletter_run import maybe_report
+        calls = {}
+
+        def fake_compute(story, extraction, match_threshold=0.6):
+            calls["compute_thr"] = match_threshold
+            return {}
+
+        def fake_print_report(meta, metrics, verbose=False, story_results=None,
+                              extraction_results=None, match_threshold=0.6):
+            calls["verbose"] = verbose
+            calls["print_thr"] = match_threshold
+
+        monkeypatch.setattr(newsletter_report, "compute_all_metrics", fake_compute)
+        monkeypatch.setattr(newsletter_report, "print_report", fake_print_report)
+        maybe_report(self._meta(), [], True, None, verbose=True, match_threshold=0.9)
+        assert calls == {"compute_thr": 0.9, "verbose": True, "print_thr": 0.9}
+
+    def test_comparison_verbosity_follows_flag(self, tmp_path, monkeypatch):
+        from evals import newsletter_report
+        from evals.newsletter_run import maybe_report, write_results
+        calls = {}
+
+        def fake_print_comparison(meta1, metrics1, meta2, metrics2, verbose=False,
+                                  story1=None, story2=None):
+            calls["verbose"] = verbose
+
+        monkeypatch.setattr(newsletter_report, "print_comparison", fake_print_comparison)
+        prior = tmp_path / "prior.jsonl"
+        write_results(prior, self._meta(), [])
+        maybe_report(self._meta(), [], False, str(prior), verbose=False)
+        assert calls["verbose"] is False
+
+    def test_cli_accepts_verbose_and_match_threshold(self, monkeypatch):
+        import sys as _sys
+        seen = {}
+
+        async def fake_main(args):
+            seen["args"] = args
+
+        monkeypatch.setattr(newsletter_run, "main", fake_main)
+        monkeypatch.setattr(_sys, "argv",
+                            ["prog", "--verbose", "--match-threshold", "0.8"])
+        newsletter_run.cli()
+        assert seen["args"].verbose is True
+        assert seen["args"].match_threshold == 0.8
+
+    def test_cli_quiets_httpx_logging(self, monkeypatch):
+        import logging
+        import sys as _sys
+
+        async def fake_main(args):
+            return None
+
+        monkeypatch.setattr(newsletter_run, "main", fake_main)
+        monkeypatch.setattr(_sys, "argv", ["prog"])
+        logging.getLogger("httpx").setLevel(logging.NOTSET)
+        newsletter_run.cli()
+        assert logging.getLogger("httpx").level == logging.WARNING
+
+
+class TestProgress:
+    def test_progress_lines_written_when_enabled(self, capsys):
+        golden = [_newsletter(
+            "nl1", reviewed=True,
+            stories=[_story("nl1:0", title="S", text="body")],
+        )]
+        _run(run_evaluation(
+            golden, _classifier(_full_llm()), mode="all", parallelism=1,
+            progress=True,
+        ))
+        err = capsys.readouterr().err
+        assert "[1/2]" in err
+        assert "[2/2]" in err
+
+    def test_no_progress_output_by_default(self, capsys):
+        golden = [_newsletter(
+            "nl1", reviewed=True,
+            stories=[_story("nl1:0", title="S", text="body")],
+        )]
+        _run(run_evaluation(golden, _classifier(_full_llm()), mode="all", parallelism=1))
+        assert "[1/2]" not in capsys.readouterr().err
 
 
 class TestMainPreflight:
@@ -595,3 +1056,61 @@ class TestMainReport:
         )))
         printed = capsys.readouterr().out
         assert "Newsletter Comparison Report" in printed
+
+    def test_compare_to_meta_less_file_does_not_crash_run(
+        self, tmp_path, monkeypatch, capsys
+    ):
+        """A bad --compare-to file (e.g. a .cot.jsonl sidecar) must not raise
+        after the paid run, and the results path must still be printed."""
+        self._patch_classifier(monkeypatch)
+        golden = tmp_path / "g.jsonl"
+        _write_golden(golden, [_newsletter(
+            "nl1", reviewed=True, stories=[_story("nl1:0", title="S", text="body")],
+        )])
+        bad = tmp_path / "bad.cot.jsonl"
+        bad.write_text('{"type": "thinking", "story_id": "x"}\n')
+        out = tmp_path / "r"
+        asyncio.run(newsletter_run.main(_main_args(
+            golden_set=str(golden), output_dir=str(out), mode="all",
+            compare_to=str(bad),
+        )))
+        err = capsys.readouterr().err
+        assert "Error" in err and "compare" in err
+        assert "Results written to" in err
+
+    def test_summary_mentions_cot_sidecar(self, tmp_path, monkeypatch, capsys):
+        # Patch with the needle-matching prompts config so the FakeLLM returns
+        # thinking content and the .cot.jsonl sidecar actually gets written.
+        def fake_build(config, no_cache):
+            llm = _full_llm()
+            return NewsletterClassifier(cloud_llm=llm, config=_prompts_config()), llm
+        monkeypatch.setattr(newsletter_run, "build_classifier", fake_build)
+        golden = tmp_path / "g.jsonl"
+        _write_golden(golden, [_newsletter(
+            "nl1", reviewed=True, stories=[_story("nl1:0", title="S", text="body")],
+        )])
+        out = tmp_path / "r"
+        asyncio.run(newsletter_run.main(_main_args(
+            golden_set=str(golden), output_dir=str(out), mode="all",
+        )))
+        err = capsys.readouterr().err
+        assert "Chain-of-thought written to" in err
+        assert ".cot.jsonl" in err
+
+    def test_main_reports_unlabeled_story_skips(self, tmp_path, monkeypatch, capsys):
+        self._patch_classifier(monkeypatch)
+        golden = tmp_path / "g.jsonl"
+        _write_golden(golden, [_newsletter(
+            "nl1", reviewed=True,
+            stories=[
+                _story("nl1:0", title="S", text="body", reviewed=True),
+                _story("nl1:1", title="U", text="v", reviewed=False),
+            ],
+        )])
+        out = tmp_path / "r"
+        asyncio.run(newsletter_run.main(_main_args(
+            golden_set=str(golden), output_dir=str(out), mode="quality",
+        )))
+        err = capsys.readouterr().err
+        assert "1 story" in err
+        assert "unlabeled" in err or "never labeled" in err

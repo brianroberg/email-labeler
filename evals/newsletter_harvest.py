@@ -18,6 +18,7 @@ Usage:
 import argparse
 import asyncio
 import json
+import logging
 import sys
 import tomllib
 from datetime import datetime, timezone
@@ -191,9 +192,30 @@ def write_golden_set(newsletters: list[GoldenNewsletter], output_path: Path) -> 
             f.write(json.dumps(newsletter.to_dict()) + "\n")
 
 
+def quiet_http_logging() -> None:
+    """Silence httpx/httpcore per-request INFO logs.
+
+    Importing daemon (for format_thread_transcript) runs its module-level
+    logging.basicConfig(level=INFO), which makes httpx print a timestamped
+    'HTTP Request: ...' line for every proxy call — noise that drowns out the
+    harvest's own progress messages.
+    """
+    for name in ("httpx", "httpcore"):
+        logging.getLogger(name).setLevel(logging.WARNING)
+
+
 async def main(args: argparse.Namespace) -> None:
+    quiet_http_logging()
     config = load_eval_config(args.config)
-    proxy = GmailProxyClient(proxy_url=args.proxy_url)
+    try:
+        proxy = GmailProxyClient(proxy_url=args.proxy_url)
+    except ProxyAuthError as exc:
+        # Raised at construction when PROXY_API_KEY is unset — a traceback here
+        # buries the one env var the user needs to set.
+        print(f"Error: {exc}", file=sys.stderr)
+        print("Set PROXY_API_KEY (e.g. via the .env symlink to agent-stack/.env) "
+              "and re-run.", file=sys.stderr)
+        sys.exit(1)
 
     newsletters = await harvest_newsletters(
         proxy=proxy,
@@ -215,18 +237,32 @@ async def main(args: argparse.Namespace) -> None:
     output_path.parent.mkdir(parents=True, exist_ok=True)
     write_golden_set(newsletters, output_path)
     print(f"Appended {len(newsletters)} newsletters to {output_path}", file=sys.stderr)
+    print(
+        "Next: add ground truth with "
+        f"`uv run python -m evals.newsletter_label --golden-set {output_path}`",
+        file=sys.stderr,
+    )
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(description="Harvest candidate newsletters for golden set")
+    parser.add_argument("--output", default="evals/newsletter_golden_set.jsonl",
+                        help="Output JSONL path, relative to the CWD — run from the repo root "
+                             "so the default chains with the other eval tools "
+                             "(default: %(default)s)")
+    parser.add_argument("--max-threads", type=int, default=50,
+                        help="Max threads to fetch (default: %(default)s)")
+    parser.add_argument("--recipient",
+                        help="Newsletter recipient (default: config[newsletter][recipient])")
+    parser.add_argument("--config",
+                        help="Path to config.toml (default: the repo-root config.toml, "
+                             "regardless of CWD)")
+    parser.add_argument("--proxy-url", help="API proxy URL (overrides PROXY_URL env var)")
+    return parser
 
 
 def cli():
-    parser = argparse.ArgumentParser(description="Harvest candidate newsletters for golden set")
-    parser.add_argument("--output", default="evals/newsletter_golden_set.jsonl",
-                        help="Output JSONL path")
-    parser.add_argument("--max-threads", type=int, default=50, help="Max threads to fetch")
-    parser.add_argument("--recipient",
-                        help="Newsletter recipient (default: config[newsletter][recipient])")
-    parser.add_argument("--config", help="Path to config.toml (default: ./config.toml)")
-    parser.add_argument("--proxy-url", help="API proxy URL (overrides PROXY_URL env var)")
-    args = parser.parse_args()
+    args = build_parser().parse_args()
     asyncio.run(main(args))
 
 

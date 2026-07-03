@@ -1,8 +1,16 @@
 """Tests for evals.newsletter_report — newsletter eval metrics on hand-built fixtures."""
 
+import json
+import sys
+
+import pytest
+
 from evals.newsletter_report import (
     THEMES,
     TIERS,
+    _format_dim_table,
+    build_trend_rows,
+    cli,
     compute_all_metrics,
     compute_dimension_exact_match,
     compute_dimension_mae,
@@ -12,9 +20,42 @@ from evals.newsletter_report import (
     compute_tier_metrics,
     format_mae_delta,
     format_metric_delta,
+    load_story_titles,
     match_stories,
+    match_stories_detailed,
+    print_comparison,
+    print_report,
+    print_trend,
+    theme_parse_anomalies,
 )
-from evals.newsletter_schemas import ExtractionPrediction, StoryPrediction
+from evals.newsletter_schemas import (
+    ExtractionPrediction,
+    NewsletterRunMeta,
+    StoryPrediction,
+)
+
+
+def _write_results(path, meta, rows=()):
+    with open(path, "w") as f:
+        f.write(json.dumps(meta.to_dict()) + "\n")
+        for row in rows:
+            f.write(json.dumps(row.to_dict()) + "\n")
+
+
+def _meta(mode="all", **kwargs) -> NewsletterRunMeta:
+    defaults = dict(
+        run_id="abcdef0123456789",
+        timestamp="2026-07-03T00:00:00+00:00",
+        config_hash="cfg",
+        config_path="config.toml",
+        newsletter_model="test-model",
+        golden_set_path="golden.jsonl",
+        golden_set_count=1,
+        story_count=1,
+        mode=mode,
+    )
+    defaults.update(kwargs)
+    return NewsletterRunMeta(**defaults)
 
 
 def _pred(
@@ -130,13 +171,16 @@ class TestTierMetrics:
         assert abs(m["per_class"]["good"]["precision"] - 0.5) < 1e-9
 
     def test_parse_failure_counted_as_error_excluded_from_matrix(self):
+        # parse failure: quality was attempted (scores_raw captured) but
+        # predicted_scores is None -> error, excluded from matrix.
+        # A stray predicted_tier is present but must be ignored because scores
+        # failed to parse (guards exclusion-by-None-scores, not by None-tier).
+        failed = _pred(predicted_scores=None, expected_tier="good", predicted_tier="good")
+        failed.scores_raw = "garbage the parser rejected"
         results = [
             _pred(predicted_scores={"simple": 5}, expected_tier="excellent",
                   predicted_tier="excellent"),
-            # parse failure: predicted_scores is None -> error, excluded from matrix.
-            # A stray predicted_tier is present but must be ignored because scores
-            # failed to parse (guards exclusion-by-None-scores, not by None-tier).
-            _pred(predicted_scores=None, expected_tier="good", predicted_tier="good"),
+            failed,
         ]
         m = compute_tier_metrics(results)
         assert m["errors"] == 1
@@ -292,6 +336,602 @@ class TestExtractionMetrics:
         assert abs(m["macro_recall"] - 1.0) < 1e-9
 
 
+
+
+class TestMatchStoriesUsesText:
+    def test_vague_title_verbatim_text_still_matches(self):
+        # The mangle scenario: the model invents a vague title but the extracted
+        # text is a verbatim span of the golden story. Matching must be on TEXT,
+        # not title wording.
+        golden_text = ("Priya's junior year started with a broken ankle and a "
+                       "cancelled semester abroad, and she joined our Thursday "
+                       "study out of boredom and stayed out of conviction.")
+        predicted = [{"title": "Ministry Moments", "text": golden_text}]
+        golden = [{"story_id": "g:2", "title": "Priya's Injury and the Thursday Study",
+                   "text": golden_text}]
+        matched, _, _ = match_stories(predicted, golden)
+        assert matched == 1
+
+    def test_copied_title_garbled_text_does_not_match(self):
+        # Converse: a plausible copied title must not mask a garbled text span.
+        predicted = [{"title": "Marcus the Skeptic",
+                      "text": "completely unrelated words about the annual budget"}]
+        golden = [{"story_id": "g:0", "title": "Marcus the Skeptic",
+                   "text": "Marcus came to our Tuesday night dinner in January "
+                           "as a self-described skeptic and left praying aloud."}]
+        matched, _, _ = match_stories(predicted, golden)
+        assert matched == 0
+
+
+class TestMatchStoriesDetailed:
+    def test_reports_pairs_and_unmatched(self):
+        predicted = [
+            {"title": "P0", "text": "the quick brown fox jumped over the dog"},
+            {"title": "P1", "text": "a spurious donation appeal paragraph"},
+        ]
+        golden = [
+            {"story_id": "g:0", "title": "G0",
+             "text": "the quick brown fox jumped over the cat"},
+            {"story_id": "g:1", "title": "G1",
+             "text": "an entirely different account of the retreat weekend"},
+        ]
+        detail = match_stories_detailed(predicted, golden)
+        assert len(detail["matched"]) == 1
+        pair = detail["matched"][0]
+        assert pair["pred_index"] == 0
+        assert pair["gold_index"] == 0
+        assert 0.6 <= pair["ratio"] <= 1.0
+        assert detail["unmatched_predicted"] == [1]
+        assert detail["unmatched_golden"] == [1]
+
+    def test_respects_threshold(self):
+        predicted = [{"title": "", "text": "the quick brown fox"}]
+        golden = [{"story_id": "g:0", "title": "", "text": "an unrelated gardening story"}]
+        strict = match_stories_detailed(predicted, golden, threshold=0.9)
+        assert strict["matched"] == []
+        loose = match_stories_detailed(predicted, golden, threshold=0.0)
+        assert len(loose["matched"]) == 1
+
+
+class TestExtractionAbstention:
+    def test_correct_no_stories_scores_perfect(self):
+        # A newsletter with 0 predicted and 0 golden stories is a CORRECT
+        # abstention -> per-newsletter precision/recall 1.0, not 0.0.
+        nl_empty = ExtractionPrediction(thread_id="C", golden_stories=[],
+                                        predicted_stories=[])
+        nl_good = ExtractionPrediction(
+            thread_id="A",
+            golden_stories=[{"story_id": "A:0", "title": "", "text": "alpha faith"}],
+            predicted_stories=[{"title": "", "text": "alpha faith"}],
+        )
+        m = compute_extraction_metrics([nl_good, nl_empty])
+        assert m["macro_precision"] == 1.0
+        assert m["macro_recall"] == 1.0
+        empty_row = next(r for r in m["per_newsletter"] if r["thread_id"] == "C")
+        assert empty_row["precision"] == 1.0
+        assert empty_row["recall"] == 1.0
+
+    def test_empty_results_yield_none_not_zero(self):
+        m = compute_extraction_metrics([])
+        assert m["count"] == 0
+        for key in ("micro_precision", "micro_recall", "micro_f1",
+                    "macro_precision", "macro_recall", "macro_f1"):
+            assert m[key] is None
+
+
+class TestThemeMetricsGating:
+    def test_quality_parse_failure_does_not_drop_theme_row(self):
+        # Story with malformed quality response (predicted_scores None) but a
+        # perfectly parsed theme prediction must still count in theme metrics.
+        results = [
+            _pred(story_id="ok", expected_themes=["church"], predicted_themes=["church"],
+                  predicted_scores={"simple": 3}),
+        ]
+        failed = _pred(story_id="priya", expected_themes=["christlikeness"],
+                       predicted_themes=[], predicted_scores=None)
+        failed.themes_raw = "NONE"
+        results.append(failed)
+        m = compute_multilabel_metrics(results, THEMES)
+        assert m["count"] == 2
+        # christlikeness expected but not predicted -> FN -> recall 0
+        assert m["per_theme"]["christlikeness"]["recall"] == 0.0
+
+    def test_error_rows_still_excluded(self):
+        errored = _pred(story_id="down", expected_themes=["church"],
+                        error="connection refused")
+        m = compute_multilabel_metrics([errored], THEMES)
+        assert m["count"] == 0
+
+    def test_empty_scored_yields_none_not_zero(self):
+        m = compute_multilabel_metrics([], THEMES)
+        assert m["count"] == 0
+        for key in ("micro_precision", "micro_recall", "micro_f1", "macro_f1"):
+            assert m[key] is None
+        assert m["exact_set_match"] is None
+
+
+class TestTierErrorStories:
+    def test_error_story_ids_listed(self):
+        failed = _pred(story_id="t:2", predicted_scores=None, expected_tier="good")
+        failed.scores_raw = "unparseable quality response"
+        results = [
+            _pred(story_id="fine", predicted_scores={"simple": 3},
+                  expected_tier="good", predicted_tier="good"),
+            failed,
+        ]
+        m = compute_tier_metrics(results)
+        assert m["errors"] == 1
+        assert m["error_stories"] == ["t:2"]
+
+
+class TestTierQualityNotAttempted:
+    def test_themes_mode_rows_are_skipped_not_errors(self):
+        # A --mode themes run never attempts the quality call: error=None AND
+        # scores_raw=None. Those rows are "quality not attempted", not parse
+        # failures — the tier section must not render as "0 stories, N errors".
+        row = _pred(story_id="t:0", expected_tier="good",
+                    expected_themes=["church"], predicted_themes=["church"])
+        row.themes_raw = "CHURCH"
+        m = compute_tier_metrics([row])
+        assert m["errors"] == 0
+        assert m["error_stories"] == []
+        assert m["count"] == 0
+
+    def test_network_error_rows_still_count_as_errors(self):
+        # error rows have scores_raw=None too, but must stay errors.
+        m = compute_tier_metrics([
+            _pred(story_id="down", expected_tier="good", error="connection refused"),
+        ])
+        assert m["errors"] == 1
+        assert m["error_stories"] == ["down"]
+
+    def test_verbose_failures_section_excludes_not_attempted(self, capsys):
+        row = _pred(story_id="t:0", expected_themes=["church"],
+                    predicted_themes=["church"])
+        row.themes_raw = "CHURCH"
+        metrics = compute_all_metrics([row])
+        print_report(_meta(mode="themes"), metrics, verbose=True, story_results=[row])
+        out = capsys.readouterr().out
+        assert "Parse/Network Failures" not in out
+
+
+class TestThemeParseAnomalies:
+    def test_invalid_token_and_empty_parse_detected(self):
+        marcus = _pred(story_id="g:0", predicted_themes=["church"],
+                       predicted_scores={"simple": 3})
+        marcus.themes_raw = "FELLOWSHIP\nCHURCH"
+        alina = _pred(story_id="g:1", predicted_themes=[],
+                      predicted_scores={"simple": 3})
+        alina.themes_raw = "The themes of hope and belonging shine through this piece."
+        clean_none = _pred(story_id="g:2", predicted_themes=[],
+                           predicted_scores={"simple": 3})
+        clean_none.themes_raw = "NONE"
+        clean = _pred(story_id="g:3", predicted_themes=["scripture"],
+                      predicted_scores={"simple": 3})
+        clean.themes_raw = "SCRIPTURE"
+        anomalies = theme_parse_anomalies([marcus, alina, clean_none, clean])
+        by_id = {a["story_id"]: a for a in anomalies}
+        assert set(by_id) == {"g:0", "g:1"}
+        assert by_id["g:0"]["kind"] == "invalid_tokens"
+        assert by_id["g:0"]["invalid_tokens"] == ["FELLOWSHIP"]
+        assert by_id["g:1"]["kind"] == "empty_parse"
+        assert by_id["g:1"]["themes_raw"].startswith("The themes")
+
+    def test_rows_without_raw_are_skipped(self):
+        # Legacy rows / error rows carry no themes_raw -> no anomaly.
+        anomalies = theme_parse_anomalies([_pred(story_id="x", predicted_themes=[])])
+        assert anomalies == []
+
+
+class TestComputeAllMetricsBundleKeys:
+    def test_story_count_and_anomalies_present(self):
+        m = compute_all_metrics([], [])
+        assert m["story_count"] == 0
+        assert m["theme_anomalies"] == []
+
+
+class TestPrintReportSections:
+    def _extraction_only_metrics(self):
+        extraction = [
+            ExtractionPrediction(
+                thread_id="A",
+                golden_stories=[{"story_id": "A:0", "title": "", "text": "alpha faith"}],
+                predicted_stories=[{"title": "", "text": "alpha faith"}],
+            ),
+        ]
+        return compute_all_metrics([], extraction), extraction
+
+    def test_extraction_only_run_omits_quality_and_theme_sections(self, capsys):
+        metrics, _ = self._extraction_only_metrics()
+        print_report(_meta(mode="extraction"), metrics)
+        out = capsys.readouterr().out
+        assert "Themes (multi-label)" not in out
+        assert "Quality Dimensions" not in out
+        assert "Extraction" in out
+
+    def test_header_shows_golden_set_path(self, capsys):
+        metrics, _ = self._extraction_only_metrics()
+        print_report(_meta(golden_set_path="/data/golden.jsonl"), metrics)
+        out = capsys.readouterr().out
+        assert "/data/golden.jsonl" in out
+
+    def test_extraction_section_shows_count_and_threshold(self, capsys):
+        metrics, extraction = self._extraction_only_metrics()
+        print_report(_meta(), metrics, extraction_results=extraction,
+                     match_threshold=0.4)
+        out = capsys.readouterr().out
+        assert "1 newsletter" in out
+        assert "0.4" in out
+
+    def test_single_error_pluralized_and_named(self, capsys):
+        failed = _pred(story_id="t:2", predicted_scores=None, expected_tier="good")
+        failed.scores_raw = "unparseable quality response"
+        story_results = [
+            _pred(story_id="ok", predicted_scores={"simple": 3},
+                  expected_tier="good", predicted_tier="good"),
+            failed,
+        ]
+        metrics = compute_all_metrics(story_results)
+        print_report(_meta(), metrics, story_results=story_results)
+        out = capsys.readouterr().out
+        assert "1 error)" in out
+        assert "1 errors" not in out
+        assert "t:2" in out  # the failing story is named
+
+    def test_story_count_pluralizes_as_stories(self, capsys):
+        story_results = [
+            _pred(story_id=f"s{i}", predicted_scores={"simple": 3},
+                  expected_tier="good", predicted_tier="good")
+            for i in range(2)
+        ]
+        metrics = compute_all_metrics(story_results)
+        print_report(_meta(), metrics, story_results=story_results)
+        out = capsys.readouterr().out
+        assert "2 stories" in out
+        assert "storys" not in out
+
+    def test_theme_anomaly_count_shown(self, capsys):
+        row = _pred(story_id="g:0", predicted_themes=["church"],
+                    predicted_scores={"simple": 3})
+        row.themes_raw = "FELLOWSHIP\nCHURCH"
+        metrics = compute_all_metrics([row])
+        print_report(_meta(), metrics, story_results=[row])
+        out = capsys.readouterr().out
+        assert "anomal" in out.lower()
+
+
+class TestPrintReportVerbose:
+    def _mangled_extraction(self):
+        return ExtractionPrediction(
+            thread_id="thread-g",
+            golden_stories=[
+                {"story_id": "g:0", "title": "Marcus the Skeptic",
+                 "text": "Marcus came to dinner as a skeptic and left praying aloud."},
+                {"story_id": "g:1", "title": "Nine Freshmen",
+                 "text": "Nine freshmen showed up to the cookout with no idea."},
+            ],
+            predicted_stories=[
+                {"title": "Supporting the Mission",
+                 "text": "Would you consider a year-end gift to keep this going?"},
+            ],
+        )
+
+    def test_verbose_lists_unmatched_titles(self, capsys):
+        extraction = [self._mangled_extraction()]
+        metrics = compute_all_metrics([], extraction)
+        print_report(_meta(mode="extraction"), metrics, verbose=True,
+                     extraction_results=extraction)
+        out = capsys.readouterr().out
+        assert "Supporting the Mission" in out  # unmatched predicted title
+        assert "Marcus the Skeptic" in out  # unmatched golden title
+        assert "Nine Freshmen" in out
+
+    def test_verbose_lists_matched_pairs_with_ratio_on_mismatch(self, capsys):
+        extraction = [
+            ExtractionPrediction(
+                thread_id="t",
+                golden_stories=[
+                    {"story_id": "t:0", "title": "G0",
+                     "text": "the quick brown fox jumped over the lazy dog"},
+                    {"story_id": "t:1", "title": "G1",
+                     "text": "a wholly different story about the retreat"},
+                ],
+                predicted_stories=[
+                    {"title": "P0",
+                     "text": "the quick brown fox jumped over the lazy cat"},
+                ],
+            ),
+        ]
+        metrics = compute_all_metrics([], extraction)
+        print_report(_meta(mode="extraction"), metrics, verbose=True,
+                     extraction_results=extraction)
+        out = capsys.readouterr().out
+        assert "P0" in out and "G0" in out  # the matched pair is shown
+        assert "0.9" in out  # its ratio
+
+    def test_verbose_diffs_respect_match_threshold(self, capsys):
+        # At a permissive threshold everything matches; the diff lines must
+        # agree with the headline metrics computed at the same threshold.
+        extraction = [self._mangled_extraction()]
+        metrics = compute_all_metrics([], extraction, match_threshold=0.0)
+        print_report(_meta(mode="extraction"), metrics, verbose=True,
+                     extraction_results=extraction, match_threshold=0.0)
+        out = capsys.readouterr().out
+        assert "matched=1" in out
+
+    def test_verbose_lists_parse_failures_with_raw(self, capsys):
+        failed = _pred(story_id="g:2", predicted_scores=None, expected_tier="good")
+        failed.scores_raw = "SIMPLE: 4\nCONCRETE: 4\nPERSONAL: 5"
+        metrics = compute_all_metrics([failed])
+        print_report(_meta(), metrics, verbose=True, story_results=[failed])
+        out = capsys.readouterr().out
+        assert "g:2" in out
+        assert "SIMPLE: 4" in out
+
+    def test_verbose_disagreements_include_quality_parse_failure_with_theme_diff(
+        self, capsys,
+    ):
+        # Quality parse failed but themes parsed fine and disagree -> the story
+        # must still appear in Story Disagreements.
+        failed = _pred(story_id="g:2", predicted_scores=None,
+                       expected_themes=["christlikeness"], predicted_themes=[])
+        failed.themes_raw = "NONE"
+        metrics = compute_all_metrics([failed])
+        print_report(_meta(), metrics, verbose=True, story_results=[failed])
+        out = capsys.readouterr().out
+        section = out.split("Story Disagreements")[1]
+        assert "g:2" in section
+        assert "christlikeness" in section
+
+    def test_verbose_shows_theme_anomaly_raw(self, capsys):
+        row = _pred(story_id="g:1", predicted_themes=[],
+                    predicted_scores={"simple": 3})
+        row.themes_raw = "The themes of hope and belonging shine through."
+        metrics = compute_all_metrics([row])
+        print_report(_meta(), metrics, verbose=True, story_results=[row])
+        out = capsys.readouterr().out
+        assert "hope and belonging" in out
+
+    def test_verbose_disagreements_show_titles_from_golden_set(self, tmp_path, capsys):
+        golden = tmp_path / "golden.jsonl"
+        golden.write_text(json.dumps({
+            "type": "golden_newsletter", "thread_id": "t", "message_id": "m",
+            "sender": "s", "subject": "subj", "body": "b",
+            "stories": [{"story_id": "t:1", "title": "Alina at the Welcome Table",
+                         "text": "x"}],
+        }) + "\n")
+        row = _pred(story_id="t:1", predicted_scores={"simple": 3},
+                    expected_tier="good", predicted_tier="fair")
+        metrics = compute_all_metrics([row])
+        print_report(_meta(golden_set_path=str(golden)), metrics, verbose=True,
+                     story_results=[row])
+        out = capsys.readouterr().out
+        assert "Alina at the Welcome Table" in out
+
+
+class TestLoadStoryTitles:
+    def test_reads_titles_by_story_id(self, tmp_path):
+        golden = tmp_path / "golden.jsonl"
+        golden.write_text(json.dumps({
+            "type": "golden_newsletter", "thread_id": "t", "message_id": "m",
+            "sender": "s", "subject": "subj", "body": "b",
+            "stories": [{"story_id": "t:0", "title": "Marcus", "text": "x"}],
+        }) + "\n")
+        assert load_story_titles(str(golden)) == {"t:0": "Marcus"}
+
+    def test_missing_file_returns_empty(self):
+        assert load_story_titles("/nope/does-not-exist.jsonl") == {}
+
+
+class TestDimTableAlignment:
+    def test_data_rows_align_with_header(self):
+        mae = {d: 0.5 for d in ["simple", "concrete", "personal", "dynamic"]}
+        exact = {d: 0.5 for d in mae}
+        within = {d: 1.0 for d in mae}
+        lines = _format_dim_table(mae, exact, within).splitlines()
+        header, first_row = lines[0], lines[2]
+        # The MAE column must start at the same offset in header and data rows.
+        assert first_row.index("0.50") == header.index("MAE")
+
+
+class TestPrintComparisonModes:
+    def _story_metrics(self):
+        results = [
+            _pred(story_id="s", predicted_scores={"simple": 3},
+                  expected_tier="good", predicted_tier="good",
+                  expected_themes=["church"], predicted_themes=["church"]),
+        ]
+        return compute_all_metrics(results)
+
+    def _extraction_metrics(self):
+        extraction = [
+            ExtractionPrediction(
+                thread_id="A",
+                golden_stories=[{"story_id": "A:0", "title": "", "text": "alpha faith"}],
+                predicted_stories=[{"title": "", "text": "alpha faith"}],
+            ),
+        ]
+        return compute_all_metrics([], extraction)
+
+    def test_header_shows_each_runs_mode(self, capsys):
+        m = self._story_metrics()
+        print_comparison(_meta(mode="quality"), m, _meta(mode="quality"), m)
+        out = capsys.readouterr().out
+        header = out.split("--- Tier ---")[0]
+        assert "mode=quality" in header
+
+    def test_mode_mismatch_warns(self, capsys):
+        print_comparison(
+            _meta(mode="quality"), self._story_metrics(),
+            _meta(mode="extraction"), self._extraction_metrics(),
+        )
+        out = capsys.readouterr().out
+        assert "WARNING" in out
+        assert "quality" in out and "extraction" in out
+
+    def test_same_mode_does_not_warn(self, capsys):
+        m = self._story_metrics()
+        print_comparison(_meta(mode="quality"), m, _meta(mode="quality"), m)
+        assert "WARNING" not in capsys.readouterr().out
+
+    def test_empty_sections_render_na_not_minus_100pct(self, capsys):
+        # Quality-mode run A vs extraction-mode run B: B has no tier/theme data,
+        # so per-class F1 and theme F1 must be N/A, never a -100.0% "regression".
+        print_comparison(
+            _meta(mode="quality"), self._story_metrics(),
+            _meta(mode="extraction"), self._extraction_metrics(),
+        )
+        out = capsys.readouterr().out
+        assert "-100.0%" not in out
+        # e.g. the "good F1" row: Run A 100%, Run B N/A, delta N/A
+        good_row = next(ln for ln in out.splitlines() if "good F1" in ln)
+        assert "N/A" in good_row
+
+
+class TestTrendRows:
+    def _write_two_runs(self, tmp_path):
+        story = _pred(story_id="s", predicted_scores={"simple": 3},
+                      expected_tier="good", predicted_tier="good",
+                      predicted_themes=["church"], expected_themes=["church"])
+        # File names sort in the OPPOSITE order of their timestamps, so
+        # chronological ordering must come from run_meta.timestamp.
+        _write_results(
+            tmp_path / "a_newest.jsonl",
+            _meta(run_id="b" * 16, timestamp="2026-07-02T00:00:00+00:00",
+                  prompt_hash="hash-newer", tag="newer"),
+            [story],
+        )
+        _write_results(
+            tmp_path / "z_oldest.jsonl",
+            _meta(run_id="a" * 16, timestamp="2026-07-01T00:00:00+00:00",
+                  prompt_hash="hash-older", tag="older"),
+            [story],
+        )
+
+    def test_rows_sorted_chronologically_with_timestamp_and_prompt_hash(self, tmp_path):
+        self._write_two_runs(tmp_path)
+        rows, errors = build_trend_rows(tmp_path)
+        assert errors == []
+        assert [r["timestamp"] for r in rows] == [
+            "2026-07-01T00:00:00+00:00", "2026-07-02T00:00:00+00:00",
+        ]
+        assert rows[0]["prompt_hash"] == "hash-older"
+        assert rows[0]["tier_accuracy"] == 1.0
+
+    def test_print_trend_has_timestamp_column_in_order(self, tmp_path, capsys):
+        self._write_two_runs(tmp_path)
+        print_trend(tmp_path)
+        out = capsys.readouterr().out
+        assert "Timestamp" in out
+        assert out.index("older") < out.index("newer")
+
+
+class TestCliJsonAndErrors:
+    def _write_run(self, path, **meta_kwargs):
+        story = _pred(story_id="s", predicted_scores={"simple": 3},
+                      expected_tier="good", predicted_tier="good",
+                      predicted_themes=["church"], expected_themes=["church"])
+        _write_results(path, _meta(**meta_kwargs), [story])
+
+    def test_compare_format_json_emits_json(self, tmp_path, monkeypatch, capsys):
+        a, b = tmp_path / "a.jsonl", tmp_path / "b.jsonl"
+        self._write_run(a, run_id="a" * 16)
+        self._write_run(b, run_id="b" * 16)
+        monkeypatch.setattr(sys, "argv", [
+            "newsletter_report", "--compare", str(a), str(b), "--format", "json",
+        ])
+        cli()
+        data = json.loads(capsys.readouterr().out)
+        assert data["run_a"]["meta"]["run_id"] == "a" * 16
+        assert data["run_b"]["metrics"]["tier"]["accuracy"] == 1.0
+
+    def test_results_dir_format_json_emits_json(self, tmp_path, monkeypatch, capsys):
+        self._write_run(tmp_path / "r.jsonl")
+        monkeypatch.setattr(sys, "argv", [
+            "newsletter_report", "--results-dir", str(tmp_path), "--format", "json",
+        ])
+        cli()
+        data = json.loads(capsys.readouterr().out)
+        assert isinstance(data, list)
+        assert data[0]["run_id"] == "abcdef0123456789"
+
+    def test_results_dir_verbose_warns_it_is_unsupported(self, tmp_path, monkeypatch, capsys):
+        self._write_run(tmp_path / "r.jsonl")
+        monkeypatch.setattr(sys, "argv", [
+            "newsletter_report", "--results-dir", str(tmp_path), "--verbose",
+        ])
+        cli()
+        assert "--verbose" in capsys.readouterr().err
+
+    def test_missing_results_file_exits_cleanly(self, monkeypatch, capsys):
+        monkeypatch.setattr(sys, "argv", [
+            "newsletter_report", "--results", "/nope/missing.jsonl",
+        ])
+        with pytest.raises(SystemExit) as excinfo:
+            cli()
+        assert excinfo.value.code == 1
+        err = capsys.readouterr().err
+        assert "missing.jsonl" in err
+        assert "Traceback" not in err
+
+    def test_compare_ignores_cot_sidecars_from_globs(self, tmp_path, monkeypatch, capsys):
+        # The documented workflow globs *<tag>*.jsonl, which also matches the
+        # .cot.jsonl sidecar every thinking run writes. --compare must ignore
+        # sidecars and compare the two real results files.
+        a, b = tmp_path / "20260701_all_baseline_aaaa.jsonl", tmp_path / "20260702_all_variant_bbbb.jsonl"
+        self._write_run(a, run_id="a" * 16)
+        self._write_run(b, run_id="b" * 16)
+        a_cot = tmp_path / "20260701_all_baseline_aaaa.cot.jsonl"
+        b_cot = tmp_path / "20260702_all_variant_bbbb.cot.jsonl"
+        a_cot.write_text(json.dumps({"type": "thinking", "story_id": "s"}) + "\n")
+        b_cot.write_text(json.dumps({"type": "thinking", "story_id": "s"}) + "\n")
+        # Shell-glob expansion order: cot file sorts before its results file.
+        monkeypatch.setattr(sys, "argv", [
+            "newsletter_report", "--compare",
+            str(a_cot), str(a), str(b_cot), str(b),
+        ])
+        cli()
+        captured = capsys.readouterr()
+        assert "Newsletter Comparison Report" in captured.out
+        assert "aaaaaaaa" in captured.out
+        assert "bbbbbbbb" in captured.out
+        assert "sidecar" in captured.err  # tells the user what was skipped
+
+    def test_compare_errors_when_not_two_results_files_remain(
+        self, tmp_path, monkeypatch, capsys,
+    ):
+        a = tmp_path / "run_a.jsonl"
+        self._write_run(a, run_id="a" * 16)
+        cot = tmp_path / "run_a.cot.jsonl"
+        cot.write_text(json.dumps({"type": "thinking", "story_id": "s"}) + "\n")
+        monkeypatch.setattr(sys, "argv", [
+            "newsletter_report", "--compare", str(a), str(cot),
+        ])
+        with pytest.raises(SystemExit) as excinfo:
+            cli()
+        assert excinfo.value.code != 0
+        assert "Traceback" not in capsys.readouterr().err
+
+    def test_results_on_cot_sidecar_hints_at_main_file(self, tmp_path, monkeypatch, capsys):
+        cot = tmp_path / "run.cot.jsonl"
+        cot.write_text(json.dumps({"type": "thinking", "story_id": "s"}) + "\n")
+        monkeypatch.setattr(sys, "argv", ["newsletter_report", "--results", str(cot)])
+        with pytest.raises(SystemExit) as excinfo:
+            cli()
+        assert excinfo.value.code == 1
+        err = capsys.readouterr().err
+        assert "chain-of-thought sidecar" in err
+        assert "Traceback" not in err
+
+    def test_meta_less_file_exits_cleanly(self, tmp_path, monkeypatch, capsys):
+        bad = tmp_path / "no_meta.jsonl"
+        bad.write_text(json.dumps({"type": "story_prediction", "story_id": "s",
+                                   "thread_id": "t"}) + "\n")
+        monkeypatch.setattr(sys, "argv", ["newsletter_report", "--results", str(bad)])
+        with pytest.raises(SystemExit) as excinfo:
+            cli()
+        assert excinfo.value.code == 1
+        assert "no_meta.jsonl" in capsys.readouterr().err
 
 
 class TestComparisonDeltaSign:

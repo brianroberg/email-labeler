@@ -292,6 +292,45 @@ class TestCorruptCacheFile:
         inner2.complete.assert_not_awaited()
 
 
+    async def test_current_entry_with_empty_thinking_is_a_hit(self, tmp_path: Path):
+        """An entry written by current code with thinking='' (model emitted no
+        <think> block) must be a cache hit under include_thinking=True — not a
+        legacy entry to re-fetch. Otherwise every terse response (NO_STORIES,
+        'NONE' themes) is re-billed on every run and re-appended to disk."""
+        cache_path = tmp_path / "cache.jsonl"
+
+        inner1 = _make_inner()
+        _set_return(inner1, "NO_STORIES", "")  # legitimately no thinking
+        cached1 = CachedLLMClient(inner1, cache_path)
+        await cached1.complete("sys", "usr", include_thinking=True)
+        cached1.flush()
+
+        inner2 = _make_inner()
+        cached2 = CachedLLMClient(inner2, cache_path)
+        response, thinking = await cached2.complete("sys", "usr", include_thinking=True)
+
+        assert response == "NO_STORIES"
+        assert thinking == ""
+        assert cached2.hits == 1
+        assert cached2.misses == 0
+        inner2.complete.assert_not_awaited()
+        # No duplicate entry appended to the cache file
+        cached2.flush()
+        assert len(cache_path.read_text().strip().splitlines()) == 1
+
+    async def test_same_session_empty_thinking_is_a_hit(self, tmp_path: Path):
+        """Within one session, a miss that returned no thinking must not
+        re-fire the LLM on the next include_thinking=True call."""
+        inner = _make_inner()
+        _set_return(inner, "NONE", "")
+        cached = CachedLLMClient(inner, tmp_path / "cache.jsonl")
+
+        await cached.complete("sys", "usr", include_thinking=True)  # miss
+        await cached.complete("sys", "usr", include_thinking=True)  # must hit
+
+        assert inner.complete.await_count == 1
+        assert cached.hits == 1
+
     async def test_old_cache_with_unstripped_double_bracket_think(self, tmp_path: Path):
         """Cache entries with <<think>> blocks in response are normalized on load."""
         cache_path = tmp_path / "cache.jsonl"
