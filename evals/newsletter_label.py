@@ -43,12 +43,12 @@ from textual import work
 from textual.app import App, ComposeResult
 from textual.binding import Binding
 from textual.screen import Screen
-from textual.widgets import Input, Label, ListItem, ListView, Static
+from textual.widgets import Label, ListItem, ListView, Static
 
 from evals import plural
 from evals.newsletter_schemas import GoldenNewsletter, GoldenStory
 from newsletter import compute_tier, parse_stories
-from tui_common import BottomModal, HintScreen, PageListView
+from tui_common import BottomModal, HintScreen, PageListView, PromptLineScreen
 
 _DIMENSIONS = ("simple", "concrete", "personal", "dynamic")
 
@@ -626,35 +626,6 @@ def build_detail_rows(newsletter, index, total, width) -> list[tuple[str, int | 
 # ---------------------------------------------------------------------------
 
 _MAX_UNDO = 100  # bound the per-newsletter undo stack
-
-
-class PromptLineScreen(BottomModal):
-    """One-line text prompt with prefill. Dismisses stripped text, None on Esc.
-
-    Prefills with *initial* (edit the current value instead of retyping it
-    blind); Input rejects control characters, so a stray Esc can't pollute
-    the golden set.
-    """
-
-    BINDINGS = [Binding("escape", "cancel", "Cancel")]
-
-    def __init__(self, prompt: str, initial: str = "") -> None:
-        super().__init__()
-        self._prompt = prompt
-        self._initial = initial
-
-    def compose(self) -> ComposeResult:
-        yield Static(self._prompt, markup=False)
-        yield Input(value=self._initial, id="prompt-input")
-
-    def on_mount(self) -> None:
-        self.query_one(Input).focus()
-
-    def on_input_submitted(self, event: Input.Submitted) -> None:
-        self.dismiss(event.value.strip())
-
-    def action_cancel(self) -> None:
-        self.dismiss(None)
 
 
 class ConfirmScreen(BottomModal):

@@ -11,7 +11,7 @@ Conventions (issue #43):
 from textual.app import ComposeResult
 from textual.binding import Binding
 from textual.screen import ModalScreen
-from textual.widgets import ListView, Static
+from textual.widgets import Input, ListView, Static
 
 CANCEL = "cancel"  # dismissal sentinel distinct from None (None = "clear")
 
@@ -69,6 +69,35 @@ class HintScreen(BottomModal):
 
     def on_key(self, event) -> None:
         event.stop()
+        self.dismiss(None)
+
+
+class PromptLineScreen(BottomModal):
+    """One-line text prompt with prefill. Dismisses stripped text, None on Esc.
+
+    Prefills with *initial* (edit the current value instead of retyping it
+    blind); Input rejects control characters, so a stray Esc can't pollute
+    the golden set.
+    """
+
+    BINDINGS = [Binding("escape", "cancel", "Cancel")]
+
+    def __init__(self, prompt: str, initial: str = "") -> None:
+        super().__init__()
+        self._prompt = prompt
+        self._initial = initial
+
+    def compose(self) -> ComposeResult:
+        yield Static(self._prompt, markup=False)
+        yield Input(value=self._initial, id="prompt-input")
+
+    def on_mount(self) -> None:
+        self.query_one(Input).focus()
+
+    def on_input_submitted(self, event: Input.Submitted) -> None:
+        self.dismiss(event.value.strip())
+
+    def action_cancel(self) -> None:
         self.dismiss(None)
 
 

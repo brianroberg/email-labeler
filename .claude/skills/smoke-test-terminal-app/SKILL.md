@@ -139,7 +139,10 @@ but don't commit it.
 > reusing this, or you'll send the wrong keystrokes after the next edit. That is
 > the whole reason this is a skill and not a saved script.
 
-The review tool (`python -m evals.review`) is a blind keypress loop using
+HISTORICAL EXAMPLE — the review tool has since been ported to Textual
+(issue #43), so today you would drive it with tmux capture-pane or Textual's
+Pilot instead; the pexpect method below still applies to plain-stdout prompt
+loops. At the time, `python -m evals.review` was a blind keypress loop using
 `readchar`; it reads/writes `golden_set.jsonl`. A driver that classifies one
 thread, skips one, and excludes one — then verifies the saved file and that the
 excluded thread drops out of the queue on a second run:

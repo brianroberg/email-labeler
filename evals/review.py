@@ -3,7 +3,7 @@
 Usage:
     python -m evals.review                    # blind mode (default)
     python -m evals.review --show-labels      # see existing labels
-    python -m evals.review --edit             # curses TUI for editing reviewed threads
+    python -m evals.review --edit             # TUI for editing reviewed threads
     python -m evals.review --stage 1          # review sender type only
     python -m evals.review --stage 2          # review label only
     python -m evals.review --unreviewed-only
@@ -18,10 +18,13 @@ import sys
 import tempfile
 from pathlib import Path
 
-import readchar
+from textual.app import App, ComposeResult
+from textual.containers import VerticalScroll
+from textual.widgets import Static
 
 from evals.schemas import GoldenThread
 from gmail_utils import decode_body
+from tui_common import CANCEL, KeyMenuScreen, PromptLineScreen
 
 SENDER_TYPES = ["person", "service"]
 LABELS = ["needs_response", "fyi", "low_priority"]
@@ -74,264 +77,322 @@ def save_golden_set(threads: list[GoldenThread], path: Path) -> None:
 
 
 # ---------------------------------------------------------------------------
-# Input helpers
+# Review session: cursor + one-snapshot-per-thread undo (no UI)
 # ---------------------------------------------------------------------------
 
-def get_hotkey() -> str:
-    """Read a single keypress without requiring Enter.
+class ReviewSession:
+    """Cursor + undo stack for the review queue, decoupled from the UI.
 
-    Returns a lowercase single character, or "" for Enter.
-    Returns "q" on EOF / KeyboardInterrupt / unexpected errors.
+    Undo is owned here, not in the key handlers: each thread gets exactly
+    one snapshot captured on entry, regardless of how the review mutates it
+    (confirm, classify, skip, exclude, notes).  This keeps the undo stack in
+    lock-step with the cursor — one advance pushes one snapshot — so a later
+    undo walks back one classification at a time without over-rewinding past
+    skips or leaving a half-applied blind-mode sender behind.
     """
-    try:
-        key = readchar.readkey()
-    except Exception:
-        return "q"
-    if key in ("\r", "\n"):
-        return ""
-    # Ignore multi-byte special keys (arrows, etc.)
-    if len(key) > 1:
-        return ""
-    return key.lower()
 
+    def __init__(self, threads: list[GoldenThread], *, start_at: int = 0):
+        self.threads = threads
+        self.index = start_at
+        self.undo_stack: list[dict] = []
+        self._entry = (
+            _capture_snapshot(threads[start_at], start_at) if start_at < len(threads) else None
+        )
 
-def prompt_hotkey_menu(header: str, options: list[tuple[str, str]]) -> str:
-    """Display a hotkey menu and return the pressed key.
+    @property
+    def done(self) -> bool:
+        return self.index >= len(self.threads)
 
-    *options* is a list of ``(key, description)`` tuples, e.g.
-    ``[("p", "person"), ("s", "service")]``.
-    """
-    menu = "  ".join(f"[{k}] {desc}" for k, desc in options)
-    print(f"\n{header}")
-    print(menu, end="", flush=True)
-    key = get_hotkey()
-    print()  # newline after keypress
-    return key
+    @property
+    def thread(self) -> GoldenThread:
+        return self.threads[self.index]
 
+    def advance(self) -> None:
+        """Record the pre-review snapshot of the current thread and move on."""
+        self.undo_stack.append(self._entry)
+        self.index += 1
+        if not self.done:
+            self._entry = _capture_snapshot(self.threads[self.index], self.index)
 
-def _prompt_sender_type() -> str | None:
-    """Hotkey sub-menu for sender type. Returns value or None on cancel."""
-    key = prompt_hotkey_menu("Select sender type:", [("p", "person"), ("s", "service")])
-    return _SENDER_KEY_MAP.get(key)
-
-
-def _prompt_label() -> str | None:
-    """Hotkey sub-menu for label. Returns value or None on cancel."""
-    key = prompt_hotkey_menu(
-        "Select label:", [("r", "needs_response"), ("f", "fyi"), ("l", "low_priority")]
-    )
-    return _LABEL_KEY_MAP.get(key)
-
-
-def _prompt_notes() -> str:
-    """Prompt for free-text notes (uses regular input with Enter)."""
-    try:
-        return input("Notes: ").strip()
-    except EOFError:
-        return ""
+    def undo(self) -> str:
+        """Discard in-progress edits, then step back to the previous decision."""
+        _restore_snapshot(self.threads, self._entry)
+        if not self.undo_stack:
+            return "  Nothing to undo."
+        self.index = _restore_snapshot(self.threads, self.undo_stack.pop())
+        self._entry = _capture_snapshot(self.threads[self.index], self.index)
+        return f"  <- Undone. Back to thread {self.index + 1}/{len(self.threads)}."
 
 
 # ---------------------------------------------------------------------------
-# Display
+# Display / menu builders (pure)
 # ---------------------------------------------------------------------------
 
-def display_thread(
+def build_review_lines(
     thread: GoldenThread, index: int, total: int, *, show_labels: bool = True, stage: int | None = None
-) -> None:
-    """Display a thread for review."""
-    print(f"\n{'=' * 60}")
-    print(f"Thread {index + 1}/{total}  (id: {thread.thread_id})")
-    print(f"{'=' * 60}")
-    print(f"Subject:  {thread.subject}")
-    print(f"Senders:  {', '.join(thread.senders)}")
-    print(f"Snippet:  {thread.snippet}")
-    print(f"Source:   {thread.source}")
-    print(f"Reviewed: {thread.reviewed}")
+) -> list[str]:
+    """Content lines for one thread under review."""
+    lines = [
+        "=" * 60,
+        f"Thread {index + 1}/{total}  (id: {thread.thread_id})",
+        "=" * 60,
+        f"Subject:  {thread.subject}",
+        f"Senders:  {', '.join(thread.senders)}",
+        f"Snippet:  {thread.snippet}",
+        f"Source:   {thread.source}",
+        f"Reviewed: {thread.reviewed}",
+    ]
     if thread.notes:
-        print(f"Notes:    {thread.notes}")
-
-    # Body
-    print("\n--- Body ---")
+        lines.append(f"Notes:    {thread.notes}")
+    lines.append("")
+    lines.append("--- Body ---")
     for i, msg in enumerate(thread.messages):
         body = decode_body(msg.get("payload", {}))
-        print(f"[Message {i + 1}] {body}")
-
+        lines.append(f"[Message {i + 1}] {body}")
     if show_labels:
-        print("\nCurrent labels:")
+        lines.append("")
+        lines.append("Current labels:")
         if stage != 2:
-            print(f"  Sender type: {thread.expected_sender_type}")
+            lines.append(f"  Sender type: {thread.expected_sender_type}")
         if stage != 1:
-            print(f"  Label:       {thread.expected_label}")
+            lines.append(f"  Label:       {thread.expected_label}")
+    return lines
+
+
+def build_menu(header: str, options: list[tuple[str, str]]) -> str:
+    """Menu legend, e.g. ``Actions:`` then ``[s] sender  [l] label ...``."""
+    return header + "\n" + "  ".join(f"[{k}] {desc}" for k, desc in options)
+
+
+_QUEUE_OPTIONS = [("n", "notes"), ("z", "undo"), ("k", "skip"), ("e", "exclude"), ("q", "quit")]
 
 
 # ---------------------------------------------------------------------------
-# Normal review mode (one thread at a time)
+# Textual UI layer
 # ---------------------------------------------------------------------------
 
-def review_thread_normal(
-    thread: GoldenThread, index: int, total: int, *, stage: int | None = None,
-) -> str:
-    """Normal review: show labels, prompt for action.
+class ReviewApp(App):
+    """Sequential golden-set review: one thread at a time, blind or normal.
 
-    When *stage* is ``1``, only show/allow editing sender type.
-    When *stage* is ``2``, only show/allow editing label.
-
-    Returns ``"advance"``, ``"quit"``, ``"back"``, or ``"stay"``.  Undo
-    snapshots are owned by :func:`review_loop` (one per thread), so this
-    function only mutates *thread* and never touches the undo stack.
+    Key handling mirrors the old readchar loop: single lowercase hotkeys,
+    Enter confirms in normal mode.  Deliberate change from readchar: arrow /
+    page keys scroll the thread body instead of acting like Enter.
     """
-    display_thread(thread, index, total, show_labels=True, stage=stage)
 
-    # Build action menu based on which stages are being reviewed
-    actions: list[tuple[str, str]] = [("", "confirm")]
-    if stage != 2:
-        actions.append(("s", "sender"))
-    if stage != 1:
-        actions.append(("l", "label"))
-    actions.extend([("n", "notes"), ("z", "undo"), ("k", "skip"), ("e", "exclude"), ("q", "quit")])
+    DEFAULT_CSS = """
+    ReviewApp #review-scroll {
+        height: 1fr;
+    }
+    ReviewApp #status {
+        color: $text-muted;
+    }
+    """
 
-    while True:
-        key = prompt_hotkey_menu("Actions:", actions)
+    def __init__(self, threads, *, start_at: int = 0, blind: bool = False, stage: int | None = None):
+        super().__init__()
+        self.session = ReviewSession(threads, start_at=start_at)
+        self.blind = blind
+        self.stage = stage
+        self._step = "actions"  # "actions" (normal) | "sender" | "label" (blind)
 
-        if key == "" or key == "y":
-            thread.reviewed = True
-            return "advance"
+    def compose(self) -> ComposeResult:
+        yield VerticalScroll(Static(id="thread-content", markup=False), id="review-scroll")
+        yield Static(id="menu", markup=False)
+        yield Static(id="status", markup=False)
 
-        if key == "s" and stage != 2:
-            new_type = _prompt_sender_type()
-            if new_type:
-                thread.expected_sender_type = new_type
-                print(f"  -> Sender type set to: {new_type}")
-                thread.reviewed = True
-                return "advance"
-            continue  # cancelled — re-show menu
+    def on_mount(self) -> None:
+        self._show_thread()
 
-        if key == "l" and stage != 1:
-            new_label = _prompt_label()
-            if new_label:
-                thread.expected_label = new_label
-                print(f"  -> Label set to: {new_label}")
-                thread.reviewed = True
-                return "advance"
-            continue  # cancelled — re-show menu
+    # -- rendering -----------------------------------------------------------
 
-        if key == "n":
-            thread.notes = _prompt_notes()
-            print("  -> Notes saved. (Thread not yet confirmed — press Enter to confirm)")
-            continue  # re-show action menu (thread already displayed)
+    def _show_thread(self) -> None:
+        self._refresh_content()
+        self.query_one("#review-scroll", VerticalScroll).scroll_home(animate=False)
+        if self.blind:
+            self._step = "label" if self.stage == 2 else "sender"
+        else:
+            self._step = "actions"
+        self._refresh_menu()
 
-        if key == "z":
-            return "back"
+    def _refresh_content(self) -> None:
+        s = self.session
+        lines = build_review_lines(
+            s.thread, s.index, len(s.threads), show_labels=not self.blind, stage=self.stage
+        )
+        self.query_one("#thread-content", Static).update("\n".join(lines))
 
-        if key == "k":
-            # Temporary skip: render no judgment; resurfaces in a later review.
-            print("  -> Skipped (no judgment).")
-            return "advance"
+    def _refresh_menu(self) -> None:
+        if self._step == "actions":
+            actions: list[tuple[str, str]] = [("", "confirm")]
+            if self.stage != 2:
+                actions.append(("s", "sender"))
+            if self.stage != 1:
+                actions.append(("l", "label"))
+            actions.extend(_QUEUE_OPTIONS)
+            menu = build_menu("Actions:", actions)
+        elif self._step == "sender":
+            menu = build_menu("Sender type:", [("p", "person"), ("s", "service")] + _QUEUE_OPTIONS)
+        else:
+            menu = build_menu(
+                "Label:",
+                [("r", "needs_response"), ("f", "fyi"), ("l", "low_priority")] + _QUEUE_OPTIONS,
+            )
+        self.query_one("#menu", Static).update(menu)
 
-        if key == "e":
+    def _status(self, msg: str) -> None:
+        self.query_one("#status", Static).update(msg)
+
+    # -- queue movement --------------------------------------------------------
+
+    def _advance(self) -> None:
+        self.session.advance()
+        if self.session.done:
+            self.exit("done")
+        else:
+            self._show_thread()
+
+    def _undo(self) -> None:
+        msg = self.session.undo()
+        self._show_thread()
+        self._status(msg)
+
+    # -- key dispatch ------------------------------------------------------------
+
+    def on_key(self, event) -> None:
+        if self.screen is not self.screen_stack[0]:
+            return  # a modal (submenu / notes) owns the keys
+        key = event.key
+        if key == "enter":
+            hot = ""
+        elif len(key) == 1:
+            hot = key.lower()
+        else:
+            scroll = self.query_one("#review-scroll", VerticalScroll)
+            if key == "up":
+                scroll.scroll_relative(y=-1, animate=False)
+            elif key == "down":
+                scroll.scroll_relative(y=1, animate=False)
+            elif key == "pageup":
+                scroll.scroll_page_up(animate=False)
+            elif key == "pagedown":
+                scroll.scroll_page_down(animate=False)
+            elif key == "home":
+                scroll.scroll_home(animate=False)
+            elif key == "end":
+                scroll.scroll_end(animate=False)
+            return
+        self._status("")
+        if self._step == "actions":
+            self._handle_actions(hot)
+        elif self._step == "sender":
+            self._handle_sender(hot)
+        else:
+            self._handle_label(hot)
+
+    def _handle_queue_keys(self, hot: str, invalid_prefix: str) -> None:
+        """The n/z/k/e/q keys shared by every prompt."""
+        thread = self.session.thread
+        if hot == "n":
+            self._edit_notes()
+        elif hot == "z":
+            self._undo()
+        elif hot == "k":
+            self._status("  -> Skipped (no judgment).")
+            self._advance()
+        elif hot == "e":
             thread.excluded = True
             thread.reviewed = True
-            print("  -> Thread excluded (permanently set aside).")
-            return "advance"
+            self._status("  -> Thread excluded (permanently set aside).")
+            self._advance()
+        elif hot == "q":
+            self.exit("quit")
+        else:
+            self._status(f"  {invalid_prefix}: {hot!r}")
 
-        if key == "q":
-            return "quit"
+    def _handle_actions(self, hot: str) -> None:
+        thread = self.session.thread
+        if hot in ("", "y"):
+            thread.reviewed = True
+            self._advance()
+        elif hot == "s" and self.stage != 2:
+            def apply(result) -> None:
+                if result != CANCEL:
+                    thread.expected_sender_type = result
+                    thread.reviewed = True
+                    self._status(f"  -> Sender type set to: {result}")
+                    self._advance()
 
-        print(f"  Unknown action: {key!r}")
-
-
-# ---------------------------------------------------------------------------
-# Blind review mode
-# ---------------------------------------------------------------------------
-
-def review_thread_blind(
-    thread: GoldenThread, index: int, total: int, *, stage: int | None = None,
-) -> str:
-    """Blind review: hide labels, prompt sender type then label.
-
-    When *stage* is ``1``, only prompt for sender type.
-    When *stage* is ``2``, only prompt for label.
-
-    Returns ``"advance"``, ``"quit"``, ``"back"``, or ``"stay"``.  Undo
-    snapshots are owned by :func:`review_loop` (one per thread); a ``"back"``
-    here reverts the whole thread, so the sender/label steps never need their
-    own snapshots.
-    """
-    display_thread(thread, index, total, show_labels=False)
-
-    # Step 1: sender type
-    if stage != 2:
-        while True:
-            key = prompt_hotkey_menu(
-                "Sender type:",
-                [
-                    ("p", "person"), ("s", "service"), ("n", "notes"), ("z", "undo"),
-                    ("k", "skip"), ("e", "exclude"), ("q", "quit"),
-                ],
+            self.push_screen(
+                KeyMenuScreen(
+                    "Select sender type:  [p] person  [s] service  (other key cancels)",
+                    _SENDER_KEY_MAP,
+                ),
+                apply,
             )
-            if key in _SENDER_KEY_MAP:
-                thread.expected_sender_type = _SENDER_KEY_MAP[key]
-                print(f"  -> {thread.expected_sender_type}")
-                break
-            if key == "z":
-                return "back"
-            if key == "n":
-                thread.notes = _prompt_notes()
-                print("  -> Notes saved.")
-                continue
-            if key == "k":
-                print("  -> Skipped (no judgment).")
-                return "advance"
-            if key == "e":
-                thread.excluded = True
-                thread.reviewed = True
-                print("  -> Thread excluded (permanently set aside).")
-                return "advance"
-            if key == "q":
-                return "quit"
-            print(f"  Invalid key: {key!r}")
+        elif hot == "l" and self.stage != 1:
+            def apply(result) -> None:
+                if result != CANCEL:
+                    thread.expected_label = result
+                    thread.reviewed = True
+                    self._status(f"  -> Label set to: {result}")
+                    self._advance()
 
-    # Step 2: label
-    if stage != 1:
-        while True:
-            key = prompt_hotkey_menu(
-                "Label:",
-                [
-                    ("r", "needs_response"), ("f", "fyi"), ("l", "low_priority"),
-                    ("n", "notes"), ("z", "undo"), ("k", "skip"), ("e", "exclude"), ("q", "quit"),
-                ],
+            self.push_screen(
+                KeyMenuScreen(
+                    "Select label:  [r] needs_response  [f] fyi  [l] low_priority"
+                    "  (other key cancels)",
+                    _LABEL_KEY_MAP,
+                ),
+                apply,
             )
-            if key in _LABEL_KEY_MAP:
-                thread.expected_label = _LABEL_KEY_MAP[key]
+        else:
+            self._handle_queue_keys(hot, "Unknown action")
+
+    def _handle_sender(self, hot: str) -> None:
+        thread = self.session.thread
+        if hot in _SENDER_KEY_MAP:
+            thread.expected_sender_type = _SENDER_KEY_MAP[hot]
+            self._status(f"  -> {thread.expected_sender_type}")
+            if self.stage == 1:
                 thread.reviewed = True
-                print(f"  -> Classified as {thread.expected_sender_type} / {thread.expected_label}")
-                return "advance"
-            if key == "n":
-                thread.notes = _prompt_notes()
-                print("  -> Notes saved.")
-                continue
-            if key == "z":
-                return "back"
-            if key == "k":
-                print("  -> Skipped (no judgment).")
-                return "advance"
-            if key == "e":
-                thread.excluded = True
-                thread.reviewed = True
-                print("  -> Thread excluded (permanently set aside).")
-                return "advance"
-            if key == "q":
-                return "quit"
-            print(f"  Invalid key: {key!r}")
+                self._advance()
+            else:
+                self._step = "label"
+                self._refresh_menu()
+        else:
+            self._handle_queue_keys(hot, "Invalid key")
 
-    # stage==1 only: mark reviewed after sender type
-    thread.reviewed = True
-    return "advance"
+    def _handle_label(self, hot: str) -> None:
+        thread = self.session.thread
+        if hot in _LABEL_KEY_MAP:
+            thread.expected_label = _LABEL_KEY_MAP[hot]
+            thread.reviewed = True
+            self._status(
+                f"  -> Classified as {thread.expected_sender_type} / {thread.expected_label}"
+            )
+            self._advance()
+        else:
+            self._handle_queue_keys(hot, "Invalid key")
 
+    def _edit_notes(self) -> None:
+        thread = self.session.thread
+        in_blind = self.blind
 
-# ---------------------------------------------------------------------------
-# Queue selection
-# ---------------------------------------------------------------------------
+        def apply(result) -> None:
+            if result is None:
+                self._status("  Notes unchanged.")
+                return
+            thread.notes = result
+            self._refresh_content()  # keep the Notes: line current (step unchanged)
+            if in_blind:
+                self._status("  -> Notes saved.")
+            else:
+                self._status(
+                    "  -> Notes saved. (Thread not yet confirmed — press Enter to confirm)"
+                )
+
+        self.push_screen(PromptLineScreen("Notes:", initial=thread.notes), apply)
+
 
 def select_review_threads(
     threads: list[GoldenThread], *, unreviewed_only: bool = False, filter_label: str | None = None
@@ -349,46 +410,13 @@ def select_review_threads(
     return result
 
 
-# ---------------------------------------------------------------------------
-# Main loop
-# ---------------------------------------------------------------------------
-
 def review_loop(
     threads: list[GoldenThread], *, start_at: int = 0, blind: bool = False, stage: int | None = None
 ) -> None:
-    """Main interactive review loop.  Does NOT save — caller is responsible.
-
-    Undo is owned here, not in the review functions: each thread gets exactly
-    one snapshot captured on entry, regardless of how the review mutates it
-    (confirm, classify, skip, exclude, notes).  This keeps the undo stack in
-    lock-step with the cursor — one ``"advance"`` pushes one snapshot — so a
-    later ``z`` walks back one classification at a time without over-rewinding
-    past skips or leaving a half-applied blind-mode sender behind.
-    """
-    review_fn = review_thread_blind if blind else review_thread_normal
-    undo_stack: list[dict] = []
-    total = len(threads)
-    i = start_at
-
-    while i < total:
-        # Snapshot the thread's pre-review state so undo can restore it exactly.
-        entry = _capture_snapshot(threads[i], i)
-        result = review_fn(threads[i], i, total, stage=stage)
-        if result == "quit":
-            break
-        if result == "advance":
-            undo_stack.append(entry)
-            i += 1
-        elif result == "back":
-            # Discard any in-progress edits to the current thread, then step
-            # back to the previous decision and restore the thread it touched.
-            _restore_snapshot(threads, entry)
-            if not undo_stack:
-                print("  Nothing to undo.")
-            else:
-                i = _restore_snapshot(threads, undo_stack.pop())
-                print(f"  <- Undone. Back to thread {i + 1}/{total}.")
-        # "stay" → loop again on the same thread
+    """Launch the review TUI.  Does NOT save — caller is responsible."""
+    if not threads or start_at >= len(threads):
+        return
+    ReviewApp(threads, start_at=start_at, blind=blind, stage=stage).run()
 
 
 # ---------------------------------------------------------------------------
@@ -412,7 +440,7 @@ def cli():
         help="Start at this index into the review queue (0-based, after excluded "
              "threads and any --filter-label/--unreviewed-only filters are applied)",
     )
-    parser.add_argument("--edit", action="store_true", help="Curses TUI for editing reviewed threads")
+    parser.add_argument("--edit", action="store_true", help="TUI for editing reviewed threads")
     args = parser.parse_args()
 
     path = Path(args.golden_set)
