@@ -264,7 +264,7 @@ def newsletter_exclude_status(newsletter) -> str:
 
 
 # ---------------------------------------------------------------------------
-# Pure helpers for the TUI (no curses; fully testable)
+# Pure helpers for the TUI (no UI dependency; fully testable)
 # ---------------------------------------------------------------------------
 
 _HELP_ITEMS = (
@@ -469,7 +469,7 @@ def build_extractor(config: dict):
 
     base_url, api_key = resolve_newsletter_llm_endpoint()
     if not base_url:
-        # Fail fast, before curses starts — otherwise the missing endpoint only
+        # Fail fast, before the app starts — otherwise the missing endpoint only
         # surfaces as a truncated error when Space is pressed deep in the TUI.
         raise SystemExit(
             "No LLM endpoint configured for Phase-A seeding: set NEWSLETTER_LLM_URL "
@@ -504,7 +504,7 @@ def build_extractor(config: dict):
 
 
 # ---------------------------------------------------------------------------
-# Pure rendering helpers (no curses; fully testable)
+# Pure rendering helpers (no UI; fully testable)
 # ---------------------------------------------------------------------------
 
 def display_width(text: str) -> int:
@@ -640,7 +640,7 @@ class ConfirmScreen(BottomModal):
 
     def on_key(self, event) -> None:
         event.stop()
-        self.dismiss(event.key.lower() == "y")
+        self.dismiss_once(event.key.lower() == "y")
 
 
 class ScoreScreen(BottomModal):
@@ -667,12 +667,14 @@ class ScoreScreen(BottomModal):
 
     def on_key(self, event) -> None:
         event.stop()
+        if self._dismissed:
+            return  # key queued behind the dismissal (auto-repeat)
         if event.key not in ("1", "2", "3", "4", "5"):
-            self.dismiss(None)
+            self.dismiss_once(None)
             return
         self._scores[_DIMENSIONS[len(self._scores)]] = int(event.key)
         if len(self._scores) == len(_DIMENSIONS):
-            self.dismiss(dict(self._scores))
+            self.dismiss_once(dict(self._scores))
         else:
             self.query_one("#score-prompt", Static).update(self._prompt_text())
 
@@ -696,8 +698,10 @@ class ThemeScreen(BottomModal):
 
     def on_key(self, event) -> None:
         event.stop()
+        if self._dismissed:
+            return  # key queued behind the dismissal (auto-repeat)
         if event.key == "enter":
-            self.dismiss(list(self._selected))
+            self.dismiss_once(list(self._selected))
             return
         theme = _THEME_KEYS.get(event.key.lower())
         if theme is not None:
@@ -841,6 +845,11 @@ class DetailScreen(Screen):
         if not self._status_msg:
             self._set_status("")  # keep the row counter current
 
+    def on_page_list_view_user_navigated(self, event) -> None:
+        # One-shot statuses clear on the next navigation keypress, restoring
+        # the "row N/M" position counter (parity with the curses status line).
+        self._set_status("")
+
     # -- persistence / undo ---------------------------------------------------
 
     def _save(self) -> None:
@@ -854,6 +863,22 @@ class DetailScreen(Screen):
     def _push_undo(self) -> None:
         self.undo_stack.append(capture_snapshot(self.newsletter))
         del self.undo_stack[:-_MAX_UNDO]
+
+    def _begin_flow(self) -> bool:
+        """Claim the single mutation-flow slot.
+
+        Two key events processed back-to-back (auto-repeat / mashing) each
+        spawn a worker; the check-and-set runs before the worker's first
+        await, so the second worker bails instead of stacking a second
+        prompt over the first.
+        """
+        if self._busy:
+            return False
+        self._busy = True
+        return True
+
+    def _end_flow(self) -> None:
+        self._busy = False
 
     def _cursor_body_idx(self):
         listview = self.query_one("#rows", ListView)
@@ -912,8 +937,14 @@ class DetailScreen(Screen):
 
     @work
     async def _make_story(self) -> None:
-        if self._busy:
+        if not self._begin_flow():
             return
+        try:
+            await self._run_make_story()
+        finally:
+            self._end_flow()
+
+    async def _run_make_story(self) -> None:
         if self.sel_start is None:
             self._set_status("Set a selection start with 's' first.")
             return
@@ -937,8 +968,14 @@ class DetailScreen(Screen):
 
     @work
     async def _seed(self) -> None:
-        if self._busy:
+        if not self._begin_flow():
             return
+        try:
+            await self._run_seed()
+        finally:
+            self._end_flow()
+
+    async def _run_seed(self) -> None:
         if self.extract_fn is None:
             self._set_status("Seeding disabled in edit mode (run without --edit to seed).")
             return
@@ -948,24 +985,23 @@ class DetailScreen(Screen):
         ):
             self._set_status("Seed cancelled — stories kept.")
             return
-        self._busy = True
         self._set_status("Seeding…")
-        self._push_undo()
         try:
-            # extract_fn is synchronous (it wraps its own asyncio.run); run it
-            # in a thread so the UI stays live instead of blocking the loop.
-            stories, raw = await asyncio.to_thread(
-                seed_from_extractor, self.newsletter, self.extract_fn
-            )
+            # Only the network call runs in the thread; the newsletter is
+            # mutated on the UI task AFTER the await, so dismissing the
+            # screen mid-seed cancels this worker and the late extractor
+            # result is discarded instead of clobbering curated stories.
+            raw = await asyncio.to_thread(self.extract_fn, self.newsletter.body)
+            pairs = parse_stories(raw)
         except Exception as exc:
-            self.undo_stack.pop()  # nothing changed; keep prior undo intact
+            # No undo snapshot was pushed, so the stack stays clean.
             self._set_status("")
             self.app.push_screen(HintScreen(f"Seed failed: {exc}"))
         else:
+            self._push_undo()
+            stories = seed_stories(self.newsletter, pairs)
             self._save()
             self._set_status(seed_outcome_message(raw, len(stories)))
-        finally:
-            self._busy = False
 
     # -- story curation ----------------------------------------------------------
 
@@ -974,8 +1010,14 @@ class DetailScreen(Screen):
 
     @work
     async def _add_story(self) -> None:
-        if self._busy:
+        if not self._begin_flow():
             return
+        try:
+            await self._run_add_story()
+        finally:
+            self._end_flow()
+
+    async def _run_add_story(self) -> None:
         title = await self.app.push_screen_wait(PromptLineScreen("New title:"))
         text = None
         if title:
@@ -993,8 +1035,14 @@ class DetailScreen(Screen):
 
     @work
     async def _edit_story(self) -> None:
-        if self._busy:
+        if not self._begin_flow():
             return
+        try:
+            await self._run_edit_story()
+        finally:
+            self._end_flow()
+
+    async def _run_edit_story(self) -> None:
         si = await self._prompt_story_index()
         if si is None:
             self._set_status("No valid story # — nothing edited.")
@@ -1030,8 +1078,14 @@ class DetailScreen(Screen):
 
     @work
     async def _delete_story(self) -> None:
-        if self._busy:
+        if not self._begin_flow():
             return
+        try:
+            await self._run_delete_story()
+        finally:
+            self._end_flow()
+
+    async def _run_delete_story(self) -> None:
         si = await self._prompt_story_index()
         if si is None:
             self._set_status("No valid story # — nothing deleted.")
@@ -1062,8 +1116,14 @@ class DetailScreen(Screen):
 
     @work
     async def _label_story(self) -> None:
-        if self._busy:
+        if not self._begin_flow():
             return
+        try:
+            await self._run_label_story()
+        finally:
+            self._end_flow()
+
+    async def _run_label_story(self) -> None:
         si = await self._prompt_story_index()
         if si is None:
             self._set_status("No valid story # — nothing labeled.")
@@ -1084,8 +1144,14 @@ class DetailScreen(Screen):
 
     @work
     async def _toggle_story_excluded(self) -> None:
-        if self._busy:
+        if not self._begin_flow():
             return
+        try:
+            await self._run_toggle_story_excluded()
+        finally:
+            self._end_flow()
+
+    async def _run_toggle_story_excluded(self) -> None:
         si = await self._prompt_story_index()
         if si is None:
             self._set_status("No valid story # — nothing toggled.")
@@ -1103,8 +1169,14 @@ class DetailScreen(Screen):
 
     @work
     async def _notes(self) -> None:
-        if self._busy:
+        if not self._begin_flow():
             return
+        try:
+            await self._run_notes()
+        finally:
+            self._end_flow()
+
+    async def _run_notes(self) -> None:
         new_notes = await self.app.push_screen_wait(
             PromptLineScreen("Notes:", initial=self.newsletter.notes)
         )

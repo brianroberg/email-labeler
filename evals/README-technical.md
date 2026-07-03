@@ -217,9 +217,9 @@ TUI details:
 - **Undo** (`z`) is a multi-level stack (up to 100 snapshots per newsletter). A
   snapshot is pushed only when a mutation actually happens — cancelled prompts
   never consume an undo level.
-- **Esc** cancels any prompt (title/text/notes/story #), clears an active
-  `s`/`e` selection before acting as "back", and `ESCDELAY` defaults to 25 ms so
-  it feels instant.
+- **Esc** cancels any prompt (title/text/notes/story #) and clears an active
+  `s`/`e` selection before acting as "back". (Textual handles Esc natively —
+  the old curses `ESCDELAY` workaround is gone.)
 - **Prompts prefill current values**: `E` prefills the title and (single-line)
   text with blank=keep semantics (multi-line text remains blank=keep — body-span
   selection is the intended paragraph-level repair path); `n` prefills existing

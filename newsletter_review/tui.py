@@ -14,7 +14,7 @@ from textual.containers import VerticalScroll
 from textual.screen import Screen
 from textual.widgets import Input, Label, ListItem, ListView, Static
 
-from tui_common import CANCEL, BottomModal, KeyMenuScreen
+from tui_common import CANCEL, BottomModal, KeyMenuScreen, PageListView
 
 # ---------------------------------------------------------------------------
 # Column widths for list view
@@ -27,7 +27,7 @@ _COL_GAP = 2
 
 
 # ---------------------------------------------------------------------------
-# Pure data functions (no curses, fully testable)
+# Pure data functions (no UI, fully testable)
 # ---------------------------------------------------------------------------
 
 def load_assessments(path: Path) -> list[dict]:
@@ -120,7 +120,7 @@ def format_list_row(record: dict, max_x: int) -> str:
 
 
 def build_detail_lines(record: dict, width: int = 80) -> list[str]:
-    """Build content lines for the detail view. Pure function, no curses."""
+    """Build content lines for the detail view. Pure function, no UI."""
     subject = record.get("subject", "")
     sender = record.get("from", "")
     timestamp = record.get("timestamp", "")
@@ -248,8 +248,8 @@ class DetailScreen(Screen):
         Binding("q", "app.quit_app", "Quit"),
         Binding("up", "scroll_up", "Scroll up", show=False),
         Binding("down", "scroll_down", "Scroll down", show=False),
-        Binding("pageup", "page_up", "Page up", show=False),
-        Binding("pagedown", "page_down", "Page down", show=False),
+        Binding("pageup,ctrl+b", "page_up", "Page up", show=False),
+        Binding("pagedown,ctrl+f", "page_down", "Page down", show=False),
         Binding("home", "scroll_home", "Top", show=False),
         Binding("end", "scroll_end", "Bottom", show=False),
     ]
@@ -342,12 +342,17 @@ class ReviewApp(App):
             f"  Subject"
         )
         yield Static(hdr, id="header", markup=False)
-        yield ListView(id="records")
+        yield PageListView(id="records")
         help_text = "↑/↓:Nav  PgUp/PgDn  Enter:Detail  [f]ilter  q:Quit"
         yield Static(help_text, id="help", markup=False)
 
     def on_mount(self) -> None:
         self._refresh_list()
+
+    def on_resize(self, event) -> None:
+        # Re-render rows so column truncation tracks the new width.
+        if self.is_mounted:
+            self._refresh_list()
 
     def _refresh_list(self) -> None:
         self.filtered = apply_filters(

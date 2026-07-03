@@ -1465,3 +1465,147 @@ class TestCli:
         label.cli()
 
         assert seen["ids"] == ["todo"]
+
+
+class TestModalRobustness:
+    async def test_score_screen_survives_held_digit_key(self, tmp_path):
+        # Auto-repeat can queue a 5th digit behind the dismissal of the 4th;
+        # it must be ignored, not IndexError-crash the app.
+        from textual import events
+
+        nl = _newsletter("tR", body="b0")
+        seed_stories(nl, [("A", "a")])
+        app = _label_app([nl], tmp_path)
+        async with app.run_test(size=SIZE) as pilot:
+            await pilot.press("enter")
+            await pilot.press("l", "0", "enter")
+            for _ in range(6):
+                app.post_message(events.Key("3", "3"))
+            await pilot.pause()
+            assert app.is_running
+            await pilot.press("enter")  # finish themes
+            assert nl.stories[0].expected_scores == {
+                "simple": 3, "concrete": 3, "personal": 3, "dynamic": 3,
+            }
+
+    async def test_prompt_line_survives_double_enter(self, tmp_path):
+        from textual import events
+
+        nl = _newsletter("tR", body="b0", notes="keep")
+        app = _label_app([nl], tmp_path)
+        async with app.run_test(size=SIZE) as pilot:
+            await pilot.press("enter", "n")
+            app.post_message(events.Key("enter", None))
+            app.post_message(events.Key("enter", None))
+            await pilot.pause()
+            assert app.is_running
+            assert nl.notes == "keep"
+            from evals.newsletter_label import DetailScreen
+
+            assert isinstance(app.screen, DetailScreen)
+
+    async def test_confirm_screen_survives_double_key(self, tmp_path):
+        from textual import events
+
+        nl = _newsletter("tR", body="b0")
+        seed_stories(nl, [("Keep", "b0")])
+        app = _label_app([nl], tmp_path, extract_fn=lambda body: "TITLE: New\nTEXT: x")
+        async with app.run_test(size=SIZE) as pilot:
+            await pilot.press("enter", "space")
+            app.post_message(events.Key("n", "n"))
+            app.post_message(events.Key("n", "n"))
+            await _drain(app, pilot)
+            assert app.is_running
+            assert [s.title for s in nl.stories] == ["Keep"]
+            from evals.newsletter_label import DetailScreen
+
+            # the queued second key must not pop the detail screen underneath
+            assert isinstance(app.screen, DetailScreen)
+
+    async def test_mashed_action_key_opens_a_single_prompt(self, tmp_path):
+        # Two queued 'd' presses must not spawn two concurrent delete flows.
+        from textual import events
+
+        nl = _newsletter("tR", body="b0")
+        seed_stories(nl, [("A", "a"), ("B", "b")])
+        app = _label_app([nl], tmp_path)
+        async with app.run_test(size=SIZE) as pilot:
+            await pilot.press("enter")
+            app.post_message(events.Key("d", "d"))
+            app.post_message(events.Key("d", "d"))
+            await pilot.pause()
+            await pilot.press("0", "enter")
+            await pilot.pause()
+            assert app.is_running
+            assert [s.title for s in nl.stories] == ["B"]
+            from evals.newsletter_label import DetailScreen
+
+            assert isinstance(app.screen, DetailScreen)  # no second prompt stacked
+
+    async def test_notes_control_characters_never_persist(self, tmp_path):
+        # A paste can carry control chars into the Input; they must be
+        # stripped before landing in the golden set.
+        from textual.widgets import Input
+
+        nl = _newsletter("tR", body="b0")
+        app = _label_app([nl], tmp_path)
+        async with app.run_test(size=SIZE) as pilot:
+            await pilot.press("enter", "n")
+            app.screen.query_one(Input).value = "good\x1b[31mbad\x07note"
+            await pilot.press("enter")
+            assert "\x1b" not in nl.notes
+            assert "\x07" not in nl.notes
+            assert "good" in nl.notes and "note" in nl.notes
+
+
+class TestSeedAbort:
+    async def test_escape_during_seed_discards_the_seed_result(self, tmp_path):
+        import threading
+
+        release = threading.Event()
+
+        def slow_extract(body):
+            release.wait(timeout=5)
+            return "TITLE: Machine seed\nTEXT: b0"
+
+        nl = _newsletter("tA", body="b0")
+        seed_stories(nl, [("Hand curated", "b0")])
+        nl.reviewed = True
+        app = _label_app([nl], tmp_path, extract_fn=slow_extract)
+        async with app.run_test(size=SIZE) as pilot:
+            await pilot.press("enter", "space", "y")  # confirm reseed, in flight
+            await pilot.pause()
+            await pilot.press("escape")  # abandon the newsletter mid-seed
+            release.set()
+            await _drain(app, pilot)
+            # The late extractor result must NOT clobber the curated stories.
+            assert [s.title for s in nl.stories] == ["Hand curated"]
+            assert nl.reviewed is True
+
+
+class TestStatusLifecycle:
+    async def test_status_clears_on_next_navigation_keypress(self, tmp_path):
+        nl = _newsletter("tS", body="b0\nb1")
+        app = _label_app([nl], tmp_path)
+        async with app.run_test(size=SIZE) as pilot:
+            await pilot.press("enter", "z")  # -> "Nothing to undo."
+            assert "Nothing to undo" in _status(app)
+            await pilot.press("down")
+            assert "Nothing to undo" not in _status(app)
+            assert "row 2/" in _status(app)
+
+
+class TestListPaging:
+    async def test_page_down_lands_exactly_one_page_down(self, tmp_path):
+        from textual.widgets import ListView
+
+        nls = [_newsletter(f"t{i}", subject=f"subject-{i}") for i in range(10)]
+        app = _label_app(nls, tmp_path)
+        async with app.run_test(size=(100, 8)) as pilot:
+            # title + header + help = 3 rows -> list height 5
+            await pilot.press("pagedown")
+            assert app.query_one(ListView).index == 5
+            await pilot.press("end")
+            assert app.query_one(ListView).index == 9
+            await pilot.press("home")
+            assert app.query_one(ListView).index == 0

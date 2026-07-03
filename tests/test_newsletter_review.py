@@ -559,3 +559,72 @@ class TestRunReviewTui:
     def test_empty_records_prints_and_returns(self, capsys):
         run_review_tui([])
         assert "No assessment records" in capsys.readouterr().out
+
+
+class TestReviewAppRobustness:
+    async def test_filter_menu_survives_key_auto_repeat(self):
+        # Two back-to-back keys (terminal auto-repeat) must not double-dismiss
+        # the modal and crash the app with ScreenStackError.
+        from textual import events
+
+        app = ReviewApp(_ui_records())
+        async with app.run_test(size=SIZE) as pilot:
+            await pilot.press("f")
+            app.post_message(events.Key("t", "t"))
+            app.post_message(events.Key("t", "t"))
+            await pilot.pause()
+            assert app.is_running
+            await pilot.press("g")
+            assert "tier:good" in _title(app)
+
+    async def test_filter_keys_are_case_insensitive(self):
+        app = ReviewApp(_ui_records())
+        async with app.run_test(size=SIZE) as pilot:
+            await pilot.press("f", "T", "G")  # uppercase, like the curses .lower()
+            assert "tier:good" in _title(app)
+
+    async def test_typing_cancel_as_sender_filter_is_a_filter_not_a_dismissal(self):
+        app = ReviewApp(_ui_records())
+        async with app.run_test(size=SIZE) as pilot:
+            await pilot.press("f", "s")
+            await pilot.press(*"cancel")
+            await pilot.press("enter")
+            assert "sender:cancel" in _title(app)
+
+    async def test_list_page_and_home_end_move_cursor(self):
+        from textual.widgets import ListView
+
+        records = [_make_record(subject=f"r{i}") for i in range(20)]
+        app = ReviewApp(records)
+        async with app.run_test(size=(100, 8)) as pilot:
+            # title + header + help = 3 rows -> list height 5
+            await pilot.press("pagedown")
+            assert app.query_one(ListView).index == 5
+            await pilot.press("end")
+            assert app.query_one(ListView).index == 19
+            await pilot.press("home")
+            assert app.query_one(ListView).index == 0
+
+    async def test_ctrl_b_and_ctrl_f_page_the_list_cursor(self):
+        from textual.widgets import ListView
+
+        records = [_make_record(subject=f"r{i}") for i in range(20)]
+        app = ReviewApp(records)
+        async with app.run_test(size=(100, 8)) as pilot:
+            await pilot.press("ctrl+f")
+            assert app.query_one(ListView).index == 5
+            await pilot.press("ctrl+b")
+            assert app.query_one(ListView).index == 0
+
+    async def test_detail_rewraps_on_resize(self):
+        words = [f"word{i:02d}" for i in range(24)]
+        record = _make_record(subject="Long")
+        record["stories"][0]["text"] = " ".join(words)
+        app = ReviewApp([record])
+        async with app.run_test(size=(100, 30)) as pilot:
+            await pilot.press("enter")
+            await pilot.resize_terminal(40, 30)
+            await pilot.pause()
+            text = "\n".join(str(w.render()) for w in app.screen.query(Static))
+            for word in words:
+                assert word in text

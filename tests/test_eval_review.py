@@ -429,3 +429,36 @@ class TestCliPreservesExcluded:
         dup_labels = sorted(t.expected_label for t in saved if t.thread_id == "dup")
         assert dup_labels == ["fyi", "needs_response"]  # both judgments kept
         assert all(t.reviewed for t in saved if t.thread_id == "dup")
+
+
+class TestScrollAndStages:
+    async def test_arrow_keys_scroll_the_thread_body(self, tmp_path):
+        import base64
+
+        body = "\n".join(f"line {i}" for i in range(80))
+        data = base64.urlsafe_b64encode(body.encode()).decode()
+        thread = _golden("t1", messages=[{"payload": {"mimeType": "text/plain", "body": {"data": data}}}])
+        app = ReviewApp([thread], blind=False)
+        async with app.run_test(size=SIZE) as pilot:
+            scroll = app.query_one("#review-scroll")
+            assert scroll.scroll_offset.y == 0
+            await pilot.press("down", "down", "down")
+            assert scroll.scroll_offset.y == 3
+            await pilot.press("up")
+            assert scroll.scroll_offset.y == 2
+
+    async def test_stage_2_disables_the_sender_submenu(self, tmp_path):
+        threads = [_golden("t1")]
+        app = ReviewApp(threads, blind=False, stage=2)
+        async with app.run_test(size=SIZE) as pilot:
+            await pilot.press("s")
+            assert "Unknown action" in _status(app)
+            assert threads[0].expected_sender_type == "person"
+
+    async def test_stage_1_disables_the_label_submenu(self, tmp_path):
+        threads = [_golden("t1")]
+        app = ReviewApp(threads, blind=False, stage=1)
+        async with app.run_test(size=SIZE) as pilot:
+            await pilot.press("l")
+            assert "Unknown action" in _status(app)
+            assert threads[0].expected_label == "fyi"

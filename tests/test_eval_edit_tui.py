@@ -208,3 +208,16 @@ class TestRunEditTui:
     def test_empty_threads_prints_and_returns(self, capsys):
         run_edit_tui([], [], "unused-path")
         assert "No threads to edit." in capsys.readouterr().out
+
+
+class TestListCursorKeys:
+    async def test_home_and_end_move_the_cursor(self, tmp_path):
+        from textual.widgets import ListView
+
+        threads = [_golden(f"t{i}") for i in range(12)]
+        app = _edit_app(threads, tmp_path)
+        async with app.run_test(size=(100, 8)) as pilot:
+            await pilot.press("end")
+            assert app.query_one(ListView).index == 11
+            await pilot.press("home")
+            assert app.query_one(ListView).index == 0
