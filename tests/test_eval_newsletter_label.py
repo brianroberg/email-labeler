@@ -1137,11 +1137,13 @@ class TestDetailRowCache:
             from textual.widgets import Label
 
             lv = _detail(app).query_one("#rows")
-            rendered = " ".join(
-                str(item.query_one(Label).render()) for item in lv.children
-            )
+            row_texts = [str(item.query_one(Label).render()) for item in lv.children]
+            rendered = " ".join(row_texts)
             for word in words:
                 assert word in rendered
+            # The rows were actually rebuilt at the new width (marker col +
+            # width-2 content = 39 cols max) — not just soft-wrapped visually.
+            assert all(len(t) <= 39 for t in row_texts), max(row_texts, key=len)
 
 
 class TestDetailSelection:
@@ -1609,3 +1611,20 @@ class TestListPaging:
             assert app.query_one(ListView).index == 9
             await pilot.press("home")
             assert app.query_one(ListView).index == 0
+
+
+class TestLabelAppReviewFindings:
+    async def test_enter_auto_repeat_opens_a_single_detail(self, tmp_path):
+        from textual import events
+
+        from evals.newsletter_label import DetailScreen
+
+        nls = [_newsletter("t0"), _newsletter("t1")]
+        app = _label_app(nls, tmp_path)
+        async with app.run_test(size=SIZE) as pilot:
+            app.post_message(events.Key("enter", None))
+            app.post_message(events.Key("enter", None))
+            await pilot.pause()
+            assert len(app.screen_stack) == 2  # base + ONE detail
+            await pilot.press("escape")
+            assert not isinstance(app.screen, DetailScreen)

@@ -12,9 +12,9 @@ from textual.app import App, ComposeResult
 from textual.binding import Binding
 from textual.containers import VerticalScroll
 from textual.screen import Screen
-from textual.widgets import Input, Label, ListItem, ListView, Static
+from textual.widgets import Label, ListItem, ListView, Static
 
-from tui_common import CANCEL, BottomModal, KeyMenuScreen, PageListView
+from tui_common import CANCEL, KeyMenuScreen, PageListView, PromptLineScreen
 
 # ---------------------------------------------------------------------------
 # Column widths for list view
@@ -221,25 +221,6 @@ _TIER_PROMPT = "[e]xcellent  [g]ood  [f]air  [p]oor  [c]lear  (other cancels)"
 _THEME_PROMPT = "[s]cripture [c]hristlikeness [h]urch [v]ocation_family [d]isciple_making [x]clear"
 
 
-class SenderFilterScreen(BottomModal):
-    """Text input for the sender filter. Enter confirms (empty clears), Esc cancels."""
-
-    BINDINGS = [Binding("escape", "cancel", "Cancel")]
-
-    def compose(self) -> ComposeResult:
-        yield Static("Sender filter  (Enter=confirm, empty=clear, Esc=cancel)", markup=False)
-        yield Input(id="sender-input")
-
-    def on_mount(self) -> None:
-        self.query_one(Input).focus()
-
-    def on_input_submitted(self, event: Input.Submitted) -> None:
-        self.dismiss(event.value.strip() or None)  # empty string → clear filter
-
-    def action_cancel(self) -> None:
-        self.dismiss(CANCEL)
-
-
 class DetailScreen(Screen):
     """Scrollable detail view for one assessment record."""
 
@@ -350,24 +331,25 @@ class ReviewApp(App):
         self._refresh_list()
 
     def on_resize(self, event) -> None:
-        # Re-render rows so column truncation tracks the new width.
-        if self.is_mounted:
-            self._refresh_list()
+        # Re-render rows so column truncation tracks the new width. self.size
+        # is still the OLD size while this handler runs — use the event's.
+        self._refresh_list(width=event.size.width)
 
-    def _refresh_list(self) -> None:
+    def _refresh_list(self, *, reset_cursor: bool = False, width: int | None = None) -> None:
         self.filtered = apply_filters(
             self.all_records,
             tier=self.f_tier, theme=self.f_theme, sender=self.f_sender,
         )
-        width = max(40, self.size.width)
+        width = max(40, width if width is not None else self.size.width)
         listview = self.query_one(ListView)
+        cursor = 0 if reset_cursor else (listview.index or 0)
         listview.clear()
         listview.extend(
             ListItem(Label(format_list_row(record, width), markup=False))
             for record in self.filtered
         )
         if self.filtered:
-            listview.index = 0
+            listview.index = min(cursor, len(self.filtered) - 1)
 
         filter_str = format_filter_summary(
             tier=self.f_tier, theme=self.f_theme, sender=self.f_sender,
@@ -380,6 +362,8 @@ class ReviewApp(App):
         self.query_one("#title", Static).update(title)
 
     def on_list_view_selected(self, event: ListView.Selected) -> None:
+        if len(self.screen_stack) > 1:
+            return  # a detail/modal is already up (Enter auto-repeat)
         index = self.query_one(ListView).index
         if index is not None and self.filtered:
             self.push_screen(
@@ -393,17 +377,18 @@ class ReviewApp(App):
         def on_tier(result) -> None:
             if result != CANCEL:
                 self.f_tier = result
-                self._refresh_list()
+                self._refresh_list(reset_cursor=True)
 
         def on_theme(result) -> None:
             if result != CANCEL:
                 self.f_theme = result
-                self._refresh_list()
+                self._refresh_list(reset_cursor=True)
 
         def on_sender(result) -> None:
-            if result != CANCEL:
-                self.f_sender = result
-                self._refresh_list()
+            if result is None:
+                return  # Esc = cancel
+            self.f_sender = result or None  # empty string clears the filter
+            self._refresh_list(reset_cursor=True)
 
         def on_type(result) -> None:
             if result == "tier":
@@ -411,7 +396,10 @@ class ReviewApp(App):
             elif result == "theme":
                 self.push_screen(KeyMenuScreen(_THEME_PROMPT, _THEME_KEYS), on_theme)
             elif result == "sender":
-                self.push_screen(SenderFilterScreen(), on_sender)
+                self.push_screen(
+                    PromptLineScreen("Sender filter  (Enter=confirm, empty=clear, Esc=cancel)"),
+                    on_sender,
+                )
 
         self.push_screen(KeyMenuScreen(_FILTER_TYPE_PROMPT, _FILTER_TYPE_KEYS), on_type)
 

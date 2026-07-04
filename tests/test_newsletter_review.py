@@ -628,3 +628,51 @@ class TestReviewAppRobustness:
             text = "\n".join(str(w.render()) for w in app.screen.query(Static))
             for word in words:
                 assert word in text
+
+
+class TestReviewAppReviewFindings:
+    async def test_sender_filter_survives_double_enter(self):
+        from textual import events
+
+        app = ReviewApp(_ui_records())
+        async with app.run_test(size=SIZE) as pilot:
+            await pilot.press("f", "s")
+            await pilot.press(*"dm.org")
+            app.post_message(events.Key("enter", None))
+            app.post_message(events.Key("enter", None))
+            await pilot.pause()
+            assert app.is_running
+            assert "sender:dm.org" in _title(app)
+
+    async def test_sender_filter_strips_control_characters(self):
+        from textual.widgets import Input
+
+        app = ReviewApp(_ui_records())
+        async with app.run_test(size=SIZE) as pilot:
+            await pilot.press("f", "s")
+            app.screen.query_one(Input).value = "dm\x1b[31m.org"
+            await pilot.press("enter")
+            assert app.f_sender is not None
+            assert "\x1b" not in app.f_sender
+
+    async def test_resize_preserves_list_cursor(self):
+        records = [_make_record(subject=f"r{i}") for i in range(10)]
+        app = ReviewApp(records)
+        async with app.run_test(size=(100, 12)) as pilot:
+            await pilot.press("down", "down", "down")
+            assert app.query_one(ListView).index == 3
+            await pilot.resize_terminal(120, 14)
+            await pilot.pause()
+            assert app.query_one(ListView).index == 3
+
+    async def test_enter_auto_repeat_opens_a_single_detail(self):
+        from textual import events
+
+        app = ReviewApp(_ui_records())
+        async with app.run_test(size=SIZE) as pilot:
+            app.post_message(events.Key("enter", None))
+            app.post_message(events.Key("enter", None))
+            await pilot.pause()
+            assert len(app.screen_stack) == 2  # base + ONE detail
+            await pilot.press("escape")
+            assert not isinstance(app.screen, DetailScreen)

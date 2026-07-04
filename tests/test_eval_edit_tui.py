@@ -221,3 +221,26 @@ class TestListCursorKeys:
             assert app.query_one(ListView).index == 11
             await pilot.press("home")
             assert app.query_one(ListView).index == 0
+
+
+class TestEditAppReviewFindings:
+    async def test_enter_auto_repeat_opens_a_single_detail(self, tmp_path):
+        from textual import events
+
+        app = _edit_app([_golden("t1"), _golden("t2")], tmp_path)
+        async with app.run_test(size=SIZE) as pilot:
+            app.post_message(events.Key("enter", None))
+            app.post_message(events.Key("enter", None))
+            await pilot.pause()
+            assert len(app.screen_stack) == 2  # base + ONE detail
+            await pilot.press("escape")
+            assert not isinstance(app.screen, DetailScreen)
+
+    async def test_resize_rerenders_rows_at_new_width(self, tmp_path):
+        long_subject = "S" * 90
+        app = _edit_app([_golden("t1", subject=long_subject)], tmp_path)
+        async with app.run_test(size=(60, 20)) as pilot:
+            assert long_subject not in _screen_text(app)  # truncated at 60 cols
+            await pilot.resize_terminal(160, 24)
+            await pilot.pause()
+            assert long_subject in _screen_text(app)  # re-rendered wider

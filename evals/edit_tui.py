@@ -267,8 +267,13 @@ class EditApp(App):
     def on_mount(self) -> None:
         self._refresh_list()
 
-    def _refresh_list(self) -> None:
-        width = max(40, self.size.width)
+    def on_resize(self, event) -> None:
+        # Re-render rows so column truncation tracks the new width. self.size
+        # is still the OLD size while this handler runs — use the event's.
+        self._refresh_list(width=event.size.width)
+
+    def _refresh_list(self, width: int | None = None) -> None:
+        width = max(40, width if width is not None else self.size.width)
         listview = self.query_one("#threads", ListView)
         cursor = listview.index or 0
         listview.clear()
@@ -280,6 +285,8 @@ class EditApp(App):
 
     def on_list_view_selected(self, event) -> None:
         event.stop()
+        if len(self.screen_stack) > 1:
+            return  # a detail/modal is already up (Enter auto-repeat)
         index = self.query_one("#threads", ListView).index
         if index is None:
             return

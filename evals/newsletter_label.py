@@ -1264,6 +1264,9 @@ class LabelApp(App):
             self._open_detail(index)
 
     def _open_detail(self, index: int) -> None:
+        if len(self.screen_stack) > 1:
+            return  # a detail/modal is already up (Enter auto-repeat)
+
         def on_dismiss(result) -> None:
             if result == "quit":
                 self.exit("quit")
