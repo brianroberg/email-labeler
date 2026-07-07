@@ -185,7 +185,7 @@ async def evaluate_extraction(
     """Run extract_stories on the raw body; compare predicted vs golden story list.
 
     Extraction is scored at the newsletter-body level: the raw body goes in, and
-    the predicted [{title,text}] list is matched (in the report) against the
+    the predicted [{text}] list is matched (in the report) against the
     newsletter's confirmed golden stories. The extraction chain-of-thought is
     captured into a newsletter-level ``NewsletterThinkingEntry`` (thread_id +
     extraction_cot) so segmentation mangles can be prompt-debugged from the
@@ -194,7 +194,7 @@ async def evaluate_extraction(
     pred = ExtractionPrediction(
         thread_id=newsletter.thread_id,
         golden_stories=[
-            {"story_id": s.story_id, "title": s.title, "text": s.text}
+            {"story_id": s.story_id, "text": s.text}
             for s in newsletter.stories
         ],
     )
@@ -209,7 +209,7 @@ async def evaluate_extraction(
     start = time.monotonic()
     try:
         stories = await local_classifier.extract_stories(newsletter.body)
-        pred.predicted_stories = [{"title": t, "text": x} for t, x in stories]
+        pred.predicted_stories = [{"text": x} for x in stories]
         thinking.extraction_cot = capture.last_thinking or ""
     except (httpx.ConnectError, httpx.TimeoutException) as exc:
         pred.error = format_network_error(exc, "newsletter LLM")
@@ -229,7 +229,7 @@ async def evaluate_story(
 ) -> tuple[StoryPrediction, NewsletterThinkingEntry]:
     """Score one fixed golden story on quality and/or themes; derive tier from scores.
 
-    Quality and themes are evaluated on the fixed golden (title, text), decoupled
+    Quality and themes are evaluated on the fixed golden story text, decoupled
     from extraction variability. predicted_tier is derived via compute_tier only
     when the scores parsed; a parse failure leaves scores/tier None (an error in
     the report, not a mis-tier). *do_quality*/*do_themes* let quality/themes modes
@@ -256,7 +256,7 @@ async def evaluate_story(
     try:
         if do_quality:
             capture.last_raw = None
-            scores, quality_cot = await local_classifier.assess_quality(story.title, story.text)
+            scores, quality_cot = await local_classifier.assess_quality(story.text)
             pred.scores_raw = capture.last_raw
             pred.predicted_scores = scores
             thinking.quality_cot = quality_cot
@@ -265,7 +265,7 @@ async def evaluate_story(
 
         if do_themes:
             capture.last_raw = None
-            themes, theme_cot = await local_classifier.classify_themes(story.title, story.text)
+            themes, theme_cot = await local_classifier.classify_themes(story.text)
             pred.themes_raw = capture.last_raw
             pred.predicted_themes = themes
             thinking.theme_cot = theme_cot
