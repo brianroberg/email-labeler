@@ -56,7 +56,9 @@ def parse_stories(raw: str) -> list[str]:
 
     Returns empty list for NO_STORIES or unparseable input.
     """
-    stripped = raw.strip()
+    # Normalize CRLF/CR to LF first so the blank-line split and the verbatim
+    # story slices behave identically regardless of the model's line endings.
+    stripped = raw.replace("\r\n", "\n").replace("\r", "\n").strip()
     if not stripped or stripped.upper() == "NO_STORIES":
         return []
 
@@ -70,7 +72,11 @@ def parse_stories(raw: str) -> list[str]:
         block = block.strip()
         if not block:
             continue
-        match = re.match(r"^STORY:\s*(.*)", block, flags=re.DOTALL)
+        # ``search`` (not ``match``): a preamble line the model glued onto the
+        # first STORY: with a single newline is skipped rather than dropping the
+        # whole block. The first STORY: wins and DOTALL keeps any later
+        # "STORY:"-prefixed body line as part of this story's text.
+        match = re.search(r"^STORY:\s*(.*)", block, flags=re.DOTALL | re.MULTILINE)
         if match:
             text = match.group(1).strip()
             if text:

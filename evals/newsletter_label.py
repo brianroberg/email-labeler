@@ -1308,9 +1308,13 @@ class DetailScreen(Screen):
         cursor = self._cursor_body_idx()
         if cursor is None:
             cursor = self._first_body_line()
-        if cursor is None:
-            self._set_status("This newsletter has no body to select from.")
-            return
+            if cursor is None:
+                self._set_status("This newsletter has no body to select from.")
+                return
+            # Cursor was on a header/marker row: move it onto the anchored body
+            # line so Enter can mark the boundary (otherwise the highlight shows
+            # but _cursor_body_idx stays None and the commit never fires).
+            self.anchor_body = cursor
         self.mode = "span"
         self.span_edit = begin_add_span(cursor)
         self._refresh()
@@ -1423,7 +1427,12 @@ class DetailScreen(Screen):
                     "Text (story not found in body; edit as text):", initial=collapsed,
                 )
             )
-            if new_text is None or new_text == story.text:
+            # Compare against the collapsed prefill, not story.text: the single-
+            # line prompt can't represent a multi-line story, so "no change" means
+            # the value still equals the prefill — treat that (and an emptied
+            # field) as a cancel so accepting the prefill never flattens or wipes
+            # the original text.
+            if new_text is None or not new_text or new_text == collapsed:
                 self._set_status("Edit cancelled.")
                 return
             self._push_undo()
@@ -1550,6 +1559,13 @@ class DetailScreen(Screen):
         if not self._begin_flow():
             return
         try:
+            # When nothing needs confirming, _accept never awaits, so the _busy
+            # latch is released before a second mashed `c` worker runs. Bail if a
+            # prior accept already dismissed this screen — otherwise this worker
+            # would re-confirm/save/refresh the popped screen (a NoMatches crash
+            # and a redundant write).
+            if self._dismiss_guard:
+                return
             msg = accept_confirmation_message(self.newsletter)
             if msg is not None and not await self.app.push_screen_wait(ConfirmScreen(msg)):
                 self._set_status("Not accepted — press l to label the remaining stories.")

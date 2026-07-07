@@ -340,6 +340,24 @@ class TestQuit:
         assert app.return_value == "quit"
         assert threads[0].reviewed is False
 
+    async def test_double_confirm_on_last_thread_does_not_crash(self, tmp_path):
+        # Confirming the final thread advances to done and calls exit(); a second
+        # Enter already queued behind it must NOT re-enter the handler and index
+        # threads[len] (an IndexError that crashes run() before cli() can save).
+        from textual import events
+
+        threads = [_golden("t0")]
+        app = ReviewApp(threads, blind=False)
+        async with app.run_test(size=SIZE) as pilot:
+            app.post_message(events.Key("enter", None))
+            app.post_message(events.Key("enter", None))
+            await pilot.pause()
+            await pilot.pause()
+            await pilot.pause()
+        # Reaching here without run_test re-raising means no crash.
+        assert app.return_value == "done"
+        assert threads[0].reviewed is True
+
 
 # ---------------------------------------------------------------------------
 # Queue selection — excluded threads are never reviewed

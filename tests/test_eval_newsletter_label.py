@@ -1276,6 +1276,20 @@ class TestDetailSpanNew:
             assert len(nl.stories) == 1
             assert nl.stories[0].text == "para one\npara two"
 
+    async def test_add_story_from_header_row_anchors_to_body(self, tmp_path):
+        # On open the cursor sits on the metadata header (body_idx None).
+        # Pressing `a` there must move the cursor onto the first body line so the
+        # two-press flow can commit, instead of stranding it on the header where
+        # Enter can never mark a boundary.
+        nl = _newsletter("tA", body="b0\nb1")
+        app = _label_app([nl], tmp_path)  # no extract_fn -> no auto-seed
+        async with app.run_test(size=SIZE) as pilot:
+            await pilot.press("enter")           # open detail; cursor on header
+            await pilot.press("a")               # add-story from the header row
+            await pilot.press("enter")           # mark start (first body line)
+            await pilot.press("enter")           # mark end -> commit
+            assert [s.text for s in nl.stories] == ["b0"]
+
     async def test_esc_cancels_span_without_creating_a_story(self, tmp_path):
         nl = _newsletter("tA", body="para one\npara two")
         app = _label_app([nl], tmp_path)
@@ -1349,6 +1363,21 @@ class TestDetailSpanEdit:
             await pilot.press("enter")
             await _drain(app, pilot)
             assert nl.stories[0].text == "corrected text"
+
+    async def test_edit_unlocatable_accept_prefill_keeps_multiline_text(self, tmp_path):
+        # An unlocatable MULTI-line story falls back to the single-line text
+        # prompt, prefilled with a whitespace-collapsed copy. Accepting that
+        # prefill unchanged must keep the original multi-line text rather than
+        # silently flattening the newlines into spaces.
+        nl = _newsletter("tE", body="l0\nl1")
+        seed_stories(nl, ["multi\nline story not in body"])
+        app = _label_app([nl], tmp_path)
+        async with app.run_test(size=SIZE) as pilot:
+            await pilot.press("enter")
+            await pilot.press("1", "e")     # can't locate -> text prompt (prefill collapsed)
+            await pilot.press("enter")      # accept the prefill unchanged
+            await _drain(app, pilot)
+            assert nl.stories[0].text == "multi\nline story not in body"
 
     async def test_unlocatable_fallback_escape_is_a_clean_cancel(self, tmp_path):
         # Escaping the fallback text prompt must not mutate the story or push an
@@ -1662,6 +1691,35 @@ class TestDetailAccept:
             assert nls[1].reviewed is False       # second `c` did NOT accept t1
             assert "Newsletter 2/2" not in _screen_text(app)  # not skipped past t1
             assert "Newsletter 2/3" in _screen_text(app)      # advanced exactly one
+
+    async def test_mashed_accept_does_not_re_run_on_the_popped_screen(self, tmp_path, monkeypatch):
+        # The await-free accept path releases the _busy latch before the second
+        # queued `c` worker runs; that worker must NOT re-confirm/save/refresh the
+        # already-dismissed screen (a latent NoMatches crash + a redundant write).
+        from textual import events
+
+        import evals.newsletter_label as NL
+
+        calls = []
+        orig = NL.confirm_story_list
+        monkeypatch.setattr(NL, "confirm_story_list", lambda nl: calls.append(nl) or orig(nl))
+
+        nls = [_newsletter(f"t{i}", body=f"b{i}") for i in range(3)]
+        for i, nl in enumerate(nls):
+            seed_stories(nl, [f"b{i}"])
+            assign_scores_and_themes(nl.stories[0], _scores(), [])
+        app = _label_app(nls, tmp_path)
+        async with app.run_test(size=SIZE) as pilot:
+            await pilot.press("enter")            # open t0 (fully labeled -> no confirm)
+            app.post_message(events.Key("c", "c"))
+            app.post_message(events.Key("c", "c"))
+            await pilot.pause()
+            await pilot.pause()
+            await pilot.pause()
+            assert app.is_running
+            # Exactly one accept committed: the second worker bailed instead of
+            # re-running confirm_story_list on the popped t0 screen.
+            assert len(calls) == 1
 
 
 class TestDetailStoryExclusion:

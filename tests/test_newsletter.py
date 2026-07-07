@@ -83,6 +83,20 @@ class TestParseStories:
         assert len(stories) == 1
         assert "Second paragraph" in stories[0]
 
+    def test_preamble_glued_to_first_story_is_not_dropped(self):
+        # The model prefaces the list with a line glued to the first STORY: by a
+        # single newline (no blank line). The first story must still be parsed,
+        # not silently dropped.
+        raw = "Here are the stories:\nSTORY: Alpha\n\nSTORY: Bravo"
+        stories = parse_stories(raw)
+        assert stories == ["Alpha", "Bravo"]
+
+    def test_crlf_separated_stories_are_split(self):
+        # Windows-style CRLF line endings must not collapse every story into one.
+        raw = "STORY: Alpha\r\n\r\nSTORY: Bravo\r\n\r\nSTORY: Charlie"
+        stories = parse_stories(raw)
+        assert stories == ["Alpha", "Bravo", "Charlie"]
+
 
 class TestParseQualityScores:
     def test_valid_scores(self):

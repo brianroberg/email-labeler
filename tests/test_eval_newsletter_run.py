@@ -288,7 +288,7 @@ class TestEvaluateStory:
 
 def _full_llm():
     return FakeLLM([
-        ("EXTRACT", "TITLE: S\nTEXT: body", "ecot"),
+        ("EXTRACT", "STORY: body", "ecot"),
         ("QUALITY", "SIMPLE: 3\nCONCRETE: 3\nPERSONAL: 3\nDYNAMIC: 3", "qcot"),
         ("THEME", "SCRIPTURE", "tcot"),
     ])
@@ -311,6 +311,9 @@ class TestRunEvaluation:
         extractions = [r for r in rows if isinstance(r, ExtractionPrediction)]
         stories = [r for r in rows if isinstance(r, StoryPrediction)]
         assert len(extractions) == 1
+        # The extractor output ("STORY: body") must actually parse into a story,
+        # otherwise the test passes even when extraction is broken.
+        assert extractions[0].predicted_stories == [{"text": "body"}]
         assert len(stories) == 1
         assert stories[0].predicted_tier == "good"  # avg 3.0
         story_entries = [t for t in thinking if t.story_id]
@@ -665,7 +668,7 @@ class TestExtractionThinking:
         assert entry.story_id == ""
 
     def test_run_evaluation_collects_extraction_thinking(self):
-        llm = FakeLLM([("body text", "TITLE: A\nTEXT: a", "xcot")])
+        llm = FakeLLM([("body text", "STORY: a", "xcot")])
         golden = [_newsletter("nl1", reviewed=True, stories=[_story("nl1:0")])]
         rows, thinking = _run(run_evaluation(
             golden, _classifier(llm), mode="extraction", parallelism=1,

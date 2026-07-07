@@ -261,6 +261,8 @@ class ReviewApp(App):
     def on_key(self, event) -> None:
         if self.screen is not self.screen_stack[0]:
             return  # a modal (submenu / notes) owns the keys
+        if self.session.done:
+            return  # last thread already advanced; exit() is queued, ignore keys
         key = event.key
         if key == "enter":
             hot = ""
