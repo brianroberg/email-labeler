@@ -5,24 +5,28 @@ Usage:
     python -m evals.newsletter_label --edit              # manual-only (no LLM seeding)
     python -m evals.newsletter_label --unreviewed-only
 
-Phase A (curate stories / extraction truth): press ``Space`` to seed candidate
-stories by running the production ``newsletter.parse_stories`` over a fresh
-LLM extraction of the body (an uncached call on every press; the seed is a
-deletable starting point, and re-seeding over an existing list asks for
-confirmation), then build the authoritative story list
-by marking body segments — move the cursor over the rendered body, press ``s``/
-``e`` to set the selection start/end line, and ``Enter`` to make a story from
-that inclusive span — plus add/edit/delete candidates. Body lines already
-covered by a story are dimmed, so paragraphs the seed omitted stand out.
-Confirming the list sets ``newsletter.reviewed=True``; every story keeps its
-stable ``story_id`` (``f"{thread_id}:{n}"``) and only missing/duplicate ids are
-repaired with fresh unique ones. A newsletter can also be skipped
-(``k``) without marking it reviewed, so it resurfaces in a later pass.
+The detail screen is **body-centric**: it shows the newsletter body with each
+story's span highlighted *in place*, so the extracted excerpts and their context
+are visible together. A compact story strip above the body lists each story with
+its located line range. Two explicit modes drive story refinement, and the mode
+bar always names the active mode and its keys:
 
-Phase B (per-story labels): assign the 4 dimension scores
-(simple/concrete/personal/dynamic, 1-5) and multi-select themes; on save the
-``expected_tier`` is derived via ``newsletter.compute_tier`` and
-``story.reviewed`` is set.
+Phase A — curate stories / extraction truth.
+  * **Auto-seed**: opening an unreviewed, story-less newsletter runs a fresh LLM
+    extraction (``newsletter.parse_stories`` over the production extraction
+    prompt) so the model's stories are already visible. Press ``r`` to re-seed.
+  * **Browse mode** (default): ``n``/``p`` or a number key selects a story;
+    ``a`` starts a new story, ``e`` edits the selected story's boundaries,
+    ``d`` deletes it, ``C`` clears all stories, ``u`` excludes it. ``c`` accepts
+    the story list (marks ``reviewed=True``) and advances to the next newsletter.
+  * **Span mode** (via ``a``/``e``): pick a story's boundaries by marking the
+    first line and the last line. A new story is two presses of ``Enter``
+    (mark start, mark end); ``s``/``e`` fine-tune the start/end; ``Esc`` cancels.
+    A committed story's text is the verbatim inclusive body slice.
+
+Phase B — per-story labels: with a story selected, ``l`` assigns the 4 dimension
+scores (simple/concrete/personal/dynamic, 1-5) and multi-select themes; on save
+``expected_tier`` is derived via ``newsletter.compute_tier``.
 
 The state transitions are factored into PURE functions (below) so they can be
 unit-tested without a terminal; the Textual UI layer on top is tested with
@@ -37,7 +41,9 @@ import os
 import sys
 import tempfile
 import unicodedata
+from dataclasses import dataclass, replace
 from pathlib import Path
+from typing import NamedTuple
 
 from textual import work
 from textual.app import App, ComposeResult
@@ -103,7 +109,7 @@ def seed_from_extractor(newsletter, extract_fn):
 
     *extract_fn* takes the raw body and returns the raw LLM extraction string
     (kept injectable so tests never touch a network). The production
-    ``parse_stories`` turns that into (title, text) pairs. Returns
+    ``parse_stories`` turns that into a list of story texts. Returns
     ``(stories, raw)`` so the caller can report the outcome (e.g. distinguish
     a NO_STORIES verdict from unparseable output — see ``seed_outcome_message``).
     """
@@ -111,8 +117,8 @@ def seed_from_extractor(newsletter, extract_fn):
     return seed_stories(newsletter, parse_stories(raw)), raw
 
 
-def seed_stories(newsletter, story_pairs):
-    """Populate candidate stories from ``parse_stories`` (title, text) pairs.
+def seed_stories(newsletter, story_texts):
+    """Populate candidate stories from ``parse_stories`` story texts.
 
     Replaces any existing story list, assigns stable ids, and records the seed
     provenance. Replacing the list invalidates any prior confirmation, so
@@ -121,8 +127,8 @@ def seed_stories(newsletter, story_pairs):
     the prior state, ``reviewed`` included, via the snapshot).
     """
     newsletter.stories = [
-        GoldenStory(story_id=f"{newsletter.thread_id}:{i}", title=title, text=text)
-        for i, (title, text) in enumerate(story_pairs)
+        GoldenStory(story_id=f"{newsletter.thread_id}:{i}", text=text)
+        for i, text in enumerate(story_texts)
     ]
     newsletter.seeded_from = "parse_stories"
     newsletter.reviewed = False
@@ -147,46 +153,49 @@ def _next_story_id(newsletter) -> str:
     return f"{prefix}{max_suffix + 1}"
 
 
-def add_story(newsletter, title, text):
+def add_story(newsletter, text):
     """Append a new candidate story with a stable, unique story_id.
 
     Does not confirm the list — ``newsletter.reviewed`` is untouched and the
     new story starts unreviewed.
     """
-    story = GoldenStory(
-        story_id=_next_story_id(newsletter),
-        title=title,
-        text=text,
-    )
+    story = GoldenStory(story_id=_next_story_id(newsletter), text=text)
     newsletter.stories.append(story)
     return story
 
 
-def create_story_from_body(newsletter, start_line, end_line, title):
+def create_story_from_body(newsletter, start_line, end_line):
     """Build a candidate story from an inclusive span of body lines.
 
     *start_line* / *end_line* are indices into ``newsletter.body.splitlines()``;
     they are normalized (min/max) and clamped to the valid range, so order and
     out-of-range values are tolerated. The span text is the inclusive
-    ``lo..hi`` slice joined with newlines. A falsy *title* is auto-derived from
-    the first ~8 words of the segment. Appends via ``add_story`` (stable,
+    ``lo..hi`` slice joined with newlines. Appends via ``add_story`` (stable,
     unique ``story_id``); ``newsletter.reviewed`` is left untouched.
+    """
+    lo, hi = _clamp_span(newsletter, start_line, end_line)
+    body_lines = newsletter.body.splitlines()
+    text = "\n".join(body_lines[lo:hi + 1])
+    return add_story(newsletter, text)
+
+
+def _clamp_span(newsletter, start_line, end_line) -> tuple[int, int]:
+    """Normalize + clamp an inclusive (start, end) body-line span.
+
+    Both endpoints are clamped to ``[0, last]``, so a span that lies entirely
+    past either end (e.g. ``(99, 99)``) collapses to the nearest boundary line
+    rather than an empty slice — the clamp is monotonic, so ``lo <= hi`` holds.
     """
     body_lines = newsletter.body.splitlines()
     last = max(0, len(body_lines) - 1)
-    lo = max(0, min(start_line, end_line))
-    hi = min(last, max(start_line, end_line))
-    text = "\n".join(body_lines[lo:hi + 1])
-    if not title:
-        title = " ".join(text.split()[:8]).strip() or "(untitled)"
-    return add_story(newsletter, title, text)
+    lo = max(0, min(last, min(start_line, end_line)))
+    hi = max(0, min(last, max(start_line, end_line)))
+    return lo, hi
 
 
-def edit_story(newsletter, index, *, title=None, text=None):
-    """Edit a candidate's title and/or text span. Unspecified fields are kept."""
+def edit_story(newsletter, index, *, text=None):
+    """Edit a candidate's text span. An unspecified field is kept."""
     story = newsletter.stories[index]
-    if title is not None:
-        story.title = title
     if text is not None:
         story.text = text
 
@@ -198,6 +207,11 @@ def delete_story(newsletter, index):
     ids (gaps are fine — ids are stable, never positional).
     """
     newsletter.stories.pop(index)
+
+
+def clear_stories(newsletter):
+    """Remove every story (start the story list over from scratch)."""
+    newsletter.stories = []
 
 
 def confirm_story_list(newsletter):
@@ -264,24 +278,187 @@ def newsletter_exclude_status(newsletter) -> str:
 
 
 # ---------------------------------------------------------------------------
+# Span-locating (derive a story's body-line range from its text at runtime)
+# ---------------------------------------------------------------------------
+
+def _line_matches(body_stripped: str, story_stripped: str, *, fuzzy: bool) -> bool:
+    """Whether a body line corresponds to a story line.
+
+    Exact (stripped) equality — human-created stories are verbatim body slices,
+    so they match exactly. With *fuzzy*, a whitespace-collapsed comparison also
+    tolerates the minor internal-spacing variance an LLM seed may introduce,
+    without the false positives a bare substring test would produce.
+    """
+    if body_stripped == story_stripped:
+        return True
+    if not fuzzy:
+        return False
+    return " ".join(body_stripped.split()) == " ".join(story_stripped.split())
+
+
+def _locate_run(body_lines, story_lines, *, fuzzy: bool) -> tuple[int, int] | None:
+    """First contiguous run of non-blank body lines matching *story_lines*."""
+    n = len(body_lines)
+    for start in range(n):
+        if not body_lines[start].strip():
+            continue
+        si = 0
+        bi = start
+        last = None
+        while bi < n and si < len(story_lines):
+            bstr = body_lines[bi].strip()
+            if not bstr:
+                bi += 1
+                continue
+            if _line_matches(bstr, story_lines[si], fuzzy=fuzzy):
+                last = bi
+                si += 1
+                bi += 1
+            else:
+                break
+        if si == len(story_lines) and last is not None:
+            return (start, last)
+    return None
+
+
+def locate_story_span(body_lines, story_text) -> tuple[int, int] | None:
+    """Locate *story_text* as a contiguous run of body lines.
+
+    The story's non-blank lines must match a run of non-blank body lines in
+    order (blank body lines between them are skipped). Returns the inclusive
+    ``(lo, hi)`` body-line range trimmed to the first/last matched non-blank
+    line, or ``None`` when the text can't be located (e.g. a hand-edited story
+    whose text no longer appears verbatim).
+
+    An **exact** run is preferred over a whitespace-collapsed (fuzzy) one, so a
+    story that is a verbatim body slice always locates at its true region even
+    if an earlier region would fuzzy-match.
+    """
+    story_lines = [ln.strip() for ln in story_text.splitlines() if ln.strip()]
+    if not story_lines:
+        return None
+    return (
+        _locate_run(body_lines, story_lines, fuzzy=False)
+        or _locate_run(body_lines, story_lines, fuzzy=True)
+    )
+
+
+def locate_story_spans(newsletter) -> list[tuple[int, int] | None]:
+    """Locate every story's body-line span (see ``locate_story_span``).
+
+    One entry per story, ``None`` where a story can't be located. Module-global
+    so the row-cache path can be counted/patched in tests.
+    """
+    body_lines = newsletter.body.splitlines()
+    return [locate_story_span(body_lines, s.text) for s in newsletter.stories]
+
+
+def story_at_body_line(spans, body_idx) -> int | None:
+    """Index of the first story whose located span contains *body_idx*."""
+    for i, span in enumerate(spans):
+        if span is not None and span[0] <= body_idx <= span[1]:
+            return i
+    return None
+
+
+# ---------------------------------------------------------------------------
+# Span-edit state machine (pure)
+# ---------------------------------------------------------------------------
+
+@dataclass
+class SpanEdit:
+    """Working state while marking/adjusting a story's body-line span.
+
+    *story_index* is None for a brand-new story, else the story being re-bounded.
+    *stage* is one of ``"mark-start"`` (pick the first line), ``"mark-end"``
+    (pick the last line), or ``"adjust"`` (re-bounding an existing span).
+    """
+
+    story_index: int | None
+    start: int
+    end: int
+    stage: str
+
+
+def begin_add_span(cursor: int) -> SpanEdit:
+    """Start a new-story span edit anchored at the cursor's body line."""
+    return SpanEdit(story_index=None, start=cursor, end=cursor, stage="mark-start")
+
+
+def begin_edit_span(spans, story_index) -> SpanEdit | None:
+    """Start re-bounding an existing story, seeded with its located span.
+
+    Returns None when the story can't be located in the body (nothing to seed).
+    """
+    span = spans[story_index] if 0 <= story_index < len(spans) else None
+    if span is None:
+        return None
+    lo, hi = span
+    return SpanEdit(story_index=story_index, start=lo, end=hi, stage="adjust")
+
+
+def span_mark(edit: SpanEdit, cursor: int) -> tuple[SpanEdit, bool]:
+    """Handle the Enter key in span mode; returns ``(new_edit, should_commit)``.
+
+    In ``mark-start`` the cursor fixes the start and the edit advances to
+    ``mark-end``. In ``mark-end`` the cursor fixes the end and the edit commits.
+    In ``adjust`` the current start/end commit as-is.
+    """
+    if edit.stage == "mark-start":
+        return replace(edit, start=cursor, end=cursor, stage="mark-end"), False
+    if edit.stage == "mark-end":
+        return replace(edit, end=cursor), True
+    return edit, True  # adjust
+
+
+def span_cursor_moved(edit: SpanEdit, cursor: int) -> SpanEdit:
+    """Track cursor movement: both ends in ``mark-start``, else the end."""
+    if edit.stage == "mark-start":
+        return replace(edit, start=cursor, end=cursor)
+    return replace(edit, end=cursor)
+
+
+def span_set_start(edit: SpanEdit, cursor: int) -> SpanEdit:
+    """Fine-adjust: set the span start to the cursor's body line."""
+    return replace(edit, start=cursor)
+
+
+def span_set_end(edit: SpanEdit, cursor: int) -> SpanEdit:
+    """Fine-adjust: set the span end to the cursor's body line."""
+    return replace(edit, end=cursor)
+
+
+def span_range(edit: SpanEdit) -> tuple[int, int]:
+    """The inclusive (lo, hi) highlight range for the current edit."""
+    return min(edit.start, edit.end), max(edit.start, edit.end)
+
+
+def commit_span_edit(newsletter, edit: SpanEdit) -> GoldenStory:
+    """Commit a span edit to a story (new or re-bounded).
+
+    A new story (``story_index is None``) is appended via ``create_story_from_body``.
+    Re-bounding replaces the story's text with the verbatim inclusive body slice
+    while PRESERVING its ``story_id``, labels, themes, notes, and excluded flag.
+    """
+    lo, hi = span_range(edit)
+    if edit.story_index is None:
+        return create_story_from_body(newsletter, lo, hi)
+    lo, hi = _clamp_span(newsletter, lo, hi)
+    body_lines = newsletter.body.splitlines()
+    story = newsletter.stories[edit.story_index]
+    story.text = "\n".join(body_lines[lo:hi + 1])
+    return story
+
+
+# ---------------------------------------------------------------------------
 # Pure helpers for the TUI (no UI dependency; fully testable)
 # ---------------------------------------------------------------------------
 
-_HELP_ITEMS = (
-    "↑/↓:move", "PgUp/PgDn:page", "s/e:select", "Enter:make-story", "Space:seed",
-    "[a]dd", "[E]dit", "[d]el", "[c]onfirm", "[l]abel", "[u]exclude", "[n]otes",
-    "[z]undo", "[k]skip", "[X]exclude-nl", "Esc:back", "q:quit",
-)
-
-
-def format_help_lines(width: int) -> list[str]:
-    """Pack the detail-view hotkey help into lines of at most *width* chars.
-
-    Wide terminals get one line; narrow ones wrap so no hotkey is ever hidden.
-    """
+def _pack_bar(items, width: int) -> list[str]:
+    """Pack *items* into lines of at most *width* chars (two-space separators)."""
     lines: list[str] = []
     current = ""
-    for item in _HELP_ITEMS:
+    for item in items:
         candidate = f"{current}  {item}" if current else item
         if current and len(candidate) > max(1, width):
             lines.append(current)
@@ -293,8 +470,41 @@ def format_help_lines(width: int) -> list[str]:
     return lines
 
 
+_BROWSE_KEYS = (
+    "n/p:pick-story", "1-9:pick", "[a]dd", "[e]dit-bounds", "[d]el", "[l]abel",
+    "[u]excl-story", "[C]lear-all", "[r]eseed", "[c]:accept+next", "[k]skip",
+    "[z]undo", "[N]otes", "[X]excl-nl", "Esc:back", "q:quit",
+)
+
+
+def browse_mode_bar(newsletter, selected, width: int) -> list[str]:
+    """Footer help for browse mode; names the mode + the selected story."""
+    if selected is not None:
+        head = f"[BROWSE] story {selected + 1}/{len(newsletter.stories)} selected"
+    elif newsletter.stories:
+        head = "[BROWSE] no story selected (n/p or a number to pick)"
+    else:
+        head = "[BROWSE] no stories yet"
+    return _pack_bar([head, *_BROWSE_KEYS], width)
+
+
+def span_mode_bar(edit, width: int) -> list[str]:
+    """Footer help for span mode; names the current marking stage."""
+    stage_text = {
+        "mark-start": "move to the FIRST line, Enter marks start",
+        "mark-end": "move to the LAST line, Enter commits",
+        "adjust": "move/[s]et-start/[e]nd, Enter commits",
+    }.get(getattr(edit, "stage", ""), "")
+    head = f"[SPAN] {stage_text}" if stage_text else "[SPAN]"
+    return _pack_bar(
+        [head, "arrows:move", "s:set-start", "e:set-end", "Enter:mark/commit",
+         "Esc:cancel"],
+        width,
+    )
+
+
 def seed_confirmation_message(newsletter) -> str | None:
-    """Confirmation to show before Space re-seeds over existing stories.
+    """Confirmation to show before ``r`` re-seeds over existing stories.
 
     Returns None when seeding is safe (empty story list); otherwise a y/N
     question stating how many stories — and how many carrying Phase-B labels —
@@ -333,32 +543,28 @@ def confirm_status_message(newsletter) -> str:
     return status
 
 
+def accept_confirmation_message(newsletter) -> str | None:
+    """Confirmation before ``c`` accepts a newsletter with unlabeled stories.
+
+    Returns None when every non-excluded story is labeled (accept silently);
+    otherwise a y/N question naming how many stories are still unlabeled.
+    """
+    n = unlabeled_story_count(newsletter)
+    if n == 0:
+        return None
+    return f"{plural(n, 'story', 'stories')} still unlabeled — accept & advance anyway? y/N"
+
+
 def row_for_body_line(rows, body_idx) -> int:
     """First rendered-row index carrying *body_idx* (see ``build_detail_rows``).
 
-    Used to re-anchor the cursor to the body line it was on after the story
-    list above the body grows/shrinks. Falls back to the last row (or 0).
+    Used to re-anchor the cursor to the body line it was on after the rows
+    above the body grow/shrink. Falls back to the last row (or 0).
     """
-    for ri, (_, bi) in enumerate(rows):
-        if bi == body_idx:
+    for ri, row in enumerate(rows):
+        if row.body_idx == body_idx:
             return ri
     return max(0, len(rows) - 1)
-
-
-def covered_body_lines(newsletter) -> set[int]:
-    """Body-line indices whose text already appears in some story.
-
-    Good seeds are verbatim spans of the body, so substring matching of each
-    non-blank body line against the story texts marks what is covered — the
-    view dims covered lines so OMITTED paragraphs stand out.
-    """
-    texts = [s.text for s in newsletter.stories]
-    covered = set()
-    for i, line in enumerate(newsletter.body.splitlines()):
-        stripped = line.strip()
-        if stripped and any(stripped in t for t in texts):
-            covered.add(i)
-    return covered
 
 
 def label_progress(newsletter) -> tuple[int, int]:
@@ -389,6 +595,42 @@ def format_list_row(newsletter) -> str:
     labeled, total = label_progress(newsletter)
     sender = (newsletter.sender or "")[:24]
     return f"{r:<2} {f'{labeled}/{total}':<6} {sender:<24} {newsletter.subject}"
+
+
+def story_excerpt(text: str, width: int) -> str:
+    """First-words excerpt of a story's text, collapsed and truncated to *width*."""
+    collapsed = " ".join(text.split())
+    if not collapsed:
+        return "(empty)"
+    if len(collapsed) <= width:
+        return collapsed
+    return collapsed[:max(1, width - 1)].rstrip() + "…"
+
+
+def format_story_strip(newsletter, spans, selected, width: int) -> list[str]:
+    """One strip line per story: marker, number, located range, flags, excerpt.
+
+    A story that can't be located in the body is flagged ``⚠ not found``; a
+    labeled story shows its dimension scores; an excluded story shows ``EXCL``.
+    With no stories, a single hint line is returned so the strip is never blank.
+    """
+    if not newsletter.stories:
+        return ["Stories: none — [a]dd a story or [r]eseed from the model"]
+    lines = []
+    for i, s in enumerate(newsletter.stories):
+        marker = "▶" if i == selected else " "
+        span = spans[i] if i < len(spans) else None
+        loc = f"L{span[0] + 1}-{span[1] + 1}" if span else "⚠ not found"
+        flags = []
+        if s.expected_scores is not None:
+            flags.append("/".join(str(s.expected_scores.get(d, "?")) for d in _DIMENSIONS))
+        if s.excluded:
+            flags.append("EXCL")
+        flag_str = f" [{'  '.join(flags)}]" if flags else ""
+        prefix = f"{marker}{i + 1}. {loc}{flag_str}  "
+        excerpt = story_excerpt(s.text, max(10, width - len(prefix)))
+        lines.append((prefix + excerpt)[:width])
+    return lines
 
 
 def format_theme_legend(selected, width: int) -> str:
@@ -470,7 +712,7 @@ def build_extractor(config: dict):
     base_url, api_key = resolve_newsletter_llm_endpoint()
     if not base_url:
         # Fail fast, before the app starts — otherwise the missing endpoint only
-        # surfaces as a truncated error when Space is pressed deep in the TUI.
+        # surfaces as a truncated error when a seed is triggered deep in the TUI.
         raise SystemExit(
             "No LLM endpoint configured for Phase-A seeding: set NEWSLETTER_LLM_URL "
             "or CLOUD_LLM_URL, or run with --edit to curate without seeding."
@@ -568,20 +810,33 @@ def wrap_text(text: str, width: int) -> list[str]:
     return lines
 
 
-def build_detail_rows(newsletter, index, total, width) -> list[tuple[str, int | None]]:
-    """Build the wrapped detail-view rows with body-line provenance.
+class DetailRow(NamedTuple):
+    """One rendered detail-view row.
 
-    Each returned row is ``(text, body_line_index_or_None)``. Header/metadata/
-    story-list rows carry ``None``. Each logical body line (from
-    ``body.splitlines()``) is wrapped to *width*, and every resulting physical
-    row carries THAT body line's index — the provenance map the view uses for
-    selection and highlighting.
+    *body_idx* is the source body-line index (``None`` for header/marker rows).
+    *story_idx* is the owning story's index when the row falls inside a located
+    span (``None`` otherwise). *kind* is ``"header"``, ``"marker"``, or ``"body"``.
     """
-    rows: list[tuple[str, int | None]] = []
+
+    text: str
+    body_idx: int | None
+    story_idx: int | None
+    kind: str
+
+
+def build_detail_rows(newsletter, index, total, width, *, spans) -> list[DetailRow]:
+    """Build the wrapped detail-view rows with body-line + story provenance.
+
+    A compact metadata header precedes the body. Each located story span gets a
+    ``▶ Story N`` marker row at its first body line, and every body row inside a
+    span carries that story's index (first-story-wins on overlap) — the map the
+    view uses to tint story regions. Each logical body line is wrapped to *width*.
+    """
+    rows: list[DetailRow] = []
 
     def add_header(text: str) -> None:
         for line in wrap_text(text, width):
-            rows.append((line, None))
+            rows.append(DetailRow(line, None, None, "header"))
 
     add_header(f"Newsletter {index + 1}/{total}  (id: {newsletter.thread_id})")
     add_header("=" * max(1, min(60, width)))
@@ -590,34 +845,28 @@ def build_detail_rows(newsletter, index, total, width) -> list[tuple[str, int | 
     add_header(f"Reviewed: {newsletter.reviewed}")
     if newsletter.excluded:
         add_header("Excluded: True — skipped by the queue and eval runs (X to restore)")
-    add_header(f"Seeded:   {newsletter.seeded_from or '-'}")
     if newsletter.notes:
         add_header(f"Notes:    {newsletter.notes}")
-    add_header("")
-    add_header(f"--- Stories ({len(newsletter.stories)}) ---")
-    for i, s in enumerate(newsletter.stories):
-        flags = []
-        if s.excluded:
-            flags.append("EXCLUDED")
-        if s.reviewed:
-            flags.append(s.expected_tier or "reviewed")
-        flag_str = f"  [{', '.join(flags)}]" if flags else ""
-        add_header(f"[{i}] {s.title}{flag_str}")
-        # Show the full parsed text inline (indented), wrapped to the width.
-        for text_line in wrap_text(s.text, max(1, width - 6)):
-            add_header(f"      {text_line}")
-        label_bits = []
-        if s.expected_scores is not None:
-            dims = "/".join(str(s.expected_scores.get(d, "?")) for d in _DIMENSIONS)
-            label_bits.append(f"scores: {dims}")
-        label_bits.append(f"themes: {', '.join(s.expected_themes) or '-'}")
-        add_header("    " + "   ".join(label_bits))
-    add_header("")
     add_header("--- Body ---")
 
+    # Map body-line -> span-start story and -> owning story (first-wins).
+    starts: dict[int, int] = {}
+    membership: dict[int, int] = {}
+    for si, span in enumerate(spans):
+        if span is None:
+            continue
+        lo, hi = span
+        starts.setdefault(lo, si)
+        for b in range(lo, hi + 1):
+            membership.setdefault(b, si)
+
     for body_idx, body_line in enumerate(newsletter.body.splitlines()):
+        if body_idx in starts:
+            si = starts[body_idx]
+            rows.append(DetailRow(f"▶ Story {si + 1}", None, si, "marker"))
+        sidx = membership.get(body_idx)
         for physical in wrap_text(body_line, width):
-            rows.append((physical, body_idx))
+            rows.append(DetailRow(physical, body_idx, sidx, "body"))
     return rows
 
 
@@ -713,37 +962,64 @@ class ThemeScreen(BottomModal):
 
 
 class DetailScreen(Screen):
-    """Curate + label one newsletter. Dismisses with "back", "skip", or "quit"."""
+    """Curate + label one newsletter. Dismisses with "back", "skip", "accepted",
+    or "quit"."""
 
     BINDINGS = [
         Binding("escape", "esc", "Back", show=False),
         Binding("q", "quit_app", "Quit", show=False),
-        Binding("space", "seed", "Seed", show=False),
-        Binding("s", "sel_start", "Selection start", show=False),
-        Binding("e", "sel_end", "Selection end", show=False),
+        Binding("r", "seed", "Reseed", show=False),
         Binding("a", "add_story", "Add story", show=False),
-        Binding("E", "edit_story", "Edit story", show=False),
+        Binding("e", "e_key", "Edit bounds / set end", show=False),
+        Binding("s", "s_key", "Set start", show=False),
+        Binding("n", "select_next", "Next story", show=False),
+        Binding("p", "select_prev", "Prev story", show=False),
+        Binding("1", "select_number(1)", "Story 1", show=False),
+        Binding("2", "select_number(2)", "Story 2", show=False),
+        Binding("3", "select_number(3)", "Story 3", show=False),
+        Binding("4", "select_number(4)", "Story 4", show=False),
+        Binding("5", "select_number(5)", "Story 5", show=False),
+        Binding("6", "select_number(6)", "Story 6", show=False),
+        Binding("7", "select_number(7)", "Story 7", show=False),
+        Binding("8", "select_number(8)", "Story 8", show=False),
+        Binding("9", "select_number(9)", "Story 9", show=False),
         Binding("d", "delete_story", "Delete story", show=False),
-        Binding("c", "confirm_list", "Confirm list", show=False),
         Binding("l", "label_story", "Label story", show=False),
         Binding("u", "toggle_story_excluded", "Exclude story", show=False),
-        Binding("n", "notes", "Notes", show=False),
+        Binding("C", "clear_all", "Clear all stories", show=False),
+        Binding("c", "accept", "Accept + next", show=False),
+        Binding("N", "notes", "Notes", show=False),
         Binding("z", "undo", "Undo", show=False),
         Binding("X", "toggle_newsletter_excluded", "Exclude newsletter", show=False),
         Binding("k", "skip", "Skip", show=False),
     ]
 
     DEFAULT_CSS = """
+    DetailScreen #storystrip {
+        color: $text-muted;
+    }
     DetailScreen #rows {
         height: 1fr;
     }
-    DetailScreen #rows .covered {
-        color: $text-disabled;
+    DetailScreen #rows .story-a {
+        color: $secondary;
     }
-    DetailScreen #rows .selected {
+    DetailScreen #rows .story-b {
+        color: $primary;
+    }
+    DetailScreen #rows .story-selected {
         text-style: bold;
+        background: $boost;
     }
-    DetailScreen #help {
+    DetailScreen #rows .span-working {
+        text-style: bold;
+        background: $accent;
+    }
+    DetailScreen #rows .marker {
+        color: $text-muted;
+        text-style: italic;
+    }
+    DetailScreen #modebar {
         color: $text-muted;
     }
     """
@@ -756,31 +1032,43 @@ class DetailScreen(Screen):
         self.all_newsletters = all_newsletters
         self.path = path
         self.extract_fn = extract_fn
-        self.sel_start = None  # selected body-line index
-        self.sel_end = None
+        self.mode = "browse"  # "browse" | "span"
+        self.selected_story: int | None = None
+        self.span_edit: SpanEdit | None = None
         self.undo_stack: list[dict] = []  # snapshots, pushed only on real mutations
         self.anchor_body = None  # body line to re-anchor the cursor to after a mutation
-        self._rows: list[tuple[str, int | None]] | None = None
-        self._covered: set[int] = set()
+        self._rows: list[DetailRow] | None = None
+        self._spans: list = []
         self._status_msg = ""
-        self._busy = False  # a seed is in flight; mutating keys are ignored
+        self._busy = False  # a seed/flow is in flight; mutating keys are ignored
+        self._dismiss_guard = False  # guards a second dismiss on an already-popped screen
         self._last_size: tuple[int, int] | None = None
 
     def compose(self) -> ComposeResult:
+        yield Static(id="storystrip", markup=False)
         yield PageListView(id="rows")
-        yield Static(id="help", markup=False)
+        yield Static(id="modebar", markup=False)
         yield Static(id="status", markup=False)
 
     def on_mount(self) -> None:
         self._refresh(rebuild=True)
         self.query_one("#rows", ListView).focus()
         self._set_status("")
+        # Auto-seed: opening an unreviewed, story-less newsletter runs a fresh
+        # extraction so the model's stories are visible without a keypress.
+        if self.extract_fn and not self.newsletter.stories and not self.newsletter.reviewed:
+            self._seed(auto=True)
 
     def on_resize(self, event) -> None:
         size = (event.size.width, event.size.height)
         prev, self._last_size = self._last_size, size
         if prev is not None and prev != size and self._rows is not None:
             # Rewrap to the new width so no body content is lost to clipping.
+            # Re-anchor by BODY line (not physical row) so a resize while marking
+            # a span doesn't drag the in-progress boundary to whatever body line
+            # the old physical row now maps to after the rewrap.
+            if self.anchor_body is None:
+                self.anchor_body = self._cursor_body_idx()
             self._refresh(rebuild=True)
 
     # -- rendering ----------------------------------------------------------
@@ -788,66 +1076,120 @@ class DetailScreen(Screen):
     def _width(self) -> int:
         return max(20, self.app.size.width)
 
-    def _refresh(self, rebuild: bool = False) -> None:
-        if rebuild or self._rows is None:
-            # Rows + covered-lines are expensive (display-width wrap of the
-            # whole body, substring scan per line); rebuild only on mutation
-            # or resize. Module-global lookups on purpose (test seam).
-            self._rows = build_detail_rows(
-                self.newsletter, self.nl_index, len(self.newsletters), self._width() - 2
+    def _clamp_selection(self) -> None:
+        if self.selected_story is not None and self.selected_story >= len(self.newsletter.stories):
+            self.selected_story = (
+                len(self.newsletter.stories) - 1 if self.newsletter.stories else None
             )
-            self._covered = covered_body_lines(self.newsletter)
 
-        lo = hi = None
-        if self.sel_start is not None and self.sel_end is not None:
-            lo, hi = min(self.sel_start, self.sel_end), max(self.sel_start, self.sel_end)
-        elif self.sel_start is not None:
-            lo = hi = self.sel_start
+    def _refresh(self, rebuild: bool = False) -> None:
+        self._clamp_selection()
+        if rebuild or self._rows is None:
+            # Rows + spans are expensive (display-width wrap of the whole body,
+            # locate scan per story); rebuild only on mutation or resize.
+            # Module-global lookups on purpose (test seam).
+            self._spans = locate_story_spans(self.newsletter)
+            self._rows = build_detail_rows(
+                self.newsletter, self.nl_index, len(self.newsletters),
+                self._width() - 2, spans=self._spans,
+            )
+
+        span_lo = span_hi = None
+        if self.mode == "span" and self.span_edit is not None:
+            span_lo, span_hi = span_range(self.span_edit)
 
         listview = self.query_one("#rows", ListView)
         if self.anchor_body is not None:
-            # The story list above the body grew/shrank: keep the cursor on
-            # the same BODY line, not the same physical row.
+            # The rows above the body grew/shrank: keep the cursor on the same
+            # BODY line, not the same physical row.
             cursor = row_for_body_line(self._rows, self.anchor_body)
             self.anchor_body = None
         else:
             cursor = listview.index or 0
         listview.clear()
         items = []
-        for text, body_idx in self._rows:
-            selected = body_idx is not None and lo is not None and lo <= body_idx <= hi
-            # Column 0 is reserved for the selection marker on EVERY row, so
-            # text never shifts when a selection appears.
-            marker = "*" if selected else " "
-            label = Label(marker + (text or " "), markup=False)
-            if selected:
-                label.add_class("selected")
-            elif body_idx is not None and body_idx in self._covered:
-                # Dim body lines already captured by a story, so paragraphs
-                # the seed OMITTED stand out at normal brightness.
-                label.add_class("covered")
+        for row in self._rows:
+            in_span = (
+                row.body_idx is not None and span_lo is not None
+                and span_lo <= row.body_idx <= span_hi
+            )
+            gutter, cls = self._row_gutter_class(row, in_span)
+            label = Label(gutter + (row.text or " "), markup=False)
+            if cls:
+                label.add_class(cls)
             items.append(ListItem(label))
         listview.extend(items)
         if self._rows:
             listview.index = max(0, min(cursor, len(self._rows) - 1))
-        self.query_one("#help", Static).update("\n".join(format_help_lines(self._width() - 1)))
+
+        self.query_one("#storystrip", Static).update(
+            "\n".join(format_story_strip(
+                self.newsletter, self._spans, self.selected_story, self._width() - 1,
+            ))
+        )
+        if self.mode == "span":
+            bar = span_mode_bar(self.span_edit, self._width() - 1)
+        else:
+            bar = browse_mode_bar(self.newsletter, self.selected_story, self._width() - 1)
+        self.query_one("#modebar", Static).update("\n".join(bar))
+
+    def _row_gutter_class(self, row: DetailRow, in_span: bool) -> tuple[str, str]:
+        """The (2-cell gutter, CSS class) for a rendered row.
+
+        Column 0 is reserved on every row so text never shifts. The span-working
+        highlight wins, then the selected story, then plain story membership.
+        """
+        if row.kind == "marker":
+            return "▸ ", "marker"
+        if in_span:
+            return "┃ ", "span-working"
+        if row.story_idx is not None:
+            if row.story_idx == self.selected_story:
+                return "┃ ", "story-selected"
+            return "│ ", ("story-a" if row.story_idx % 2 == 0 else "story-b")
+        return "  ", ""
 
     def _set_status(self, msg: str) -> None:
         self._status_msg = msg
         if msg:
             text = msg
+        elif self.mode == "span" and self.span_edit is not None:
+            text = self._span_status()
         else:
             listview = self.query_one("#rows", ListView)
             text = f"row {(listview.index or 0) + 1}/{len(self._rows or [])}"
         self.query_one("#status", Static).update(text)
 
+    def _span_status(self) -> str:
+        edit = self.span_edit
+        lo, hi = span_range(edit)
+        if edit.stage == "mark-start":
+            return "SPAN: move to the FIRST line, Enter marks start (Esc cancels)."
+        if edit.stage == "mark-end":
+            return (
+                f"SPAN: start=L{edit.start + 1}; move to the LAST line, Enter commits. "
+                "s/e adjust, Esc cancels."
+            )
+        return (
+            f"SPAN: lines L{lo + 1}-L{hi + 1}; Enter commits, s/e adjust, Esc cancels."
+        )
+
     def on_list_view_highlighted(self, event) -> None:
+        if self.mode == "span" and self.span_edit is not None:
+            bi = self._cursor_body_idx()
+            if bi is not None:
+                moved = span_cursor_moved(self.span_edit, bi)
+                if (moved.start, moved.end) != (self.span_edit.start, self.span_edit.end):
+                    self.span_edit = moved
+                    self._refresh()  # highlight update only (no rebuild)
+            self._set_status("")
+            return
         if not self._status_msg:
             self._set_status("")  # keep the row counter current
 
     def on_page_list_view_user_navigated(self, event) -> None:
-        # One-shot statuses clear on the next navigation keypress, restoring
-        # the "row N/M" position counter (parity with the curses status line).
+        # One-shot statuses clear on the next navigation keypress, restoring the
+        # "row N/M" position counter (parity with the curses status line).
         self._set_status("")
 
     # -- persistence / undo ---------------------------------------------------
@@ -867,10 +1209,9 @@ class DetailScreen(Screen):
     def _begin_flow(self) -> bool:
         """Claim the single mutation-flow slot.
 
-        Two key events processed back-to-back (auto-repeat / mashing) each
-        spawn a worker; the check-and-set runs before the worker's first
-        await, so the second worker bails instead of stacking a second
-        prompt over the first.
+        Two key events processed back-to-back (auto-repeat / mashing) each spawn
+        a worker; the check-and-set runs before the worker's first await, so the
+        second worker bails instead of stacking a second prompt over the first.
         """
         if self._busy:
             return False
@@ -884,196 +1225,266 @@ class DetailScreen(Screen):
         listview = self.query_one("#rows", ListView)
         if not self._rows or listview.index is None:
             return None
-        return self._rows[listview.index][1]
+        return self._rows[listview.index].body_idx
 
-    async def _prompt_story_index(self):
-        raw = await self.app.push_screen_wait(PromptLineScreen("Story #:"))
-        if raw is None or not raw.isdigit():
+    def _require_selected(self, what: str):
+        """Return the selected story index, or None with a status hint."""
+        if self.selected_story is None or self.selected_story >= len(self.newsletter.stories):
+            self._set_status(f"Select a story first (n/p or a number) to {what}.")
             return None
-        si = int(raw)
-        if 0 <= si < len(self.newsletter.stories):
-            return si
-        return None
+        return self.selected_story
 
     # -- navigation-ish actions ------------------------------------------------
 
     def action_esc(self) -> None:
-        if self.sel_start is not None or self.sel_end is not None:
-            self.sel_start = self.sel_end = None
+        if self.mode == "span":
+            self.mode = "browse"
+            self.span_edit = None
             self._refresh()
-            self._set_status("Selection cleared.")
+            self._set_status("Span edit cancelled.")
         else:
-            self.dismiss("back")
+            self._dismiss_once("back")
+
+    def _dismiss_once(self, result) -> None:
+        """Dismiss the screen at most once.
+
+        The mutation-flow ``_busy`` latch only serializes workers that *await*
+        between claim and release; an await-free ``_accept`` (nothing to confirm)
+        releases the latch before a second queued worker runs, so two mashed
+        ``c`` presses could both reach ``dismiss`` — the second on an
+        already-popped screen (a crash). This one-shot guard prevents that.
+        (Named ``_dismiss_guard``, not ``_closing`` — Textual owns ``_closing``
+        on the message pump, and clobbering it jams the screen's teardown.)
+        """
+        if not self._dismiss_guard:
+            self._dismiss_guard = True
+            self.dismiss(result)
 
     def action_skip(self) -> None:
-        self.dismiss("skip")  # never marks reviewed; list opens the next one
+        if self.mode == "span" or self._busy:
+            return
+        self._dismiss_once("skip")  # never marks reviewed; list opens the next one
 
     def action_quit_app(self) -> None:
-        self.dismiss("quit")
+        self._dismiss_once("quit")
 
-    # -- selection ------------------------------------------------------------
+    # -- story selection -------------------------------------------------------
 
-    def action_sel_start(self) -> None:
-        body_idx = self._cursor_body_idx()
-        if body_idx is None:
-            self._set_status("Move the cursor onto a body line first.")
+    def _select_story(self, si: int) -> None:
+        if not self.newsletter.stories:
+            self._set_status("No stories — press a to add or r to seed.")
+            return
+        si %= len(self.newsletter.stories)
+        self.selected_story = si
+        span = self._spans[si] if si < len(self._spans) else None
+        if span is not None:
+            self.anchor_body = span[0]  # scroll the story into view
+        self._refresh()
+        self._set_status(f"Story {si + 1}/{len(self.newsletter.stories)} selected.")
+
+    def action_select_next(self) -> None:
+        if self._busy or self.mode == "span":
+            return
+        cur = self.selected_story if self.selected_story is not None else -1
+        self._select_story(cur + 1)
+
+    def action_select_prev(self) -> None:
+        if self._busy or self.mode == "span":
+            return
+        cur = self.selected_story if self.selected_story is not None else 0
+        self._select_story(cur - 1)
+
+    def action_select_number(self, n: int) -> None:
+        if self._busy or self.mode == "span":
+            return
+        if 1 <= n <= len(self.newsletter.stories):
+            self._select_story(n - 1)
         else:
-            self.sel_start = body_idx
-            self._refresh()
-            self._set_status(f"Selection start = body line {body_idx} (Esc clears).")
+            self._set_status(f"No story {n}.")
 
-    def action_sel_end(self) -> None:
-        body_idx = self._cursor_body_idx()
-        if body_idx is None:
+    # -- span mode (mark / edit boundaries) -----------------------------------
+
+    def _enter_span_new(self) -> None:
+        cursor = self._cursor_body_idx()
+        if cursor is None:
+            cursor = self._first_body_line()
+        if cursor is None:
+            self._set_status("This newsletter has no body to select from.")
+            return
+        self.mode = "span"
+        self.span_edit = begin_add_span(cursor)
+        self._refresh()
+        self._set_status(self._span_status())
+
+    def _first_body_line(self):
+        for row in self._rows or []:
+            if row.body_idx is not None:
+                return row.body_idx
+        return None
+
+    def action_add_story(self) -> None:
+        if self._busy or self.mode == "span":
+            return
+        self._enter_span_new()
+
+    def action_e_key(self) -> None:
+        # In span mode: set the end to the cursor. In browse: edit the selected
+        # story's boundaries (enter span mode seeded with its located span).
+        if self.mode == "span":
+            self._span_adjust(span_set_end)
+            return
+        if self._busy:
+            return
+        si = self._require_selected("edit its boundaries")
+        if si is None:
+            return
+        edit = begin_edit_span(self._spans, si)
+        if edit is None:
+            self._edit_text_fallback(si)
+            return
+        self.mode = "span"
+        self.span_edit = edit
+        span = self._spans[si]
+        self.anchor_body = span[1]  # cursor at the current end
+        self._refresh()
+        self._set_status(self._span_status())
+
+    def action_s_key(self) -> None:
+        # Only meaningful in span mode (set the start to the cursor).
+        if self.mode == "span":
+            self._span_adjust(span_set_start)
+
+    def _span_adjust(self, fn) -> None:
+        cursor = self._cursor_body_idx()
+        if cursor is None:
             self._set_status("Move the cursor onto a body line first.")
-        else:
-            self.sel_end = body_idx
-            self._refresh()
-            self._set_status(f"Selection end = body line {body_idx} (Esc clears).")
+            return
+        self.span_edit = fn(self.span_edit, cursor)
+        self._refresh()
+        self._set_status(self._span_status())
 
     def on_list_view_selected(self, event) -> None:
         event.stop()  # don't bubble to LabelApp's open-detail handler
-        self._make_story()
+        if self.mode == "span":
+            self._span_enter()
+        else:
+            self._select_under_cursor()
+
+    def _span_enter(self) -> None:
+        cursor = self._cursor_body_idx()
+        if cursor is None:
+            self._set_status("Move the cursor onto a body line first.")
+            return
+        self.span_edit, commit = span_mark(self.span_edit, cursor)
+        if commit:
+            self._commit_span()
+        else:
+            self._refresh()
+            self._set_status(self._span_status())
+
+    def _commit_span(self) -> None:
+        edit = self.span_edit
+        self.anchor_body = self._cursor_body_idx()
+        self._push_undo()
+        story = commit_span_edit(self.newsletter, edit)
+        # Select the story we just created/edited so labeling can follow.
+        try:
+            self.selected_story = self.newsletter.stories.index(story)
+        except ValueError:
+            self.selected_story = None
+        self.mode = "browse"
+        self.span_edit = None
+        self._save()
+        excerpt = story_excerpt(story.text, 40)
+        verb = "updated" if edit.story_index is not None else "created"
+        self._set_status(f"Story {verb}: {excerpt}")
+
+    def _select_under_cursor(self) -> None:
+        cursor = self._cursor_body_idx()
+        si = story_at_body_line(self._spans, cursor) if cursor is not None else None
+        if si is None:
+            self._set_status("No story on this line — press a to add one.")
+            return
+        self._select_story(si)
+
+    def _edit_text_fallback(self, si: int) -> None:
+        """Boundary edit is impossible (story not locatable) — edit text directly."""
+        self._run_edit_text_fallback(si)
 
     @work
-    async def _make_story(self) -> None:
+    async def _run_edit_text_fallback(self, si: int) -> None:
         if not self._begin_flow():
             return
         try:
-            await self._run_make_story()
+            story = self.newsletter.stories[si]
+            collapsed = " ".join(story.text.split())
+            new_text = await self.app.push_screen_wait(
+                PromptLineScreen(
+                    "Text (story not found in body; edit as text):", initial=collapsed,
+                )
+            )
+            if new_text is None or new_text == story.text:
+                self._set_status("Edit cancelled.")
+                return
+            self._push_undo()
+            edit_story(self.newsletter, si, text=new_text)
+            self._save()
+            self._set_status(f"Story [{si + 1}] text updated.")
         finally:
             self._end_flow()
-
-    async def _run_make_story(self) -> None:
-        if self.sel_start is None:
-            self._set_status("Set a selection start with 's' first.")
-            return
-        s_line = self.sel_start
-        e_line = self.sel_end if self.sel_end is not None else self.sel_start
-        title = await self.app.push_screen_wait(PromptLineScreen("Title (blank=auto):"))
-        if title is None:
-            self._set_status("Story creation cancelled.")
-            return
-        self.anchor_body = self._cursor_body_idx()
-        self._push_undo()
-        story = create_story_from_body(self.newsletter, s_line, e_line, title)
-        self.sel_start = self.sel_end = None
-        self._save()
-        self._set_status(f"Story created: {story.title}")
 
     # -- seeding ---------------------------------------------------------------
 
     def action_seed(self) -> None:
-        self._seed()
+        if self.mode == "span":
+            return
+        self._seed(auto=False)
 
     @work
-    async def _seed(self) -> None:
+    async def _seed(self, auto: bool = False) -> None:
         if not self._begin_flow():
             return
         try:
-            await self._run_seed()
+            await self._run_seed(auto=auto)
         finally:
             self._end_flow()
 
-    async def _run_seed(self) -> None:
+    async def _run_seed(self, auto: bool = False) -> None:
         if self.extract_fn is None:
-            self._set_status("Seeding disabled in edit mode (run without --edit to seed).")
+            if not auto:
+                self._set_status("Seeding disabled in edit mode (run without --edit to seed).")
             return
-        confirm_msg = seed_confirmation_message(self.newsletter)
-        if confirm_msg is not None and not await self.app.push_screen_wait(
-            ConfirmScreen(confirm_msg)
-        ):
-            self._set_status("Seed cancelled — stories kept.")
-            return
-        self._set_status("Seeding…")
+        if not auto:
+            confirm_msg = seed_confirmation_message(self.newsletter)
+            if confirm_msg is not None and not await self.app.push_screen_wait(
+                ConfirmScreen(confirm_msg)
+            ):
+                self._set_status("Seed cancelled — stories kept.")
+                return
+        self._set_status("Extracting stories…")
         try:
-            # Only the network call runs in the thread; the newsletter is
-            # mutated on the UI task AFTER the await, so dismissing the
-            # screen mid-seed cancels this worker and the late extractor
-            # result is discarded instead of clobbering curated stories.
+            # Only the network call runs in the thread; the newsletter is mutated
+            # on the UI task AFTER the await, so dismissing the screen mid-seed
+            # cancels this worker and the late extractor result is discarded
+            # instead of clobbering curated stories.
             raw = await asyncio.to_thread(self.extract_fn, self.newsletter.body)
-            pairs = parse_stories(raw)
+            texts = parse_stories(raw)
         except Exception as exc:
             # No undo snapshot was pushed, so the stack stays clean.
             self._set_status("")
             self.app.push_screen(HintScreen(f"Seed failed: {exc}"))
         else:
             self._push_undo()
-            stories = seed_stories(self.newsletter, pairs)
+            self.selected_story = None
+            stories = seed_stories(self.newsletter, texts)
             self._save()
             self._set_status(seed_outcome_message(raw, len(stories)))
 
-    # -- story curation ----------------------------------------------------------
-
-    def action_add_story(self) -> None:
-        self._add_story()
-
-    @work
-    async def _add_story(self) -> None:
-        if not self._begin_flow():
-            return
-        try:
-            await self._run_add_story()
-        finally:
-            self._end_flow()
-
-    async def _run_add_story(self) -> None:
-        title = await self.app.push_screen_wait(PromptLineScreen("New title:"))
-        text = None
-        if title:
-            text = await self.app.push_screen_wait(PromptLineScreen("New text:"))
-        if title and text:
-            self._push_undo()
-            add_story(self.newsletter, title, text)
-            self._save()
-            self._set_status(f"Story added: {title}")
-        else:
-            self._set_status("Add cancelled — need a title and text.")
-
-    def action_edit_story(self) -> None:
-        self._edit_story()
-
-    @work
-    async def _edit_story(self) -> None:
-        if not self._begin_flow():
-            return
-        try:
-            await self._run_edit_story()
-        finally:
-            self._end_flow()
-
-    async def _run_edit_story(self) -> None:
-        si = await self._prompt_story_index()
-        if si is None:
-            self._set_status("No valid story # — nothing edited.")
-            return
-        story = self.newsletter.stories[si]
-        new_title = await self.app.push_screen_wait(
-            PromptLineScreen("Title (blank=keep):", initial=story.title)
-        )
-        if new_title is None:
-            self._set_status("Edit cancelled.")
-            return
-        # Multi-line text can't be edited in a one-line prompt; fall back to
-        # blank=keep for it (body selection is the intended repair path).
-        text_initial = story.text if "\n" not in story.text else ""
-        new_text = await self.app.push_screen_wait(
-            PromptLineScreen("Text (blank=keep):", initial=text_initial)
-        )
-        if new_text is None:
-            self._set_status("Edit cancelled.")
-            return
-        new_title = new_title or story.title
-        new_text = new_text or story.text
-        if new_title == story.title and new_text == story.text:
-            self._set_status("No changes.")
-            return
-        self._push_undo()
-        edit_story(self.newsletter, si, title=new_title, text=new_text)
-        self._save()
-        self._set_status(f"Story [{si}] updated.")
+    # -- story curation --------------------------------------------------------
 
     def action_delete_story(self) -> None:
+        if self.mode == "span":
+            return
         self._delete_story()
 
     @work
@@ -1086,32 +1497,74 @@ class DetailScreen(Screen):
             self._end_flow()
 
     async def _run_delete_story(self) -> None:
-        si = await self._prompt_story_index()
+        si = self._require_selected("delete it")
         if si is None:
-            self._set_status("No valid story # — nothing deleted.")
             return
         story = self.newsletter.stories[si]
+        excerpt = story_excerpt(story.text, 40)
         if story.expected_scores is not None and not await self.app.push_screen_wait(
-            ConfirmScreen(f"[{si}] {story.title} has labels — delete anyway? y/N")
+            ConfirmScreen(f"[{si + 1}] {excerpt} has labels — delete anyway? y/N")
         ):
             self._set_status("Delete cancelled.")
             return
         self._push_undo()
         delete_story(self.newsletter, si)
+        self.selected_story = None
         self._save()
-        self._set_status(f"Deleted [{si}] {story.title} (z to undo).")
+        self._set_status(f"Deleted [{si + 1}] {excerpt} (z to undo).")
 
-    def action_confirm_list(self) -> None:
-        if self._busy:
+    def action_clear_all(self) -> None:
+        if self.mode == "span":
             return
-        self._push_undo()
-        confirm_story_list(self.newsletter)
-        self._save()
-        self._set_status(confirm_status_message(self.newsletter))
+        self._clear_all()
 
-    # -- Phase B: labeling ------------------------------------------------------
+    @work
+    async def _clear_all(self) -> None:
+        if not self._begin_flow():
+            return
+        try:
+            if not self.newsletter.stories:
+                self._set_status("No stories to clear.")
+                return
+            n = len(self.newsletter.stories)
+            if not await self.app.push_screen_wait(
+                ConfirmScreen(f"Clear all {plural(n, 'story', 'stories')}? y/N")
+            ):
+                self._set_status("Clear cancelled.")
+                return
+            self._push_undo()
+            clear_stories(self.newsletter)
+            self.selected_story = None
+            self._save()
+            self._set_status("All stories cleared (z to undo). Press a to add one.")
+        finally:
+            self._end_flow()
+
+    def action_accept(self) -> None:
+        if self.mode == "span":
+            return
+        self._accept()
+
+    @work
+    async def _accept(self) -> None:
+        if not self._begin_flow():
+            return
+        try:
+            msg = accept_confirmation_message(self.newsletter)
+            if msg is not None and not await self.app.push_screen_wait(ConfirmScreen(msg)):
+                self._set_status("Not accepted — press l to label the remaining stories.")
+                return
+            confirm_story_list(self.newsletter)
+            self._save()
+            self._dismiss_once("accepted")
+        finally:
+            self._end_flow()
+
+    # -- Phase B: labeling -----------------------------------------------------
 
     def action_label_story(self) -> None:
+        if self.mode == "span":
+            return
         self._label_story()
 
     @work
@@ -1124,9 +1577,8 @@ class DetailScreen(Screen):
             self._end_flow()
 
     async def _run_label_story(self) -> None:
-        si = await self._prompt_story_index()
+        si = self._require_selected("label it")
         if si is None:
-            self._set_status("No valid story # — nothing labeled.")
             return
         story = self.newsletter.stories[si]
         scores = await self.app.push_screen_wait(ScoreScreen(current=story.expected_scores))
@@ -1137,34 +1589,25 @@ class DetailScreen(Screen):
         self._push_undo()
         assign_scores_and_themes(story, scores, themes)
         self._save()
-        self._set_status(f"Labeled [{si}] {story.expected_tier}.")
+        self._set_status(f"Labeled [{si + 1}] {story.expected_tier}.")
 
     def action_toggle_story_excluded(self) -> None:
-        self._toggle_story_excluded()
-
-    @work
-    async def _toggle_story_excluded(self) -> None:
-        if not self._begin_flow():
+        if self.mode == "span" or self._busy:
             return
-        try:
-            await self._run_toggle_story_excluded()
-        finally:
-            self._end_flow()
-
-    async def _run_toggle_story_excluded(self) -> None:
-        si = await self._prompt_story_index()
+        si = self._require_selected("exclude it")
         if si is None:
-            self._set_status("No valid story # — nothing toggled.")
             return
         self._push_undo()
         story = self.newsletter.stories[si]
         story.excluded = not story.excluded
         self._save()
         self._set_status(
-            f"[{si}] {'excluded from' if story.excluded else 'included in'} scoring."
+            f"[{si + 1}] {'excluded from' if story.excluded else 'included in'} scoring."
         )
 
     def action_notes(self) -> None:
+        if self.mode == "span":
+            return
         self._notes()
 
     @work
@@ -1190,20 +1633,21 @@ class DetailScreen(Screen):
             self._save()
             self._set_status("Notes updated.")
 
-    # -- undo / exclusion ---------------------------------------------------------
+    # -- undo / exclusion ------------------------------------------------------
 
     def action_undo(self) -> None:
-        if self._busy:
+        if self._busy or self.mode == "span":
             return
         if self.undo_stack:
             restore_snapshot(self.newsletter, self.undo_stack.pop())
+            self.selected_story = None
             self._save()
             self._set_status(f"Undone ({len(self.undo_stack)} more undo levels).")
         else:
             self._set_status("Nothing to undo.")
 
     def action_toggle_newsletter_excluded(self) -> None:
-        if self._busy:
+        if self._busy or self.mode == "span":
             return
         self._push_undo()
         toggle_newsletter_excluded(self.newsletter)
@@ -1271,13 +1715,13 @@ class LabelApp(App):
             if result == "quit":
                 self.exit("quit")
                 return
-            if result == "skip" and index < len(self.newsletters) - 1:
-                # Linear skip-through: advance and immediately open the next
-                # newsletter. Skipping never marks reviewed, so it resurfaces.
+            if result in ("skip", "accepted") and index < len(self.newsletters) - 1:
+                # Linear advance: open the next newsletter. "skip" never marks
+                # reviewed; "accepted" already did (confirm_story_list).
                 self.query_one("#newsletters", ListView).index = index + 1
                 self._open_detail(index + 1)
                 return
-            # "back", or "skip" on the last newsletter -> back to the list;
+            # "back", or advancing off the last newsletter -> back to the list;
             # rebuild rows so reviewed/excluded flags are current.
             self._refresh_list()
 
@@ -1299,7 +1743,6 @@ def label_loop(newsletters, all_newsletters, path, *, extract_fn=None):
         print("No newsletters to label.")
         return
     LabelApp(newsletters, all_newsletters, Path(path), extract_fn=extract_fn).run()
-
 
 
 # ---------------------------------------------------------------------------
