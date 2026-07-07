@@ -142,13 +142,14 @@ def build_detail_lines(record: dict, width: int = 80) -> list[str]:
         return lines
 
     for i, story in enumerate(stories):
-        title = story.get("title", "Untitled")
         tier = story.get("tier") or "—"
         avg = story.get("average_score")
         avg_str = f"{avg:.1f}" if avg is not None else "—"
         themes = story.get("themes", [])
 
-        lines.append(f"--- Story {i + 1}/{len(stories)}: {title} [{tier}, avg: {avg_str}] ---")
+        # Stories are identified by a text excerpt (titles were removed).
+        excerpt = _truncate(" ".join(story.get("text", "").split()), 50)
+        lines.append(f"--- Story {i + 1}/{len(stories)}: {excerpt} [{tier}, avg: {avg_str}] ---")
 
         if themes:
             lines.append(f"Themes: {', '.join(themes)}")

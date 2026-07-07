@@ -31,7 +31,6 @@ def _make_record(
     if stories is None:
         stories = [
             {
-                "title": "A Great Story",
                 "text": "Once upon a time in a campus ministry...",
                 "scores": {"simple": 4, "concrete": 3, "personal": 5, "dynamic": 2},
                 "average_score": 3.5,
@@ -115,13 +114,13 @@ class TestApplyFilters:
     def test_theme_filter_matches_story_theme(self):
         records = [
             _make_record(stories=[{
-                "title": "S", "text": "T", "scores": None,
+                "text": "T", "scores": None,
                 "average_score": None, "tier": None,
                 "themes": ["scripture", "church"],
                 "quality_cot": "", "theme_cot": "",
             }]),
             _make_record(stories=[{
-                "title": "S", "text": "T", "scores": None,
+                "text": "T", "scores": None,
                 "average_score": None, "tier": None,
                 "themes": ["disciple_making"],
                 "quality_cot": "", "theme_cot": "",
@@ -209,11 +208,12 @@ class TestBuildDetailLines:
         text = "\n".join(lines)
         assert "excellent" in text
 
-    def test_includes_story_title_and_tier(self):
+    def test_includes_story_text_excerpt_and_tier(self):
         record = _make_record()
         lines = build_detail_lines(record)
         text = "\n".join(lines)
-        assert "A Great Story" in text
+        # Stories are identified by a text excerpt, not a title.
+        assert "Once upon a time in a campus ministry" in text
         assert "good" in text
 
     def test_includes_quality_scores(self):
@@ -243,24 +243,24 @@ class TestBuildDetailLines:
 
     def test_handles_missing_scores(self):
         record = _make_record(stories=[{
-            "title": "No Scores", "text": "Content",
+            "text": "Content without any scores",
             "scores": None, "average_score": None, "tier": None,
             "themes": [], "quality_cot": "", "theme_cot": "",
         }])
         lines = build_detail_lines(record)
         text = "\n".join(lines)
-        assert "No Scores" in text
+        assert "Content without any scores" in text
 
     def test_handles_multiple_stories(self):
         stories = [
             {
-                "title": "Story A", "text": "Content A",
+                "text": "Content A about a student",
                 "scores": {"simple": 5, "concrete": 5, "personal": 5, "dynamic": 5},
                 "average_score": 5.0, "tier": "excellent",
                 "themes": ["scripture"], "quality_cot": "cot A", "theme_cot": "theme A",
             },
             {
-                "title": "Story B", "text": "Content B",
+                "text": "Content B about a mentor",
                 "scores": {"simple": 2, "concrete": 2, "personal": 2, "dynamic": 2},
                 "average_score": 2.0, "tier": "fair",
                 "themes": ["church"], "quality_cot": "cot B", "theme_cot": "theme B",
@@ -269,8 +269,8 @@ class TestBuildDetailLines:
         record = _make_record(stories=stories)
         lines = build_detail_lines(record)
         text = "\n".join(lines)
-        assert "Story A" in text
-        assert "Story B" in text
+        assert "Content A about a student" in text
+        assert "Content B about a mentor" in text
         assert "1/2" in text
         assert "2/2" in text
 
@@ -360,7 +360,7 @@ def _ui_records():
             overall_tier="excellent",
             sender="dave@dm.org",
             stories=[{
-                "title": "Vocation Story", "text": "T", "scores": None,
+                "text": "T", "scores": None,
                 "average_score": None, "tier": None,
                 "themes": ["vocation_family"], "quality_cot": "", "theme_cot": "",
             }],
@@ -404,7 +404,7 @@ class TestReviewAppDetail:
             text = "\n".join(str(w.render()) for w in app.screen.query(Static))
             assert "Subject one" in text
             assert "Overall: poor" in text
-            assert "A Great Story" in text
+            assert "Once upon a time in a campus ministry" in text
 
     async def test_detail_status_shows_position(self):
         app = ReviewApp(_ui_records())
