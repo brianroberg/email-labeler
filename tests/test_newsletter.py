@@ -21,24 +21,21 @@ from newsletter import (
 
 class TestParseStories:
     def test_single_story(self):
-        raw = "TITLE: Sarah's Journey\nTEXT: Sarah came to campus as a freshman..."
+        raw = "STORY: Sarah came to campus as a freshman..."
         stories = parse_stories(raw)
         assert len(stories) == 1
-        assert stories[0][0] == "Sarah's Journey"
-        assert "Sarah came to campus" in stories[0][1]
+        assert "Sarah came to campus" in stories[0]
 
     def test_multiple_stories(self):
         raw = (
-            "TITLE: First Story\n"
-            "TEXT: Content of first story.\n"
+            "STORY: Content of first story.\n"
             "\n"
-            "TITLE: Second Story\n"
-            "TEXT: Content of second story."
+            "STORY: Content of second story."
         )
         stories = parse_stories(raw)
         assert len(stories) == 2
-        assert stories[0][0] == "First Story"
-        assert stories[1][0] == "Second Story"
+        assert stories[0] == "Content of first story."
+        assert stories[1] == "Content of second story."
 
     def test_no_stories(self):
         stories = parse_stories("NO_STORIES")
@@ -50,15 +47,14 @@ class TestParseStories:
 
     def test_multiline_story_text(self):
         raw = (
-            "TITLE: A Long Story\n"
-            "TEXT: First paragraph of the story.\n"
+            "STORY: First paragraph of the story.\n"
             "Second paragraph continues here.\n"
             "Third paragraph wraps up."
         )
         stories = parse_stories(raw)
         assert len(stories) == 1
-        assert "First paragraph" in stories[0][1]
-        assert "Third paragraph" in stories[0][1]
+        assert "First paragraph" in stories[0]
+        assert "Third paragraph" in stories[0]
 
     def test_empty_input(self):
         stories = parse_stories("")
@@ -67,6 +63,25 @@ class TestParseStories:
     def test_garbage_input(self):
         stories = parse_stories("This is not formatted correctly at all")
         assert stories == []
+
+    def test_inner_line_starting_with_story_stays_one_story(self):
+        # A story whose own body contains a line starting with "STORY:" must not
+        # be split — delimiters are only recognized after a blank line.
+        raw = (
+            "STORY: Line one of the story.\n"
+            "STORY: is a prefix that starts this line inside the same story."
+        )
+        stories = parse_stories(raw)
+        assert len(stories) == 1
+        assert "prefix that starts this line" in stories[0]
+
+    def test_multi_paragraph_story_stays_one_story(self):
+        raw = "STORY: First paragraph.\n\n\nSecond paragraph after a blank line."
+        # A blank line inside a single STORY block (no following STORY:) is part
+        # of the story, not a delimiter.
+        stories = parse_stories(raw)
+        assert len(stories) == 1
+        assert "Second paragraph" in stories[0]
 
 
 class TestParseQualityScores:
@@ -188,11 +203,11 @@ def newsletter_config():
                 },
                 "quality_assessment": {
                     "system": "Score the story.",
-                    "user_template": "Story title: {title}\nStory text:\n{text}",
+                    "user_template": "Story text:\n{text}",
                 },
                 "theme_classification": {
                     "system": "Classify themes.",
-                    "user_template": "Story title: {title}\nStory text:\n{text}",
+                    "user_template": "Story text:\n{text}",
                 },
             },
         }
@@ -207,12 +222,12 @@ def nl_classifier(mock_cloud_llm, newsletter_config):
 class TestExtractStories:
     async def test_extracts_stories(self, nl_classifier, mock_cloud_llm):
         mock_cloud_llm.complete.return_value = (
-            "TITLE: A Great Story\nTEXT: Once upon a time...",
+            "STORY: Once upon a time...",
             "thinking about stories",
         )
         stories = await nl_classifier.extract_stories("newsletter body text")
         assert len(stories) == 1
-        assert stories[0][0] == "A Great Story"
+        assert stories[0] == "Once upon a time..."
         mock_cloud_llm.complete.assert_called_once()
 
     async def test_returns_empty_for_no_stories(self, nl_classifier, mock_cloud_llm):
@@ -233,36 +248,35 @@ class TestAssessQuality:
             "SIMPLE: 4\nCONCRETE: 3\nPERSONAL: 5\nDYNAMIC: 2",
             "quality reasoning",
         )
-        scores, cot = await nl_classifier.assess_quality("Title", "Story text")
+        scores, cot = await nl_classifier.assess_quality("Story text")
         assert scores == {"simple": 4, "concrete": 3, "personal": 5, "dynamic": 2}
         assert cot == "quality reasoning"
 
     async def test_returns_none_on_parse_failure(self, nl_classifier, mock_cloud_llm):
         mock_cloud_llm.complete.return_value = ("garbled output", "")
-        scores, cot = await nl_classifier.assess_quality("Title", "Story text")
+        scores, cot = await nl_classifier.assess_quality("Story text")
         assert scores is None
 
-    async def test_passes_title_and_text(self, nl_classifier, mock_cloud_llm):
+    async def test_passes_text(self, nl_classifier, mock_cloud_llm):
         mock_cloud_llm.complete.return_value = (
             "SIMPLE: 3\nCONCRETE: 3\nPERSONAL: 3\nDYNAMIC: 3",
             "",
         )
-        await nl_classifier.assess_quality("My Title", "My story text")
+        await nl_classifier.assess_quality("My story text")
         user_content = mock_cloud_llm.complete.call_args.args[1]
-        assert "My Title" in user_content
         assert "My story text" in user_content
 
 
 class TestClassifyThemes:
     async def test_classifies_themes(self, nl_classifier, mock_cloud_llm):
         mock_cloud_llm.complete.return_value = ("SCRIPTURE\nCHURCH", "theme reasoning")
-        themes, cot = await nl_classifier.classify_themes("Title", "Story text")
+        themes, cot = await nl_classifier.classify_themes("Story text")
         assert themes == ["scripture", "church"]
         assert cot == "theme reasoning"
 
     async def test_returns_empty_for_none(self, nl_classifier, mock_cloud_llm):
         mock_cloud_llm.complete.return_value = ("NONE", "")
-        themes, cot = await nl_classifier.classify_themes("Title", "Story text")
+        themes, cot = await nl_classifier.classify_themes("Story text")
         assert themes == []
 
 
@@ -270,13 +284,13 @@ class TestClassifyNewsletter:
     async def test_full_pipeline(self, nl_classifier, mock_cloud_llm):
         """Full pipeline: extract 1 story, score it, tag themes."""
         mock_cloud_llm.complete.side_effect = [
-            ("TITLE: Test Story\nTEXT: A student named Jake...", ""),
+            ("STORY: A student named Jake...", ""),
             ("SIMPLE: 4\nCONCRETE: 5\nPERSONAL: 4\nDYNAMIC: 3", "quality cot"),
             ("CHRISTLIKENESS\nDISCIPLE_MAKING", "theme cot"),
         ]
         results = await nl_classifier.classify_newsletter("newsletter body")
         assert len(results) == 1
-        assert results[0].title == "Test Story"
+        assert results[0].text == "A student named Jake..."
         assert results[0].scores == {"simple": 4, "concrete": 5, "personal": 4, "dynamic": 3}
         assert results[0].average_score == 4.0
         assert results[0].tier == NewsletterTier.EXCELLENT
@@ -293,7 +307,7 @@ class TestClassifyNewsletter:
 
     async def test_quality_failure_still_classifies_themes(self, nl_classifier, mock_cloud_llm):
         mock_cloud_llm.complete.side_effect = [
-            ("TITLE: Story\nTEXT: Content here", ""),
+            ("STORY: Content here", ""),
             ("garbled quality output", ""),
             ("SCRIPTURE", "theme cot"),
         ]
@@ -305,7 +319,7 @@ class TestClassifyNewsletter:
 
     async def test_theme_failure_preserves_quality(self, nl_classifier, mock_cloud_llm):
         mock_cloud_llm.complete.side_effect = [
-            ("TITLE: Story\nTEXT: Content", ""),
+            ("STORY: Content", ""),
             ("SIMPLE: 3\nCONCRETE: 3\nPERSONAL: 3\nDYNAMIC: 3", "quality cot"),
             RuntimeError("LLM error"),
         ]
@@ -316,7 +330,7 @@ class TestClassifyNewsletter:
 
     async def test_multiple_stories(self, nl_classifier, mock_cloud_llm):
         mock_cloud_llm.complete.side_effect = [
-            ("TITLE: Story A\nTEXT: Content A\n\nTITLE: Story B\nTEXT: Content B", ""),
+            ("STORY: Content A\n\nSTORY: Content B", ""),
             ("SIMPLE: 5\nCONCRETE: 5\nPERSONAL: 5\nDYNAMIC: 5", ""),
             ("SCRIPTURE", ""),
             ("SIMPLE: 2\nCONCRETE: 2\nPERSONAL: 2\nDYNAMIC: 2", ""),
@@ -337,7 +351,7 @@ class TestClassifyNewsletterTransientOutage:
     async def test_transient_quality_outage_propagates(self, nl_classifier, mock_cloud_llm):
         """LLMUnavailableError during quality assessment propagates (not swallowed)."""
         mock_cloud_llm.complete.side_effect = [
-            ("TITLE: Story\nTEXT: Content", ""),         # extract_stories
+            ("STORY: Content", ""),                      # extract_stories
             LLMUnavailableError("cloud endpoint down"),  # assess_quality
         ]
         with pytest.raises(LLMUnavailableError):
@@ -346,7 +360,7 @@ class TestClassifyNewsletterTransientOutage:
     async def test_transient_theme_outage_propagates(self, nl_classifier, mock_cloud_llm):
         """LLMUnavailableError during theme classification propagates too."""
         mock_cloud_llm.complete.side_effect = [
-            ("TITLE: Story\nTEXT: Content", ""),                       # extract_stories
+            ("STORY: Content", ""),                                   # extract_stories
             ("SIMPLE: 3\nCONCRETE: 3\nPERSONAL: 3\nDYNAMIC: 3", ""),  # assess_quality
             LLMUnavailableError("cloud endpoint down"),               # classify_themes
         ]
@@ -357,7 +371,7 @@ class TestClassifyNewsletterTransientOutage:
         """A non-transient per-story error (RuntimeError) is still swallowed: the story
         gets no scores but themes are still classified and the result is returned."""
         mock_cloud_llm.complete.side_effect = [
-            ("TITLE: Story\nTEXT: Content", ""),  # extract_stories
+            ("STORY: Content", ""),  # extract_stories
             RuntimeError("malformed story crashed scoring"),  # assess_quality
             ("SCRIPTURE", "theme cot"),  # classify_themes still runs
         ]
@@ -372,7 +386,6 @@ class TestWriteAssessment:
         output_file = tmp_path / "assessments.jsonl"
         stories = [
             StoryResult(
-                title="Test Story",
                 text="Story content",
                 scores={"simple": 4, "concrete": 3, "personal": 5, "dynamic": 2},
                 average_score=3.5,
@@ -401,7 +414,7 @@ class TestWriteAssessment:
         assert record["subject"] == "February Update"
         assert record["overall_tier"] == "good"
         assert len(record["stories"]) == 1
-        assert record["stories"][0]["title"] == "Test Story"
+        assert "title" not in record["stories"][0]
         assert record["stories"][0]["text"] == "Story content"
         assert record["stories"][0]["scores"]["simple"] == 4
         assert record["stories"][0]["themes"] == ["scripture", "church"]
@@ -410,7 +423,7 @@ class TestWriteAssessment:
 
     def test_appends_to_existing_file(self, tmp_path):
         output_file = tmp_path / "assessments.jsonl"
-        story = StoryResult(title="S", text="T", tier=NewsletterTier.FAIR)
+        story = StoryResult(text="T", tier=NewsletterTier.FAIR)
         for i in range(3):
             write_assessment(
                 output_file=str(output_file),
@@ -426,7 +439,7 @@ class TestWriteAssessment:
 
     def test_creates_parent_directories(self, tmp_path):
         output_file = tmp_path / "sub" / "dir" / "assessments.jsonl"
-        story = StoryResult(title="S", text="T", tier=NewsletterTier.POOR)
+        story = StoryResult(text="T", tier=NewsletterTier.POOR)
         write_assessment(
             output_file=str(output_file),
             message_id="msg_001",
@@ -441,7 +454,6 @@ class TestWriteAssessment:
     def test_story_without_scores(self, tmp_path):
         output_file = tmp_path / "assessments.jsonl"
         story = StoryResult(
-            title="No Scores",
             text="Content",
             scores=None,
             average_score=None,

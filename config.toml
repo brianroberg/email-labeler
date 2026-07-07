@@ -153,14 +153,11 @@ A "story" is a narrative segment about people, events, or ministry activities. S
 - Administrative announcements
 - Contact information
 
-For each story, provide:
-1. A short title (5-10 words)
-2. The full text of the story as it appears in the newsletter
+For each story, provide the full text of the story as it appears in the newsletter.
 
 Respond in this exact format (one story per block, separated by blank lines):
 
-TITLE: [short title]
-TEXT: [full story text]
+STORY: [full story text]
 
 If the newsletter contains no stories, respond with exactly: NO_STORIES"""
 
@@ -183,8 +180,7 @@ CONCRETE: [1-5]
 PERSONAL: [1-5]
 DYNAMIC: [1-5]"""
 
-user_template = """Story title: {title}
-Story text:
+user_template = """Story text:
 {text}"""
 
 [newsletter.prompts.theme_classification]
@@ -202,6 +198,5 @@ A story may match multiple themes, or none at all. Only select themes that the s
 
 Think step by step. Use <think> tags for your reasoning, then respond with ONLY the matching theme names, one per line. If no themes match, respond with: NONE"""
 
-user_template = """Story title: {title}
-Story text:
+user_template = """Story text:
 {text}"""

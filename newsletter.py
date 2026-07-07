@@ -39,7 +39,6 @@ _DIMENSIONS = ("simple", "concrete", "personal", "dynamic")
 
 @dataclass
 class StoryResult:
-    title: str
     text: str
     scores: dict[str, int] | None = None
     average_score: float | None = None
@@ -49,12 +48,11 @@ class StoryResult:
     theme_cot: str = ""
 
 
-def parse_stories(raw: str) -> list[tuple[str, str]]:
-    """Parse LLM story extraction output into (title, text) pairs.
+def parse_stories(raw: str) -> list[str]:
+    """Parse LLM story extraction output into a list of story texts.
 
-    Expected format:
-        TITLE: <title>
-        TEXT: <story text, possibly multi-line>
+    Expected format (one story per block, blocks separated by blank lines):
+        STORY: <story text, possibly multi-line>
 
     Returns empty list for NO_STORIES or unparseable input.
     """
@@ -63,17 +61,20 @@ def parse_stories(raw: str) -> list[tuple[str, str]]:
         return []
 
     stories = []
-    blocks = re.split(r"(?=^TITLE:)", stripped, flags=re.MULTILINE)
+    # Split only at a STORY: that begins the text or follows a blank line (the
+    # documented "one story per block, separated by blank lines" format). This
+    # keeps a story whose own body contains a line starting with "STORY:" intact
+    # instead of splitting it in two.
+    blocks = re.split(r"(?:\A|\n[ \t]*\n)(?=STORY:)", stripped)
     for block in blocks:
         block = block.strip()
         if not block:
             continue
-        match = re.match(r"^TITLE:\s*(.+)\nTEXT:\s*(.*)", block, flags=re.DOTALL)
+        match = re.match(r"^STORY:\s*(.*)", block, flags=re.DOTALL)
         if match:
-            title = match.group(1).strip()
-            text = match.group(2).strip()
-            if title and text:
-                stories.append((title, text))
+            text = match.group(1).strip()
+            if text:
+                stories.append(text)
 
     return stories
 
@@ -152,7 +153,6 @@ def write_assessment(
         "overall_tier": overall_tier.value if overall_tier else None,
         "stories": [
             {
-                "title": s.title,
                 "text": s.text,
                 "scores": s.scores,
                 "average_score": s.average_score,
@@ -196,8 +196,8 @@ class NewsletterClassifier:
         self.quality_config = nl_config["prompts"]["quality_assessment"]
         self.theme_config = nl_config["prompts"]["theme_classification"]
 
-    async def extract_stories(self, body: str) -> list[tuple[str, str]]:
-        """Extract individual stories from a newsletter body."""
+    async def extract_stories(self, body: str) -> list[str]:
+        """Extract individual story texts from a newsletter body."""
         user_content = self.extraction_config["user_template"].format(body=body)
         raw, _ = await self.cloud_llm.complete(
             self.extraction_config["system"],
@@ -206,9 +206,9 @@ class NewsletterClassifier:
         )
         return parse_stories(raw)
 
-    async def assess_quality(self, title: str, text: str) -> tuple[dict[str, int] | None, str]:
+    async def assess_quality(self, text: str) -> tuple[dict[str, int] | None, str]:
         """Score a story on the 4-dimension quality rubric."""
-        user_content = self.quality_config["user_template"].format(title=title, text=text)
+        user_content = self.quality_config["user_template"].format(text=text)
         raw, cot = await self.cloud_llm.complete(
             self.quality_config["system"],
             user_content,
@@ -217,9 +217,9 @@ class NewsletterClassifier:
         scores = parse_quality_scores(raw)
         return scores, cot
 
-    async def classify_themes(self, title: str, text: str) -> tuple[list[str], str]:
+    async def classify_themes(self, text: str) -> tuple[list[str], str]:
         """Tag a story with Ends Statement themes."""
-        user_content = self.theme_config["user_template"].format(title=title, text=text)
+        user_content = self.theme_config["user_template"].format(text=text)
         raw, cot = await self.cloud_llm.complete(
             self.theme_config["system"],
             user_content,
@@ -228,7 +228,7 @@ class NewsletterClassifier:
         return parse_themes(raw), cot
 
     async def classify_newsletter(self, body: str) -> list[StoryResult]:
-        """Run the full newsletter classification pipeline.
+        """Run the full newsletter classification pipeline over story texts.
 
         Individual *per-story* failures are isolated — a quality failure doesn't
         prevent theme classification, and vice versa.
@@ -244,11 +244,11 @@ class NewsletterClassifier:
             return []
 
         results = []
-        for title, text in stories:
-            result = StoryResult(title=title, text=text)
+        for text in stories:
+            result = StoryResult(text=text)
 
             try:
-                scores, quality_cot = await self.assess_quality(title, text)
+                scores, quality_cot = await self.assess_quality(text)
                 result.quality_cot = quality_cot
                 if scores:
                     result.scores = scores
@@ -257,16 +257,16 @@ class NewsletterClassifier:
             except LLMUnavailableError:
                 raise  # transient — let the daemon retry the whole newsletter
             except Exception:
-                log.warning("Quality assessment failed for story: %s", title)
+                log.warning("Quality assessment failed for story: %s", text[:60])
 
             try:
-                themes, theme_cot = await self.classify_themes(title, text)
+                themes, theme_cot = await self.classify_themes(text)
                 result.themes = themes
                 result.theme_cot = theme_cot
             except LLMUnavailableError:
                 raise  # transient — let the daemon retry the whole newsletter
             except Exception:
-                log.warning("Theme classification failed for story: %s", title)
+                log.warning("Theme classification failed for story: %s", text[:60])
 
             results.append(result)
 
