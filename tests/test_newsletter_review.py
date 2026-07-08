@@ -3,7 +3,7 @@
 import json
 
 import pytest
-from textual.widgets import ListView, Static
+from textual.widgets import Label, ListView, Static
 
 from newsletter_review.tui import (
     DetailScreen,
@@ -14,6 +14,7 @@ from newsletter_review.tui import (
     format_list_row,
     load_assessments,
     run_review_tui,
+    sort_by_send_date,
     wrap_text,
 )
 
@@ -171,6 +172,41 @@ class TestApplyFilters:
         result = apply_filters([], tier="good")
         assert result == []
 
+    def test_since_filter_keeps_on_or_after_cutoff(self):
+        # Issue #36: date filter on the send-date, inclusive of the boundary.
+        records = [
+            _make_record(thread_id="old", send_date="2024-01-01T00:00:00+00:00"),
+            _make_record(thread_id="edge", send_date="2024-06-15T09:00:00+00:00"),
+            _make_record(thread_id="new", send_date="2024-12-31T00:00:00+00:00"),
+        ]
+        result = apply_filters(records, since="2024-06-15")
+        assert {r["thread_id"] for r in result} == {"edge", "new"}
+
+    def test_since_filter_excludes_records_without_send_date(self):
+        records = [
+            _make_record(thread_id="dated", send_date="2024-12-31T00:00:00+00:00"),
+            _make_record(thread_id="undated", send_date=None),
+        ]
+        result = apply_filters(records, since="2024-01-01")
+        assert [r["thread_id"] for r in result] == ["dated"]
+
+
+class TestSortBySendDate:
+    def test_desc_newest_first(self):
+        recs = [
+            _make_record(thread_id="a", send_date="2024-01-01T00:00:00+00:00"),
+            _make_record(thread_id="b", send_date="2024-03-01T00:00:00+00:00"),
+            _make_record(thread_id="c", send_date="2024-02-01T00:00:00+00:00"),
+        ]
+        assert [r["thread_id"] for r in sort_by_send_date(recs)] == ["b", "c", "a"]
+
+    def test_missing_send_date_sorts_last(self):
+        recs = [
+            _make_record(thread_id="undated", send_date=None),
+            _make_record(thread_id="dated", send_date="2024-01-01T00:00:00+00:00"),
+        ]
+        assert [r["thread_id"] for r in sort_by_send_date(recs)] == ["dated", "undated"]
+
 
 # ---------------------------------------------------------------------------
 # _format_list_row
@@ -200,6 +236,15 @@ class TestFormatListRow:
         row = format_list_row(_make_record(overall_tier=None), 120)
         # Should not crash; should show a placeholder
         assert row  # non-empty string
+
+    def test_includes_send_date(self):
+        # Issue #36: the list date column shows the email SEND date (date part).
+        row = format_list_row(_make_record(send_date="2026-02-19T09:00:00+00:00"), 120)
+        assert "2026-02-19" in row
+
+    def test_missing_send_date_shows_placeholder(self):
+        row = format_list_row(_make_record(send_date=None), 120)
+        assert row.startswith("—")  # date column is first, placeholder for no send-date
 
 
 # ---------------------------------------------------------------------------
@@ -368,6 +413,10 @@ class TestFormatFilterSummary:
         assert "tier:poor" in result
         assert "theme:church" in result
         assert "sender:john" in result
+
+    def test_since_filter(self):
+        result = format_filter_summary(since="2024-06-15")
+        assert "since:2024-06-15" in result
 
     def test_returns_empty_for_all_none(self):
         assert format_filter_summary() == ""
@@ -734,3 +783,61 @@ class TestReviewAppReviewFindings:
             assert len(app.screen_stack) == 2  # base + ONE detail
             await pilot.press("escape")
             assert not isinstance(app.screen, DetailScreen)
+
+
+def _dated_records():
+    """Records with distinct fixed send-dates (all in 2024) for sort/date tests."""
+    return [
+        _make_record(subject="Jan", send_date="2024-01-10T00:00:00+00:00"),
+        _make_record(subject="Mar", send_date="2024-03-10T00:00:00+00:00"),
+        _make_record(subject="Feb", send_date="2024-02-10T00:00:00+00:00"),
+    ]
+
+
+class TestReviewAppSort:
+    async def test_default_sort_by_send_date_desc(self):
+        app = ReviewApp(_dated_records())
+        async with app.run_test(size=SIZE):
+            # Newest send-date first.
+            assert [r["subject"] for r in app.filtered] == ["Mar", "Feb", "Jan"]
+            first_row = str(app.query_one(ListView).children[0].query_one(Label).render())
+            assert first_row.startswith("2024-03-10")
+
+
+class TestReviewAppDateFilter:
+    async def test_since_via_date_menu_narrows(self):
+        app = ReviewApp(_dated_records())
+        async with app.run_test(size=SIZE) as pilot:
+            await pilot.press("f", "d", "s")            # filter -> date -> since…
+            await pilot.press(*"2024-02-15")            # type the date
+            await pilot.press("enter")
+            assert "since:2024-02-15" in _title(app)
+            # Only Mar (2024-03-10) is on/after the cutoff.
+            assert [r["subject"] for r in app.filtered] == ["Mar"]
+
+    async def test_past_30_days_excludes_old_fixed_dates(self):
+        # The fixture's 2024 dates are far older than 30 days from "now", so a
+        # "Past 30 days" filter empties the list — deterministic regardless of clock.
+        app = ReviewApp(_dated_records())
+        async with app.run_test(size=SIZE) as pilot:
+            await pilot.press("f", "d", "3")
+            assert "since:" in _title(app)
+            assert len(app.query_one(ListView)) == 0
+
+    async def test_clear_date_filter_restores_all(self):
+        app = ReviewApp(_dated_records())
+        async with app.run_test(size=SIZE) as pilot:
+            await pilot.press("f", "d", "3")
+            assert len(app.query_one(ListView)) == 0
+            await pilot.press("f", "d", "x")            # clear
+            assert len(app.query_one(ListView)) == 3
+            assert "since:" not in _title(app)
+
+    async def test_invalid_since_date_shows_hint_and_keeps_filter(self):
+        app = ReviewApp(_dated_records())
+        async with app.run_test(size=SIZE) as pilot:
+            await pilot.press("f", "d", "s")
+            await pilot.press(*"not-a-date")
+            await pilot.press("enter")
+            assert app.f_since is None            # rejected
+            assert len(app.query_one(ListView)) == 3  # unfiltered

@@ -78,7 +78,10 @@ python -m newsletter_review --sender dm.org          # Filter by sender
 python -m newsletter_review --file path/to/file.jsonl  # Custom JSONL path
 ```
 
-Hotkeys: `f` opens the filter menu (`t` tier → `e/g/f/p/c`, `h` theme → `s/c/h/v/d/x`, `s` sender text input), `Enter` opens detail, `Esc` back, `q` quit.
+The listing shows a send-date column and is sorted by send-date descending (newest
+first; records with no send-date sort last).
+
+Hotkeys: `f` opens the filter menu (`t` tier → `e/g/f/p/c`, `h` theme → `s/c/h/v/d/x`, `s` sender text input, `d` date → `3`=past 30d / `9`=past 90d / `y`=past 365d / `s`=since YYYY-MM-DD / `x`=clear), `Enter` opens detail, `Esc` back, `q` quit.
 
 ### Newsletter evaluation
 
