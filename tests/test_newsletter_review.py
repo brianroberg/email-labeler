@@ -27,6 +27,8 @@ def _make_record(
     thread_id="t_001",
     message_id="msg_001",
     timestamp="2026-02-20T12:00:00Z",
+    send_date="2026-02-19T09:00:00+00:00",
+    model="claude-sonnet-4-6",
 ):
     if stories is None:
         stories = [
@@ -40,15 +42,23 @@ def _make_record(
                 "theme_cot": "This illustrates Scripture study.",
             }
         ]
-    return {
+    record = {
         "timestamp": timestamp,
         "message_id": message_id,
         "thread_id": thread_id,
         "from": sender,
         "subject": subject,
+        "send_date": send_date,
+        "model": model,
         "overall_tier": overall_tier,
         "stories": stories,
     }
+    # Old records predate these fields; pass None to omit (backward-compat tests).
+    if send_date is None:
+        del record["send_date"]
+    if model is None:
+        del record["model"]
+    return record
 
 
 # ---------------------------------------------------------------------------
@@ -207,6 +217,32 @@ class TestBuildDetailLines:
         lines = build_detail_lines(_make_record(overall_tier="excellent"))
         text = "\n".join(lines)
         assert "excellent" in text
+
+    def test_header_shows_send_date_and_model_and_processed(self):
+        # Issue #35: email send-date grouped with email-intrinsic data, and a
+        # separate classification block with the processed date + model.
+        lines = build_detail_lines(_make_record(
+            send_date="2026-02-19T09:00:00+00:00",
+            model="claude-sonnet-4-6",
+            timestamp="2026-02-20T12:00:00+00:00",
+        ))
+        text = "\n".join(lines)
+        assert "Sent:" in text
+        assert "2026-02-19T09:00:00+00:00" in text  # send-date
+        assert "Processed:" in text
+        assert "2026-02-20T12:00:00+00:00" in text  # processed timestamp
+        assert "Model:" in text
+        assert "claude-sonnet-4-6" in text
+        # The processed date must NOT be presented under a bare "Date:" label
+        # (the exact #35 complaint).
+        assert "Date:" not in text
+
+    def test_header_missing_send_date_and_model_show_placeholders(self):
+        lines = build_detail_lines(_make_record(send_date=None, model=None))
+        text = "\n".join(lines)
+        # Missing send-date must not be misrepresented as the processed date.
+        assert "Sent: unknown" in text
+        assert "Model: —" in text
 
     def test_includes_story_text_excerpt_and_tier(self):
         record = _make_record()

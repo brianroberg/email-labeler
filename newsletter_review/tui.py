@@ -132,18 +132,30 @@ def format_list_row(record: dict, max_x: int) -> str:
 
 
 def build_detail_lines(record: dict, width: int = 80) -> list[str]:
-    """Build content lines for the detail view. Pure function, no UI."""
+    """Build content lines for the detail view. Pure function, no UI.
+
+    The header separates email-intrinsic data (subject, sender, send-date) from
+    classification data (processed date, model, tier, stories) with a blank line,
+    so the send-date is never confused with the processed date (issue #35).
+    """
     subject = record.get("subject", "")
     sender = record.get("from", "")
-    timestamp = record.get("timestamp", "")
+    send_date = record.get("send_date") or "unknown"
+    processed = record.get("timestamp", "")
+    model = record.get("model") or "—"
     overall_tier = record.get("overall_tier") or "—"
     stories = record.get("stories", [])
 
     lines = [
+        # Email-intrinsic block
         subject,
         "=" * min(60, width),
-        f"From:    {sender}",
-        f"Date:    {timestamp}",
+        f"From: {sender}",
+        f"Sent: {send_date}",
+        "",
+        # Classification block
+        f"Processed: {processed}",
+        f"Model: {model}",
         f"Overall: {overall_tier}",
         f"Stories: {len(stories)}",
         "",
