@@ -955,10 +955,10 @@ class TestNewsletterRouting:
         mock_newsletter_classifier.classify_newsletter.return_value = [
             StoryResult(
                 text="Content",
-                scores={"simple": 4, "concrete": 4, "personal": 4, "dynamic": 4},
-                average_score=4.0,
+                scores={"simple": 3, "concrete": 3, "personal": 3, "dynamic": 3},
+                average_score=3.0,
                 tier=NewsletterTier.EXCELLENT,
-                themes=["scripture"],
+                themes={"scripture": "emphasized"},
             )
         ]
 
@@ -1043,7 +1043,7 @@ class TestNewsletterRouting:
         assert result is True
         call_kwargs = mock_label_manager.apply_newsletter_classification.call_args.kwargs
         assert call_kwargs["tier"] is None
-        assert call_kwargs["themes"] == []
+        assert call_kwargs["themes"] == {}
 
     async def test_newsletter_only_skips_non_newsletter(
         self,
@@ -1091,10 +1091,10 @@ class TestNewsletterRouting:
         mock_newsletter_classifier.classify_newsletter.return_value = [
             StoryResult(
                 text="Content",
-                scores={"simple": 4, "concrete": 4, "personal": 4, "dynamic": 4},
-                average_score=4.0,
+                scores={"simple": 3, "concrete": 3, "personal": 3, "dynamic": 3},
+                average_score=3.0,
                 tier=NewsletterTier.EXCELLENT,
-                themes=["scripture"],
+                themes={"scripture": "emphasized"},
             )
         ]
 

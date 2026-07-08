@@ -238,8 +238,8 @@ class TestEvaluateExtraction:
 
 class TestEvaluateStory:
     def _story_llm(self):
-        quality_out = "SIMPLE: 4\nCONCRETE: 5\nPERSONAL: 4\nDYNAMIC: 3"
-        theme_out = "SCRIPTURE\nCHURCH"
+        quality_out = "SIMPLE: GOOD\nCONCRETE: GOOD\nPERSONAL: GOOD\nDYNAMIC: OK"
+        theme_out = "SCRIPTURE: EMPHASIZED\nCHURCH: PRESENT"
         return FakeLLM([
             ("QUALITY", quality_out, "quality reasoning"),
             ("THEME", theme_out, "theme reasoning"),
@@ -249,24 +249,24 @@ class TestEvaluateStory:
         llm = self._story_llm()
         story = _story(
             "nl1:0", text="the text",
-            expected_scores={"simple": 4, "concrete": 4, "personal": 4, "dynamic": 4},
-            expected_tier="excellent", expected_themes=["scripture"],
+            expected_scores={"simple": 3, "concrete": 3, "personal": 3, "dynamic": 3},
+            expected_tier="excellent", expected_themes={"scripture": "emphasized"},
         )
         pred, thinking = _run(evaluate_story(story, "nl1", _classifier(llm)))
 
         assert pred.story_id == "nl1:0"
         assert pred.thread_id == "nl1"
         # expected_* carried from the golden story
-        assert pred.expected_scores == {"simple": 4, "concrete": 4, "personal": 4, "dynamic": 4}
+        assert pred.expected_scores == {"simple": 3, "concrete": 3, "personal": 3, "dynamic": 3}
         assert pred.expected_tier == "excellent"
-        assert pred.expected_themes == ["scripture"]
+        assert pred.expected_themes == {"scripture": "emphasized"}
         # predicted_*
-        assert pred.predicted_scores == {"simple": 4, "concrete": 5, "personal": 4, "dynamic": 3}
-        assert pred.predicted_themes == ["scripture", "church"]
-        # tier derived via compute_tier: avg = (4+5+4+3)/4 = 4.0 -> excellent
+        assert pred.predicted_scores == {"simple": 3, "concrete": 3, "personal": 3, "dynamic": 2}
+        assert pred.predicted_themes == {"scripture": "emphasized", "church": "present"}
+        # tier derived via compute_tier: avg = (3+3+3+2)/4 = 2.75 -> excellent
         assert pred.predicted_tier == "excellent"
         # raw captured
-        assert "SIMPLE: 4" in pred.scores_raw
+        assert "SIMPLE: GOOD" in pred.scores_raw
         assert "SCRIPTURE" in pred.themes_raw
         assert pred.error is None
         # thinking sidecar carries both cots
@@ -283,14 +283,14 @@ class TestEvaluateStory:
         pred, _thinking = _run(evaluate_story(story, "nl2", _classifier(llm)))
         assert pred.predicted_scores is None
         assert pred.predicted_tier is None
-        assert pred.predicted_themes == []
+        assert pred.predicted_themes == {}
 
 
 def _full_llm():
     return FakeLLM([
         ("EXTRACT", "STORY: body", "ecot"),
-        ("QUALITY", "SIMPLE: 3\nCONCRETE: 3\nPERSONAL: 3\nDYNAMIC: 3", "qcot"),
-        ("THEME", "SCRIPTURE", "tcot"),
+        ("QUALITY", "SIMPLE: GOOD\nCONCRETE: GOOD\nPERSONAL: OK\nDYNAMIC: OK", "qcot"),
+        ("THEME", "SCRIPTURE: PRESENT", "tcot"),
     ])
 
 
@@ -315,7 +315,7 @@ class TestRunEvaluation:
         # otherwise the test passes even when extraction is broken.
         assert extractions[0].predicted_stories == [{"text": "body"}]
         assert len(stories) == 1
-        assert stories[0].predicted_tier == "good"  # avg 3.0
+        assert stories[0].predicted_tier == "good"  # avg (3+3+2+2)/4 = 2.5
         story_entries = [t for t in thinking if t.story_id]
         assert story_entries[0].quality_cot == "qcot"
         # all-mode also carries a newsletter-level extraction thinking entry
@@ -363,7 +363,7 @@ class TestRunEvaluation:
         ))
         assert not any("THEME" in user for _sys, user in llm.calls)
         assert rows[0].predicted_scores is not None
-        assert rows[0].predicted_themes == []
+        assert rows[0].predicted_themes == {}
         assert rows[0].themes_raw is None
 
     def test_themes_mode_fires_no_quality_llm_calls(self):
@@ -372,7 +372,7 @@ class TestRunEvaluation:
             self._golden(), _classifier(llm), mode="themes", parallelism=1,
         ))
         assert not any("QUALITY" in user for _sys, user in llm.calls)
-        assert rows[0].predicted_themes == ["scripture"]
+        assert rows[0].predicted_themes == {"scripture": "present"}
         assert rows[0].predicted_scores is None
         assert rows[0].predicted_tier is None
         assert rows[0].scores_raw is None
@@ -452,38 +452,43 @@ class TestFormatRunSummary:
     def test_garbage_theme_response_is_a_parse_failure(self):
         from evals.newsletter_run import format_run_summary
         rows = [self._story_row(
-            scores_raw="SIMPLE: 3\nCONCRETE: 3\nPERSONAL: 3\nDYNAMIC: 3",
-            predicted_scores={"simple": 3, "concrete": 3, "personal": 3, "dynamic": 3},
-            themes_raw="just some prose, no labels", predicted_themes=[],
+            scores_raw="SIMPLE: OK\nCONCRETE: OK\nPERSONAL: OK\nDYNAMIC: OK",
+            predicted_scores={"simple": 2, "concrete": 2, "personal": 2, "dynamic": 2},
+            themes_raw="just some prose, no labels", predicted_themes={},
         )]
         assert "1 theme parse failure" in format_run_summary(rows)
 
     def test_none_theme_response_is_not_a_failure(self):
         from evals.newsletter_run import format_run_summary
         rows = [self._story_row(
-            scores_raw="SIMPLE: 3\nCONCRETE: 3\nPERSONAL: 3\nDYNAMIC: 3",
-            predicted_scores={"simple": 3, "concrete": 3, "personal": 3, "dynamic": 3},
-            themes_raw="NONE", predicted_themes=[],
+            scores_raw="SIMPLE: OK\nCONCRETE: OK\nPERSONAL: OK\nDYNAMIC: OK",
+            predicted_scores={"simple": 2, "concrete": 2, "personal": 2, "dynamic": 2},
+            themes_raw="NONE", predicted_themes={},
         )]
         assert "theme parse failure" not in format_run_summary(rows)
 
-    def test_clamped_scores_surfaced(self):
+    def test_all_absent_theme_response_is_not_a_failure(self):
+        # A response grading every theme ABSENT is a valid empty result (issue
+        # #53), not garbage — it must not count as a theme parse failure.
         from evals.newsletter_run import format_run_summary
         rows = [self._story_row(
-            scores_raw="SIMPLE: 9\nCONCRETE: 4\nPERSONAL: 3\nDYNAMIC: 2",
-            predicted_scores={"simple": 5, "concrete": 4, "personal": 3, "dynamic": 2},
-            themes_raw="NONE",
+            scores_raw="SIMPLE: OK\nCONCRETE: OK\nPERSONAL: OK\nDYNAMIC: OK",
+            predicted_scores={"simple": 2, "concrete": 2, "personal": 2, "dynamic": 2},
+            themes_raw=(
+                "SCRIPTURE: ABSENT\nCHRISTLIKENESS: ABSENT\nCHURCH: ABSENT\n"
+                "VOCATION_FAMILY: ABSENT\nDISCIPLE_MAKING: ABSENT"
+            ),
+            predicted_themes={},
         )]
-        summary = format_run_summary(rows)
-        assert "clamped" in summary
-        assert "SIMPLE" in summary
+        assert "theme parse failure" not in format_run_summary(rows)
 
     def test_dropped_theme_tokens_surfaced(self):
         from evals.newsletter_run import format_run_summary
         rows = [self._story_row(
-            scores_raw="SIMPLE: 3\nCONCRETE: 3\nPERSONAL: 3\nDYNAMIC: 3",
-            predicted_scores={"simple": 3, "concrete": 3, "personal": 3, "dynamic": 3},
-            themes_raw="FELLOWSHIP\nCHURCH", predicted_themes=["church"],
+            scores_raw="SIMPLE: OK\nCONCRETE: OK\nPERSONAL: OK\nDYNAMIC: OK",
+            predicted_scores={"simple": 2, "concrete": 2, "personal": 2, "dynamic": 2},
+            themes_raw="FELLOWSHIP: PRESENT\nCHURCH: EMPHASIZED",
+            predicted_themes={"church": "emphasized"},
         )]
         assert "FELLOWSHIP" in format_run_summary(rows)
 
@@ -497,9 +502,9 @@ class TestFormatRunSummary:
     def test_clean_run_reports_no_errors(self):
         from evals.newsletter_run import format_run_summary
         rows = [self._story_row(
-            scores_raw="SIMPLE: 3\nCONCRETE: 3\nPERSONAL: 3\nDYNAMIC: 3",
-            predicted_scores={"simple": 3, "concrete": 3, "personal": 3, "dynamic": 3},
-            themes_raw="SCRIPTURE", predicted_themes=["scripture"],
+            scores_raw="SIMPLE: OK\nCONCRETE: OK\nPERSONAL: OK\nDYNAMIC: OK",
+            predicted_scores={"simple": 2, "concrete": 2, "personal": 2, "dynamic": 2},
+            themes_raw="SCRIPTURE: PRESENT", predicted_themes={"scripture": "present"},
         )]
         summary = format_run_summary(rows)
         assert "Rows: 1" in summary
@@ -1021,7 +1026,7 @@ class TestMainPreflight:
         def fake_build(config, no_cache):
             llm = DeadLLM([
                 ("EXTRACT", "NO_STORIES", ""),
-                ("QUALITY", "SIMPLE: 3\nCONCRETE: 3\nPERSONAL: 3\nDYNAMIC: 3", ""),
+                ("QUALITY", "SIMPLE: OK\nCONCRETE: OK\nPERSONAL: OK\nDYNAMIC: OK", ""),
                 ("THEME", "NONE", ""),
             ])
             return NewsletterClassifier(cloud_llm=llm, config=config), llm
@@ -1061,7 +1066,7 @@ class TestMainReport:
             stories=[_story(
                 "nl1:0", text="body",
                 expected_scores={"simple": 3, "concrete": 3, "personal": 3, "dynamic": 3},
-                expected_tier="good", expected_themes=["scripture"],
+                expected_tier="good", expected_themes={"scripture": "present"},
             )],
         )])
         out = tmp_path / "r"
@@ -1080,7 +1085,7 @@ class TestMainReport:
             stories=[_story(
                 "nl1:0", text="body",
                 expected_scores={"simple": 3, "concrete": 3, "personal": 3, "dynamic": 3},
-                expected_tier="good", expected_themes=["scripture"],
+                expected_tier="good", expected_themes={"scripture": "present"},
             )],
         )])
         # First run to produce a prior results file to compare against.

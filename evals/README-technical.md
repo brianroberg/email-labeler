@@ -219,9 +219,10 @@ duplicates — a delete leaves an id gap by design, so cross-run comparisons key
 on `story_id` stay valid.
 
 **Phase B** labels the selected story (`l`): the 4 dimensions (simple, concrete,
-personal, dynamic; `1`–`5`), multi-select themes, notes (`N`), undo (`z`);
-`expected_tier` is auto-derived via `compute_tier` on save and `story.reviewed`
-is set. Saves are atomic (temp-file + rename). `excluded` stories are kept as
+personal, dynamic) each graded Poor/OK/Good (keys `1`/`2`/`3`); themes graded
+Absent/Present/Emphasized (each key `s`/`c`/`h`/`v`/`d` cycles through the three);
+notes (`N`), undo (`z`); `expected_tier` is auto-derived via `compute_tier` (mean
+of the 1/2/3 dimension scores) on save and `story.reviewed` is set. Saves are atomic (temp-file + rename). `excluded` stories are kept as
 extraction truth but skipped from quality/theme scoring.
 
 A **whole newsletter** can be excluded with `X` in the detail view: it is

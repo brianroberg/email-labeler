@@ -36,6 +36,14 @@ _VALID_THEMES = {
 
 _DIMENSIONS = ("simple", "concrete", "personal", "dynamic")
 
+# Storytelling dimensions are graded on a 3-value rubric (issue #53). The tokens
+# map to integers so the tier average and eval metrics stay simple arithmetic.
+_SCORE_TOKENS = {"POOR": 1, "OK": 2, "GOOD": 3}
+
+# Ends-Statement themes are graded on a 3-value rubric (issue #53). "absent" is
+# represented by omission, so only these two grades ever appear in a stored dict.
+_THEME_GRADES = {"PRESENT": "present", "EMPHASIZED": "emphasized"}
+
 
 @dataclass
 class StoryResult:
@@ -43,7 +51,7 @@ class StoryResult:
     scores: dict[str, int] | None = None
     average_score: float | None = None
     tier: NewsletterTier | None = None
-    themes: list[str] = field(default_factory=list)
+    themes: dict[str, str] = field(default_factory=dict)
     quality_cot: str = ""
     theme_cot: str = ""
 
@@ -88,56 +96,84 @@ def parse_stories(raw: str) -> list[str]:
 def parse_quality_scores(raw: str) -> dict[str, int] | None:
     """Parse LLM quality assessment output into dimension scores.
 
-    Returns None if any dimension is missing or has an unparseable value.
-    Clamps scores to 1-5 range.
+    Each dimension is graded POOR/OK/GOOD (mapped to 1/2/3). Returns None if any
+    dimension is missing or its value is not one of those tokens (a legacy digit
+    or an unknown word is a parse failure, not a clamped score).
     """
     if not raw.strip():
         return None
 
     scores = {}
     for dim in _DIMENSIONS:
-        pattern = rf"{dim.upper()}\s*:\s*(\d+)"
+        pattern = rf"{dim.upper()}\s*:\s*(POOR|OK|GOOD)\b"
         match = re.search(pattern, raw, flags=re.IGNORECASE)
         if not match:
             return None
-        try:
-            value = int(match.group(1))
-        except ValueError:
-            return None
-        scores[dim] = max(1, min(5, value))
+        scores[dim] = _SCORE_TOKENS[match.group(1).upper()]
 
     return scores
 
 
-def parse_themes(raw: str) -> list[str]:
-    """Parse LLM theme classification output into theme labels.
+def parse_themes(raw: str) -> dict[str, str]:
+    """Parse LLM theme classification output into graded theme labels.
 
-    Returns list of lowercase theme names. Ignores unrecognized themes.
-    Returns empty list for NONE response.
+    Each recognized theme line is ``THEME: ABSENT|PRESENT|EMPHASIZED``. Returns a
+    dict mapping lowercase theme name -> "present"/"emphasized"; Absent themes and
+    unrecognized names are omitted. Returns an empty dict for a NONE response.
     """
     stripped = raw.strip()
     if not stripped or stripped.upper() == "NONE":
-        return []
+        return {}
 
-    themes = []
+    themes: dict[str, str] = {}
     for line in stripped.splitlines():
-        token = line.strip().upper()
-        if token in _VALID_THEMES:
-            themes.append(token.lower())
+        match = re.match(
+            r"\s*([A-Za-z_]+)\s*:\s*(ABSENT|PRESENT|EMPHASIZED)\b",
+            line,
+            flags=re.IGNORECASE,
+        )
+        if not match:
+            continue
+        name = match.group(1).upper()
+        grade = match.group(2).upper()
+        if name in _VALID_THEMES and grade in _THEME_GRADES:
+            themes[name.lower()] = _THEME_GRADES[grade]
 
     return themes
 
 
 def compute_tier(scores: dict[str, int]) -> NewsletterTier:
-    """Derive quality tier from dimension scores."""
+    """Derive quality tier from the 3-value dimension scores.
+
+    Dimensions are 1/2/3 (Poor/OK/Good); the tier is banded off their mean:
+    excellent >= 2.75, good >= 2.25, fair >= 1.75, else poor (issue #53).
+    """
     avg = sum(scores.values()) / len(scores)
-    if avg >= 4.0:
+    if avg >= 2.75:
         return NewsletterTier.EXCELLENT
-    if avg >= 3.0:
+    if avg >= 2.25:
         return NewsletterTier.GOOD
-    if avg >= 2.0:
+    if avg >= 1.75:
         return NewsletterTier.FAIR
     return NewsletterTier.POOR
+
+
+# Ordering of theme grades for cross-story aggregation (higher = stronger).
+THEME_GRADE_RANK = {"present": 1, "emphasized": 2}
+
+
+def aggregate_theme_grades(stories: list["StoryResult"]) -> dict[str, str]:
+    """Merge per-story graded themes into one dict for the whole newsletter.
+
+    Each theme takes the strongest grade seen across all stories
+    (emphasized > present); themes absent from every story are omitted.
+    """
+    merged: dict[str, str] = {}
+    for story in stories:
+        for theme, grade in story.themes.items():
+            if THEME_GRADE_RANK.get(grade, 0) > THEME_GRADE_RANK.get(merged.get(theme, ""), 0):
+                merged[theme] = grade
+    return merged
 
 
 def write_assessment(
@@ -223,8 +259,8 @@ class NewsletterClassifier:
         scores = parse_quality_scores(raw)
         return scores, cot
 
-    async def classify_themes(self, text: str) -> tuple[list[str], str]:
-        """Tag a story with Ends Statement themes."""
+    async def classify_themes(self, text: str) -> tuple[dict[str, str], str]:
+        """Tag a story with graded Ends Statement themes (theme -> grade)."""
         user_content = self.theme_config["user_template"].format(text=text)
         raw, cot = await self.cloud_llm.complete(
             self.theme_config["system"],

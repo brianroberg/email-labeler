@@ -241,6 +241,28 @@ class TestBuildDetailLines:
         text = "\n".join(lines)
         assert "scripture" in text
 
+    def test_graded_themes_show_grade(self):
+        # New records carry graded themes (theme -> present/emphasized); the
+        # detail view shows the grade (issue #53).
+        record = _make_record(stories=[{
+            "text": "Content", "scores": None, "average_score": None, "tier": None,
+            "themes": {"scripture": "emphasized", "church": "present"},
+            "quality_cot": "", "theme_cot": "",
+        }])
+        text = "\n".join(build_detail_lines(record))
+        assert "scripture (emphasized)" in text
+        assert "church (present)" in text
+
+    def test_legacy_list_themes_still_render(self):
+        # Old records store a present-only list; still render as plain names.
+        record = _make_record(stories=[{
+            "text": "Content", "scores": None, "average_score": None, "tier": None,
+            "themes": ["scripture", "church"], "quality_cot": "", "theme_cot": "",
+        }])
+        text = "\n".join(build_detail_lines(record))
+        assert "scripture" in text
+        assert "church" in text
+
     def test_handles_missing_scores(self):
         record = _make_record(stories=[{
             "text": "Content without any scores",

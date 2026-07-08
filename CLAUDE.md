@@ -52,9 +52,9 @@ When `NEWSLETTER_ONLY=1`, the daemon switches to a newsletter-specific pipeline 
 ```
 Poll loop → find unprocessed newsletters (To/Cc matches config recipient)
   → Extract individual stories from newsletter body (Cloud LLM)
-  → Score each story on 4 quality dimensions: simple, concrete, personal, dynamic (Cloud LLM)
-  → Classify each story against Ends Statement themes (Cloud LLM)
-  → Compute overall tier (excellent/good/fair/poor) from averaged scores
+  → Score each story on 4 quality dimensions (simple, concrete, personal, dynamic) as Poor/OK/Good (Cloud LLM)
+  → Grade each story against Ends Statement themes as Absent/Present/Emphasized (Cloud LLM)
+  → Compute overall tier (excellent/good/fair/poor) from the averaged dimension scores (Poor/OK/Good → 1/2/3; excellent ≥ 2.75, good ≥ 2.25, fair ≥ 1.75, else poor)
   → Apply tier + theme labels via api-proxy → Gmail
   → Append assessment record to JSONL file
 ```
@@ -66,7 +66,7 @@ Newsletter uses its own `[newsletter.llm]` config (currently Sonnet 4.6) indepen
 - `agent/newsletter` — Marker (always applied)
 - `agent/newsletter/excellent|good|fair|poor` — Overall quality tier
 - `agent/newsletter/no-stories` — Newsletter contained no extractable stories
-- `agent/newsletter/theme/*` — Per-story theme labels (scripture, christlikeness, church, vocation-family, disciple-making)
+- `agent/newsletter/theme/*` — Per-story theme labels (scripture, christlikeness, church, vocation-family, disciple-making); applied **only when the theme is graded Emphasized** (Present/Absent are recorded in the assessment JSONL but not labeled)
 
 ### Newsletter Review TUI
 

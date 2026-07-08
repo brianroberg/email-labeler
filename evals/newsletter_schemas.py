@@ -8,15 +8,28 @@ older golden sets and result files keep loading as the schema grows.
 from dataclasses import dataclass, field
 
 
+def _coerce_themes(value) -> dict[str, str]:
+    """Normalize a stored themes value to a grade dict (issue #53).
+
+    Accepts the current dict form (theme -> "present"/"emphasized"), a legacy
+    present-only ``list[str]`` (each coerced to grade "present"), or None/empty.
+    """
+    if not value:
+        return {}
+    if isinstance(value, dict):
+        return dict(value)
+    return {name: "present" for name in value}
+
+
 @dataclass
 class GoldenStory:
     """One story within a golden newsletter (ground truth)."""
 
     story_id: str  # stable, f"{thread_id}:{index}"
     text: str
-    expected_scores: dict[str, int] | None = None  # simple/concrete/personal/dynamic, 1-5
+    expected_scores: dict[str, int] | None = None  # simple/concrete/personal/dynamic, 1-3 (Poor/OK/Good)
     expected_tier: str | None = None  # "excellent" / "good" / "fair" / "poor"
-    expected_themes: list[str] = field(default_factory=list)  # lowercase theme names
+    expected_themes: dict[str, str] = field(default_factory=dict)  # theme -> "present"/"emphasized"
     reviewed: bool = False
     notes: str = ""
     excluded: bool = False  # drop from quality/theme scoring, keep as extraction truth
@@ -42,7 +55,7 @@ class GoldenStory:
             text=d["text"],
             expected_scores=d.get("expected_scores"),
             expected_tier=d.get("expected_tier"),
-            expected_themes=d.get("expected_themes", []),
+            expected_themes=_coerce_themes(d.get("expected_themes")),
             reviewed=d.get("reviewed", False),
             notes=d.get("notes", ""),
             excluded=d.get("excluded", False),
@@ -109,10 +122,10 @@ class StoryPrediction:
     thread_id: str
     expected_scores: dict[str, int] | None = None
     expected_tier: str | None = None
-    expected_themes: list[str] = field(default_factory=list)
+    expected_themes: dict[str, str] = field(default_factory=dict)
     predicted_scores: dict[str, int] | None = None
     predicted_tier: str | None = None
-    predicted_themes: list[str] = field(default_factory=list)
+    predicted_themes: dict[str, str] = field(default_factory=dict)
     scores_raw: str | None = None
     themes_raw: str | None = None
     duration_seconds: float = 0.0
@@ -142,10 +155,10 @@ class StoryPrediction:
             thread_id=d["thread_id"],
             expected_scores=d.get("expected_scores"),
             expected_tier=d.get("expected_tier"),
-            expected_themes=d.get("expected_themes", []),
+            expected_themes=_coerce_themes(d.get("expected_themes")),
             predicted_scores=d.get("predicted_scores"),
             predicted_tier=d.get("predicted_tier"),
-            predicted_themes=d.get("predicted_themes", []),
+            predicted_themes=_coerce_themes(d.get("predicted_themes")),
             scores_raw=d.get("scores_raw"),
             themes_raw=d.get("themes_raw"),
             duration_seconds=d.get("duration_seconds", 0.0),

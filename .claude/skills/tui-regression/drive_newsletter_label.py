@@ -60,15 +60,15 @@ async def s_auto_seed_and_label(chk):
         await drain(app, pilot)
         chk.eq(len(nl.stories), 1, "auto-seed produced one story")
         chk.that(nl.stories and "Sarah" in nl.stories[0].text, "seeded text is the body")
-        # Phase B: score 4/4/4/4 + scripture theme.
+        # Phase B: score all-Good (1/2/3 = Poor/OK/Good) + scripture theme emphasized.
         await pilot.press("1", "l")
-        await pilot.press("4", "4", "4", "4")
-        await pilot.press("s", "enter")
+        await pilot.press("3", "3", "3", "3")
+        await pilot.press("s", "s", "enter")   # scripture: present -> emphasized
         await drain(app, pilot)
-        chk.eq(nl.stories[0].expected_scores, {"simple": 4, "concrete": 4, "personal": 4, "dynamic": 4},
+        chk.eq(nl.stories[0].expected_scores, {"simple": 3, "concrete": 3, "personal": 3, "dynamic": 3},
                "scores assigned")
-        chk.eq(nl.stories[0].expected_tier, "excellent", "tier derived from avg 4.0")
-        chk.eq(nl.stories[0].expected_themes, ["scripture"], "theme assigned")
+        chk.eq(nl.stories[0].expected_tier, "excellent", "tier derived from avg 3.0")
+        chk.eq(nl.stories[0].expected_themes, {"scripture": "emphasized"}, "theme assigned")
         chk.that(nl.stories[0].reviewed, "story marked reviewed")
         await pilot.press("c")              # accept (all labeled -> silent) -> back to list
         await drain(app, pilot)
@@ -309,7 +309,7 @@ async def s_relabel_and_score_cancel(chk):
         await drain(app, pilot)
         chk.that("Reviewed: True" in _e2e.screen_text(app), "reviewed=True header rendered")
         orig = dict(nl.stories[0].expected_scores)
-        # Cancel score entry with a non-1-5 key -> labels untouched.
+        # Cancel score entry with a non-1-3 key -> labels untouched.
         await pilot.press("1", "l")
         await pilot.press("9")
         await drain(app, pilot)

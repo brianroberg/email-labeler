@@ -241,7 +241,7 @@ async def evaluate_story(
         thread_id=thread_id,
         expected_scores=story.expected_scores,
         expected_tier=story.expected_tier,
-        expected_themes=list(story.expected_themes),
+        expected_themes=dict(story.expected_themes),
     )
     thinking = NewsletterThinkingEntry(story_id=story.story_id)
 
@@ -480,19 +480,38 @@ def write_thinking_sidecar(
     return sidecar_path
 
 
-def clamped_dimensions(scores_raw: str) -> list[str]:
-    """Dimensions whose raw model score was outside 1-5 (silently clamped).
+_THEME_LINE_RE = re.compile(r"^\s*([A-Za-z_]+)\s*:\s*([A-Za-z]+)")
 
-    Re-reads the raw quality response with parse_quality_scores' own pattern:
-    an out-of-range score is strong evidence the model misread the rubric, so
-    the run summary must surface it rather than leave it buried in scores_raw.
+
+def _theme_line_anomalies(themes_raw: str) -> tuple[bool, list[str]]:
+    """Classify a raw theme response for the run summary (issue #53 format).
+
+    Each theme line is ``NAME: ABSENT|PRESENT|EMPHASIZED``. Returns
+    ``(is_garbage, dropped_name_tokens)`` where *is_garbage* is True when the
+    response is neither NONE nor contains any recognizable theme grading (prose
+    masquerading as a confident answer), and *dropped_name_tokens* lists any
+    off-taxonomy theme names the parser silently ignored. An all-ABSENT response
+    is a valid empty result, not garbage.
     """
-    clamped = []
-    for dim in ("simple", "concrete", "personal", "dynamic"):
-        match = re.search(rf"{dim.upper()}\s*:\s*(\d+)", scores_raw, flags=re.IGNORECASE)
-        if match and not 1 <= int(match.group(1)) <= 5:
-            clamped.append(dim.upper())
-    return clamped
+    stripped = themes_raw.strip()
+    if not stripped or stripped.upper() == "NONE":
+        return False, []
+
+    valid_grades = {"ABSENT", "PRESENT", "EMPHASIZED"}
+    graded_any = False
+    dropped: list[str] = []
+    for line in stripped.splitlines():
+        match = _THEME_LINE_RE.match(line)
+        if not match:
+            continue
+        name, grade = match.group(1).upper(), match.group(2).upper()
+        if grade not in valid_grades:
+            continue  # not a theme grading line
+        graded_any = True
+        if name not in _VALID_THEMES:
+            dropped.append(name)
+    is_garbage = not graded_any
+    return is_garbage, dropped
 
 
 def summarize_rows(rows: list) -> dict:
@@ -503,8 +522,7 @@ def summarize_rows(rows: list) -> dict:
       parse_quality_scores returned None
     - theme_parse_failures: theme response was neither NONE nor parseable —
       garbage output masquerading as a confident "no themes"
-    - clamped: {story_id: [DIMS]} where raw scores were out of 1-5
-    - dropped_theme_tokens: {token: count} of off-taxonomy labels parse_themes
+    - dropped_theme_tokens: {token: count} of off-taxonomy theme names parse_themes
       silently dropped from otherwise-parsed responses
     """
     counts = {
@@ -512,7 +530,6 @@ def summarize_rows(rows: list) -> dict:
         "errors": 0,
         "quality_parse_failures": 0,
         "theme_parse_failures": 0,
-        "clamped": {},
         "dropped_theme_tokens": {},
     }
     for r in rows:
@@ -520,28 +537,17 @@ def summarize_rows(rows: list) -> dict:
             counts["errors"] += 1
             continue
         scores_raw = getattr(r, "scores_raw", None)
-        if scores_raw is not None:
-            if getattr(r, "predicted_scores", None) is None:
-                counts["quality_parse_failures"] += 1
-            else:
-                dims = clamped_dimensions(scores_raw)
-                if dims:
-                    counts["clamped"][r.story_id] = dims
+        if scores_raw is not None and getattr(r, "predicted_scores", None) is None:
+            counts["quality_parse_failures"] += 1
         themes_raw = getattr(r, "themes_raw", None)
         if themes_raw is not None:
-            stripped = themes_raw.strip()
-            if stripped and stripped.upper() != "NONE":
-                invalid = [
-                    line.strip() for line in stripped.splitlines()
-                    if line.strip() and line.strip().upper() not in _VALID_THEMES
-                ]
-                if not r.predicted_themes:
-                    counts["theme_parse_failures"] += 1
-                elif invalid:
-                    for token in invalid:
-                        counts["dropped_theme_tokens"][token] = (
-                            counts["dropped_theme_tokens"].get(token, 0) + 1
-                        )
+            is_garbage, dropped = _theme_line_anomalies(themes_raw)
+            if is_garbage:
+                counts["theme_parse_failures"] += 1
+            for token in dropped:
+                counts["dropped_theme_tokens"][token] = (
+                    counts["dropped_theme_tokens"].get(token, 0) + 1
+                )
     return counts
 
 
@@ -581,14 +587,6 @@ def format_run_summary(rows: list) -> str:
     if counts["theme_parse_failures"]:
         problems.append(plural(counts["theme_parse_failures"], "theme parse failure"))
     lines = [f"  Rows: {counts['rows']} ({', '.join(problems) if problems else 'no errors'})"]
-    if counts["clamped"]:
-        detail = "; ".join(
-            f"{sid}: {', '.join(dims)}" for sid, dims in counts["clamped"].items()
-        )
-        lines.append(
-            f"  Out-of-range scores clamped to 1-5 in "
-            f"{plural(len(counts['clamped']), 'story', 'stories')} ({detail})"
-        )
     if counts["dropped_theme_tokens"]:
         detail = ", ".join(
             f"{tok} x{n}" for tok, n in sorted(counts["dropped_theme_tokens"].items())

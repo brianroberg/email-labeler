@@ -97,8 +97,8 @@ def newsletters() -> list[GoldenNewsletter]:
         reviewed=True, seeded_from="parse_stories",
     )
     s = GoldenStory(story_id="nl-reviewed:0", text="Dana mentored three interns over the summer.",
-                    expected_scores=_scores(4, 4, 5, 4), expected_tier="excellent",
-                    expected_themes=["disciple_making"], reviewed=True)
+                    expected_scores=_scores(3, 3, 3, 3), expected_tier="excellent",
+                    expected_themes={"disciple_making": "emphasized"}, reviewed=True)
     reviewed.stories = [s]
     nls.append(reviewed)
 
@@ -151,8 +151,8 @@ def newsletters() -> list[GoldenNewsletter]:
         GoldenStory(
             story_id="nl-mixed:0",
             text="Paragraph one of the retreat story.\n\nParagraph two continues the same retreat story.",
-            expected_scores=_scores(3, 3, 3, 3), expected_tier="good",
-            expected_themes=["church"], reviewed=True),
+            expected_scores=_scores(3, 3, 2, 2), expected_tier="good",
+            expected_themes={"church": "present"}, reviewed=True),
         GoldenStory(story_id="nl-mixed:1", text="A separate short story about a baptism."),  # unlabeled
     ]
     nls.append(mixed)
@@ -233,9 +233,10 @@ def threads() -> list[GoldenThread]:
 # ---------------------------------------------------------------------------
 
 def _story_rec(text, scores=None, tier=None, themes=None, qcot="", tcot=""):
+    # Scores are 1/2/3 (Poor/OK/Good); themes are graded dicts (issue #53).
     avg = round(sum(scores.values()) / len(scores), 2) if scores else None
     return {"text": text, "scores": scores, "average_score": avg, "tier": tier,
-            "themes": themes or [], "quality_cot": qcot, "theme_cot": tcot}
+            "themes": {} if themes is None else themes, "quality_cot": qcot, "theme_cot": tcot}
 
 
 def assessment_records() -> list[dict]:
@@ -245,26 +246,28 @@ def assessment_records() -> list[dict]:
         "timestamp": "2026-01-05T10:00:00+00:00", "message_id": "a1", "thread_id": "a1",
         "from": "newsletter@dm.org", "subject": "Excellent edition", "overall_tier": "excellent",
         "stories": [_story_rec("Sarah led 5 students to a scripture retreat this weekend.",
-                               _scores(5, 5, 4, 4), "excellent", ["scripture", "disciple_making"],
+                               _scores(3, 3, 3, 3), "excellent",
+                               {"scripture": "emphasized", "disciple_making": "present"},
                                qcot="Concrete names and numbers throughout.", tcot="Clear scripture focus.")],
     })
     recs.append({
+        # Legacy record: present-only LIST themes — exercises backward-compat rendering.
         "timestamp": "2026-01-06T11:00:00+00:00", "message_id": "a2", "thread_id": "a2",
         "from": "weekly@ministry.org", "subject": "Good update", "overall_tier": "good",
-        "stories": [_story_rec("The church hosted a community dinner.", _scores(3, 3, 3, 3),
+        "stories": [_story_rec("The church hosted a community dinner.", _scores(3, 3, 2, 2),
                                "good", ["church"], qcot="Solid but generic.", tcot="Church theme.")],
     })
     recs.append({
         "timestamp": "2026-01-07T12:00:00+00:00", "message_id": "a3", "thread_id": "a3",
         "from": "digest@dm.org", "subject": "Fair digest", "overall_tier": "fair",
-        "stories": [_story_rec("Some vocation and family news was shared.", _scores(2, 2, 2, 3),
-                               "fair", ["vocation_family"])],
+        "stories": [_story_rec("Some vocation and family news was shared.", _scores(2, 2, 2, 2),
+                               "fair", {"vocation_family": "present"})],
     })
     recs.append({
         "timestamp": "2026-01-08T13:00:00+00:00", "message_id": "a4", "thread_id": "a4",
         "from": "bulletin@church.net", "subject": "Poor bulletin", "overall_tier": "poor",
         "stories": [_story_rec("Announcements and administrative items only.", _scores(1, 1, 1, 2),
-                               "poor", [])],
+                               "poor", {})],
     })
     # No-stories record.
     recs.append({
@@ -276,24 +279,25 @@ def assessment_records() -> list[dict]:
         "timestamp": "2026-01-10T15:00:00+00:00", "message_id": "a6", "thread_id": "a6",
         "from": "multi@partner-org.com", "subject": "Multi-theme edition", "overall_tier": "good",
         "stories": [
-            _story_rec("Christ-like service and scripture memorization combined.", _scores(4, 3, 4, 3),
-                       "good", ["christlikeness", "scripture"], qcot="A" * 400, tcot="B" * 400),
-            _story_rec("Disciple-making across three campuses.", _scores(3, 4, 3, 3),
-                       "good", ["disciple_making"]),
+            _story_rec("Christ-like service and scripture memorization combined.", _scores(3, 2, 3, 2),
+                       "good", {"christlikeness": "emphasized", "scripture": "present"},
+                       qcot="A" * 400, tcot="B" * 400),
+            _story_rec("Disciple-making across three campuses.", _scores(3, 2, 3, 2),
+                       "good", {"disciple_making": "emphasized"}),
         ],
     })
     # Emoji/wide subject.
     recs.append({
         "timestamp": "2026-01-11T16:00:00+00:00", "message_id": "a7", "thread_id": "a7",
         "from": "global@dm.org", "subject": "🌍 東京 global report", "overall_tier": "excellent",
-        "stories": [_story_rec("東京 team baptized 8 new believers 🙏.", _scores(5, 4, 5, 4),
-                               "excellent", ["church", "disciple_making"])],
+        "stories": [_story_rec("東京 team baptized 8 new believers 🙏.", _scores(3, 3, 3, 3),
+                               "excellent", {"church": "present", "disciple_making": "emphasized"})],
     })
     # Long CoT for detail scrolling.
     recs.append({
         "timestamp": "2026-01-12T17:00:00+00:00", "message_id": "a8", "thread_id": "a8",
         "from": "verbose@dm.org", "subject": "Long reasoning", "overall_tier": "fair",
-        "stories": [_story_rec("A modest story.", _scores(2, 3, 2, 2), "fair", ["scripture"],
+        "stories": [_story_rec("A modest story.", _scores(2, 2, 2, 2), "fair", {"scripture": "present"},
                                qcot="\n".join(f"reasoning line {i}" for i in range(30)),
                                tcot="\n".join(f"theme reasoning {i}" for i in range(30)))],
     })

@@ -69,6 +69,18 @@ def _truncate(text: str, width: int) -> str:
     return text[: width - 3] + "..."
 
 
+def _format_themes(themes) -> str:
+    """Render a story's themes for the detail view.
+
+    New records store a graded dict (theme -> "present"/"emphasized"), shown as
+    ``name (grade)``; legacy records store a present-only list, shown as plain
+    names (issue #53).
+    """
+    if isinstance(themes, dict):
+        return ", ".join(f"{name} ({grade})" for name, grade in themes.items())
+    return ", ".join(themes)
+
+
 def wrap_text(text: str, width: int) -> list[str]:
     """Wrap text to width, preserving existing newlines."""
     if not text:
@@ -152,7 +164,7 @@ def build_detail_lines(record: dict, width: int = 80) -> list[str]:
         lines.append(f"--- Story {i + 1}/{len(stories)}: {excerpt} [{tier}, avg: {avg_str}] ---")
 
         if themes:
-            lines.append(f"Themes: {', '.join(themes)}")
+            lines.append(f"Themes: {_format_themes(themes)}")
 
         lines.append("")
 

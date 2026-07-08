@@ -17,9 +17,9 @@ class TestGoldenStory:
         s = GoldenStory(
             story_id="t_001:0",
             text="The full story text goes here.",
-            expected_scores={"simple": 4, "concrete": 5, "personal": 3, "dynamic": 2},
+            expected_scores={"simple": 3, "concrete": 3, "personal": 2, "dynamic": 1},
             expected_tier="good",
-            expected_themes=["scripture", "church"],
+            expected_themes={"scripture": "emphasized", "church": "present"},
             reviewed=True,
             notes="clear story",
             excluded=False,
@@ -30,13 +30,13 @@ class TestGoldenStory:
         assert restored.story_id == "t_001:0"
         assert restored.text == "The full story text goes here."
         assert restored.expected_scores == {
-            "simple": 4,
-            "concrete": 5,
-            "personal": 3,
-            "dynamic": 2,
+            "simple": 3,
+            "concrete": 3,
+            "personal": 2,
+            "dynamic": 1,
         }
         assert restored.expected_tier == "good"
-        assert restored.expected_themes == ["scripture", "church"]
+        assert restored.expected_themes == {"scripture": "emphasized", "church": "present"}
         assert restored.reviewed is True
         assert restored.notes == "clear story"
         assert restored.excluded is False
@@ -45,10 +45,18 @@ class TestGoldenStory:
         s = GoldenStory.from_dict({"story_id": "x:0", "text": "B"})
         assert s.expected_scores is None
         assert s.expected_tier is None
-        assert s.expected_themes == []
+        assert s.expected_themes == {}
         assert s.reviewed is False
         assert s.notes == ""
         assert s.excluded is False
+
+    def test_legacy_list_themes_coerced_to_present(self):
+        # Golden sets written under the old boolean scheme carry a present-only
+        # list; loading them coerces each to grade "present" (issue #53).
+        s = GoldenStory.from_dict(
+            {"story_id": "x:0", "text": "B", "expected_themes": ["scripture", "church"]}
+        )
+        assert s.expected_themes == {"scripture": "present", "church": "present"}
 
     def test_legacy_title_key_is_tolerated(self):
         # Golden sets written before titles were removed still carry a "title"
@@ -71,7 +79,7 @@ class TestGoldenNewsletter:
                 GoldenStory(
                     story_id="t_001:1",
                     text="two",
-                    expected_themes=["vocation-family"],
+                    expected_themes={"vocation_family": "present"},
                 ),
             ],
             source="harvested",
@@ -101,7 +109,7 @@ class TestGoldenNewsletter:
         assert restored.stories[0].story_id == "t_001:0"
         assert restored.stories[1].story_id == "t_001:1"
         assert restored.stories[1].text == "two"
-        assert restored.stories[1].expected_themes == ["vocation-family"]
+        assert restored.stories[1].expected_themes == {"vocation_family": "present"}
 
     def test_defaults_when_keys_missing(self):
         nl = GoldenNewsletter.from_dict(
@@ -127,14 +135,14 @@ class TestStoryPrediction:
         p = StoryPrediction(
             story_id="t_001:0",
             thread_id="t_001",
-            expected_scores={"simple": 4, "concrete": 3, "personal": 5, "dynamic": 2},
+            expected_scores={"simple": 3, "concrete": 2, "personal": 3, "dynamic": 1},
             expected_tier="good",
-            expected_themes=["scripture"],
-            predicted_scores={"simple": 3, "concrete": 3, "personal": 4, "dynamic": 2},
+            expected_themes={"scripture": "present"},
+            predicted_scores={"simple": 2, "concrete": 2, "personal": 3, "dynamic": 1},
             predicted_tier="fair",
-            predicted_themes=["scripture", "church"],
-            scores_raw="SIMPLE: 3 ...",
-            themes_raw="scripture, church",
+            predicted_themes={"scripture": "emphasized", "church": "present"},
+            scores_raw="SIMPLE: OK ...",
+            themes_raw="scripture: emphasized",
             duration_seconds=1.5,
             error=None,
         )
@@ -144,23 +152,23 @@ class TestStoryPrediction:
         assert restored.story_id == "t_001:0"
         assert restored.thread_id == "t_001"
         assert restored.expected_scores == {
-            "simple": 4,
-            "concrete": 3,
-            "personal": 5,
-            "dynamic": 2,
+            "simple": 3,
+            "concrete": 2,
+            "personal": 3,
+            "dynamic": 1,
         }
         assert restored.expected_tier == "good"
-        assert restored.expected_themes == ["scripture"]
+        assert restored.expected_themes == {"scripture": "present"}
         assert restored.predicted_scores == {
-            "simple": 3,
-            "concrete": 3,
-            "personal": 4,
-            "dynamic": 2,
+            "simple": 2,
+            "concrete": 2,
+            "personal": 3,
+            "dynamic": 1,
         }
         assert restored.predicted_tier == "fair"
-        assert restored.predicted_themes == ["scripture", "church"]
-        assert restored.scores_raw == "SIMPLE: 3 ..."
-        assert restored.themes_raw == "scripture, church"
+        assert restored.predicted_themes == {"scripture": "emphasized", "church": "present"}
+        assert restored.scores_raw == "SIMPLE: OK ..."
+        assert restored.themes_raw == "scripture: emphasized"
         assert restored.duration_seconds == 1.5
         assert restored.error is None
 
@@ -168,14 +176,26 @@ class TestStoryPrediction:
         p = StoryPrediction.from_dict({"story_id": "x:0", "thread_id": "x"})
         assert p.expected_scores is None
         assert p.expected_tier is None
-        assert p.expected_themes == []
+        assert p.expected_themes == {}
         assert p.predicted_scores is None
         assert p.predicted_tier is None
-        assert p.predicted_themes == []
+        assert p.predicted_themes == {}
         assert p.scores_raw is None
         assert p.themes_raw is None
         assert p.duration_seconds == 0.0
         assert p.error is None
+
+    def test_legacy_list_themes_coerced_to_present(self):
+        p = StoryPrediction.from_dict(
+            {
+                "story_id": "x:0",
+                "thread_id": "x",
+                "expected_themes": ["scripture"],
+                "predicted_themes": ["scripture", "church"],
+            }
+        )
+        assert p.expected_themes == {"scripture": "present"}
+        assert p.predicted_themes == {"scripture": "present", "church": "present"}
 
 
 class TestExtractionPrediction:

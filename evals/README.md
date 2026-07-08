@@ -136,9 +136,10 @@ Navigate to `http://localhost:5000`. Features:
 
 The daemon's newsletter pipeline (active under `NEWSLETTER_ONLY=1`) grades
 ministry-newsletter stories: it **extracts** stories from a body, **scores** each
-on 4 quality dimensions (simple/concrete/personal/dynamic, 1–5) → a **tier**
-(excellent/good/fair/poor), and tags **themes** (scripture/christlikeness/church/
-vocation-family/disciple-making). This harness measures whether that grading is any
+on 4 quality dimensions (simple/concrete/personal/dynamic) as **Poor/OK/Good** → a
+**tier** (excellent/good/fair/poor, from the averaged scores), and grades **themes**
+(scripture/christlikeness/church/vocation-family/disciple-making) as
+**Absent/Present/Emphasized**. This harness measures whether that grading is any
 good, so you can **iterate on the prompts** and see the effect of each change.
 
 It mirrors the email eval's 4 stages, with newsletter-specific modules prefixed

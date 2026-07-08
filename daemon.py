@@ -22,7 +22,13 @@ from config_utils import substitute_env_vars
 from gmail_utils import decode_body, get_header
 from labeler import LabelManager, _get_priority
 from llm_client import LLMClient, LLMUnavailableError
-from newsletter import NewsletterClassifier, NewsletterTier, is_newsletter, write_assessment
+from newsletter import (
+    NewsletterClassifier,
+    NewsletterTier,
+    aggregate_theme_grades,
+    is_newsletter,
+    write_assessment,
+)
 from proxy_client import (
     TRANSIENT_TRANSPORT_ERRORS,
     GmailProxyClient,
@@ -349,13 +355,12 @@ async def process_single_thread(
 
                 # Determine overall tier (best story's tier)
                 best_tier = None
-                all_themes = []
                 for sr in story_results:
                     if sr.tier is not None:
                         if best_tier is None or _TIER_RANK.get(sr.tier, 0) > _TIER_RANK.get(best_tier, 0):
                             best_tier = sr.tier
-                    all_themes.extend(sr.themes)
-                all_themes = list(dict.fromkeys(all_themes))  # dedupe, preserve order
+                # Merge graded themes across stories (strongest grade per theme)
+                all_themes = aggregate_theme_grades(story_results)
 
                 async with (write_sem or nullcontext()):
                     await label_manager.apply_newsletter_classification(
