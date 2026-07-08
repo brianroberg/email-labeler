@@ -15,7 +15,16 @@ from textual.containers import VerticalScroll
 from textual.screen import Screen
 from textual.widgets import Label, ListItem, ListView, Static
 
-from tui_common import CANCEL, HintScreen, KeyMenuScreen, PageListView, PromptLineScreen
+from tui_common import (
+    CANCEL,
+    HintScreen,
+    KeyMenuScreen,
+    PageListView,
+    PromptLineScreen,
+)
+from tui_common import (
+    truncate as _truncate,
+)
 
 # ---------------------------------------------------------------------------
 # Column widths for list view
@@ -74,13 +83,6 @@ def apply_filters(
         # send-date can't satisfy a positive date filter, so they drop out (#36).
         result = [r for r in result if (r.get("send_date") or "")[:10] >= since]
     return result
-
-
-def _truncate(text: str, width: int) -> str:
-    """Truncate text to width chars, adding ``...`` if needed."""
-    if len(text) <= width:
-        return text
-    return text[: width - 3] + "..."
 
 
 def _format_themes(themes) -> str:

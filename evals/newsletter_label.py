@@ -37,9 +37,7 @@ import argparse
 import asyncio
 import copy
 import json
-import os
 import sys
-import tempfile
 import unicodedata
 from dataclasses import dataclass, replace
 from pathlib import Path
@@ -51,7 +49,7 @@ from textual.binding import Binding
 from textual.screen import Screen
 from textual.widgets import Label, ListItem, ListView, Static
 
-from evals import plural
+from evals import atomic_write_jsonl, plural
 from evals.newsletter_schemas import GoldenNewsletter, GoldenStory
 from newsletter import compute_tier, parse_stories
 from tui_common import BottomModal, HintScreen, PageListView, PromptLineScreen
@@ -90,19 +88,7 @@ def load_golden_set(path: Path) -> list[GoldenNewsletter]:
 
 def save_golden_set(newsletters: list[GoldenNewsletter], path: Path) -> None:
     """Save the golden set atomically (temp file + rename)."""
-    path = Path(path)
-    fd, tmp_path = tempfile.mkstemp(dir=path.parent, suffix=".jsonl.tmp")
-    try:
-        with os.fdopen(fd, "w") as f:
-            for nl in newsletters:
-                f.write(json.dumps(nl.to_dict()) + "\n")
-        os.rename(tmp_path, path)
-    except BaseException:
-        try:
-            os.unlink(tmp_path)
-        except OSError:
-            pass
-        raise
+    atomic_write_jsonl(newsletters, path)
 
 
 # ---------------------------------------------------------------------------

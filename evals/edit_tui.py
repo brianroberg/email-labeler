@@ -20,6 +20,7 @@ from evals.review import _LABEL_KEY_MAP, _SENDER_KEY_MAP, save_golden_set
 from evals.schemas import GoldenThread
 from gmail_utils import decode_body
 from tui_common import CANCEL, HintScreen, KeyMenuScreen, PageListView
+from tui_common import truncate as _truncate
 
 # Abbreviation maps for compact list display
 _SENDER_ABBREV = {"person": "PER", "service": "SVC"}
@@ -36,13 +37,6 @@ _COL_GAP = 2      # space between columns
 # ---------------------------------------------------------------------------
 # Pure helpers
 # ---------------------------------------------------------------------------
-
-def _truncate(text: str, width: int) -> str:
-    """Truncate *text* to *width* chars, adding ``...`` if needed."""
-    if len(text) <= width:
-        return text
-    return text[: width - 3] + "..."
-
 
 def _format_list_row(thread: GoldenThread, max_x: int) -> str:
     """Format a single thread as one list-view line."""

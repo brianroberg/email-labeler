@@ -15,6 +15,14 @@ from textual.screen import ModalScreen
 from textual.widgets import Input, ListView, Static
 
 
+def truncate(text: str, width: int) -> str:
+    """Truncate *text* to *width* characters, adding a ``...`` ellipsis if it
+    doesn't fit. Shared by the list-row renderers across the TUIs (issue #49)."""
+    if len(text) <= width:
+        return text
+    return text[: width - 3] + "..."
+
+
 class _Cancel:
     """Dismissal sentinel distinct from None (None = "clear").
 

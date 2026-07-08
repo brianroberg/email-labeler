@@ -13,15 +13,14 @@ Usage:
 
 import argparse
 import json
-import os
 import sys
-import tempfile
 from pathlib import Path
 
 from textual.app import App, ComposeResult
 from textual.containers import VerticalScroll
 from textual.widgets import Static
 
+from evals import atomic_write_jsonl
 from evals.schemas import GoldenThread
 from gmail_utils import decode_body
 from tui_common import CANCEL, KeyMenuScreen, PromptLineScreen
@@ -62,18 +61,7 @@ def load_golden_set(path: Path) -> list[GoldenThread]:
 
 def save_golden_set(threads: list[GoldenThread], path: Path) -> None:
     """Save golden set atomically (temp file + rename)."""
-    fd, tmp_path = tempfile.mkstemp(dir=path.parent, suffix=".jsonl.tmp")
-    try:
-        with os.fdopen(fd, "w") as f:
-            for thread in threads:
-                f.write(json.dumps(thread.to_dict()) + "\n")
-        os.rename(tmp_path, path)
-    except BaseException:
-        try:
-            os.unlink(tmp_path)
-        except OSError:
-            pass
-        raise
+    atomic_write_jsonl(threads, path)
 
 
 # ---------------------------------------------------------------------------
