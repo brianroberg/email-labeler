@@ -116,7 +116,7 @@ class DetailScreen(Screen):
         Binding("q", "quit_app", "Quit", show=False),
         Binding("s", "edit_sender", "Sender", show=False),
         Binding("l", "edit_label", "Label", show=False),
-        Binding("e", "unexclude", "Unexclude", show=False),
+        Binding("e", "toggle_excluded", "Toggle exclude", show=False),
         Binding("up", "scroll_up", "Scroll up", show=False),
         Binding("down", "scroll_down", "Scroll down", show=False),
         Binding("pageup", "page_up", "Page up", show=False),
@@ -156,8 +156,8 @@ class DetailScreen(Screen):
     def _refresh(self) -> None:
         lines = _build_detail_lines(self.thread, self.index, self.total)
         self.query_one("#detail-content", Static).update("\n".join(lines))
-        unexclude = "  [e]unexclude" if self.thread.excluded else ""
-        help_text = f"\u2191/\u2193:Scroll  [s]ender  [l]abel{unexclude}  Esc:Back  q:Quit"
+        excl = "[e]unexclude" if self.thread.excluded else "[e]exclude"
+        help_text = f"\u2191/\u2193:Scroll  [s]ender  [l]abel  {excl}  Esc:Back  q:Quit"
         self.query_one("#detail-help", Static).update(help_text)
         status = f"Sender: {self.thread.expected_sender_type}  Label: {self.thread.expected_label}"
         self.query_one("#detail-status", Static).update(status)
@@ -190,12 +190,13 @@ class DetailScreen(Screen):
 
         self.app.push_screen(KeyMenuScreen(_LABEL_PROMPT, _LABEL_KEY_MAP), apply)
 
-    def action_unexclude(self) -> None:
-        # Un-exclude only; excluding happens in the review loop.
-        if self.thread.excluded:
-            self.thread.excluded = False
-            self._auto_save()
-            self._refresh()
+    def action_toggle_excluded(self) -> None:
+        # Symmetric exclude/unexclude toggle (issue #52). `reviewed` is left
+        # untouched — excluded is orthogonal to reviewed, matching the newsletter
+        # labeler's toggle. Reversible by pressing `e` again.
+        self.thread.excluded = not self.thread.excluded
+        self._auto_save()
+        self._refresh()
 
     # -- navigation ----------------------------------------------------------
 

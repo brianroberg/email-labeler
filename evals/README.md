@@ -54,7 +54,7 @@ Interactive CLI for reviewing and correcting labels in the golden set. Saves ato
 **Setting an email aside.** Some threads aren't useful as test cases. Two options:
 
 - **Skip** (`k`) — render no judgment. The thread is left unreviewed and resurfaces in a later review session.
-- **Exclude** (`e`) — permanently set the thread aside. It is dropped from the review queue and never evaluated. Excluded threads are flagged with an `X` in the `--edit` list view; to bring one back, open `--edit`, select it, and press `e` to un-exclude.
+- **Exclude** (`e`) — permanently set the thread aside. It is dropped from the review queue and never evaluated. Excluded threads are flagged with an `X` in the `--edit` list view. In `--edit`, `e` is a **toggle**: press it on an included thread to exclude it, or on an excluded one to bring it back.
 
 Hotkeys: sender type `p`/`s` (person/service); label `r`/`f`/`l` (needs_response/fyi/low_priority); `n` notes; `z` undo; `k` skip; `e` exclude; `q` quit.
 
@@ -65,7 +65,7 @@ uv run python -m evals.review
 # Show existing labels while reviewing
 uv run python -m evals.review --show-labels
 
-# Textual TUI for editing reviewed threads (also where you un-exclude)
+# Textual TUI for editing reviewed threads (also where you toggle exclude/un-exclude)
 uv run python -m evals.review --edit
 
 # Review only sender classification (stage 1) or label classification (stage 2)
