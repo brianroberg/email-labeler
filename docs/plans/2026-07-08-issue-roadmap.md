@@ -75,7 +75,7 @@ spike that answers cost/feasibility.
 | Issue | What | Priority | Effort | Depends on |
 |---|---|---|---|---|
 | **#13** | Grow the email golden set to ≥60 reviewed threads, balanced across labels/sender types. **Sub-tasks added:** (1) a read-only `--stats` mode on `evals.review` (composition dashboard — total / excluded / reviewed-unexcluded, plus sender×label crosstab); (2) a `--sender-type person\|service` filter on `evals.review` (it has `--filter-label` but no sender filter today) so the reviewed-pending backlog can be drained toward thin cells. Both are small, reuse `load_golden_set`/`SENDER_TYPES`/`LABELS`, and steer the curation | **P1** | M–L (human review) | — *(enables the rest)* |
-| **#14** | Fix the stable under-classification (needs_response→fyi ×1, fyi→low_priority ×2) via prompt-criteria tuning | **P1** | M | **#13** |
+| **#14** | Fix the stable under-classification (needs_response→fyi ×1, fyi→low_priority ×2) via prompt-criteria tuning. **⚠ These tallies predate the 252-thread expansion** — re-run `evals.run_eval` + `evals.report --verbose` against the current set before acting | **P1** | M | **#13** |
 | **#12** | Reduce local latency: A/B a lean prompt (drop the reasoning scaffold) vs current; adopt if accuracy holds | **P1–P2** | M | **#13** |
 | **#2** | Reconcile golden-set labels with whole-thread state (already-replied → FYI); optionally add an explicit prompt rule | **P2** | S–M | overlaps #13 |
 
@@ -84,15 +84,26 @@ accuracy number trustworthy. Fold #2's label-consistency pass into the #13 curat
 effort (same activity, same data). Then #14 (correctness of the rare, high-stakes class)
 before #12 (latency, which must not regress accuracy).
 
-**Current status (measured 2026-07-08):** 236 reviewed & usable threads — the ≥60 *count*
-target is already met (~4×). Label balance is fine (needs_response 36 / fyi 95 /
-low_priority 105); the earlier "needs_response barely represented" worry is resolved. The
-remaining lever is **sender balance**: person is only 45/236 (~19%), and that's the
-privacy-critical, locally-served path (#14/#12), so its coverage is the thin side. The
-weakest cell (person/low_priority = 4) likely reflects a true low base rate — don't
-force it. Growth from here is mostly a *reviewing* task: ~164 harvested-but-unreviewed
-threads already sit on disk, so the new `--stats` and `--sender-type` review filters are
-the tools to drain that backlog toward person coverage, then re-baseline accuracy.
+**Current status (measured 2026-07-08, after the owner's expansion pass):** 252 reviewed
+& usable threads out of 401 harvested (2 excluded) — the ≥60 *count* target is met (~4×).
+Label balance is fine (needs_response 47 / fyi 99 / low_priority 106); the earlier
+"needs_response barely represented" worry is resolved. Full sender×label crosstab of the
+scored set:
+
+```
+           needs_response   fyi   low_priority   total
+    person             20    32              4      56
+   service             27    67            102     196
+    total              47    99            106     252
+```
+
+The remaining lever is **sender balance**: person is 56/252 (~22%) — up from the earlier
+45, but still the thin side, and it's the privacy-critical, locally-served path
+(#14/#12). The weakest cell (person/low_priority = 4) likely reflects a true low base
+rate — don't force it. Growth from here is mostly a *reviewing* task: ~147
+harvested-but-unreviewed threads (401 − 2 excluded − 252 reviewed) still sit on disk, so
+the new `--stats` and `--sender-type` review filters are the tools to drain that backlog
+toward person coverage, then re-baseline accuracy.
 
 ---
 
