@@ -13,7 +13,6 @@ class GoldenStory:
     """One story within a golden newsletter (ground truth)."""
 
     story_id: str  # stable, f"{thread_id}:{index}"
-    title: str
     text: str
     expected_scores: dict[str, int] | None = None  # simple/concrete/personal/dynamic, 1-5
     expected_tier: str | None = None  # "excellent" / "good" / "fair" / "poor"
@@ -25,7 +24,6 @@ class GoldenStory:
     def to_dict(self) -> dict:
         return {
             "story_id": self.story_id,
-            "title": self.title,
             "text": self.text,
             "expected_scores": self.expected_scores,
             "expected_tier": self.expected_tier,
@@ -37,9 +35,10 @@ class GoldenStory:
 
     @classmethod
     def from_dict(cls, d: dict) -> "GoldenStory":
+        # ``title`` was dropped from the schema; older golden sets that still
+        # carry it load fine because the extra key is simply ignored here.
         return cls(
             story_id=d["story_id"],
-            title=d["title"],
             text=d["text"],
             expected_scores=d.get("expected_scores"),
             expected_tier=d.get("expected_tier"),
@@ -159,8 +158,8 @@ class ExtractionPrediction:
     """One prediction per newsletter in extraction mode."""
 
     thread_id: str
-    golden_stories: list[dict] = field(default_factory=list)  # [{"story_id","title","text"}]
-    predicted_stories: list[dict] = field(default_factory=list)  # [{"title","text"}]
+    golden_stories: list[dict] = field(default_factory=list)  # [{"story_id","text"}]
+    predicted_stories: list[dict] = field(default_factory=list)  # [{"text"}]
     duration_seconds: float = 0.0
     error: str | None = None
 

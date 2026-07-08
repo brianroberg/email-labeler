@@ -23,7 +23,7 @@ Harvest always appends to `--output`, deduplicating by thread ID. There is no ov
 |---|---|
 | `--golden-set` | Path to golden set JSONL (default: `evals/golden_set.jsonl`) |
 | `--show-labels` | Show existing labels (default is blind mode) |
-| `--edit` | Curses TUI for editing reviewed threads (auto-saves on each change) |
+| `--edit` | Textual TUI for editing reviewed threads (auto-saves on each change) |
 | `--stage` | Review only stage 1 (sender) or stage 2 (label) |
 | `--unreviewed-only` | Show only threads not yet reviewed |
 | `--filter-label` | Show only threads with this label |
@@ -162,47 +162,67 @@ exits 1 with a one-line message instead of a traceback.
 | Flag | Description |
 |---|---|
 | `--golden-set` | Path to newsletter golden set JSONL (default: `evals/newsletter_golden_set.jsonl`) |
-| `--edit` | Disable LLM seeding — manual curation only. Same curses TUI, but `Space` is inert and no LLM endpoint is needed |
+| `--edit` | Disable LLM seeding — manual curation only. Same Textual TUI, but auto-seed and `r` (reseed) are inert and no LLM endpoint is needed |
 | `--unreviewed-only` | Show only newsletters not yet reviewed |
 | `--include-excluded` | Also queue excluded newsletters, so they can be inspected or restored with the `X` hotkey (default: excluded newsletters are skipped) |
 | `--config` | Path to config.toml (default: the repo-root `config.toml`, regardless of CWD) |
 
-Both modes open the same curses TUI; `--edit` only removes the Phase-A LLM
+Both modes open the same Textual TUI; `--edit` only removes the Phase-A LLM
 seeding (it does **not** filter to reviewed newsletters — combine with
 `--unreviewed-only` or not as needed). Without `--edit`, a missing
 `NEWSLETTER_LLM_URL`/`CLOUD_LLM_URL` exits immediately at startup with an
-actionable message instead of failing later inside the TUI when `Space` is
-pressed.
+actionable message instead of failing later inside the TUI.
 
-Two phases per newsletter. **Phase A** curates the story list (extraction
-truth). Press `Space` to seed candidate stories by running the production
-`parse_stories` extractor over a **fresh, uncached** LLM extraction of the body
-(every press re-runs the call). Re-seeding over a non-empty list asks
-`Replace N stories (M labeled) with a fresh seed? y/N`; a `Seeding…` indicator
-shows during the call, and the outcome is reported on the status line
-(`Seeded N stories.` / `Extractor returned NO_STORIES.` / `Extractor output had
-no parseable story blocks.`). Under `--edit`, `Space` shows an explanatory
-"seeding disabled" message. The seed is a deletable starting point; the reviewer
-builds the authoritative list by marking body segments — move the cursor over the
-rendered body (body lines already covered by a story are **dimmed**, so omitted
-paragraphs stand out), press `s`/`e` to set the selection start/end line and
-`Enter` to make a story from that inclusive span — plus `a`dd/`E`dit/`d`elete.
-Deleting a story that carries labels asks `y/N` confirmation, and deletes echo
-what was removed. Confirming (`c`) sets `newsletter.reviewed=True` and warns how
-many stories are still unlabeled. Story ids are **stable**: they are assigned at
-creation (max existing numeric suffix + 1, so delete-then-add never collides) and
-confirm preserves them, only repairing duplicates — deleting a story leaves an id
-gap by design, so cross-run comparisons keyed on `story_id` stay valid.
-Re-seeding with `Space` resets `newsletter.reviewed=False` — a reseeded
-newsletter must be re-confirmed before it counts for reviewed-only runs (undo
-restores the prior state).
-Pressing `k` skips the newsletter without marking it reviewed, so it resurfaces
-in a later pass (and the list view jumps straight to the next queued newsletter).
-**Phase B** labels each story: the 4 dimensions (simple, concrete, personal,
-dynamic; `1`–`5`), multi-select themes, notes, undo; `expected_tier` is
-auto-derived via `compute_tier` on save and `story.reviewed` is set. Saves are
-atomic (temp-file + rename). `excluded` stories are kept as extraction truth but
-skipped from quality/theme scoring.
+The detail screen is **body-centric**: the newsletter body fills the screen with
+each story's span highlighted **in place** (a colored gutter bar + tint, and a
+`▶ Story N` marker row at the span's first line), a compact **story strip** above
+the body listing each story (`▶N. L<lo>-<hi> [scores] excerpt`, `⚠ not found` if
+the text can't be located), and a **mode bar** that always names the active mode
+and its keys. A story's line span is **derived at runtime** by matching its text
+against the body (`locate_story_span`) — the golden set stores only the story
+text, never line numbers.
+
+Two phases per newsletter. **Phase A** curates the story list (extraction truth)
+in two explicit modes:
+
+- **Auto-seed**: opening an *unreviewed, story-less* newsletter automatically
+  runs the production `parse_stories` extractor over a fresh, uncached LLM
+  extraction of the body (status shows `Extracting stories…`), so the model's
+  stories are visible without a keypress. `r` re-seeds manually; re-seeding over
+  a non-empty list asks `Replace N stories (M labeled) with a fresh seed? y/N`
+  and the outcome is reported on the status line (`Seeded N stories.` /
+  `Extractor returned NO_STORIES.` / `Extractor output had no parseable story
+  blocks.`). Re-seeding resets `newsletter.reviewed=False`. Under `--edit`,
+  auto-seed and `r` are inert. Leaving the screen mid-seed discards the late
+  result (the newsletter is mutated only after the network await).
+- **Browse mode** (default): `n`/`p` or a number key (`1`–`9`) selects a story
+  (emphasized in the body and the strip); `Enter` on a story's body row selects
+  it. `a` starts a new story, `e` edits the selected story's boundaries, `d`
+  deletes it (a `y/N` prompt guards a labeled story; deletes echo what was
+  removed), `C` clears **all** stories after a `y/N` confirm, `u` toggles the
+  selected story's exclusion, `l` labels it. `c` **accepts** the story list
+  (`confirm_story_list` → `reviewed=True`, warning first if stories are
+  unlabeled) and advances to the next newsletter; `k` skips without marking
+  reviewed.
+- **Span mode** (entered by `a` for a new story or `e` for the selected one):
+  the working span live-highlights as the cursor moves. A new story is two
+  presses of `Enter` — mark the first line, then the last line; `s`/`e`
+  fine-adjust the start/end to the cursor; `Enter` commits and `Esc` cancels. A
+  committed story's text is the **verbatim inclusive body slice**; editing an
+  existing story replaces its text but preserves its `story_id`, labels, themes,
+  notes, and excluded flag. If a story can't be located in the body, `e` falls
+  back to a one-line text prompt.
+
+Story ids are **stable**: assigned at creation (max existing numeric suffix + 1,
+so delete-then-add never collides) and preserved by accept, which only repairs
+duplicates — a delete leaves an id gap by design, so cross-run comparisons keyed
+on `story_id` stay valid.
+
+**Phase B** labels the selected story (`l`): the 4 dimensions (simple, concrete,
+personal, dynamic; `1`–`5`), multi-select themes, notes (`N`), undo (`z`);
+`expected_tier` is auto-derived via `compute_tier` on save and `story.reviewed`
+is set. Saves are atomic (temp-file + rename). `excluded` stories are kept as
+extraction truth but skipped from quality/theme scoring.
 
 A **whole newsletter** can be excluded with `X` in the detail view: it is
 dropped from the labeling queue and from eval runs entirely (the run's load
@@ -217,21 +237,21 @@ TUI details:
 - **Undo** (`z`) is a multi-level stack (up to 100 snapshots per newsletter). A
   snapshot is pushed only when a mutation actually happens — cancelled prompts
   never consume an undo level.
-- **Esc** cancels any prompt (title/text/notes/story #), clears an active
-  `s`/`e` selection before acting as "back", and `ESCDELAY` defaults to 25 ms so
-  it feels instant.
-- **Prompts prefill current values**: `E` prefills the title and (single-line)
-  text with blank=keep semantics (multi-line text remains blank=keep — body-span
-  selection is the intended paragraph-level repair path); `n` prefills existing
-  notes; `l` shows current scores ("now X") and prefills current themes. Prompt
-  input scrolls horizontally (no width truncation) and rejects control
-  characters.
-- **Detail view**: labeled stories show `scores: a/b/c/d`; a `row X/Y` position
-  indicator sits on the status line; the help footer wraps on narrow terminals
-  and lists `Space:seed` and `PgUp/PgDn`.
+- **Esc** cancels an in-progress span edit; otherwise it acts as "back" to the
+  list. (Textual handles Esc natively — the old curses `ESCDELAY` workaround is
+  gone.)
+- **Row cache**: body rows + located spans are cached and rebuilt only on
+  mutation or resize; selection and span-highlight changes re-style the cached
+  rows without a rebuild, and a resize rewraps the body to the new width.
 - **List view**: columns are `R Lbl Sender Subject` where `Lbl` is
   labeled/total stories and the flag column shows `Y` (reviewed) or `X`
   (excluded, which takes precedence); the list supports `PgUp`/`PgDn`.
+
+> Story **titles were removed** from the pipeline (the extraction prompt now emits
+> `STORY:` blocks and quality/theme prompts take text only), so stories are
+> identified everywhere by a first-words text excerpt. This changed the
+> extraction/quality/theme `prompt_hash`, so runs recorded before the change are
+> no longer prompt-comparable.
 
 `seed_from_extractor()` returns `(stories, raw)` — the raw extractor output is
 kept so the caller can distinguish a `NO_STORIES` verdict from unparseable
@@ -260,7 +280,7 @@ output.
 Run replays the golden set through the real `NewsletterClassifier` using the
 `[newsletter.llm]` endpoint (resolved via `resolve_newsletter_llm_endpoint()`).
 Extraction mode feeds each `body` through `extract_stories`; quality/theme mode
-scores the **fixed golden `(title, text)`** of every reviewed, non-excluded story
+scores the **fixed golden story text** of every reviewed, non-excluded story
 (independent of what extraction produced) and derives the predicted tier via
 `compute_tier`. Story modes skip stories with `reviewed=False` (Phase-A-confirmed
 but never Phase-B-labeled) and print a skip count; `meta.story_count` counts what
@@ -307,10 +327,9 @@ one-to-one `SequenceMatcher` match.
 
 Metric semantics:
 
-- **Extraction matching compares story text** (whitespace-collapsed, lowercased),
-  falling back to title only when a story has no text — golden text is the
-  curated ground truth, titles are model-invented wording. `--match-threshold`
-  applies to that text similarity.
+- **Extraction matching compares story text** (whitespace-collapsed, lowercased)
+  — golden text is the curated ground truth. `--match-threshold` applies to that
+  text similarity.
 - A newsletter with 0 predicted and 0 golden stories scores
   precision = recall = 1.0 (correct abstention), not 0.0.
 - **Theme metrics** include a story iff its own theme call succeeded (row has no
@@ -344,7 +363,7 @@ any `OSError`) exit with a one-line error instead of a traceback.
 `--verbose` detail: per-story flips in `--compare` gate the tier diff on both
 runs having quality scores but compare theme sets whenever both rows' theme call
 succeeded — two `--mode themes` runs show their theme flips. Story
-Disagreements lines append story titles (best-effort
+Disagreements lines append a story text excerpt (best-effort
 lookup from the run's recorded `golden_set_path`; degrades to bare ids if the
 file moved) and include stories whose quality parse failed but whose themes
 disagree; a `Parse/Network Failures` section prints each failed story with its
@@ -353,8 +372,7 @@ prints `themes_raw` for stories whose theme output was invalid
 (`invalid tokens dropped: ...`) or unparseable (`parsed to []`); Extraction Diffs
 honor `--match-threshold` (header says `threshold <t>`) and, for any newsletter
 that isn't a perfect match, list matched pairs with their `SequenceMatcher` ratio
-plus each unmatched predicted / unmatched golden story by title (text excerpt
-when untitled).
+plus each unmatched predicted / unmatched golden story by a text excerpt.
 
 `--compare` prints a Run A/Run B/Delta table; the header shows each run's
 `prompt_hash` + `tag` + `mode=...`, and a WARNING line prints when the two runs'
@@ -367,7 +385,7 @@ column shows `-` when a run has no tag.
 Nonexistent or meta-less results files produce a one-line `Error: ...` on stderr
 and exit code 1 (all three modes) — and when the offending path is a
 `.cot.jsonl`, a hint points at the main results file. Public helpers:
-`match_stories_detailed()`, `theme_parse_anomalies()`, `load_story_titles()`,
+`match_stories_detailed()`, `theme_parse_anomalies()`, `load_story_excerpts()`,
 `build_trend_rows()`, `comparison_as_json()`.
 
 ### Newsletter shared cache & prompt separation

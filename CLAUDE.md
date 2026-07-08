@@ -32,7 +32,8 @@ uv run --extra dev ruff check .  # Lint
 - `proxy_client.py` — Gmail API proxy client (copied from email-agent)
 - `gmail_utils.py` — Header/body parsing (copied from email-agent)
 - `config.toml` — Label definitions, prompts, operational params
-- `newsletter_review/` — Curses TUI for browsing newsletter assessment results (`python -m newsletter_review`)
+- `newsletter_review/` — Textual TUI for browsing newsletter assessment results (`python -m newsletter_review`)
+- `tui_common.py` — Shared Textual widgets/screens for all TUIs (see README-technical "TUI Conventions")
 
 ## Architecture
 
@@ -77,7 +78,7 @@ python -m newsletter_review --sender dm.org          # Filter by sender
 python -m newsletter_review --file path/to/file.jsonl  # Custom JSONL path
 ```
 
-Hotkeys: `e/g/f/p` filter by tier, `1-5` filter by theme, `s` filter by sender, `c` clear filters, `q` quit.
+Hotkeys: `f` opens the filter menu (`t` tier → `e/g/f/p/c`, `h` theme → `s/c/h/v/d/x`, `s` sender text input), `Enter` opens detail, `Esc` back, `q` quit.
 
 ### Newsletter evaluation
 
@@ -160,10 +161,10 @@ All tests use mocks — no external services needed. Test files mirror source fi
 - `test_classifier.py` — Parsing functions + classification routing
 - `test_labeler.py` — Label verification + application actions
 - `test_daemon.py` — Processing pipeline + config loading
-- `test_newsletter_review.py` — TUI data loading, filtering, formatting, detail view
+- `test_newsletter_review.py` — TUI data loading, filtering, formatting + Pilot UI tests (navigation, drill-down, filters, quit)
 - `test_eval_newsletter_schemas.py` — Golden-set dataclass round-trip + missing-key tolerance
 - `test_eval_newsletter_harvest.py` — Newsletter harvest filtering, body build, dedup
-- `test_eval_newsletter_label.py` — Story curation + per-story scoring/theme pure functions
+- `test_eval_newsletter_label.py` — Story curation + per-story scoring/theme pure functions + Pilot UI tests (seeding, undo, labeling, skip-through)
 - `test_eval_newsletter_run.py` — `prompt_hash`, cache reuse, extraction vs quality/theme modes
 - `test_eval_newsletter_report.py` — `match_stories`, tier/dimension/theme metrics, comparison deltas
 - `test_eval_newsletter_cli_docs.py` — Every newsletter eval `--flag` documented in `README-technical.md`

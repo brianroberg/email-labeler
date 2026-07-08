@@ -954,7 +954,6 @@ class TestNewsletterRouting:
         mock_proxy.get_thread.return_value = newsletter_thread_response
         mock_newsletter_classifier.classify_newsletter.return_value = [
             StoryResult(
-                title="Test",
                 text="Content",
                 scores={"simple": 4, "concrete": 4, "personal": 4, "dynamic": 4},
                 average_score=4.0,
@@ -1091,7 +1090,6 @@ class TestNewsletterRouting:
         mock_proxy.get_thread.return_value = newsletter_thread_response
         mock_newsletter_classifier.classify_newsletter.return_value = [
             StoryResult(
-                title="Test",
                 text="Content",
                 scores={"simple": 4, "concrete": 4, "personal": 4, "dynamic": 4},
                 average_score=4.0,

@@ -21,7 +21,7 @@ from evals.newsletter_report import (
     compute_tier_metrics,
     format_mae_delta,
     format_metric_delta,
-    load_story_titles,
+    load_story_excerpts,
     match_stories,
     match_stories_detailed,
     print_comparison,
@@ -85,8 +85,8 @@ def _pred(
 
 class TestMatchStories:
     def test_exact_match(self):
-        predicted = [{"title": "A", "text": "the quick brown fox"}]
-        golden = [{"story_id": "t:0", "title": "A", "text": "the quick brown fox"}]
+        predicted = [{"text": "the quick brown fox"}]
+        golden = [{"story_id": "t:0", "text": "the quick brown fox"}]
         matched, n_pred, n_gold = match_stories(predicted, golden)
         assert matched == 1
         assert n_pred == 1
@@ -94,15 +94,15 @@ class TestMatchStories:
 
     def test_fuzzy_match_above_threshold(self):
         # Same story with a couple words changed — ratio stays well above 0.6.
-        predicted = [{"title": "", "text": "the quick brown fox jumped over the lazy dog"}]
-        golden = [{"story_id": "t:0", "title": "",
+        predicted = [{"text": "the quick brown fox jumped over the lazy dog"}]
+        golden = [{"story_id": "t:0",
                    "text": "the quick brown fox jumped over the lazy cat"}]
         matched, _, _ = match_stories(predicted, golden)
         assert matched == 1
 
     def test_below_threshold_no_match(self):
-        predicted = [{"title": "", "text": "completely unrelated content here"}]
-        golden = [{"story_id": "t:0", "title": "",
+        predicted = [{"text": "completely unrelated content here"}]
+        golden = [{"story_id": "t:0",
                    "text": "an entirely different subject about gardening"}]
         matched, n_pred, n_gold = match_stories(predicted, golden)
         assert matched == 0
@@ -111,10 +111,10 @@ class TestMatchStories:
 
     def test_one_to_one_greedy(self):
         # One predicted story is similar to two golden stories; it may match only one.
-        predicted = [{"title": "", "text": "alpha beta gamma delta"}]
+        predicted = [{"text": "alpha beta gamma delta"}]
         golden = [
-            {"story_id": "t:0", "title": "", "text": "alpha beta gamma delta"},
-            {"story_id": "t:1", "title": "", "text": "alpha beta gamma delta epsilon"},
+            {"story_id": "t:0", "text": "alpha beta gamma delta"},
+            {"story_id": "t:1", "text": "alpha beta gamma delta epsilon"},
         ]
         matched, n_pred, n_gold = match_stories(predicted, golden)
         assert matched == 1  # cannot match both golden stories
@@ -124,10 +124,10 @@ class TestMatchStories:
     def test_extra_predicted_drops_precision(self):
         # 2 predicted, 1 golden -> 1 match -> precision 1/2, recall 1/1.
         predicted = [
-            {"title": "", "text": "the quick brown fox"},
-            {"title": "", "text": "spurious hallucinated story"},
+            {"text": "the quick brown fox"},
+            {"text": "spurious hallucinated story"},
         ]
-        golden = [{"story_id": "t:0", "title": "", "text": "the quick brown fox"}]
+        golden = [{"story_id": "t:0", "text": "the quick brown fox"}]
         matched, n_pred, n_gold = match_stories(predicted, golden)
         assert matched == 1
         assert n_pred == 2
@@ -135,10 +135,10 @@ class TestMatchStories:
 
     def test_missing_predicted_drops_recall(self):
         # 1 predicted, 2 golden -> 1 match -> precision 1/1, recall 1/2.
-        predicted = [{"title": "", "text": "the quick brown fox"}]
+        predicted = [{"text": "the quick brown fox"}]
         golden = [
-            {"story_id": "t:0", "title": "", "text": "the quick brown fox"},
-            {"story_id": "t:1", "title": "", "text": "a wholly separate tale of woe"},
+            {"story_id": "t:0", "text": "the quick brown fox"},
+            {"story_id": "t:1", "text": "a wholly separate tale of woe"},
         ]
         matched, n_pred, n_gold = match_stories(predicted, golden)
         assert matched == 1
@@ -307,22 +307,22 @@ class TestExtractionMetrics:
         nl_a = ExtractionPrediction(
             thread_id="A",
             golden_stories=[
-                {"story_id": "A:0", "title": "", "text": "alpha story about faith"},
-                {"story_id": "A:1", "title": "", "text": "beta story about hope"},
+                {"story_id": "A:0", "text": "alpha story about faith"},
+                {"story_id": "A:1", "text": "beta story about hope"},
             ],
             predicted_stories=[
-                {"title": "", "text": "alpha story about faith"},
-                {"title": "", "text": "beta story about hope"},
+                {"text": "alpha story about faith"},
+                {"text": "beta story about hope"},
             ],
         )
         nl_b = ExtractionPrediction(
             thread_id="B",
             golden_stories=[
-                {"story_id": "B:0", "title": "", "text": "gamma story of grace"},
+                {"story_id": "B:0", "text": "gamma story of grace"},
             ],
             predicted_stories=[
-                {"title": "", "text": "gamma story of grace"},
-                {"title": "", "text": "spurious hallucination unrelated"},
+                {"text": "gamma story of grace"},
+                {"text": "spurious hallucination unrelated"},
             ],
         )
         m = compute_extraction_metrics([nl_a, nl_b])
@@ -348,17 +348,17 @@ class TestMatchStoriesUsesText:
         golden_text = ("Priya's junior year started with a broken ankle and a "
                        "cancelled semester abroad, and she joined our Thursday "
                        "study out of boredom and stayed out of conviction.")
-        predicted = [{"title": "Ministry Moments", "text": golden_text}]
-        golden = [{"story_id": "g:2", "title": "Priya's Injury and the Thursday Study",
+        predicted = [{"text": golden_text}]
+        golden = [{"story_id": "g:2",
                    "text": golden_text}]
         matched, _, _ = match_stories(predicted, golden)
         assert matched == 1
 
     def test_copied_title_garbled_text_does_not_match(self):
         # Converse: a plausible copied title must not mask a garbled text span.
-        predicted = [{"title": "Marcus the Skeptic",
+        predicted = [{
                       "text": "completely unrelated words about the annual budget"}]
-        golden = [{"story_id": "g:0", "title": "Marcus the Skeptic",
+        golden = [{"story_id": "g:0",
                    "text": "Marcus came to our Tuesday night dinner in January "
                            "as a self-described skeptic and left praying aloud."}]
         matched, _, _ = match_stories(predicted, golden)
@@ -368,13 +368,13 @@ class TestMatchStoriesUsesText:
 class TestMatchStoriesDetailed:
     def test_reports_pairs_and_unmatched(self):
         predicted = [
-            {"title": "P0", "text": "the quick brown fox jumped over the dog"},
-            {"title": "P1", "text": "a spurious donation appeal paragraph"},
+            {"text": "the quick brown fox jumped over the dog"},
+            {"text": "a spurious donation appeal paragraph"},
         ]
         golden = [
-            {"story_id": "g:0", "title": "G0",
+            {"story_id": "g:0",
              "text": "the quick brown fox jumped over the cat"},
-            {"story_id": "g:1", "title": "G1",
+            {"story_id": "g:1",
              "text": "an entirely different account of the retreat weekend"},
         ]
         detail = match_stories_detailed(predicted, golden)
@@ -387,8 +387,8 @@ class TestMatchStoriesDetailed:
         assert detail["unmatched_golden"] == [1]
 
     def test_respects_threshold(self):
-        predicted = [{"title": "", "text": "the quick brown fox"}]
-        golden = [{"story_id": "g:0", "title": "", "text": "an unrelated gardening story"}]
+        predicted = [{"text": "the quick brown fox"}]
+        golden = [{"story_id": "g:0", "text": "an unrelated gardening story"}]
         strict = match_stories_detailed(predicted, golden, threshold=0.9)
         assert strict["matched"] == []
         loose = match_stories_detailed(predicted, golden, threshold=0.0)
@@ -403,8 +403,8 @@ class TestExtractionAbstention:
                                         predicted_stories=[])
         nl_good = ExtractionPrediction(
             thread_id="A",
-            golden_stories=[{"story_id": "A:0", "title": "", "text": "alpha faith"}],
-            predicted_stories=[{"title": "", "text": "alpha faith"}],
+            golden_stories=[{"story_id": "A:0", "text": "alpha faith"}],
+            predicted_stories=[{"text": "alpha faith"}],
         )
         m = compute_extraction_metrics([nl_good, nl_empty])
         assert m["macro_precision"] == 1.0
@@ -582,8 +582,8 @@ class TestPrintReportSections:
         extraction = [
             ExtractionPrediction(
                 thread_id="A",
-                golden_stories=[{"story_id": "A:0", "title": "", "text": "alpha faith"}],
-                predicted_stories=[{"title": "", "text": "alpha faith"}],
+                golden_stories=[{"story_id": "A:0", "text": "alpha faith"}],
+                predicted_stories=[{"text": "alpha faith"}],
             ),
         ]
         return compute_all_metrics([], extraction), extraction
@@ -652,40 +652,41 @@ class TestPrintReportVerbose:
         return ExtractionPrediction(
             thread_id="thread-g",
             golden_stories=[
-                {"story_id": "g:0", "title": "Marcus the Skeptic",
+                {"story_id": "g:0",
                  "text": "Marcus came to dinner as a skeptic and left praying aloud."},
-                {"story_id": "g:1", "title": "Nine Freshmen",
+                {"story_id": "g:1",
                  "text": "Nine freshmen showed up to the cookout with no idea."},
             ],
             predicted_stories=[
-                {"title": "Supporting the Mission",
-                 "text": "Would you consider a year-end gift to keep this going?"},
+                {"text": "Would you consider a year-end gift to keep this going?"},
             ],
         )
 
-    def test_verbose_lists_unmatched_titles(self, capsys):
+    def test_verbose_lists_unmatched_stories_by_text(self, capsys):
+        # Stories are identified by a text excerpt (titles were removed), so
+        # unmatched predicted/golden stories are named by the first words of
+        # their text.
         extraction = [self._mangled_extraction()]
         metrics = compute_all_metrics([], extraction)
         print_report(_meta(mode="extraction"), metrics, verbose=True,
                      extraction_results=extraction)
         out = capsys.readouterr().out
-        assert "Supporting the Mission" in out  # unmatched predicted title
-        assert "Marcus the Skeptic" in out  # unmatched golden title
-        assert "Nine Freshmen" in out
+        assert "Would you consider a year-end gift" in out  # unmatched predicted
+        assert "Marcus came to dinner" in out  # unmatched golden
+        assert "Nine freshmen showed up" in out
 
     def test_verbose_lists_matched_pairs_with_ratio_on_mismatch(self, capsys):
         extraction = [
             ExtractionPrediction(
                 thread_id="t",
                 golden_stories=[
-                    {"story_id": "t:0", "title": "G0",
+                    {"story_id": "t:0",
                      "text": "the quick brown fox jumped over the lazy dog"},
-                    {"story_id": "t:1", "title": "G1",
+                    {"story_id": "t:1",
                      "text": "a wholly different story about the retreat"},
                 ],
                 predicted_stories=[
-                    {"title": "P0",
-                     "text": "the quick brown fox jumped over the lazy cat"},
+                    {"text": "the quick brown fox jumped over the lazy cat"},
                 ],
             ),
         ]
@@ -693,7 +694,7 @@ class TestPrintReportVerbose:
         print_report(_meta(mode="extraction"), metrics, verbose=True,
                      extraction_results=extraction)
         out = capsys.readouterr().out
-        assert "P0" in out and "G0" in out  # the matched pair is shown
+        assert "the quick brown fox" in out  # the matched pair is shown by text
         assert "0.9" in out  # its ratio
 
     def test_verbose_diffs_respect_match_threshold(self, capsys):
@@ -739,13 +740,13 @@ class TestPrintReportVerbose:
         out = capsys.readouterr().out
         assert "hope and belonging" in out
 
-    def test_verbose_disagreements_show_titles_from_golden_set(self, tmp_path, capsys):
+    def test_verbose_disagreements_show_text_excerpt_from_golden_set(self, tmp_path, capsys):
         golden = tmp_path / "golden.jsonl"
         golden.write_text(json.dumps({
             "type": "golden_newsletter", "thread_id": "t", "message_id": "m",
             "sender": "s", "subject": "subj", "body": "b",
-            "stories": [{"story_id": "t:1", "title": "Alina at the Welcome Table",
-                         "text": "x"}],
+            "stories": [{"story_id": "t:1",
+                         "text": "Alina welcomed every freshman at the table."}],
         }) + "\n")
         row = _pred(story_id="t:1", predicted_scores={"simple": 3},
                     expected_tier="good", predicted_tier="fair")
@@ -753,21 +754,21 @@ class TestPrintReportVerbose:
         print_report(_meta(golden_set_path=str(golden)), metrics, verbose=True,
                      story_results=[row])
         out = capsys.readouterr().out
-        assert "Alina at the Welcome Table" in out
+        assert "Alina welcomed every freshman" in out
 
 
-class TestLoadStoryTitles:
-    def test_reads_titles_by_story_id(self, tmp_path):
+class TestLoadStoryExcerpts:
+    def test_reads_text_excerpts_by_story_id(self, tmp_path):
         golden = tmp_path / "golden.jsonl"
         golden.write_text(json.dumps({
             "type": "golden_newsletter", "thread_id": "t", "message_id": "m",
             "sender": "s", "subject": "subj", "body": "b",
-            "stories": [{"story_id": "t:0", "title": "Marcus", "text": "x"}],
+            "stories": [{"story_id": "t:0", "text": "Marcus came to dinner"}],
         }) + "\n")
-        assert load_story_titles(str(golden)) == {"t:0": "Marcus"}
+        assert load_story_excerpts(str(golden)) == {"t:0": "Marcus came to dinner"}
 
     def test_missing_file_returns_empty(self):
-        assert load_story_titles("/nope/does-not-exist.jsonl") == {}
+        assert load_story_excerpts("/nope/does-not-exist.jsonl") == {}
 
 
 class TestDimTableAlignment:
@@ -794,8 +795,8 @@ class TestPrintComparisonModes:
         extraction = [
             ExtractionPrediction(
                 thread_id="A",
-                golden_stories=[{"story_id": "A:0", "title": "", "text": "alpha faith"}],
-                predicted_stories=[{"title": "", "text": "alpha faith"}],
+                golden_stories=[{"story_id": "A:0", "text": "alpha faith"}],
+                predicted_stories=[{"text": "alpha faith"}],
             ),
         ]
         return compute_all_metrics([], extraction)
@@ -901,8 +902,8 @@ class TestJsonOutput:
                       expected_themes=["church"], predicted_themes=["church"])
         extraction = ExtractionPrediction(
             thread_id="A",
-            golden_stories=[{"story_id": "A:0", "title": "", "text": "alpha faith"}],
-            predicted_stories=[{"title": "", "text": "alpha faith"}],
+            golden_stories=[{"story_id": "A:0", "text": "alpha faith"}],
+            predicted_stories=[{"text": "alpha faith"}],
         )
         return [story], [extraction]
 
@@ -1109,8 +1110,8 @@ class TestComparisonDeltaSign:
         extraction = [
             ExtractionPrediction(
                 thread_id="A",
-                golden_stories=[{"story_id": "A:0", "title": "", "text": "alpha faith"}],
-                predicted_stories=[{"title": "", "text": "alpha faith"}],
+                golden_stories=[{"story_id": "A:0", "text": "alpha faith"}],
+                predicted_stories=[{"text": "alpha faith"}],
             ),
         ]
         m = compute_all_metrics(results, extraction)

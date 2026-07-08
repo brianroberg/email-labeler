@@ -14,6 +14,7 @@ email-labeler/
 ├── proxy_client.py     Gmail API proxy client (shared with email-agent)
 ├── gmail_utils.py      Email header and body parsing (shared with email-agent)
 ├── config_utils.py     Config loading and env var substitution
+├── tui_common.py       Shared Textual widgets/screens for the TUIs
 ├── config.toml         Label definitions, prompts, and operational parameters
 ├── pyproject.toml      Python project metadata and dependencies
 ├── Dockerfile          Container image definition
@@ -30,6 +31,9 @@ email-labeler/
 │   ├── newsletter_run.py      Replay golden stories through the newsletter classifier
 │   ├── newsletter_report.py   Newsletter tier/dimension/theme/extraction metrics
 │   └── results/        Timestamped result files from evaluation runs
+├── newsletter_review/  Textual TUI for browsing newsletter assessments
+│   ├── __main__.py     CLI entry point (python -m newsletter_review)
+│   └── tui.py          Pure data helpers + Textual app
 └── tests/
     ├── conftest.py          Shared fixtures and sample Gmail data
     ├── test_llm_client.py   LLM client tests
@@ -217,6 +221,31 @@ Check container health with:
 docker inspect --format='{{.State.Health.Status}}' agent-stack-email-labeler-1
 ```
 
+## TUI Conventions (Textual)
+
+All interactive terminal UIs use [Textual](https://textual.textualize.io/) (a runtime
+dependency; framework choice evaluated in issue #40, migration tracked in issue #43).
+Conventions shared by every TUI:
+
+- **Pure-helper split**: data transforms (filtering, row/detail formatting, state
+  transitions, persistence) live in pure functions with direct unit tests; only the
+  widget/screen layer is Textual-specific. UI behavior is tested with Textual's
+  `Pilot` driver — real key presses in, widget state and rendered content out.
+- **Shared widgets/screens** live in `tui_common.py` (e.g. `KeyMenuScreen`, the
+  single-keypress menu that replaces the curses "press one key, anything else
+  cancels" prompt idiom, and its `CANCEL` sentinel — distinct from a chosen value
+  of `None`, which means "clear").
+- **`markup=False` for all record-derived text**: bracketed content like
+  `[f]ilter` or user text is otherwise parsed as Rich markup and silently
+  swallowed (found via pty smoke test during the issue #40 spike).
+- **Pilot test patterns**: `async with app.run_test(size=(100, 30)) as pilot:`,
+  drive with `await pilot.press(...)`, assert on widget state
+  (`app.query_one(...)`) and rendered content (`str(widget.render())`).
+  `asyncio_mode = "auto"` is set, so Pilot tests are plain `async def` tests.
+- **Async**: Textual apps are asyncio-native. Long-running work inside a UI
+  (e.g. LLM calls) must be awaited or run in a Textual worker — never
+  `asyncio.run()` inside an app, which raises `RuntimeError` in a running loop.
+
 ## Test Coverage by Module
 
 | Test file | Module | What's covered |
@@ -232,6 +261,7 @@ docker inspect --format='{{.State.Health.Status}}' agent-stack-email-labeler-1
 | `test_eval_report.py` | `evals/report.py` | Confusion matrix, precision/recall/F1, accuracy, privacy violation metrics |
 | `test_eval_newsletter_schemas.py` | `evals/newsletter_schemas.py` | Golden-set/result dataclass round-trips, missing-key tolerance |
 | `test_eval_newsletter_harvest.py` | `evals/newsletter_harvest.py` | Newsletter filtering, body build, dedup, no ground-truth inference |
-| `test_eval_newsletter_label.py` | `evals/newsletter_label.py` | Story curation + per-story scoring/theme pure functions, tier derivation, undo |
+| `test_eval_newsletter_label.py` | `evals/newsletter_label.py` | Story curation + per-story scoring/theme pure functions, tier derivation, undo + Pilot UI tests (seed guard, undo stack, delete/label flows, selection, skip-through, autosave) |
 | `test_eval_newsletter_run.py` | `evals/newsletter_run.py` | `prompt_hash`, cache reuse, extraction vs quality/theme modes |
 | `test_eval_newsletter_report.py` | `evals/newsletter_report.py` | `match_stories`, tier/dimension/theme metrics, comparison deltas |
+| `test_newsletter_review.py` | `newsletter_review/tui.py` | Pure helpers (loading, filtering, formatting) + Pilot UI tests (navigation, drill-down, tier/theme/sender filters, quit) |

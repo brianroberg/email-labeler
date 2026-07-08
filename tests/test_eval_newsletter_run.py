@@ -74,7 +74,7 @@ def _newsletter(thread_id, stories=None, **kw):
 def _story(story_id, **kw):
     # Tests model Phase-B-labeled stories by default; pass reviewed=False for
     # a Phase-A-only (confirmed but never labeled) story.
-    base = dict(story_id=story_id, title="t", text="x", reviewed=True)
+    base = dict(story_id=story_id, text="x", reviewed=True)
     base.update(kw)
     return GoldenStory(**base)
 
@@ -88,8 +88,8 @@ def _prompts_config():
         "newsletter": {
             "prompts": {
                 "story_extraction": {"system": "extract sys", "user_template": "EXTRACT {body}"},
-                "quality_assessment": {"system": "quality sys", "user_template": "QUALITY {title} {text}"},
-                "theme_classification": {"system": "theme sys", "user_template": "THEME {title} {text}"},
+                "quality_assessment": {"system": "quality sys", "user_template": "QUALITY {text}"},
+                "theme_classification": {"system": "theme sys", "user_template": "THEME {text}"},
             }
         }
     }
@@ -123,7 +123,7 @@ class TestMergePromptsOverride:
         assert base["newsletter"]["prompts"]["quality_assessment"]["system"] == "NEW quality sys"
         # sibling keys in the same block preserved (deep merge, not replace)
         qa = base["newsletter"]["prompts"]["quality_assessment"]
-        assert qa["user_template"] == "QUALITY {title} {text}"
+        assert qa["user_template"] == "QUALITY {text}"
         # other prompt blocks untouched
         assert base["newsletter"]["prompts"]["story_extraction"]["system"] == "extract sys"
         # and the hash moved
@@ -213,25 +213,25 @@ class TestFormatLoadSummary:
 
 class TestEvaluateExtraction:
     def test_records_predicted_and_golden_story_sets(self):
-        extraction_out = "TITLE: Pred One\nTEXT: pred body one\n\nTITLE: Pred Two\nTEXT: pred body two"
+        extraction_out = "STORY: pred body one\n\nSTORY: pred body two"
         llm = FakeLLM([("EXTRACT", extraction_out, "")])
         newsletter = _newsletter(
             "nl1", reviewed=True,
             stories=[
-                _story("nl1:0", title="Gold One", text="gold body one"),
-                _story("nl1:1", title="Gold Two", text="gold body two"),
+                _story("nl1:0", text="gold body one"),
+                _story("nl1:1", text="gold body two"),
             ],
         )
         pred, _thinking = _run(evaluate_extraction(newsletter, _classifier(llm)))
 
         assert pred.thread_id == "nl1"
         assert pred.predicted_stories == [
-            {"title": "Pred One", "text": "pred body one"},
-            {"title": "Pred Two", "text": "pred body two"},
+            {"text": "pred body one"},
+            {"text": "pred body two"},
         ]
         assert pred.golden_stories == [
-            {"story_id": "nl1:0", "title": "Gold One", "text": "gold body one"},
-            {"story_id": "nl1:1", "title": "Gold Two", "text": "gold body two"},
+            {"story_id": "nl1:0", "text": "gold body one"},
+            {"story_id": "nl1:1", "text": "gold body two"},
         ]
         assert pred.error is None
 
@@ -248,7 +248,7 @@ class TestEvaluateStory:
     def test_records_scores_themes_and_derives_tier(self):
         llm = self._story_llm()
         story = _story(
-            "nl1:0", title="A Story", text="the text",
+            "nl1:0", text="the text",
             expected_scores={"simple": 4, "concrete": 4, "personal": 4, "dynamic": 4},
             expected_tier="excellent", expected_themes=["scripture"],
         )
@@ -279,7 +279,7 @@ class TestEvaluateStory:
             ("QUALITY", "garbage no scores", "q"),
             ("THEME", "NONE", "t"),
         ])
-        story = _story("nl2:0", title="T", text="x")
+        story = _story("nl2:0", text="x")
         pred, _thinking = _run(evaluate_story(story, "nl2", _classifier(llm)))
         assert pred.predicted_scores is None
         assert pred.predicted_tier is None
@@ -288,7 +288,7 @@ class TestEvaluateStory:
 
 def _full_llm():
     return FakeLLM([
-        ("EXTRACT", "TITLE: S\nTEXT: body", "ecot"),
+        ("EXTRACT", "STORY: body", "ecot"),
         ("QUALITY", "SIMPLE: 3\nCONCRETE: 3\nPERSONAL: 3\nDYNAMIC: 3", "qcot"),
         ("THEME", "SCRIPTURE", "tcot"),
     ])
@@ -298,7 +298,7 @@ class TestRunEvaluation:
     def _golden(self):
         return [_newsletter(
             "nl1", reviewed=True,
-            stories=[_story("nl1:0", title="S", text="body")],
+            stories=[_story("nl1:0", text="body")],
         )]
 
     def test_all_mode_produces_extraction_and_story_rows(self, tmp_path):
@@ -311,6 +311,9 @@ class TestRunEvaluation:
         extractions = [r for r in rows if isinstance(r, ExtractionPrediction)]
         stories = [r for r in rows if isinstance(r, StoryPrediction)]
         assert len(extractions) == 1
+        # The extractor output ("STORY: body") must actually parse into a story,
+        # otherwise the test passes even when extraction is broken.
+        assert extractions[0].predicted_stories == [{"text": "body"}]
         assert len(stories) == 1
         assert stories[0].predicted_tier == "good"  # avg 3.0
         story_entries = [t for t in thinking if t.story_id]
@@ -380,8 +383,8 @@ class TestRunEvaluation:
         golden = [_newsletter(
             "nl1", reviewed=True,
             stories=[
-                _story("nl1:0", title="S", text="body", reviewed=True),
-                _story("nl1:1", title="U", text="v", reviewed=False),
+                _story("nl1:0", text="body", reviewed=True),
+                _story("nl1:1", text="v", reviewed=False),
             ],
         )]
         rows, _thinking = _run(run_evaluation(
@@ -412,8 +415,8 @@ class TestSelectStories:
         golden = [_newsletter(
             "nl1", reviewed=True,
             stories=[
-                _story("nl1:0", title="S", text="body"),
-                _story("nl1:1", title="X", text="y", excluded=True),
+                _story("nl1:0", text="body"),
+                _story("nl1:1", text="y", excluded=True),
             ],
         )]
         rows, _thinking = _run(run_evaluation(
@@ -653,19 +656,19 @@ class TestWriteThinkingSidecar:
 
 class TestExtractionThinking:
     def test_evaluate_extraction_returns_thinking_entry(self):
-        llm = FakeLLM([("body text", "TITLE: A\nTEXT: a", "extraction reasoning")])
+        llm = FakeLLM([("body text", "STORY: a", "extraction reasoning")])
         newsletter = _newsletter(
             "nl1", reviewed=True, stories=[_story("nl1:0")],
         )
         pred, entry = _run(evaluate_extraction(newsletter, _classifier(llm)))
         assert pred.thread_id == "nl1"
-        assert pred.predicted_stories == [{"title": "A", "text": "a"}]
+        assert pred.predicted_stories == [{"text": "a"}]
         assert entry.thread_id == "nl1"
         assert entry.extraction_cot == "extraction reasoning"
         assert entry.story_id == ""
 
     def test_run_evaluation_collects_extraction_thinking(self):
-        llm = FakeLLM([("body text", "TITLE: A\nTEXT: a", "xcot")])
+        llm = FakeLLM([("body text", "STORY: a", "xcot")])
         golden = [_newsletter("nl1", reviewed=True, stories=[_story("nl1:0")])]
         rows, thinking = _run(run_evaluation(
             golden, _classifier(llm), mode="extraction", parallelism=1,
@@ -706,7 +709,7 @@ class TestMainPromptsOverride:
         self._patch_classifier(monkeypatch)
         golden = tmp_path / "g.jsonl"
         _write_golden(golden, [_newsletter(
-            "nl1", reviewed=True, stories=[_story("nl1:0", title="S", text="body")],
+            "nl1", reviewed=True, stories=[_story("nl1:0", text="body")],
         )])
         out = tmp_path / "results"
 
@@ -735,7 +738,7 @@ class TestMainPromptsOverride:
         self._patch_classifier(monkeypatch)
         golden = tmp_path / "g.jsonl"
         _write_golden(golden, [_newsletter(
-            "nl1", reviewed=True, stories=[_story("nl1:0", title="S", text="body")],
+            "nl1", reviewed=True, stories=[_story("nl1:0", text="body")],
         )])
         out = tmp_path / "results"
         asyncio.run(newsletter_run.main(_main_args(
@@ -843,7 +846,7 @@ class TestEndpointNaming:
             async def complete(self, *a, **kw):
                 raise RuntimeError("LLM endpoint model-x unavailable")
 
-        story = _story("nl1:0", title="T", text="x")
+        story = _story("nl1:0", text="x")
         pred, _thinking = _run(evaluate_story(story, "nl1", _classifier(BoomLLM([]))))
         assert pred.error is not None
         assert "http://127.0.0.1:8499" in pred.error
@@ -862,7 +865,7 @@ class TestEndpointNaming:
         monkeypatch.setenv("NEWSLETTER_LLM_URL", "http://127.0.0.1:8499/v1")
         golden = tmp_path / "g.jsonl"
         _write_golden(golden, [_newsletter(
-            "nl1", reviewed=True, stories=[_story("nl1:0", title="S", text="body")],
+            "nl1", reviewed=True, stories=[_story("nl1:0", text="body")],
         )])
         with pytest.raises(SystemExit):
             asyncio.run(newsletter_run.main(_main_args(
@@ -970,7 +973,7 @@ class TestProgress:
     def test_progress_lines_written_when_enabled(self, capsys):
         golden = [_newsletter(
             "nl1", reviewed=True,
-            stories=[_story("nl1:0", title="S", text="body")],
+            stories=[_story("nl1:0", text="body")],
         )]
         _run(run_evaluation(
             golden, _classifier(_full_llm()), mode="all", parallelism=1,
@@ -983,7 +986,7 @@ class TestProgress:
     def test_no_progress_output_by_default(self, capsys):
         golden = [_newsletter(
             "nl1", reviewed=True,
-            stories=[_story("nl1:0", title="S", text="body")],
+            stories=[_story("nl1:0", text="body")],
         )]
         _run(run_evaluation(golden, _classifier(_full_llm()), mode="all", parallelism=1))
         assert "[1/2]" not in capsys.readouterr().err
@@ -1002,7 +1005,7 @@ class TestMainPreflight:
 
         golden = tmp_path / "g.jsonl"
         _write_golden(golden, [_newsletter(
-            "nl1", reviewed=True, stories=[_story("nl1:0", title="S", text="body")],
+            "nl1", reviewed=True, stories=[_story("nl1:0", text="body")],
         )])
         args = _main_args(golden_set=str(golden), output_dir=str(tmp_path / "r"),
                           skip_preflight=False)
@@ -1026,7 +1029,7 @@ class TestMainPreflight:
 
         golden = tmp_path / "g.jsonl"
         _write_golden(golden, [_newsletter(
-            "nl1", reviewed=True, stories=[_story("nl1:0", title="S", text="body")],
+            "nl1", reviewed=True, stories=[_story("nl1:0", text="body")],
         )])
         out = tmp_path / "r"
         # Endpoint "down" but --skip-preflight -> main runs to completion and writes.
@@ -1056,7 +1059,7 @@ class TestMainReport:
         _write_golden(golden, [_newsletter(
             "nl1", reviewed=True,
             stories=[_story(
-                "nl1:0", title="S", text="body",
+                "nl1:0", text="body",
                 expected_scores={"simple": 3, "concrete": 3, "personal": 3, "dynamic": 3},
                 expected_tier="good", expected_themes=["scripture"],
             )],
@@ -1075,7 +1078,7 @@ class TestMainReport:
         _write_golden(golden, [_newsletter(
             "nl1", reviewed=True,
             stories=[_story(
-                "nl1:0", title="S", text="body",
+                "nl1:0", text="body",
                 expected_scores={"simple": 3, "concrete": 3, "personal": 3, "dynamic": 3},
                 expected_tier="good", expected_themes=["scripture"],
             )],
@@ -1105,7 +1108,7 @@ class TestMainReport:
         self._patch_classifier(monkeypatch)
         golden = tmp_path / "g.jsonl"
         _write_golden(golden, [_newsletter(
-            "nl1", reviewed=True, stories=[_story("nl1:0", title="S", text="body")],
+            "nl1", reviewed=True, stories=[_story("nl1:0", text="body")],
         )])
         bad = tmp_path / "bad.cot.jsonl"
         bad.write_text('{"type": "thinking", "story_id": "x"}\n')
@@ -1127,7 +1130,7 @@ class TestMainReport:
         monkeypatch.setattr(newsletter_run, "build_classifier", fake_build)
         golden = tmp_path / "g.jsonl"
         _write_golden(golden, [_newsletter(
-            "nl1", reviewed=True, stories=[_story("nl1:0", title="S", text="body")],
+            "nl1", reviewed=True, stories=[_story("nl1:0", text="body")],
         )])
         out = tmp_path / "r"
         asyncio.run(newsletter_run.main(_main_args(
@@ -1143,8 +1146,8 @@ class TestMainReport:
         _write_golden(golden, [_newsletter(
             "nl1", reviewed=True,
             stories=[
-                _story("nl1:0", title="S", text="body", reviewed=True),
-                _story("nl1:1", title="U", text="v", reviewed=False),
+                _story("nl1:0", text="body", reviewed=True),
+                _story("nl1:1", text="v", reviewed=False),
             ],
         )])
         out = tmp_path / "r"

@@ -1,13 +1,20 @@
 """Newsletter assessment review TUI.
 
-Read-only curses interface for browsing newsletter classification results,
+Read-only Textual interface for browsing newsletter classification results,
 including per-story quality scores, themes, and chain-of-thought reasoning.
 """
 
-import curses
 import json
 import textwrap
 from pathlib import Path
+
+from textual.app import App, ComposeResult
+from textual.binding import Binding
+from textual.containers import VerticalScroll
+from textual.screen import Screen
+from textual.widgets import Label, ListItem, ListView, Static
+
+from tui_common import CANCEL, KeyMenuScreen, PageListView, PromptLineScreen
 
 # ---------------------------------------------------------------------------
 # Column widths for list view
@@ -20,7 +27,7 @@ _COL_GAP = 2
 
 
 # ---------------------------------------------------------------------------
-# Pure data functions (no curses, fully testable)
+# Pure data functions (no UI, fully testable)
 # ---------------------------------------------------------------------------
 
 def load_assessments(path: Path) -> list[dict]:
@@ -113,7 +120,7 @@ def format_list_row(record: dict, max_x: int) -> str:
 
 
 def build_detail_lines(record: dict, width: int = 80) -> list[str]:
-    """Build content lines for the detail view. Pure function, no curses."""
+    """Build content lines for the detail view. Pure function, no UI."""
     subject = record.get("subject", "")
     sender = record.get("from", "")
     timestamp = record.get("timestamp", "")
@@ -135,13 +142,14 @@ def build_detail_lines(record: dict, width: int = 80) -> list[str]:
         return lines
 
     for i, story in enumerate(stories):
-        title = story.get("title", "Untitled")
         tier = story.get("tier") or "—"
         avg = story.get("average_score")
         avg_str = f"{avg:.1f}" if avg is not None else "—"
         themes = story.get("themes", [])
 
-        lines.append(f"--- Story {i + 1}/{len(stories)}: {title} [{tier}, avg: {avg_str}] ---")
+        # Stories are identified by a text excerpt (titles were removed).
+        excerpt = _truncate(" ".join(story.get("text", "").split()), 50)
+        lines.append(f"--- Story {i + 1}/{len(stories)}: {excerpt} [{tier}, avg: {avg_str}] ---")
 
         if themes:
             lines.append(f"Themes: {', '.join(themes)}")
@@ -182,21 +190,6 @@ def build_detail_lines(record: dict, width: int = 80) -> list[str]:
 
 
 # ---------------------------------------------------------------------------
-# Curses helpers
-# ---------------------------------------------------------------------------
-
-def _safe_addstr(win, y: int, x: int, text: str, attr: int = curses.A_NORMAL) -> None:
-    """Write text to win at (y, x), clipping to avoid curses errors."""
-    max_y, max_x = win.getmaxyx()
-    if y < 0 or y >= max_y or x >= max_x:
-        return
-    available = max_x - x - 1
-    if available <= 0:
-        return
-    win.addnstr(y, x, text, available, attr)
-
-
-# ---------------------------------------------------------------------------
 # Filter key maps
 # ---------------------------------------------------------------------------
 
@@ -221,256 +214,203 @@ _THEME_KEYS = {
 
 
 # ---------------------------------------------------------------------------
-# Curses filter prompts
+# Filter prompts (match the curses prompt text)
 # ---------------------------------------------------------------------------
 
-def _prompt_filter_type(stdscr) -> str | None:
-    """Show filter type menu. Returns 'tier', 'theme', 'sender', or None."""
-    max_y, max_x = stdscr.getmaxyx()
-    prompt = "Filter: [t]ier  [h]eme  [s]ender  (other key cancels)"
-    _safe_addstr(stdscr, max_y - 1, 0, " " * (max_x - 1))
-    _safe_addstr(stdscr, max_y - 1, 0, prompt, curses.A_REVERSE)
-    stdscr.refresh()
-    key = stdscr.getch()
-    ch = chr(key) if 0 <= key < 256 else ""
-    return _FILTER_TYPE_KEYS.get(ch.lower())
+_FILTER_TYPE_PROMPT = "Filter: [t]ier  [h]eme  [s]ender  (other key cancels)"
+_TIER_PROMPT = "[e]xcellent  [g]ood  [f]air  [p]oor  [c]lear  (other cancels)"
+_THEME_PROMPT = "[s]cripture [c]hristlikeness [h]urch [v]ocation_family [d]isciple_making [x]clear"
 
 
-def _prompt_tier(stdscr) -> str | None:
-    """Show tier selection menu. Returns tier string, None to clear, or -1 to cancel."""
-    max_y, max_x = stdscr.getmaxyx()
-    prompt = "[e]xcellent  [g]ood  [f]air  [p]oor  [c]lear  (other cancels)"
-    _safe_addstr(stdscr, max_y - 1, 0, " " * (max_x - 1))
-    _safe_addstr(stdscr, max_y - 1, 0, prompt, curses.A_REVERSE)
-    stdscr.refresh()
-    key = stdscr.getch()
-    ch = chr(key) if 0 <= key < 256 else ""
-    if ch.lower() in _TIER_KEYS:
-        return _TIER_KEYS[ch.lower()]
-    return -1  # cancel sentinel
+class DetailScreen(Screen):
+    """Scrollable detail view for one assessment record."""
+
+    BINDINGS = [
+        Binding("escape", "app.pop_screen", "Back"),
+        Binding("q", "app.quit_app", "Quit"),
+        Binding("up", "scroll_up", "Scroll up", show=False),
+        Binding("down", "scroll_down", "Scroll down", show=False),
+        Binding("pageup,ctrl+b", "page_up", "Page up", show=False),
+        Binding("pagedown,ctrl+f", "page_down", "Page down", show=False),
+        Binding("home", "scroll_home", "Top", show=False),
+        Binding("end", "scroll_end", "Bottom", show=False),
+    ]
+
+    DEFAULT_CSS = """
+    DetailScreen > #detail-scroll {
+        height: 1fr;
+    }
+    """
+
+    def __init__(self, record: dict, position: int, total: int) -> None:
+        super().__init__()
+        self.record = record
+        self.position = position  # 1-based index within the (filtered) set
+        self.total = total
+
+    def compose(self) -> ComposeResult:
+        width = max(20, self.app.size.width)
+        lines = build_detail_lines(self.record, width=width)
+        yield VerticalScroll(
+            *[Static(line or " ", markup=False) for line in lines],
+            id="detail-scroll",
+        )
+        help_text = "↑/↓:Scroll  PgUp/PgDn  Home/End  Esc:Back  q:Quit"
+        yield Static(help_text, id="detail-help", markup=False)
+        subject = _truncate(self.record.get("subject", ""), width // 2)
+        status = f"Newsletter {self.position}/{self.total}  |  {subject}"
+        yield Static(status, id="detail-status", markup=False)
+
+    def _scroll(self):
+        return self.query_one("#detail-scroll", VerticalScroll)
+
+    def action_scroll_up(self) -> None:
+        self._scroll().scroll_relative(y=-1, animate=False)
+
+    def action_scroll_down(self) -> None:
+        self._scroll().scroll_relative(y=1, animate=False)
+
+    def action_page_up(self) -> None:
+        self._scroll().scroll_page_up(animate=False)
+
+    def action_page_down(self) -> None:
+        self._scroll().scroll_page_down(animate=False)
+
+    def action_scroll_home(self) -> None:
+        self._scroll().scroll_home(animate=False)
+
+    def action_scroll_end(self) -> None:
+        self._scroll().scroll_end(animate=False)
 
 
-def _prompt_theme(stdscr) -> str | None:
-    """Show theme selection menu. Returns theme string, None to clear, or -1 to cancel."""
-    max_y, max_x = stdscr.getmaxyx()
-    prompt = "[s]cripture [c]hristlikeness [h]urch [v]ocation_family [d]isciple_making [x]clear"
-    _safe_addstr(stdscr, max_y - 1, 0, " " * (max_x - 1))
-    _safe_addstr(stdscr, max_y - 1, 0, prompt, curses.A_REVERSE)
-    stdscr.refresh()
-    key = stdscr.getch()
-    ch = chr(key) if 0 <= key < 256 else ""
-    if ch.lower() in _THEME_KEYS:
-        return _THEME_KEYS[ch.lower()]
-    return -1  # cancel sentinel
+class ReviewApp(App):
+    """Newsletter assessment browser: filterable list of records, drill into detail."""
 
+    BINDINGS = [
+        Binding("q", "quit_app", "Quit"),
+        Binding("f", "filter", "Filter"),
+    ]
 
-def _prompt_sender(stdscr) -> str | None:
-    """Text input for sender filter. Enter confirms, Esc cancels. Empty clears."""
-    max_y, max_x = stdscr.getmaxyx()
-    buf = ""
-    while True:
-        prompt = f"Sender filter: {buf}_  (Enter=confirm, Esc=cancel)"
-        _safe_addstr(stdscr, max_y - 1, 0, " " * (max_x - 1))
-        _safe_addstr(stdscr, max_y - 1, 0, prompt, curses.A_REVERSE)
-        stdscr.refresh()
-        key = stdscr.getch()
-        if key == 27:  # Esc
-            return -1  # cancel sentinel
-        elif key in (curses.KEY_ENTER, ord("\n"), ord("\r")):
-            return buf.strip() or None  # empty string → clear filter
-        elif key in (curses.KEY_BACKSPACE, 127, 8):
-            buf = buf[:-1]
-        elif 32 <= key < 127:
-            buf += chr(key)
+    DEFAULT_CSS = """
+    ReviewApp #records {
+        height: 1fr;
+    }
+    ReviewApp #header {
+        text-style: underline;
+    }
+    """
 
+    def __init__(
+        self,
+        records: list[dict],
+        *,
+        init_tier: str | None = None,
+        init_theme: str | None = None,
+        init_sender: str | None = None,
+    ) -> None:
+        super().__init__()
+        self.all_records = records
+        self.filtered = records
+        self.f_tier = init_tier
+        self.f_theme = init_theme
+        self.f_sender = init_sender
 
-# ---------------------------------------------------------------------------
-# Detail view
-# ---------------------------------------------------------------------------
-
-def _detail_view(stdscr, records: list[dict], index: int) -> str:
-    """Render the detail screen for records[index]. Returns 'back' or 'quit'."""
-    scroll_y = 0
-    max_y, max_x = stdscr.getmaxyx()
-    lines = build_detail_lines(records[index], width=max_x)
-
-    while True:
-        max_y, max_x = stdscr.getmaxyx()
-        content_rows = max(1, max_y - 2)
-        max_scroll = max(0, len(lines) - content_rows)
-
-        stdscr.clear()
-        for row_i in range(content_rows):
-            line_i = scroll_y + row_i
-            if line_i >= len(lines):
-                break
-            _safe_addstr(stdscr, row_i, 0, lines[line_i])
-
-        help_text = "\u2191/\u2193:Scroll  ^B/^F:Page  Home/End  Esc:Back  q:Quit"
-        _safe_addstr(stdscr, max_y - 2, 0, help_text, curses.A_DIM)
-
-        scroll_pct = ""
-        if max_scroll > 0:
-            pct = int(scroll_y / max_scroll * 100)
-            scroll_pct = f"  ({pct}%)"
-        subject = _truncate(records[index].get("subject", ""), max_x // 2)
-        status = f"Newsletter {index + 1}/{len(records)}  |  {subject}{scroll_pct}"
-        _safe_addstr(stdscr, max_y - 1, 0, status, curses.A_BOLD)
-
-        stdscr.refresh()
-        key = stdscr.getch()
-
-        if key == curses.KEY_UP and scroll_y > 0:
-            scroll_y -= 1
-        elif key == curses.KEY_DOWN and scroll_y < max_scroll:
-            scroll_y += 1
-        elif key in (curses.KEY_PPAGE, 2):  # PgUp or Ctrl-B
-            scroll_y = max(0, scroll_y - content_rows)
-        elif key in (curses.KEY_NPAGE, 6):  # PgDn or Ctrl-F
-            scroll_y = min(max_scroll, scroll_y + content_rows)
-        elif key == curses.KEY_HOME:
-            scroll_y = 0
-        elif key == curses.KEY_END:
-            scroll_y = max_scroll
-        elif key == 27:
-            return "back"
-        elif key == ord("q"):
-            return "quit"
-        elif key == curses.KEY_RESIZE:
-            max_y, max_x = stdscr.getmaxyx()
-            lines = build_detail_lines(records[index], width=max_x)
-
-
-# ---------------------------------------------------------------------------
-# List view
-# ---------------------------------------------------------------------------
-
-def _list_view(
-    stdscr,
-    all_records: list[dict],
-    *,
-    init_tier: str | None = None,
-    init_theme: str | None = None,
-    init_sender: str | None = None,
-) -> None:
-    """Render the list screen and handle navigation, drill-down, and filtering."""
-    cursor = 0
-    scroll_offset = 0
-    f_tier = init_tier
-    f_theme = init_theme
-    f_sender = init_sender
-    filtered = apply_filters(all_records, tier=f_tier, theme=f_theme, sender=f_sender)
-
-    while True:
-        max_y, max_x = stdscr.getmaxyx()
-        header_rows = 2
-        footer_rows = 1
-        page_size = max(1, max_y - header_rows - footer_rows)
-
-        stdscr.clear()
-
-        # Title with filter summary
-        filter_str = format_filter_summary(tier=f_tier, theme=f_theme, sender=f_sender)
-        if filter_str:
-            count = f"{len(filtered)}/{len(all_records)} records"
-            title = f"Newsletter Assessments \u2014 {count}  [{filter_str}]"
-        else:
-            title = f"Newsletter Assessments \u2014 {len(filtered)} records"
-        _safe_addstr(stdscr, 0, 0, title, curses.A_BOLD)
-
+    def compose(self) -> ComposeResult:
+        yield Static(id="title", markup=False)
         hdr = (
             f"{'Tier':<{_COL_TIER}}"
             f"  {'Sender':<{_COL_SENDER}}"
             f"  {'Stories':<{_COL_STORIES}}"
             f"  Subject"
         )
-        _safe_addstr(stdscr, 1, 0, hdr, curses.A_UNDERLINE)
+        yield Static(hdr, id="header", markup=False)
+        yield PageListView(id="records")
+        help_text = "↑/↓:Nav  PgUp/PgDn  Enter:Detail  [f]ilter  q:Quit"
+        yield Static(help_text, id="help", markup=False)
 
-        for vi in range(page_size):
-            ti = scroll_offset + vi
-            if ti >= len(filtered):
-                break
-            row_text = format_list_row(filtered[ti], max_x)
-            attr = curses.A_REVERSE if ti == cursor else curses.A_NORMAL
-            _safe_addstr(stdscr, header_rows + vi, 0, row_text, attr)
+    def on_mount(self) -> None:
+        self._refresh_list()
 
-        help_text = "\u2191/\u2193:Nav  ^B/^F:Page  Enter:Detail  [f]ilter  q:Quit"
-        _safe_addstr(stdscr, max_y - 1, 0, help_text, curses.A_DIM)
+    def on_resize(self, event) -> None:
+        # Re-render rows so column truncation tracks the new width. self.size
+        # is still the OLD size while this handler runs — use the event's.
+        self._refresh_list(width=event.size.width)
 
-        stdscr.refresh()
-        key = stdscr.getch()
+    def _refresh_list(self, *, reset_cursor: bool = False, width: int | None = None) -> None:
+        self.filtered = apply_filters(
+            self.all_records,
+            tier=self.f_tier, theme=self.f_theme, sender=self.f_sender,
+        )
+        width = max(40, width if width is not None else self.size.width)
+        listview = self.query_one(ListView)
+        cursor = 0 if reset_cursor else (listview.index or 0)
+        listview.clear()
+        listview.extend(
+            ListItem(Label(format_list_row(record, width), markup=False))
+            for record in self.filtered
+        )
+        if self.filtered:
+            listview.index = min(cursor, len(self.filtered) - 1)
 
-        if key == curses.KEY_UP and cursor > 0:
-            cursor -= 1
-            if cursor < scroll_offset:
-                scroll_offset = cursor
-        elif key == curses.KEY_DOWN and cursor < len(filtered) - 1:
-            cursor += 1
-            if cursor >= scroll_offset + page_size:
-                scroll_offset = cursor - page_size + 1
-        elif key in (curses.KEY_PPAGE, 2):  # PgUp or Ctrl-B
-            cursor = max(0, cursor - page_size)
-            scroll_offset = max(0, scroll_offset - page_size)
-        elif key in (curses.KEY_NPAGE, 6):  # PgDn or Ctrl-F
-            cursor = min(len(filtered) - 1, cursor + page_size)
-            scroll_offset = min(max(0, len(filtered) - page_size), scroll_offset + page_size)
-        elif key == curses.KEY_HOME:
-            cursor = 0
-            scroll_offset = 0
-        elif key == curses.KEY_END:
-            cursor = max(0, len(filtered) - 1)
-            scroll_offset = max(0, len(filtered) - page_size)
-        elif key in (curses.KEY_ENTER, ord("\n"), ord("\r")):
-            if filtered:
-                result = _detail_view(stdscr, filtered, cursor)
-                if result == "quit":
-                    return
-        elif key == ord("f"):
-            filter_type = _prompt_filter_type(stdscr)
-            changed = False
-            if filter_type == "tier":
-                val = _prompt_tier(stdscr)
-                if val != -1:
-                    f_tier = val
-                    changed = True
-            elif filter_type == "theme":
-                val = _prompt_theme(stdscr)
-                if val != -1:
-                    f_theme = val
-                    changed = True
-            elif filter_type == "sender":
-                val = _prompt_sender(stdscr)
-                if val != -1:
-                    f_sender = val
-                    changed = True
-            if changed:
-                filtered = apply_filters(all_records, tier=f_tier, theme=f_theme, sender=f_sender)
-                cursor = 0
-                scroll_offset = 0
-        elif key == ord("q"):
-            return
-        elif key == curses.KEY_RESIZE:
-            pass
+        filter_str = format_filter_summary(
+            tier=self.f_tier, theme=self.f_theme, sender=self.f_sender,
+        )
+        if filter_str:
+            count = f"{len(self.filtered)}/{len(self.all_records)} records"
+            title = f"Newsletter Assessments — {count}  [{filter_str}]"
+        else:
+            title = f"Newsletter Assessments — {len(self.filtered)} records"
+        self.query_one("#title", Static).update(title)
+
+    def on_list_view_selected(self, event: ListView.Selected) -> None:
+        if len(self.screen_stack) > 1:
+            return  # a detail/modal is already up (Enter auto-repeat)
+        index = self.query_one(ListView).index
+        if index is not None and self.filtered:
+            self.push_screen(
+                DetailScreen(self.filtered[index], index + 1, len(self.filtered))
+            )
+
+    def action_filter(self) -> None:
+        if len(self.screen_stack) > 1:
+            return  # only from the list screen (parity with curses)
+
+        def on_tier(result) -> None:
+            if result != CANCEL:
+                self.f_tier = result
+                self._refresh_list(reset_cursor=True)
+
+        def on_theme(result) -> None:
+            if result != CANCEL:
+                self.f_theme = result
+                self._refresh_list(reset_cursor=True)
+
+        def on_sender(result) -> None:
+            if result is None:
+                return  # Esc = cancel
+            self.f_sender = result or None  # empty string clears the filter
+            self._refresh_list(reset_cursor=True)
+
+        def on_type(result) -> None:
+            if result == "tier":
+                self.push_screen(KeyMenuScreen(_TIER_PROMPT, _TIER_KEYS), on_tier)
+            elif result == "theme":
+                self.push_screen(KeyMenuScreen(_THEME_PROMPT, _THEME_KEYS), on_theme)
+            elif result == "sender":
+                self.push_screen(
+                    PromptLineScreen("Sender filter  (Enter=confirm, empty=clear, Esc=cancel)"),
+                    on_sender,
+                )
+
+        self.push_screen(KeyMenuScreen(_FILTER_TYPE_PROMPT, _FILTER_TYPE_KEYS), on_type)
+
+    def action_quit_app(self) -> None:
+        self.exit("quit")
 
 
 # ---------------------------------------------------------------------------
 # Public entry point
 # ---------------------------------------------------------------------------
-
-def _curses_main(
-    stdscr,
-    records: list[dict],
-    init_tier: str | None,
-    init_theme: str | None,
-    init_sender: str | None,
-) -> None:
-    curses.curs_set(0)
-    stdscr.keypad(True)
-    _list_view(
-        stdscr, records,
-        init_tier=init_tier, init_theme=init_theme, init_sender=init_sender,
-    )
-
 
 def run_review_tui(
     records: list[dict],
@@ -487,4 +427,7 @@ def run_review_tui(
     if not records:
         print("No assessment records to display.")
         return
-    curses.wrapper(_curses_main, records, init_tier, init_theme, init_sender)
+    ReviewApp(
+        records,
+        init_tier=init_tier, init_theme=init_theme, init_sender=init_sender,
+    ).run()

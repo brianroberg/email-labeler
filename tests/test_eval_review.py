@@ -1,21 +1,21 @@
-"""Tests for evals.review — skip/exclude actions, hotkeys, and queue selection.
+"""Tests for evals.review — session/undo semantics, queue selection, Pilot UI.
 
-The interactive prompt loops are driven by monkeypatching ``get_hotkey`` with a
-queued key sequence; menu legends are captured via ``capsys``.
+The pure ReviewSession (cursor + one-snapshot-per-thread undo) is tested
+directly; the Textual UI layer is driven with Textual's Pilot: real key
+presses in, thread mutations and rendered legends/statuses out.
 """
 
 import sys
 
-import pytest
-
 import evals.review as review
 from evals.review import (
+    ReviewApp,
+    ReviewSession,
     load_golden_set,
-    review_thread_blind,
-    review_thread_normal,
     select_review_threads,
 )
 from evals.schemas import GoldenThread
+from tui_common import PromptLineScreen
 
 
 def _golden(thread_id, **kw):
@@ -27,16 +27,54 @@ def _golden(thread_id, **kw):
     return GoldenThread(**base)
 
 
-@pytest.fixture
-def keyqueue(monkeypatch):
-    """Queue keypresses returned by ``get_hotkey`` in order."""
+SIZE = (100, 30)
 
-    def _install(keys):
-        seq = list(keys)
-        monkeypatch.setattr(review, "get_hotkey", lambda: seq.pop(0))
-        return seq
 
-    return _install
+def _screen_text(app) -> str:
+    from textual.widgets import Static
+
+    return "\n".join(str(w.render()) for w in app.screen.query(Static))
+
+
+def _status(app) -> str:
+    from textual.widgets import Static
+
+    return str(app.query_one("#status", Static).render())
+
+
+# ---------------------------------------------------------------------------
+# ReviewSession: cursor + one-snapshot-per-thread undo (pure)
+# ---------------------------------------------------------------------------
+
+class TestReviewSession:
+    def test_advance_pushes_one_snapshot_and_moves_cursor(self):
+        threads = [_golden("t0"), _golden("t1")]
+        session = ReviewSession(threads)
+        threads[0].reviewed = True
+        session.advance()
+        assert session.index == 1
+        assert len(session.undo_stack) == 1
+        assert session.undo_stack[0]["reviewed"] is False  # pre-review state
+
+    def test_undo_restores_previous_thread_and_steps_back(self):
+        threads = [_golden("t0"), _golden("t1")]
+        session = ReviewSession(threads)
+        threads[0].expected_label = "needs_response"
+        threads[0].reviewed = True
+        session.advance()
+        msg = session.undo()
+        assert session.index == 0
+        assert threads[0].expected_label == "fyi"
+        assert threads[0].reviewed is False
+        assert "Back to thread 1/2" in msg
+
+    def test_undo_discards_in_progress_edits_first(self):
+        threads = [_golden("t0")]
+        session = ReviewSession(threads)
+        threads[0].notes = "half-typed"
+        msg = session.undo()
+        assert threads[0].notes == ""  # entry snapshot restored
+        assert "Nothing to undo" in msg
 
 
 # ---------------------------------------------------------------------------
@@ -44,135 +82,281 @@ def keyqueue(monkeypatch):
 # ---------------------------------------------------------------------------
 
 class TestLegends:
-    def test_normal_menu_lists_skip_and_exclude(self, keyqueue, capsys):
-        keyqueue(["k"])
-        review_thread_normal(_golden("t"), 0, 1)
-        out = capsys.readouterr().out
-        assert "[k] skip" in out
-        assert "[e] exclude" in out
+    async def test_normal_menu_lists_skip_and_exclude(self, tmp_path):
+        app = ReviewApp([_golden("t1")], blind=False)
+        async with app.run_test(size=SIZE):
+            text = _screen_text(app)
+            assert "[k] skip" in text
+            assert "[e] exclude" in text
+            assert "[n] notes" in text
+            assert "[] confirm" in text
 
-    def test_blind_sender_prompt_lists_skip_and_exclude(self, keyqueue, capsys):
-        keyqueue(["k"])
-        review_thread_blind(_golden("t"), 0, 1, stage=1)
-        out = capsys.readouterr().out
-        assert "[k] skip" in out
-        assert "[e] exclude" in out
+    async def test_blind_sender_prompt_lists_skip_and_exclude(self, tmp_path):
+        app = ReviewApp([_golden("t1")], blind=True)
+        async with app.run_test(size=SIZE):
+            text = _screen_text(app)
+            assert "Sender type:" in text
+            assert "[p] person" in text
+            assert "[k] skip" in text
+            assert "[e] exclude" in text
 
-    def test_blind_label_prompt_lists_skip_exclude_notes_and_r(self, keyqueue, capsys):
-        keyqueue(["k"])
-        review_thread_blind(_golden("t"), 0, 1, stage=2)
-        out = capsys.readouterr().out
-        assert "[k] skip" in out
-        assert "[e] exclude" in out
-        assert "[n] notes" in out
-        assert "[r] needs_response" in out
+    async def test_blind_label_prompt_lists_skip_exclude_notes_and_r(self, tmp_path):
+        app = ReviewApp([_golden("t1")], blind=True)
+        async with app.run_test(size=SIZE) as pilot:
+            await pilot.press("p")  # answer the sender step
+            text = _screen_text(app)
+            assert "Label:" in text
+            assert "[r] needs_response" in text
+            assert "[k] skip" in text
+            assert "[e] exclude" in text
+            assert "[n] notes" in text
+
+    async def test_blind_mode_hides_current_labels(self, tmp_path):
+        app = ReviewApp([_golden("t1")], blind=True)
+        async with app.run_test(size=SIZE):
+            assert "Current labels:" not in _screen_text(app)
+
+    async def test_normal_mode_shows_current_labels(self, tmp_path):
+        app = ReviewApp([_golden("t1")], blind=False)
+        async with app.run_test(size=SIZE):
+            text = _screen_text(app)
+            assert "Current labels:" in text
+            assert "Sender type: person" in text
 
 
 # ---------------------------------------------------------------------------
-# Skip (temporary) — no persisted state
+# Skip: no judgment is recorded
 # ---------------------------------------------------------------------------
 
 class TestSkip:
-    def test_normal_skip_leaves_no_judgment(self, keyqueue):
-        keyqueue(["k"])
-        t = _golden("t")
-        result = review_thread_normal(t, 0, 1)
-        assert result == "advance"
-        assert t.reviewed is False
-        assert t.excluded is False  # skip mutates nothing on the thread
+    async def test_normal_skip_leaves_no_judgment(self, tmp_path):
+        threads = [_golden("t1"), _golden("t2")]
+        app = ReviewApp(threads, blind=False)
+        async with app.run_test(size=SIZE) as pilot:
+            await pilot.press("k")
+            assert threads[0].reviewed is False
+            assert threads[0].excluded is False
+            assert "Thread 2/2" in _screen_text(app)
+            assert "Skipped (no judgment)" in _status(app)
 
-    def test_blind_skip_leaves_no_judgment(self, keyqueue):
-        keyqueue(["k"])
-        t = _golden("t")
-        result = review_thread_blind(t, 0, 1, stage=2)
-        assert result == "advance"
-        assert t.reviewed is False
-        assert t.excluded is False
+    async def test_blind_skip_leaves_no_judgment(self, tmp_path):
+        threads = [_golden("t1"), _golden("t2")]
+        app = ReviewApp(threads, blind=True)
+        async with app.run_test(size=SIZE) as pilot:
+            await pilot.press("k")
+            assert threads[0].reviewed is False
+            assert threads[0].excluded is False
+            assert "Thread 2/2" in _screen_text(app)
 
 
 # ---------------------------------------------------------------------------
-# Exclude (permanent)
+# Exclude: permanently set aside
 # ---------------------------------------------------------------------------
 
 class TestExclude:
-    def test_normal_exclude_marks_excluded(self, keyqueue):
-        keyqueue(["e"])
-        t = _golden("t")
-        result = review_thread_normal(t, 0, 1)
-        assert result == "advance"
-        assert t.excluded is True
+    async def test_normal_exclude_marks_excluded(self, tmp_path):
+        threads = [_golden("t1"), _golden("t2")]
+        app = ReviewApp(threads, blind=False)
+        async with app.run_test(size=SIZE) as pilot:
+            await pilot.press("e")
+            assert threads[0].excluded is True
+            assert threads[0].reviewed is True
+            assert "Thread 2/2" in _screen_text(app)
 
-    def test_blind_exclude_marks_excluded(self, keyqueue):
-        keyqueue(["e"])
-        t = _golden("t")
-        result = review_thread_blind(t, 0, 1, stage=1)
-        assert result == "advance"
-        assert t.excluded is True
-
-
-# ---------------------------------------------------------------------------
-# needs_response moved to `r`; notes available in stage-2 label prompt
-# ---------------------------------------------------------------------------
-
-class TestLabelKeysAndNotes:
-    def test_r_selects_needs_response(self, keyqueue):
-        keyqueue(["r"])
-        t = _golden("t")
-        result = review_thread_blind(t, 0, 1, stage=2)
-        assert result == "advance"
-        assert t.expected_label == "needs_response"
-
-    def test_n_records_note_in_label_prompt(self, keyqueue, monkeypatch):
-        monkeypatch.setattr("builtins.input", lambda _="": "not a good test case")
-        keyqueue(["n", "r"])  # add note, then classify to advance
-        t = _golden("t")
-        result = review_thread_blind(t, 0, 1, stage=2)
-        assert result == "advance"
-        assert t.notes == "not a good test case"
-        assert t.expected_label == "needs_response"
+    async def test_blind_exclude_marks_excluded(self, tmp_path):
+        threads = [_golden("t1"), _golden("t2")]
+        app = ReviewApp(threads, blind=True)
+        async with app.run_test(size=SIZE) as pilot:
+            await pilot.press("e")
+            assert threads[0].excluded is True
+            assert threads[0].reviewed is True
 
 
 # ---------------------------------------------------------------------------
-# review_loop undo — one snapshot per thread, regardless of action
+# Classification keys, confirm, and notes
 # ---------------------------------------------------------------------------
 
-class TestReviewLoopUndo:
-    def test_undo_after_skip_returns_to_skipped_thread_not_earlier(self, keyqueue, capsys):
-        # Confirm t0, skip t1, then press undo on t2.  Undo must return to t1
-        # (the skipped thread), NOT rewind past it and silently revert t0's
-        # confirmed judgment.
+class TestClassifyAndNotes:
+    async def test_blind_p_then_r_classifies(self, tmp_path):
+        threads = [_golden("t1", expected_sender_type="service", expected_label="fyi")]
+        app = ReviewApp(threads, blind=True)
+        async with app.run_test(size=SIZE) as pilot:
+            await pilot.press("p", "r")
+        assert threads[0].expected_sender_type == "person"
+        assert threads[0].expected_label == "needs_response"
+        assert threads[0].reviewed is True
+        assert app.return_value == "done"  # queue finished
+
+    async def test_normal_enter_confirms(self, tmp_path):
+        threads = [_golden("t1")]
+        app = ReviewApp(threads, blind=False)
+        async with app.run_test(size=SIZE) as pilot:
+            await pilot.press("enter")
+        assert threads[0].reviewed is True
+        assert app.return_value == "done"
+
+    async def test_normal_y_confirms(self, tmp_path):
+        threads = [_golden("t1")]
+        app = ReviewApp(threads, blind=False)
+        async with app.run_test(size=SIZE) as pilot:
+            await pilot.press("y")
+        assert threads[0].reviewed is True
+
+    async def test_normal_s_submenu_sets_sender(self, tmp_path):
+        threads = [_golden("t1"), _golden("t2")]
+        app = ReviewApp(threads, blind=False)
+        async with app.run_test(size=SIZE) as pilot:
+            await pilot.press("s")
+            assert "Select sender type:" in _screen_text(app)
+            await pilot.press("s")  # service
+            assert threads[0].expected_sender_type == "service"
+            assert threads[0].reviewed is True
+            assert "Sender type set to: service" in _status(app)
+
+    async def test_normal_l_submenu_cancel_returns_to_menu(self, tmp_path):
+        threads = [_golden("t1"), _golden("t2")]
+        app = ReviewApp(threads, blind=False)
+        async with app.run_test(size=SIZE) as pilot:
+            await pilot.press("l", "z")  # z is not a label key -> cancel
+            assert threads[0].expected_label == "fyi"
+            assert threads[0].reviewed is False
+            assert "Actions:" in _screen_text(app)  # back on the same thread
+
+    async def test_normal_notes_do_not_confirm(self, tmp_path):
+        threads = [_golden("t1")]
+        app = ReviewApp(threads, blind=False)
+        async with app.run_test(size=SIZE) as pilot:
+            await pilot.press("n")
+            assert isinstance(app.screen, PromptLineScreen)
+            await pilot.press(*"watch this one")
+            await pilot.press("enter")
+            assert threads[0].notes == "watch this one"
+            assert threads[0].reviewed is False
+            assert "not yet confirmed" in _status(app)
+
+    async def test_blind_notes_then_classify(self, tmp_path):
+        threads = [_golden("t1")]
+        app = ReviewApp(threads, blind=True)
+        async with app.run_test(size=SIZE) as pilot:
+            await pilot.press("p")
+            await pilot.press("n")
+            await pilot.press(*"note")
+            await pilot.press("enter")
+            assert threads[0].notes == "note"
+            assert "Label:" in _screen_text(app)  # still at the label step
+            await pilot.press("r")
+        assert threads[0].expected_label == "needs_response"
+
+    async def test_unknown_key_reports_it(self, tmp_path):
+        threads = [_golden("t1")]
+        app = ReviewApp(threads, blind=False)
+        async with app.run_test(size=SIZE) as pilot:
+            await pilot.press("x")
+            assert "Unknown action" in _status(app)
+            assert threads[0].reviewed is False
+
+
+# ---------------------------------------------------------------------------
+# Stage filters
+# ---------------------------------------------------------------------------
+
+class TestStages:
+    async def test_blind_stage_1_reviews_after_sender_only(self, tmp_path):
+        threads = [_golden("t1")]
+        app = ReviewApp(threads, blind=True, stage=1)
+        async with app.run_test(size=SIZE) as pilot:
+            await pilot.press("s")  # service
+        assert threads[0].expected_sender_type == "service"
+        assert threads[0].reviewed is True
+        assert app.return_value == "done"
+
+    async def test_blind_stage_2_starts_at_label(self, tmp_path):
+        threads = [_golden("t1")]
+        app = ReviewApp(threads, blind=True, stage=2)
+        async with app.run_test(size=SIZE) as pilot:
+            assert "Label:" in _screen_text(app)
+            await pilot.press("f")
+        assert threads[0].expected_label == "fyi"
+        assert threads[0].reviewed is True
+
+
+# ---------------------------------------------------------------------------
+# Undo across the queue (the review_loop invariants, now in ReviewApp)
+# ---------------------------------------------------------------------------
+
+class TestReviewUndo:
+    async def test_undo_after_skip_returns_to_skipped_thread_not_earlier(self, tmp_path):
         threads = [_golden("t0"), _golden("t1"), _golden("t2")]
-        keyqueue(["", "k", "z", "q"])
-        review.review_loop(threads, blind=False)
-        assert threads[0].reviewed is True   # t0's confirmation survives
-        assert threads[1].reviewed is False  # t1 was only skipped, no judgment
-        assert "Back to thread 2/3" in capsys.readouterr().out  # cursor went to t1
+        app = ReviewApp(threads, blind=False)
+        async with app.run_test(size=SIZE) as pilot:
+            await pilot.press("enter")  # confirm t0
+            await pilot.press("k")  # skip t1
+            await pilot.press("z")  # undo on t2
+            assert "Back to thread 2/3" in _status(app)
+            assert threads[0].reviewed is True  # earlier confirm untouched
+            assert "Thread 2/3" in _screen_text(app)
 
-    def test_blind_single_undo_fully_reverts_one_classification(self, keyqueue):
-        # In blind full mode a thread is classified in two steps (sender, label).
-        # A single undo must revert BOTH, leaving no half-applied sender behind.
+    async def test_blind_single_undo_fully_reverts_one_classification(self, tmp_path):
         threads = [_golden("t0"), _golden("t1")]
-        keyqueue(["s", "r", "z", "q"])  # t0: service/needs_response, then undo on t1
-        review.review_loop(threads, blind=True)
-        t0 = threads[0]
-        assert t0.expected_sender_type == "person"   # reverted from service
-        assert t0.expected_label == "fyi"            # reverted from needs_response
-        assert t0.reviewed is False
+        app = ReviewApp(threads, blind=True)
+        async with app.run_test(size=SIZE) as pilot:
+            await pilot.press("s", "r")  # t0: service / needs_response
+            assert threads[0].expected_sender_type == "service"
+            await pilot.press("z")  # undo on t1
+            assert threads[0].expected_sender_type == "person"
+            assert threads[0].expected_label == "fyi"
+            assert threads[0].reviewed is False
+            assert "Thread 1/2" in _screen_text(app)
 
-    def test_blind_undo_at_label_step_reverts_current_and_steps_back(
-        self, keyqueue, monkeypatch, capsys
-    ):
-        monkeypatch.setattr("builtins.input", lambda _="": "scratch")
+    async def test_blind_undo_at_label_step_reverts_current_and_steps_back(self, tmp_path):
         threads = [_golden("t0"), _golden("t1")]
-        # t0: classify person/fyi.  t1: pick sender, jot a note, then undo.
-        keyqueue(["p", "f", "p", "n", "z", "q"])
-        review.review_loop(threads, blind=True)
-        t1 = threads[1]
-        # Undo reverts t1 entirely (no orphaned note, no half-set sender) ...
-        assert t1.notes == ""
-        assert t1.reviewed is False
-        # ... and steps back to the previous decision (t0).
-        assert "Back to thread 1/2" in capsys.readouterr().out
+        app = ReviewApp(threads, blind=True)
+        async with app.run_test(size=SIZE) as pilot:
+            await pilot.press("p", "f")  # t0 done
+            await pilot.press("p")  # t1: sender set
+            await pilot.press("n")
+            await pilot.press(*"scratch")
+            await pilot.press("enter")
+            await pilot.press("z")  # undo at the label step
+            assert "Back to thread 1/2" in _status(app)
+            assert threads[1].notes == ""  # in-progress edits discarded
+            assert threads[1].expected_sender_type == "person"
+            assert threads[0].reviewed is False  # t0 decision reverted
+
+    async def test_undo_with_empty_stack_reports_nothing(self, tmp_path):
+        threads = [_golden("t0")]
+        app = ReviewApp(threads, blind=False)
+        async with app.run_test(size=SIZE) as pilot:
+            await pilot.press("z")
+            assert "Nothing to undo" in _status(app)
+
+
+class TestQuit:
+    async def test_q_quits(self, tmp_path):
+        threads = [_golden("t0"), _golden("t1")]
+        app = ReviewApp(threads, blind=False)
+        async with app.run_test(size=SIZE) as pilot:
+            await pilot.press("q")
+        assert app.return_value == "quit"
+        assert threads[0].reviewed is False
+
+    async def test_double_confirm_on_last_thread_does_not_crash(self, tmp_path):
+        # Confirming the final thread advances to done and calls exit(); a second
+        # Enter already queued behind it must NOT re-enter the handler and index
+        # threads[len] (an IndexError that crashes run() before cli() can save).
+        from textual import events
+
+        threads = [_golden("t0")]
+        app = ReviewApp(threads, blind=False)
+        async with app.run_test(size=SIZE) as pilot:
+            app.post_message(events.Key("enter", None))
+            app.post_message(events.Key("enter", None))
+            await pilot.pause()
+            await pilot.pause()
+            await pilot.pause()
+        # Reaching here without run_test re-raising means no crash.
+        assert app.return_value == "done"
+        assert threads[0].reviewed is True
 
 
 # ---------------------------------------------------------------------------
@@ -263,3 +447,36 @@ class TestCliPreservesExcluded:
         dup_labels = sorted(t.expected_label for t in saved if t.thread_id == "dup")
         assert dup_labels == ["fyi", "needs_response"]  # both judgments kept
         assert all(t.reviewed for t in saved if t.thread_id == "dup")
+
+
+class TestScrollAndStages:
+    async def test_arrow_keys_scroll_the_thread_body(self, tmp_path):
+        import base64
+
+        body = "\n".join(f"line {i}" for i in range(80))
+        data = base64.urlsafe_b64encode(body.encode()).decode()
+        thread = _golden("t1", messages=[{"payload": {"mimeType": "text/plain", "body": {"data": data}}}])
+        app = ReviewApp([thread], blind=False)
+        async with app.run_test(size=SIZE) as pilot:
+            scroll = app.query_one("#review-scroll")
+            assert scroll.scroll_offset.y == 0
+            await pilot.press("down", "down", "down")
+            assert scroll.scroll_offset.y == 3
+            await pilot.press("up")
+            assert scroll.scroll_offset.y == 2
+
+    async def test_stage_2_disables_the_sender_submenu(self, tmp_path):
+        threads = [_golden("t1")]
+        app = ReviewApp(threads, blind=False, stage=2)
+        async with app.run_test(size=SIZE) as pilot:
+            await pilot.press("s")
+            assert "Unknown action" in _status(app)
+            assert threads[0].expected_sender_type == "person"
+
+    async def test_stage_1_disables_the_label_submenu(self, tmp_path):
+        threads = [_golden("t1")]
+        app = ReviewApp(threads, blind=False, stage=1)
+        async with app.run_test(size=SIZE) as pilot:
+            await pilot.press("l")
+            assert "Unknown action" in _status(app)
+            assert threads[0].expected_label == "fyi"

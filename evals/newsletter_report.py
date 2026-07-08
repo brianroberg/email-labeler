@@ -355,13 +355,12 @@ def compute_tier_metrics(results: list[StoryPrediction], mode: str = "all") -> d
 
 
 def _normalize(story: dict) -> str:
-    """Lowercase, whitespace-collapse the story's text-or-title for matching.
+    """Lowercase, whitespace-collapse the story's text for matching.
 
-    Text is the ground truth curated in the labeling TUI; titles are model-
-    invented wording. Matching must be on the extracted spans (text), falling
-    back to title only when a story has no text.
+    Text is the ground truth curated in the labeling TUI — extraction matching
+    is on the extracted spans (text) only.
     """
-    raw = story.get("text") or story.get("title") or ""
+    raw = story.get("text") or ""
     return re.sub(r"\s+", " ", raw).strip().lower()
 
 
@@ -373,7 +372,7 @@ def match_stories_detailed(
     """Greedy one-to-one matching with full pair/unmatched detail.
 
     Uses difflib.SequenceMatcher ratio on normalized (lowercased,
-    whitespace-collapsed) text-or-title. Highest-ratio candidate pairs are
+    whitespace-collapsed) story text. Highest-ratio candidate pairs are
     assigned first; each predicted and each golden story matches at most once.
 
     Returns:
@@ -497,14 +496,21 @@ def load_results(
     return meta, story_preds, extraction_preds
 
 
-def load_story_titles(golden_set_path: str) -> dict[str, str]:
-    """Best-effort story_id -> title map from the run's golden set file.
+def _text_excerpt(text: str) -> str:
+    """Whitespace-collapse *text* and truncate to a short label (~60 chars)."""
+    collapsed = re.sub(r"\s+", " ", text or "").strip()
+    return collapsed[:57] + "..." if len(collapsed) > 60 else collapsed
 
-    Results rows carry only story_ids; titles live in the golden set. Any
-    failure (moved/deleted file, malformed line) degrades to {} so verbose
-    output falls back to bare story_ids.
+
+def load_story_excerpts(golden_set_path: str) -> dict[str, str]:
+    """Best-effort story_id -> text-excerpt map from the run's golden set file.
+
+    Results rows carry only story_ids; the story text lives in the golden set,
+    so verbose output labels a story by the first words of its text. Any failure
+    (moved/deleted file, malformed line) degrades to {} so verbose output falls
+    back to bare story_ids.
     """
-    titles: dict[str, str] = {}
+    excerpts: dict[str, str] = {}
     try:
         with open(golden_set_path) as f:
             for line in f:
@@ -513,11 +519,11 @@ def load_story_titles(golden_set_path: str) -> dict[str, str]:
                     continue
                 d = json.loads(line)
                 for s in d.get("stories", []):
-                    if s.get("story_id") and s.get("title"):
-                        titles[s["story_id"]] = s["title"]
+                    if s.get("story_id") and s.get("text"):
+                        excerpts[s["story_id"]] = _text_excerpt(s["text"])
     except (OSError, json.JSONDecodeError):
         return {}
-    return titles
+    return excerpts
 
 
 # --- Formatters ---
@@ -642,7 +648,7 @@ def print_report(
             story_results or [],
             extraction_results or [],
             match_threshold=match_threshold,
-            titles=load_story_titles(meta.golden_set_path),
+            excerpts=load_story_excerpts(meta.golden_set_path),
             anomalies=metrics.get("theme_anomalies", []),
         )
 
@@ -650,26 +656,22 @@ def print_report(
 
 
 def _story_label(story: dict) -> str:
-    """Human-readable story identifier: the title, else a text excerpt."""
-    title = (story.get("title") or "").strip()
-    if title:
-        return title
-    text = re.sub(r"\s+", " ", story.get("text") or "").strip()
-    return text[:57] + "..." if len(text) > 60 else text
+    """Human-readable story identifier: a text excerpt (first words)."""
+    return _text_excerpt(story.get("text") or "")
 
 
 def _print_verbose_single(
     story_results: list[StoryPrediction],
     extraction_results: list[ExtractionPrediction],
     match_threshold: float = 0.6,
-    titles: dict[str, str] | None = None,
+    excerpts: dict[str, str] | None = None,
     anomalies: list[dict] | None = None,
 ) -> None:
-    titles = titles or {}
+    excerpts = excerpts or {}
 
     def label(story_id: str) -> str:
-        title = titles.get(story_id)
-        return f"{story_id} ({title})" if title else story_id
+        excerpt = excerpts.get(story_id)
+        return f"{story_id} ({excerpt})" if excerpt else story_id
 
     print("\n--- Story Disagreements ---")
     # A row is compared field-by-field on whatever DID parse: tiers only when

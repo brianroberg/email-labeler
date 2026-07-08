@@ -65,7 +65,7 @@ uv run python -m evals.review
 # Show existing labels while reviewing
 uv run python -m evals.review --show-labels
 
-# Curses TUI for editing reviewed threads (also where you un-exclude)
+# Textual TUI for editing reviewed threads (also where you un-exclude)
 uv run python -m evals.review --edit
 
 # Review only sender classification (stage 1) or label classification (stage 2)
@@ -153,14 +153,18 @@ newsletter_harvest → newsletter_label → newsletter_run → newsletter_report
   its `body` is built exactly like production input. **No ground truth is inferred** —
   newsletters land unlabeled with an empty story list. Re-runs skip
   already-harvested threads instead of re-fetching them.
-- **label** — A curses tool to build ground truth by hand (quality is
-  subjective, so there are no auto-labels). Phase A curates the story list:
-  press `Space` to seed candidates from the production extractor (a fresh LLM
-  call each press — re-seeding over an existing list asks for confirmation),
-  then the reviewer marks body segments — `s`/`e` to set the span, `Enter` to
-  make a story (already-covered body lines are dimmed so gaps stand out) — plus
-  add/edit/delete, multi-level undo (`z`), or `k` to skip the newsletter for a
-  later pass. Phase B assigns per-story dimension scores + themes. The tier is
+- **label** — A Textual tool to build ground truth by hand (quality is
+  subjective, so there are no auto-labels). The detail screen shows the
+  newsletter **body with each story highlighted in place** plus a story strip
+  and a mode bar. Phase A curates the story list: opening an unreviewed
+  newsletter **auto-seeds** candidate stories from the production extractor (a
+  fresh LLM call; `r` re-seeds, asking for confirmation over an existing list).
+  You then refine boundaries in two modes — in **browse mode** pick a story with
+  `n`/`p` or a number key; in **span mode** (`a` for a new story, `e` to
+  re-bound the selected one) mark the first line then the last line to define a
+  story from that verbatim body slice. `d` deletes, `C` clears all,
+  `c` accepts the list and advances to the next newsletter, `z` undoes, `k`
+  skips. Phase B (`l`) assigns per-story dimension scores + themes; the tier is
   auto-derived from scores. `X` excludes a whole newsletter from the queue and
   eval runs (toggle; relaunch with `--include-excluded` to see and restore
   excluded ones). `--edit` disables the LLM seeding for manual-only curation
@@ -182,7 +186,7 @@ defaults to the repo-root `config.toml` regardless of CWD).
 scoring is *decoupled* from it: one golden set holds both. Extraction is scored at
 the newsletter-body level (raw body → predicted stories → matched against the
 newsletter's golden story list). Quality + themes are scored on the **fixed golden
-`(title, text)`** of each reviewed story, independent of what extraction produced —
+story text** of each reviewed story, independent of what extraction produced —
 so a prompt tweak that only affects scoring is measured cleanly.
 
 ```bash

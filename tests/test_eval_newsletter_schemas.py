@@ -16,7 +16,6 @@ class TestGoldenStory:
     def test_round_trip_via_json(self):
         s = GoldenStory(
             story_id="t_001:0",
-            title="A missionary in Nairobi",
             text="The full story text goes here.",
             expected_scores={"simple": 4, "concrete": 5, "personal": 3, "dynamic": 2},
             expected_tier="good",
@@ -26,9 +25,9 @@ class TestGoldenStory:
             excluded=False,
         )
         d = s.to_dict()
+        assert "title" not in d
         restored = GoldenStory.from_dict(json.loads(json.dumps(d)))
         assert restored.story_id == "t_001:0"
-        assert restored.title == "A missionary in Nairobi"
         assert restored.text == "The full story text goes here."
         assert restored.expected_scores == {
             "simple": 4,
@@ -43,13 +42,20 @@ class TestGoldenStory:
         assert restored.excluded is False
 
     def test_defaults_when_keys_missing(self):
-        s = GoldenStory.from_dict({"story_id": "x:0", "title": "T", "text": "B"})
+        s = GoldenStory.from_dict({"story_id": "x:0", "text": "B"})
         assert s.expected_scores is None
         assert s.expected_tier is None
         assert s.expected_themes == []
         assert s.reviewed is False
         assert s.notes == ""
         assert s.excluded is False
+
+    def test_legacy_title_key_is_tolerated(self):
+        # Golden sets written before titles were removed still carry a "title"
+        # key; loading them must ignore the extra key, not crash.
+        s = GoldenStory.from_dict({"story_id": "x:0", "title": "Old Title", "text": "B"})
+        assert s.text == "B"
+        assert not hasattr(s, "title")
 
 
 class TestGoldenNewsletter:
@@ -61,10 +67,9 @@ class TestGoldenNewsletter:
             subject="July update",
             body="raw body verbatim",
             stories=[
-                GoldenStory(story_id="t_001:0", title="First", text="one"),
+                GoldenStory(story_id="t_001:0", text="one"),
                 GoldenStory(
                     story_id="t_001:1",
-                    title="Second",
                     text="two",
                     expected_themes=["vocation-family"],
                 ),
@@ -94,7 +99,8 @@ class TestGoldenNewsletter:
         assert len(restored.stories) == 2
         assert all(isinstance(s, GoldenStory) for s in restored.stories)
         assert restored.stories[0].story_id == "t_001:0"
-        assert restored.stories[1].title == "Second"
+        assert restored.stories[1].story_id == "t_001:1"
+        assert restored.stories[1].text == "two"
         assert restored.stories[1].expected_themes == ["vocation-family"]
 
     def test_defaults_when_keys_missing(self):
@@ -176,8 +182,8 @@ class TestExtractionPrediction:
     def test_round_trip_via_json(self):
         p = ExtractionPrediction(
             thread_id="t_001",
-            golden_stories=[{"story_id": "t_001:0", "title": "A", "text": "aaa"}],
-            predicted_stories=[{"title": "A", "text": "aaa"}, {"title": "B", "text": "bbb"}],
+            golden_stories=[{"story_id": "t_001:0", "text": "aaa"}],
+            predicted_stories=[{"text": "aaa"}, {"text": "bbb"}],
             duration_seconds=2.0,
             error=None,
         )
@@ -186,11 +192,11 @@ class TestExtractionPrediction:
         restored = ExtractionPrediction.from_dict(json.loads(json.dumps(d)))
         assert restored.thread_id == "t_001"
         assert restored.golden_stories == [
-            {"story_id": "t_001:0", "title": "A", "text": "aaa"}
+            {"story_id": "t_001:0", "text": "aaa"}
         ]
         assert restored.predicted_stories == [
-            {"title": "A", "text": "aaa"},
-            {"title": "B", "text": "bbb"},
+            {"text": "aaa"},
+            {"text": "bbb"},
         ]
         assert restored.duration_seconds == 2.0
         assert restored.error is None
