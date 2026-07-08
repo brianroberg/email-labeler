@@ -14,7 +14,7 @@ from enum import Enum
 from pathlib import Path
 
 from gmail_utils import get_header
-from llm_client import LLMClient, LLMUnavailableError
+from llm_client import LLMClient, LLMContentError, LLMUnavailableError
 
 log = logging.getLogger(__name__)
 
@@ -296,8 +296,11 @@ class NewsletterClassifier:
                     result.scores = scores
                     result.average_score = sum(scores.values()) / len(scores)
                     result.tier = compute_tier(scores)
-            except LLMUnavailableError:
-                raise  # transient — let the daemon retry the whole newsletter
+            except (LLMUnavailableError, LLMContentError):
+                # transient outage OR a content-less response (issue #30): both
+                # affect every story, so propagate to give-up rather than commit
+                # a permanently mis-graded (empty) newsletter.
+                raise
             except Exception:
                 log.warning("Quality assessment failed for story: %s", text[:60])
 
@@ -305,8 +308,8 @@ class NewsletterClassifier:
                 themes, theme_cot = await self.classify_themes(text)
                 result.themes = themes
                 result.theme_cot = theme_cot
-            except LLMUnavailableError:
-                raise  # transient — let the daemon retry the whole newsletter
+            except (LLMUnavailableError, LLMContentError):
+                raise
             except Exception:
                 log.warning("Theme classification failed for story: %s", text[:60])
 

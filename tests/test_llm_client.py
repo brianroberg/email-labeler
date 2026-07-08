@@ -5,7 +5,12 @@ from unittest.mock import AsyncMock, patch
 import httpx
 import pytest
 
-from llm_client import DEFAULT_AVAILABILITY_TIMEOUT, LLMClient, LLMUnavailableError
+from llm_client import (
+    DEFAULT_AVAILABILITY_TIMEOUT,
+    LLMClient,
+    LLMContentError,
+    LLMUnavailableError,
+)
 
 
 @pytest.fixture
@@ -324,6 +329,22 @@ class TestContentlessResponse:
             msg = str(exc_info.value)
             assert "test-cloud-model" in msg
             assert "max_tokens" in msg  # names the likely cause
+
+    async def test_content_less_raises_llm_content_error(self, cloud_client):
+        """The content-less guard raises the dedicated LLMContentError type so the
+        newsletter pipeline can re-raise it to the give-up path (issue #30). It must
+        subclass RuntimeError to preserve the email pipeline's give-up handler."""
+        assert issubclass(LLMContentError, RuntimeError)
+        mock_response = _mock_response(json_data={
+            "choices": [{"message": {"role": "assistant", "content": None}}]
+        })
+        with patch("llm_client.httpx.AsyncClient") as mock_client_cls:
+            mock_client = AsyncMock()
+            mock_client.post.return_value = mock_response
+            mock_client_cls.return_value.__aenter__ = AsyncMock(return_value=mock_client)
+            mock_client_cls.return_value.__aexit__ = AsyncMock(return_value=False)
+            with pytest.raises(LLMContentError, match="no content"):
+                await cloud_client.complete("sys", "user")
 
     async def test_none_content_raises_runtime_error(self, cloud_client):
         """An explicit `content: null` raises RuntimeError, not a downstream crash."""

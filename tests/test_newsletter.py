@@ -5,7 +5,7 @@ from unittest.mock import AsyncMock
 
 import pytest
 
-from llm_client import LLMUnavailableError
+from llm_client import LLMContentError, LLMUnavailableError
 from newsletter import (
     NewsletterClassifier,
     NewsletterTier,
@@ -440,6 +440,26 @@ class TestClassifyNewsletterTransientOutage:
             LLMUnavailableError("cloud endpoint down"),                    # classify_themes
         ]
         with pytest.raises(LLMUnavailableError):
+            await nl_classifier.classify_newsletter("body")
+
+    async def test_content_error_during_quality_propagates(self, nl_classifier, mock_cloud_llm):
+        """A content-less LLMContentError during quality propagates (issue #30) so the
+        daemon routes the whole newsletter to give-up rather than committing an empty
+        grade indistinguishable from a genuine NO_STORIES."""
+        mock_cloud_llm.complete.side_effect = [
+            ("STORY: Content", ""),                       # extract_stories
+            LLMContentError("model returned no content"),  # assess_quality
+        ]
+        with pytest.raises(LLMContentError):
+            await nl_classifier.classify_newsletter("body")
+
+    async def test_content_error_during_theme_propagates(self, nl_classifier, mock_cloud_llm):
+        mock_cloud_llm.complete.side_effect = [
+            ("STORY: Content", ""),                                        # extract_stories
+            ("SIMPLE: OK\nCONCRETE: OK\nPERSONAL: OK\nDYNAMIC: OK", ""),    # assess_quality
+            LLMContentError("model returned no content"),                  # classify_themes
+        ]
+        with pytest.raises(LLMContentError):
             await nl_classifier.classify_newsletter("body")
 
     async def test_non_transient_quality_error_stays_isolated(self, nl_classifier, mock_cloud_llm):

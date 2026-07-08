@@ -27,6 +27,19 @@ class LLMUnavailableError(Exception):
     """
 
 
+class LLMContentError(RuntimeError):
+    """The model returned no usable ``content`` (issue #30).
+
+    A reasoning model that exhausts max_tokens mid-<think>, a GLM reply carrying
+    only ``reasoning_content``, or an empty string all yield an unusable response.
+    Retrying as-is won't help, so it is request-specific/permanent and
+    give-up-eligible. It subclasses ``RuntimeError`` so the email pipeline's
+    ``except RuntimeError`` give-up handler catches it unchanged, while giving the
+    newsletter pipeline a dedicated type to re-raise (a *bare* per-story
+    RuntimeError stays isolated; a content-less one propagates to give-up).
+    """
+
+
 class LLMClient:
     """Client for OpenAI-compatible chat completion endpoints."""
 
@@ -162,7 +175,7 @@ class LLMClient:
             # (An empty string must be caught too: it would otherwise parse to a
             # default SERVICE / LOW_PRIORITY label and silently mislabel the email.)
             has_reasoning = bool(msg.get("reasoning_content") or msg.get("reasoning"))
-            raise RuntimeError(
+            raise LLMContentError(
                 f"LLM {self.model} returned no content "
                 f"(max_tokens={self.max_tokens} likely exhausted before a final answer; "
                 f"reasoning_content {'present' if has_reasoning else 'absent'})"
