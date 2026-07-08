@@ -5,6 +5,7 @@ Handles thinking tag stripping for reasoning models.
 """
 
 import re
+from dataclasses import dataclass
 
 import httpx
 
@@ -15,6 +16,20 @@ from retry import retry_with_backoff
 # loads the requested model on the first request — a cold load of a large model
 # routinely exceeds 10s, and timing out would wrongly report it unreachable.
 DEFAULT_AVAILABILITY_TIMEOUT = 60
+
+
+@dataclass(frozen=True)
+class AvailabilityResult:
+    """Result of an endpoint availability probe (issue #41 item 7).
+
+    ``ok`` is True only on HTTP 200. ``status_code`` is the HTTP status when a
+    response arrived (None if none did); ``error`` is the exception detail when
+    the request failed before a response (connect/timeout/unsupported-protocol).
+    """
+
+    ok: bool
+    status_code: int | None = None
+    error: str | None = None
 
 
 class LLMUnavailableError(Exception):
@@ -191,19 +206,20 @@ class LLMClient:
             return self._strip_thinking(content), thinking
         return self._strip_thinking(content)
 
-    async def is_available(self, timeout: float | None = None) -> bool:
-        """Check if the LLM endpoint is reachable.
+    async def probe(self, timeout: float | None = None) -> "AvailabilityResult":
+        """Probe the endpoint, returning status detail (issue #41 item 7).
 
-        Sends a minimal completion request to verify connectivity.
+        Sends a minimal completion request. ``ok`` is True only on HTTP 200.
+        ``status_code`` carries the HTTP status when a response arrived — so a
+        404 (which usually means the requested model name doesn't match the
+        served one) is distinguishable from an endpoint that is simply down.
+        ``error`` carries the exception detail when no response arrived at all.
 
         Args:
             timeout: Seconds to wait for the ping. Defaults to
                 DEFAULT_AVAILABILITY_TIMEOUT, generous enough to cover a server
                 that loads the requested model on demand (a cold load can take
                 far longer than a normal liveness probe).
-
-        Returns:
-            True if the endpoint responds successfully, False otherwise.
         """
         if timeout is None:
             timeout = DEFAULT_AVAILABILITY_TIMEOUT
@@ -223,12 +239,16 @@ class LLMClient:
             async with httpx.AsyncClient(timeout=timeout) as client:
                 response = await client.post(self.base_url, headers=headers, json=body)
 
-            return response.status_code == 200
-        except httpx.RequestError:
+            return AvailabilityResult(ok=response.status_code == 200, status_code=response.status_code)
+        except httpx.RequestError as exc:
             # Any failure to obtain a response means "not available": connect /
             # timeout, but also UnsupportedProtocol (unset/schemeless URL) and
             # read/protocol errors (e.g. a dropped connection mid cold-load).
-            return False
+            return AvailabilityResult(ok=False, error=f"{type(exc).__name__}: {exc}")
+
+    async def is_available(self, timeout: float | None = None) -> bool:
+        """Whether the endpoint is reachable (a thin bool wrapper over probe())."""
+        return (await self.probe(timeout)).ok
 
     # Matches <think>...</think> and <<think>>...</<think>> (DeepSeek variant)
     _THINK_PATTERN = re.compile(r"<<?think>>?.*?</<?think>>?", flags=re.DOTALL)

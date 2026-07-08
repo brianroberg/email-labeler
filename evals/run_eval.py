@@ -123,18 +123,32 @@ async def preflight_check(
     that loads the requested model on demand, so a cold load is not read as "down".
     """
     errors = []
-    if need_cloud and not await cloud_base.is_available(cloud_timeout):
-        errors.append(
-            f"cloud LLM '{cloud_base.model}' not reachable at "
-            f"{cloud_base.base_url or '<unset CLOUD_LLM_URL>'}"
-        )
-    if need_local and not await local_base.is_available(local_timeout):
-        errors.append(
-            f"local LLM '{local_base.model}' not reachable at "
-            f"{local_base.base_url or '<unset MLX_URL>'} "
-            "(a model-name mismatch with the served model returns 404)"
-        )
+    if need_cloud:
+        result = await cloud_base.probe(cloud_timeout)
+        if not result.ok:
+            errors.append(
+                f"cloud LLM '{cloud_base.model}' not reachable at "
+                f"{cloud_base.base_url or '<unset CLOUD_LLM_URL>'}"
+                + _model_mismatch_hint(result.status_code)
+            )
+    if need_local:
+        result = await local_base.probe(local_timeout)
+        if not result.ok:
+            errors.append(
+                f"local LLM '{local_base.model}' not reachable at "
+                f"{local_base.base_url or '<unset MLX_URL>'}"
+                + _model_mismatch_hint(result.status_code)
+            )
     return errors
+
+
+def _model_mismatch_hint(status_code: int | None) -> str:
+    """The 404-only hint (issue #41 item 7): a 404 usually means the requested
+    model name doesn't match the served model, distinct from an endpoint that is
+    simply down."""
+    if status_code == 404:
+        return " (HTTP 404 — the model name likely doesn't match the served model)"
+    return ""
 
 
 def resolve_parallelism(cli_value: int | None, config: dict) -> int:

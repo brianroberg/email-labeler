@@ -410,6 +410,45 @@ class TestContentlessResponse:
                 await glm_client.complete("sys", "user", include_thinking=True)
 
 
+class TestProbe:
+    """probe() carries status detail so preflight can distinguish a 404
+    (model-name mismatch) from an unreachable endpoint (issue #41 item 7)."""
+
+    async def test_probe_ok_on_200(self, local_client):
+        mock_response = _mock_response(json_data={"choices": [{"message": {"content": "ok"}}]})
+        with patch("llm_client.httpx.AsyncClient") as mock_client_cls:
+            mock_client = AsyncMock()
+            mock_client.post.return_value = mock_response
+            mock_client_cls.return_value.__aenter__ = AsyncMock(return_value=mock_client)
+            mock_client_cls.return_value.__aexit__ = AsyncMock(return_value=False)
+            result = await local_client.probe()
+            assert result.ok is True
+            assert result.status_code == 200
+            assert result.error is None
+
+    async def test_probe_reports_404_status(self, local_client):
+        mock_response = _mock_response(status_code=404, json_data={"error": "not found"})
+        with patch("llm_client.httpx.AsyncClient") as mock_client_cls:
+            mock_client = AsyncMock()
+            mock_client.post.return_value = mock_response
+            mock_client_cls.return_value.__aenter__ = AsyncMock(return_value=mock_client)
+            mock_client_cls.return_value.__aexit__ = AsyncMock(return_value=False)
+            result = await local_client.probe()
+            assert result.ok is False
+            assert result.status_code == 404
+
+    async def test_probe_error_on_connection_failure(self, local_client):
+        with patch("llm_client.httpx.AsyncClient") as mock_client_cls:
+            mock_client = AsyncMock()
+            mock_client.post.side_effect = httpx.ConnectError("Connection refused")
+            mock_client_cls.return_value.__aenter__ = AsyncMock(return_value=mock_client)
+            mock_client_cls.return_value.__aexit__ = AsyncMock(return_value=False)
+            result = await local_client.probe()
+            assert result.ok is False
+            assert result.status_code is None
+            assert "ConnectError" in result.error
+
+
 class TestIsAvailable:
     async def test_available_when_server_responds(self, local_client):
         """is_available returns True when server returns 200."""

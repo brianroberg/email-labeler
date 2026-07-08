@@ -52,6 +52,10 @@ class FakeLLM:
     async def is_available(self, timeout=None):
         return True
 
+    async def probe(self, timeout=None):
+        from llm_client import AvailabilityResult
+        return AvailabilityResult(ok=await self.is_available(timeout))
+
 
 def _classifier(llm):
     config = _prompts_config()
@@ -880,6 +884,43 @@ class TestEndpointNaming:
         err = capsys.readouterr().err
         assert "http://127.0.0.1:8499/v1" in err
         assert "NEWSLETTER_LLM_URL" in err
+
+    def test_preflight_404_shows_model_mismatch_hint(self, tmp_path, monkeypatch, capsys):
+        # Issue #41 item 7: the model-mismatch hint appears only on an actual 404.
+        class Mismatch(FakeLLM):
+            async def probe(self, timeout=None):
+                from llm_client import AvailabilityResult
+                return AvailabilityResult(ok=False, status_code=404)
+
+        def fake_build(config, no_cache):
+            llm = Mismatch([])
+            return NewsletterClassifier(cloud_llm=llm, config=config), llm
+        monkeypatch.setattr(newsletter_run, "build_classifier", fake_build)
+        golden = tmp_path / "g.jsonl"
+        _write_golden(golden, [_newsletter("nl1", reviewed=True, stories=[_story("nl1:0", text="b")])])
+        with pytest.raises(SystemExit):
+            asyncio.run(newsletter_run.main(_main_args(
+                golden_set=str(golden), output_dir=str(tmp_path / "r"), skip_preflight=False,
+            )))
+        assert "model name does not match" in capsys.readouterr().err
+
+    def test_preflight_down_omits_model_mismatch_hint(self, tmp_path, monkeypatch, capsys):
+        # No HTTP response (status None) -> plain unreachable, no model-mismatch hint.
+        class Down(FakeLLM):
+            async def is_available(self, timeout=None):
+                return False
+
+        def fake_build(config, no_cache):
+            llm = Down([])
+            return NewsletterClassifier(cloud_llm=llm, config=config), llm
+        monkeypatch.setattr(newsletter_run, "build_classifier", fake_build)
+        golden = tmp_path / "g.jsonl"
+        _write_golden(golden, [_newsletter("nl1", reviewed=True, stories=[_story("nl1:0", text="b")])])
+        with pytest.raises(SystemExit):
+            asyncio.run(newsletter_run.main(_main_args(
+                golden_set=str(golden), output_dir=str(tmp_path / "r"), skip_preflight=False,
+            )))
+        assert "model name does not match" not in capsys.readouterr().err
 
 
 class TestReportForwarding:

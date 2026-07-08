@@ -32,7 +32,7 @@ Directly serves the curation the owner is doing right now.
 |---|---|---|---|---|
 | **#53** | Switch theme scores binary→3-value (Absent/Present/Emphasized) and storytelling dimensions 1–5→3-value (Poor/OK/Good); update prompts, schema, tier derivation, labels | **P0** | M–L | — |
 | **#52** | Add an *exclude* action to `evals.review --edit` (only unexclude exists today); keep parity with the newsletter labeler | **P0** | S | — |
-| **#41** | Deferred newsletter-eval UX items (item 2 already done by the redesign; item 1 sub-line/`$EDITOR` open; items 4–7 open) | **P1** | S–L (triage per sub-item) | — |
+| **#41** | Deferred newsletter-eval UX items. Triaged 2026-07-08: items **2** (cursor-direct selection) and **3** (`X` newsletter exclude) already done by the Textual redesign; item **7** (`is_available` 404 detail) done here; items **1** ($EDITOR/sub-line), **4** (`q` quits), **5** (unreviewed extraction metrics — schema change), **6** (`--verbose` trend) deferred with rationale in `docs/plans/2026-07-08-phase1-decisions.md` | **P1** | S–L (triage per sub-item) | — |
 | **#35** | Newsletter review-TUI header: show sent-date *and* processed-date, separate email-intrinsic vs classification data, show model | **P1** | M | upstream capture |
 | **#36** | Newsletter listing: show send-date column, default sort by date desc, date filters (30/90/365/Since…) | **P1** | M | upstream capture |
 
