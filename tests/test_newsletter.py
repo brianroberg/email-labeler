@@ -14,10 +14,33 @@ from newsletter import (
     compute_tier,
     is_newsletter,
     parse_quality_scores,
+    parse_send_date,
     parse_stories,
     parse_themes,
     write_assessment,
 )
+
+
+class TestParseSendDate:
+    # Normalize the email send-date to ISO-8601 UTC (issue #35/#36 enabler).
+    def test_rfc2822_header_to_iso_utc(self):
+        assert parse_send_date("Mon, 1 Jan 2024 12:00:00 +0000") == "2024-01-01T12:00:00+00:00"
+
+    def test_offset_converted_to_utc(self):
+        assert parse_send_date("Mon, 1 Jan 2024 12:00:00 +0500") == "2024-01-01T07:00:00+00:00"
+
+    def test_naive_header_assumed_utc(self):
+        assert parse_send_date("1 Jan 2024 12:00:00") == "2024-01-01T12:00:00+00:00"
+
+    def test_falls_back_to_internal_date_ms(self):
+        assert parse_send_date("", "1704067200000") == "2024-01-01T00:00:00+00:00"
+
+    def test_unparseable_header_falls_back_to_internal(self):
+        assert parse_send_date("not a date at all", "1704067200000") == "2024-01-01T00:00:00+00:00"
+
+    def test_none_when_nothing_usable(self):
+        assert parse_send_date("", None) is None
+        assert parse_send_date("garbage", None) is None
 
 
 class TestParseStories:
@@ -518,6 +541,29 @@ class TestWriteAssessment:
         assert record["stories"][0]["themes"] == {"scripture": "present", "church": "emphasized"}
         assert record["stories"][0]["quality_cot"] == "quality reasoning"
         assert "timestamp" in record
+
+    def test_writes_send_date_and_model(self, tmp_path):
+        output_file = tmp_path / "assessments.jsonl"
+        write_assessment(
+            output_file=str(output_file),
+            message_id="m", thread_id="t", sender="a@b.com", subject="Subj",
+            overall_tier=NewsletterTier.GOOD, stories=[StoryResult(text="x")],
+            send_date="2024-01-01T12:00:00+00:00", model="claude-sonnet-4-6",
+        )
+        record = json.loads(output_file.read_text().strip())
+        assert record["send_date"] == "2024-01-01T12:00:00+00:00"
+        assert record["model"] == "claude-sonnet-4-6"
+
+    def test_send_date_and_model_default_to_none(self, tmp_path):
+        output_file = tmp_path / "assessments.jsonl"
+        write_assessment(
+            output_file=str(output_file),
+            message_id="m", thread_id="t", sender="a@b.com", subject="Subj",
+            overall_tier=None, stories=[StoryResult(text="x")],
+        )
+        record = json.loads(output_file.read_text().strip())
+        assert record["send_date"] is None
+        assert record["model"] is None
 
     def test_appends_to_existing_file(self, tmp_path):
         output_file = tmp_path / "assessments.jsonl"

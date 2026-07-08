@@ -2,6 +2,7 @@
 
 import asyncio
 import base64
+import json
 import logging
 from unittest.mock import AsyncMock, MagicMock
 
@@ -981,6 +982,56 @@ class TestNewsletterRouting:
         mock_classifier.classify.assert_not_called()
         mock_newsletter_classifier.classify_newsletter.assert_called_once()
         mock_label_manager.apply_newsletter_classification.assert_called_once()
+
+    async def test_assessment_records_send_date_and_model(
+        self,
+        mock_proxy,
+        mock_classifier,
+        mock_label_manager,
+        mock_newsletter_classifier,
+        cloud_sem,
+        local_sem,
+        newsletter_thread_response,
+        tmp_path,
+    ):
+        """The assessment record persists the email send-date (from the Date header,
+        ISO-8601 UTC) and the classifier model, distinct from the processed timestamp
+        (shared enabler for #35/#36)."""
+        mock_proxy.get_thread.return_value = newsletter_thread_response
+        mock_newsletter_classifier.classify_newsletter.return_value = [
+            StoryResult(
+                text="Content",
+                scores={"simple": 3, "concrete": 3, "personal": 3, "dynamic": 3},
+                average_score=3.0,
+                tier=NewsletterTier.EXCELLENT,
+                themes={"scripture": "emphasized"},
+            )
+        ]
+        # The classifier's cloud LLM reports the model that actually ran.
+        mock_newsletter_classifier.cloud_llm.model = "claude-sonnet-4-6"
+        out = tmp_path / "assessments.jsonl"
+
+        result = await process_single_thread(
+            "thread_nl",
+            ["msg_nl_001"],
+            mock_proxy,
+            mock_classifier,
+            mock_label_manager,
+            cloud_sem,
+            local_sem,
+            max_thread_chars=50000,
+            newsletter_classifier=mock_newsletter_classifier,
+            newsletter_recipient="newsletters@dm.org",
+            newsletter_output_file=str(out),
+        )
+
+        assert result is True
+        record = json.loads(out.read_text().strip())
+        # newsletter_thread_response's Date header is "Mon, 1 Jan 2024 12:00:00 +0000".
+        assert record["send_date"] == "2024-01-01T12:00:00+00:00"
+        assert record["model"] == "claude-sonnet-4-6"
+        # send-date (email-intrinsic) is distinct from the processed timestamp.
+        assert record["timestamp"] != record["send_date"]
 
     async def test_non_newsletter_uses_priority_pipeline(
         self,

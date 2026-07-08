@@ -10,6 +10,7 @@ import logging
 import re
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
+from email.utils import parsedate_to_datetime
 from enum import Enum
 from pathlib import Path
 
@@ -176,6 +177,35 @@ def aggregate_theme_grades(stories: list["StoryResult"]) -> dict[str, str]:
     return merged
 
 
+def parse_send_date(date_header: str, internal_date_ms: str | None = None) -> str | None:
+    """Normalize an email's send date to an ISO-8601 UTC string.
+
+    Prefers the RFC-2822 ``Date`` header (a header with no timezone is assumed
+    UTC); falls back to Gmail's ``internalDate`` (epoch milliseconds) when the
+    header is missing or unparseable. Returns None if neither yields a valid date.
+    ISO-8601 UTC sorts lexicographically = chronologically, which the review TUI
+    relies on for date sorting/filtering (issue #35/#36).
+    """
+    if date_header:
+        try:
+            dt = parsedate_to_datetime(date_header)
+        except (ValueError, TypeError):
+            dt = None
+        if dt is not None:
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=timezone.utc)
+            return dt.astimezone(timezone.utc).isoformat()
+
+    if internal_date_ms:
+        try:
+            seconds = int(internal_date_ms) / 1000
+            return datetime.fromtimestamp(seconds, tz=timezone.utc).isoformat()
+        except (ValueError, TypeError, OverflowError, OSError):
+            pass
+
+    return None
+
+
 def write_assessment(
     output_file: str,
     message_id: str,
@@ -184,14 +214,25 @@ def write_assessment(
     subject: str,
     overall_tier: NewsletterTier | None,
     stories: list[StoryResult],
+    *,
+    send_date: str | None = None,
+    model: str | None = None,
 ) -> None:
-    """Append a newsletter assessment record to the JSONL output file."""
+    """Append a newsletter assessment record to the JSONL output file.
+
+    ``timestamp`` is the *processed* time (UTC now). ``send_date`` is the email's
+    own send date (ISO-8601 UTC, email-intrinsic) and ``model`` is the classifier
+    model — both used by the review TUI (issue #35/#36). Old records lacking these
+    keys are read with ``.get()`` fallbacks by consumers.
+    """
     record = {
         "timestamp": datetime.now(timezone.utc).isoformat(),
         "message_id": message_id,
         "thread_id": thread_id,
         "from": sender,
         "subject": subject,
+        "send_date": send_date,
+        "model": model,
         "overall_tier": overall_tier.value if overall_tier else None,
         "stories": [
             {

@@ -27,6 +27,7 @@ from newsletter import (
     NewsletterTier,
     aggregate_theme_grades,
     is_newsletter,
+    parse_send_date,
     write_assessment,
 )
 from proxy_client import (
@@ -348,6 +349,9 @@ async def process_single_thread(
                 first_headers = messages[0]["payload"]["headers"]
                 subject = get_header(first_headers, "Subject")
                 sender = get_header(first_headers, "From")
+                send_date = parse_send_date(
+                    get_header(first_headers, "Date"), messages[0].get("internalDate")
+                )
                 transcript = format_thread_transcript(messages, max_thread_chars)
 
                 async with cloud_sem:
@@ -380,6 +384,8 @@ async def process_single_thread(
                             subject=subject,
                             overall_tier=best_tier,
                             stories=story_results,
+                            send_date=send_date,
+                            model=newsletter_classifier.cloud_llm.model,
                         )
                     except Exception:
                         log.exception("Failed to write newsletter assessment for thread %s", thread_id)
