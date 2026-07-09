@@ -104,7 +104,15 @@ uv run python -m evals.run_eval --stages stage1_only
 uv run python -m evals.run_eval --stages stage2_only
 
 # Override model without editing config.toml
-uv run python -m evals.run_eval --local-model qwen/qwen3-14b --tag qwen3-14b
+uv run python -m evals.run_eval --local-model qwen/qwen3.6-27b --tag qwen3.6-27b
+
+# Per-endpoint request overrides, also without touching config.toml:
+# a longer timeout for slow prefills, or arbitrary request-body JSON
+uv run python -m evals.run_eval --local-timeout 300
+uv run python -m evals.run_eval --cloud-extra-body '{"top_p": 0.9}'
+
+# Disable reasoning/thinking for a run (see the A/B workflow below)
+uv run python -m evals.run_eval --local-no-think
 
 # Dry run — show what would be evaluated
 uv run python -m evals.run_eval --dry-run
@@ -289,6 +297,25 @@ uv run python -m evals.run_eval --tag baseline
 uv run python -m evals.run_eval --tag new-prompts
 uv run python -m evals.report --compare evals/results/*baseline*.jsonl evals/results/*new-prompts*.jsonl
 ```
+
+**Thinking on/off A/B (reasoning models):**
+
+The local model reasons in `<think>` tags by default; that costs tokens and
+latency. To measure what disabling it does to accuracy *before* changing
+`config.toml`, run the same person-thread evaluation both ways and compare:
+
+```bash
+uv run python -m evals.run_eval --stages stage2_only --sender-type person --tag think-on
+uv run python -m evals.run_eval --stages stage2_only --sender-type person \
+    --local-no-think --tag think-off
+uv run python -m evals.report --compare evals/results/*think-on*.jsonl evals/results/*think-off*.jsonl
+```
+
+`--local-no-think` / `--cloud-no-think` emit the `chat_template_kwargs` disable
+form (Qwen / LM Studio) and also natively disable thinking on GLM-style cloud
+models. If your server expects a different flag, pass it explicitly via
+`--local-extra-body` / `--cloud-extra-body`. The extra body is part of the LLM
+cache key, so the two runs cache independently — no `--no-cache` needed.
 
 **Model swap:**
 

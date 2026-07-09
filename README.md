@@ -14,7 +14,7 @@ The system uses two classification stages to achieve this:
 
 2. **Stage 2** routes based on the Stage 1 result:
    - **Service emails** have their full body sent to the cloud LLM for classification. This is safe because service emails (receipts, newsletters, notifications) contain no personal correspondence.
-   - **Person emails** have their full body sent to a local MLX/Qwen3 instance running on the same network. The body never leaves the local network.
+   - **Person emails** have their full body sent to a local MLX/Qwen3.6 instance running on the same network. The body never leaves the local network.
 
 If the local LLM is unavailable, person emails are silently skipped and retried on the next poll cycle. They are never sent to the cloud as a fallback.
 
@@ -123,7 +123,7 @@ PROXY_API_KEY=aproxy_your_key_here
 CLOUD_LLM_URL=https://your-llm-provider.com/v1/chat/completions
 CLOUD_LLM_API_KEY=your_api_key_here
 MLX_URL=http://macbook:8080/v1/chat/completions
-MLX_MODEL=qwen/qwen3-14b
+MLX_MODEL=qwen/qwen3.6-27b
 ```
 
 See [README-technical.md](README-technical.md#environment-variables) for the full variable reference.
@@ -192,7 +192,9 @@ The daemon is designed to run unattended and recover from transient failures:
 
 - **Exponential backoff**: If a poll cycle fails, the sleep interval doubles (up to 10x the base interval), then resets on the next successful cycle.
 - **Per-email error isolation**: If one email fails to classify, the error is logged and the loop continues with the next email.
-- **MLX graceful degradation**: If the local MLX server is unreachable, person emails are skipped (retried next cycle) while service emails continue to be classified via the cloud LLM.
+- **Transient vs. request-specific failures**: An unavailable LLM endpoint — connection refused, a connect timeout, or a connection dropped/reset mid-request — raises a clear, dedicated error and is simply retried next cycle; it never counts against the thread. Failures specific to one thread (a request timeout on an oversized transcript, a persistent per-thread proxy error) fall under the give-up rule below instead.
+- **Stuck-thread give-up**: A thread that keeps failing for a thread-specific reason is abandoned after repeated attempts (default 5) and marked `agent/attempted`, so one poison thread can't be retried forever — it stays findable under that label. The per-cycle summary reports abandonments distinctly: `Processed N/M threads (K of them abandoned after repeated failures: [...])`.
+- **MLX graceful degradation**: If the local MLX server is unreachable, person emails are skipped (retried next cycle) while service emails continue to be classified via the cloud LLM. Because the local machine is expected to be offline for stretches, an outage is treated as routine: one summary line per cycle (`Local LLM offline — deferred N person email thread(s) this cycle`), not a warning per email.
 - **Safe defaults**: Unrecognizable sender type → SERVICE (safe). Unrecognizable classification → LOW_PRIORITY (archived, not deleted).
 - **Startup validation**: The daemon verifies all required Gmail labels exist before entering the poll loop.
 
