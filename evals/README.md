@@ -74,7 +74,16 @@ uv run python -m evals.review --stage 2
 
 # Only review unreviewed threads
 uv run python -m evals.review --unreviewed-only
+
+# Where does the set stand? Composition dashboard (read-only, no TUI):
+# total / excluded / pending counts plus a sender × label crosstab of the
+# reviewed & unexcluded threads — the set run_eval actually scores.
+uv run python -m evals.review --stats
 ```
+
+Use `--stats` to steer curation: the crosstab makes thin cells (e.g. few
+`person`/`needs_response` threads) obvious, so you can target harvesting and
+reviewing at the gaps instead of guessing.
 
 ## 3. Run — Replay golden set through the classifier
 

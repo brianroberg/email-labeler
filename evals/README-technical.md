@@ -28,6 +28,7 @@ Harvest always appends to `--output`, deduplicating by thread ID. There is no ov
 | `--unreviewed-only` | Show only threads not yet reviewed |
 | `--filter-label` | Show only threads with this label |
 | `--start-at` | Start at thread index (0-based) |
+| `--stats` | Print a composition summary and exit (read-only, no TUI): total / excluded / unreviewed-pending / reviewed-&-unexcluded counts, plus a sender × label crosstab of the reviewed-&-unexcluded set (what `run_eval` scores) |
 
 Review hotkeys: `p`/`s` sender (person/service); `r`/`f`/`l` label (needs_response/fyi/low_priority); `n` notes; `z` undo; `k` skip; `e` exclude; `q` quit. **Skip** (`k`) leaves the thread unreviewed so it reappears later. **Exclude** (`e`) sets `excluded=True` (also marks reviewed): excluded threads are dropped from the review queue here and from `run_eval` entirely. In the `--edit` TUI detail view, `e` is a symmetric **toggle** (exclude an included thread / un-exclude an excluded one; `reviewed` is left untouched). The `excluded` field is persisted in the golden set JSONL; legacy records using the old `skipped` key are still read as excluded.
 
