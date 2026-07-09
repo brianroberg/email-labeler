@@ -15,7 +15,6 @@ from evals.newsletter_report import (
     compute_all_metrics,
     compute_dimension_exact_match,
     compute_dimension_mae,
-    compute_dimension_within1,
     compute_extraction_metrics,
     compute_multilabel_metrics,
     compute_tier_metrics,
@@ -75,10 +74,10 @@ def _pred(
         thread_id="t",
         expected_scores=expected_scores,
         expected_tier=expected_tier,
-        expected_themes=expected_themes or [],
+        expected_themes=expected_themes or {},
         predicted_scores=predicted_scores,
         predicted_tier=predicted_tier,
-        predicted_themes=predicted_themes or [],
+        predicted_themes=predicted_themes or {},
         error=error,
     )
 
@@ -149,9 +148,9 @@ class TestMatchStories:
 class TestTierMetrics:
     def test_confusion_and_prf(self):
         results = [
-            _pred(predicted_scores={"simple": 5}, expected_tier="excellent",
+            _pred(predicted_scores={"simple": 3}, expected_tier="excellent",
                   predicted_tier="excellent"),
-            _pred(predicted_scores={"simple": 4}, expected_tier="excellent",
+            _pred(predicted_scores={"simple": 2}, expected_tier="excellent",
                   predicted_tier="good"),  # off-diagonal
             _pred(predicted_scores={"simple": 3}, expected_tier="good",
                   predicted_tier="good"),
@@ -180,7 +179,7 @@ class TestTierMetrics:
         failed = _pred(predicted_scores=None, expected_tier="good", predicted_tier="good")
         failed.scores_raw = "garbage the parser rejected"
         results = [
-            _pred(predicted_scores={"simple": 5}, expected_tier="excellent",
+            _pred(predicted_scores={"simple": 3}, expected_tier="excellent",
                   predicted_tier="excellent"),
             failed,
         ]
@@ -198,24 +197,25 @@ class TestTierMetrics:
 
 
 class TestDimensionMetrics:
-    def test_mae_and_exact_and_within1(self):
+    def test_mae_and_exact(self):
+        # 1-3 (Poor/OK/Good) scores; within-1 was dropped (#53) as degenerate.
         results = [
             _pred(
-                expected_scores={"simple": 5, "concrete": 3, "personal": 4, "dynamic": 2},
-                predicted_scores={"simple": 5, "concrete": 1, "personal": 5, "dynamic": 2},
+                expected_scores={"simple": 3, "concrete": 2, "personal": 3, "dynamic": 1},
+                predicted_scores={"simple": 3, "concrete": 1, "personal": 1, "dynamic": 1},
             ),
             _pred(
-                expected_scores={"simple": 2, "concrete": 2, "personal": 2, "dynamic": 2},
-                predicted_scores={"simple": 4, "concrete": 2, "personal": 2, "dynamic": 2},
+                expected_scores={"simple": 1, "concrete": 2, "personal": 2, "dynamic": 2},
+                predicted_scores={"simple": 3, "concrete": 2, "personal": 2, "dynamic": 2},
             ),
         ]
         mae = compute_dimension_mae(results)
-        # simple: |5-5|=0, |2-4|=2 -> mean 1.0
+        # simple: |3-3|=0, |1-3|=2 -> mean 1.0
         assert abs(mae["simple"] - 1.0) < 1e-9
-        # concrete: |3-1|=2, |2-2|=0 -> mean 1.0
-        assert abs(mae["concrete"] - 1.0) < 1e-9
-        # personal: |4-5|=1, |2-2|=0 -> mean 0.5
-        assert abs(mae["personal"] - 0.5) < 1e-9
+        # concrete: |2-1|=1, |2-2|=0 -> mean 0.5
+        assert abs(mae["concrete"] - 0.5) < 1e-9
+        # personal: |3-1|=2, |2-2|=0 -> mean 1.0
+        assert abs(mae["personal"] - 1.0) < 1e-9
         # dynamic: 0, 0 -> 0.0
         assert abs(mae["dynamic"] - 0.0) < 1e-9
 
@@ -227,17 +227,11 @@ class TestDimensionMetrics:
         # concrete: row1 wrong, row2 exact -> 1/2
         assert abs(exact["concrete"] - 0.5) < 1e-9
 
-        within1 = compute_dimension_within1(results)
-        # personal: diff 1 and 0 both within 1 -> 1.0
-        assert abs(within1["personal"] - 1.0) < 1e-9
-        # simple: diff 0 (within) and 2 (not) -> 1/2
-        assert abs(within1["simple"] - 0.5) < 1e-9
-
     def test_only_over_stories_with_both_scores(self):
         results = [
             _pred(
-                expected_scores={"simple": 4, "concrete": 4, "personal": 4, "dynamic": 4},
-                predicted_scores={"simple": 4, "concrete": 4, "personal": 4, "dynamic": 4},
+                expected_scores={"simple": 2, "concrete": 2, "personal": 2, "dynamic": 2},
+                predicted_scores={"simple": 2, "concrete": 2, "personal": 2, "dynamic": 2},
             ),
             # parse failure -> excluded entirely
             _pred(expected_scores={"simple": 1}, predicted_scores=None),
@@ -253,49 +247,58 @@ class TestDimensionMetrics:
 
 
 class TestMultilabelThemeMetrics:
+    # The default (PRIMARY) metric is positive=emphasized — what earns a Gmail
+    # label (issue #53 / A′). "detection" (>=Present) is the secondary metric.
     def test_per_theme_micro_macro_and_exact_set(self):
-        # Story 1: expected {scripture, church}, predicted {scripture}
+        # Story 1: expected {scripture, church} emphasized, predicted {scripture}
         #   scripture: TP; church: FN
         # Story 2: expected {christlikeness}, predicted {christlikeness, church}
         #   christlikeness: TP; church: FP
         results = [
-            _pred(expected_themes=["scripture", "church"], predicted_themes=["scripture"],
+            _pred(expected_themes={"scripture": "emphasized", "church": "emphasized"},
+                  predicted_themes={"scripture": "emphasized"},
                   predicted_scores={"simple": 3}),
-            _pred(expected_themes=["christlikeness"],
-                  predicted_themes=["christlikeness", "church"],
+            _pred(expected_themes={"christlikeness": "emphasized"},
+                  predicted_themes={"christlikeness": "emphasized", "church": "emphasized"},
                   predicted_scores={"simple": 3}),
         ]
         m = compute_multilabel_metrics(results, THEMES)
 
-        # scripture: TP=1, FP=0, FN=0 -> P=R=F1=1
         assert m["per_theme"]["scripture"]["f1"] == 1.0
-        # church: TP=0, FP=1, FN=1 -> P=0, R=0, F1=0
         assert m["per_theme"]["church"]["precision"] == 0.0
         assert m["per_theme"]["church"]["recall"] == 0.0
-        # christlikeness: TP=1 -> F1=1
         assert m["per_theme"]["christlikeness"]["f1"] == 1.0
-
-        # Micro: TP=2, FP=1, FN=1 -> P=2/3, R=2/3, F1=2/3
+        # Micro: TP=2, FP=1, FN=1 -> F1=2/3
         assert abs(m["micro_f1"] - (2 / 3)) < 1e-9
-
-        # Macro F1: mean over 5 themes.
-        # scripture=1, christlikeness=1, church=0, vocation_family=0(no support->0),
-        # disciple_making=0 -> (1+1+0+0+0)/5 = 0.4
+        # Macro F1: (1+1+0+0+0)/5 = 0.4
         assert abs(m["macro_f1"] - 0.4) < 1e-9
-
-        # Exact set match: neither story matches exactly -> 0/2
         assert m["exact_set_match"] == 0.0
 
     def test_exact_set_match_positive(self):
         results = [
-            _pred(expected_themes=["scripture"], predicted_themes=["scripture"],
+            _pred(expected_themes={"scripture": "emphasized"},
+                  predicted_themes={"scripture": "emphasized"},
                   predicted_scores={"simple": 3}),
-            _pred(expected_themes=["church", "scripture"],
-                  predicted_themes=["scripture", "church"],  # order-insensitive
+            _pred(expected_themes={"church": "emphasized", "scripture": "emphasized"},
+                  predicted_themes={"scripture": "emphasized", "church": "emphasized"},
                   predicted_scores={"simple": 3}),
         ]
         m = compute_multilabel_metrics(results, THEMES)
         assert m["exact_set_match"] == 1.0
+
+    def test_emphasized_vs_detection_positive(self):
+        # Golden PRESENT, predicted EMPHASIZED: an over-grade.
+        results = [
+            _pred(expected_themes={"scripture": "present"},
+                  predicted_themes={"scripture": "emphasized"},
+                  predicted_scores={"simple": 3}),
+        ]
+        # Emphasized (primary): expected is not emphasized -> a false positive.
+        emph = compute_multilabel_metrics(results, THEMES, positive="emphasized")
+        assert emph["per_theme"]["scripture"]["precision"] == 0.0
+        # Detection (secondary): both are >=Present -> a true positive.
+        det = compute_multilabel_metrics(results, THEMES, positive="detection")
+        assert det["per_theme"]["scripture"]["f1"] == 1.0
 
 
 
@@ -445,11 +448,12 @@ class TestThemeMetricsGating:
         # Story with malformed quality response (predicted_scores None) but a
         # perfectly parsed theme prediction must still count in theme metrics.
         results = [
-            _pred(story_id="ok", expected_themes=["church"], predicted_themes=["church"],
+            _pred(story_id="ok", expected_themes={"church": "emphasized"},
+                  predicted_themes={"church": "emphasized"},
                   predicted_scores={"simple": 3}),
         ]
-        failed = _pred(story_id="priya", expected_themes=["christlikeness"],
-                       predicted_themes=[], predicted_scores=None)
+        failed = _pred(story_id="priya", expected_themes={"christlikeness": "emphasized"},
+                       predicted_themes={}, predicted_scores=None)
         failed.themes_raw = "NONE"
         results.append(failed)
         m = compute_multilabel_metrics(results, THEMES)
@@ -458,7 +462,7 @@ class TestThemeMetricsGating:
         assert m["per_theme"]["christlikeness"]["recall"] == 0.0
 
     def test_error_rows_still_excluded(self):
-        errored = _pred(story_id="down", expected_themes=["church"],
+        errored = _pred(story_id="down", expected_themes={"church": "emphasized"},
                         error="connection refused")
         m = compute_multilabel_metrics([errored], THEMES)
         assert m["count"] == 0
@@ -491,7 +495,7 @@ class TestTierQualityNotAttempted:
         # scores_raw=None. Those rows are "quality not attempted", not parse
         # failures — the tier section must not render as "0 stories, N errors".
         row = _pred(story_id="t:0", expected_tier="good",
-                    expected_themes=["church"], predicted_themes=["church"])
+                    expected_themes={"church": "emphasized"}, predicted_themes={"church": "emphasized"})
         row.themes_raw = "CHURCH"
         m = compute_tier_metrics([row])
         assert m["errors"] == 0
@@ -512,7 +516,7 @@ class TestTierQualityNotAttempted:
         # In a --mode themes run the quality call is never in play, so a theme
         # call's network error must not render a misleading tier section
         # ("0 stories, 1 error"). The run's mode comes from RunMeta.
-        errored = _pred(story_id="down", expected_themes=["church"],
+        errored = _pred(story_id="down", expected_themes={"church": "emphasized"},
                         error="connection refused")
         path = tmp_path / "themes_run.jsonl"
         _write_results(path, _meta(mode="themes"), [errored])
@@ -524,8 +528,8 @@ class TestTierQualityNotAttempted:
         assert "Tier Classification" not in out
 
     def test_verbose_failures_section_excludes_not_attempted(self, capsys):
-        row = _pred(story_id="t:0", expected_themes=["church"],
-                    predicted_themes=["church"])
+        row = _pred(story_id="t:0", expected_themes={"church": "emphasized"},
+                    predicted_themes={"church": "emphasized"})
         row.themes_raw = "CHURCH"
         metrics = compute_all_metrics([row])
         print_report(_meta(mode="themes"), metrics, verbose=True, story_results=[row])
@@ -535,20 +539,28 @@ class TestTierQualityNotAttempted:
 
 class TestThemeParseAnomalies:
     def test_invalid_token_and_empty_parse_detected(self):
-        marcus = _pred(story_id="g:0", predicted_themes=["church"],
+        # Graded NAME: GRADE format (issue #53).
+        marcus = _pred(story_id="g:0", predicted_themes={"church": "emphasized"},
                        predicted_scores={"simple": 3})
-        marcus.themes_raw = "FELLOWSHIP\nCHURCH"
-        alina = _pred(story_id="g:1", predicted_themes=[],
+        marcus.themes_raw = "FELLOWSHIP: PRESENT\nCHURCH: EMPHASIZED"
+        alina = _pred(story_id="g:1", predicted_themes={},
                       predicted_scores={"simple": 3})
         alina.themes_raw = "The themes of hope and belonging shine through this piece."
-        clean_none = _pred(story_id="g:2", predicted_themes=[],
+        clean_none = _pred(story_id="g:2", predicted_themes={},
                            predicted_scores={"simple": 3})
         clean_none.themes_raw = "NONE"
-        clean = _pred(story_id="g:3", predicted_themes=["scripture"],
+        clean = _pred(story_id="g:3", predicted_themes={"scripture": "present"},
                       predicted_scores={"simple": 3})
-        clean.themes_raw = "SCRIPTURE"
-        anomalies = theme_parse_anomalies([marcus, alina, clean_none, clean])
+        clean.themes_raw = "SCRIPTURE: PRESENT"
+        all_absent = _pred(story_id="g:4", predicted_themes={},
+                           predicted_scores={"simple": 3})
+        all_absent.themes_raw = (
+            "SCRIPTURE: ABSENT\nCHRISTLIKENESS: ABSENT\nCHURCH: ABSENT\n"
+            "VOCATION_FAMILY: ABSENT\nDISCIPLE_MAKING: ABSENT"
+        )
+        anomalies = theme_parse_anomalies([marcus, alina, clean_none, clean, all_absent])
         by_id = {a["story_id"]: a for a in anomalies}
+        # g:2 (NONE), g:3 (valid), g:4 (all-ABSENT = valid empty) are NOT anomalies.
         assert set(by_id) == {"g:0", "g:1"}
         assert by_id["g:0"]["kind"] == "invalid_tokens"
         assert by_id["g:0"]["invalid_tokens"] == ["FELLOWSHIP"]
@@ -557,8 +569,30 @@ class TestThemeParseAnomalies:
 
     def test_rows_without_raw_are_skipped(self):
         # Legacy rows / error rows carry no themes_raw -> no anomaly.
-        anomalies = theme_parse_anomalies([_pred(story_id="x", predicted_themes=[])])
+        anomalies = theme_parse_anomalies([_pred(story_id="x", predicted_themes={})])
         assert anomalies == []
+
+    def test_near_miss_line_flagged(self):
+        # A near-miss line (misspelled grade) parse_themes silently drops must
+        # surface even though the response otherwise parsed — else a systematic
+        # parser gap reads as a genuine model miss (Finding 3).
+        row = _pred(story_id="n:0", predicted_themes={"scripture": "present"},
+                    predicted_scores={"simple": 3})
+        row.themes_raw = "SCRIPTURE: PRESENT\nCHURCH: EMPHASISED"
+        anomalies = theme_parse_anomalies([row])
+        assert len(anomalies) == 1
+        assert anomalies[0]["story_id"] == "n:0"
+        assert anomalies[0]["kind"] == "near_miss"
+        assert "CHURCH: EMPHASISED" in anomalies[0]["near_miss_lines"]
+
+    def test_bulleted_valid_response_is_not_flagged(self):
+        # Coherence with Finding 1: once parse_themes tolerates bullets, a bulleted
+        # VALID response must not be an anomaly.
+        row = _pred(story_id="b:0",
+                    predicted_themes={"scripture": "present", "church": "emphasized"},
+                    predicted_scores={"simple": 3})
+        row.themes_raw = "- SCRIPTURE: PRESENT\n- CHURCH: EMPHASIZED"
+        assert theme_parse_anomalies([row]) == []
 
 
 class TestThemeListSingleSource:
@@ -638,7 +672,7 @@ class TestPrintReportSections:
         assert "storys" not in out
 
     def test_theme_anomaly_count_shown(self, capsys):
-        row = _pred(story_id="g:0", predicted_themes=["church"],
+        row = _pred(story_id="g:0", predicted_themes={"church": "emphasized"},
                     predicted_scores={"simple": 3})
         row.themes_raw = "FELLOWSHIP\nCHURCH"
         metrics = compute_all_metrics([row])
@@ -722,7 +756,7 @@ class TestPrintReportVerbose:
         # Quality parse failed but themes parsed fine and disagree -> the story
         # must still appear in Story Disagreements.
         failed = _pred(story_id="g:2", predicted_scores=None,
-                       expected_themes=["christlikeness"], predicted_themes=[])
+                       expected_themes={"christlikeness": "emphasized"}, predicted_themes={})
         failed.themes_raw = "NONE"
         metrics = compute_all_metrics([failed])
         print_report(_meta(), metrics, verbose=True, story_results=[failed])
@@ -731,8 +765,25 @@ class TestPrintReportVerbose:
         assert "g:2" in section
         assert "christlikeness" in section
 
+    def test_verbose_disagreements_show_grade_only_theme_mismatch(self, capsys):
+        # Same theme KEY, different grade (present vs emphasized): an FP/FN in the
+        # primary Emphasized metric. Key-set equality hides it, so the story must
+        # still be listed under Story Disagreements with grade-aware detail.
+        row = _pred(story_id="g:5", predicted_scores={"simple": 3},
+                    expected_tier="good", predicted_tier="good",
+                    expected_themes={"scripture": "present"},
+                    predicted_themes={"scripture": "emphasized"})
+        metrics = compute_all_metrics([row])
+        print_report(_meta(), metrics, verbose=True, story_results=[row])
+        out = capsys.readouterr().out
+        section = out.split("Story Disagreements")[1]
+        assert "g:5" in section
+        assert "scripture" in section
+        assert "present" in section
+        assert "emphasized" in section
+
     def test_verbose_shows_theme_anomaly_raw(self, capsys):
-        row = _pred(story_id="g:1", predicted_themes=[],
+        row = _pred(story_id="g:1", predicted_themes={},
                     predicted_scores={"simple": 3})
         row.themes_raw = "The themes of hope and belonging shine through."
         metrics = compute_all_metrics([row])
@@ -775,11 +826,11 @@ class TestDimTableAlignment:
     def test_data_rows_align_with_header(self):
         mae = {d: 0.5 for d in ["simple", "concrete", "personal", "dynamic"]}
         exact = {d: 0.5 for d in mae}
-        within = {d: 1.0 for d in mae}
-        lines = _format_dim_table(mae, exact, within).splitlines()
+        lines = _format_dim_table(mae, exact).splitlines()
         header, first_row = lines[0], lines[2]
         # The MAE column must start at the same offset in header and data rows.
         assert first_row.index("0.50") == header.index("MAE")
+        assert "Within-1" not in header
 
 
 class TestPrintComparisonModes:
@@ -787,7 +838,7 @@ class TestPrintComparisonModes:
         results = [
             _pred(story_id="s", predicted_scores={"simple": 3},
                   expected_tier="good", predicted_tier="good",
-                  expected_themes=["church"], predicted_themes=["church"]),
+                  expected_themes={"church": "emphasized"}, predicted_themes={"church": "emphasized"}),
         ]
         return compute_all_metrics(results)
 
@@ -835,18 +886,36 @@ class TestPrintComparisonModes:
         good_row = next(ln for ln in out.splitlines() if "good F1" in ln)
         assert "N/A" in good_row
 
+    def test_themes_section_shows_detection_f1_rows(self, capsys):
+        # print_report shows a detection (>=Present) line for each single run;
+        # compare mode must too, or a detection-level regression between runs is
+        # invisible. Build a run where detection F1 (100%) differs from the
+        # Emphasized F1 (0%) so the detection rows are distinguishable.
+        row = _pred(story_id="s", predicted_scores={"simple": 3},
+                    expected_themes={"scripture": "present"},
+                    predicted_themes={"scripture": "present"})
+        m = compute_all_metrics([row])
+        print_comparison(_meta(mode="all"), m, _meta(mode="all"), m)
+        out = capsys.readouterr().out
+        themes_section = out.split("--- Themes ---")[1].split("--- Extraction ---")[0]
+        assert "Detection" in themes_section
+        # Detection micro-F1 = 100% (scripture Present in both), while the
+        # Emphasized micro-F1 above it is 0%.
+        assert "100.0%" in themes_section
+
 
 class TestVerboseCompareThemesMode:
     def test_theme_flip_shown_when_quality_never_ran(self, capsys):
         # --mode themes rows never have predicted_scores; a theme flip between
         # runs must still be listed (not "None!") under Per-story Flips.
-        def row(themes):
-            r = _pred(story_id="s", expected_themes=["church"],
+        def row(themes):  # themes: {name: grade}
+            r = _pred(story_id="s", expected_themes={"church": "emphasized"},
                       predicted_themes=themes)
-            r.themes_raw = "\n".join(t.upper() for t in themes) or "NONE"
+            r.themes_raw = "\n".join(f"{t.upper()}: EMPHASIZED" for t in themes) or "NONE"
             return r
 
-        story1, story2 = [row(["church"])], [row(["scripture"])]
+        story1 = [row({"church": "emphasized"})]
+        story2 = [row({"scripture": "emphasized"})]
         m1 = compute_all_metrics(story1)
         m2 = compute_all_metrics(story2)
         print_comparison(_meta(mode="themes"), m1, _meta(mode="themes"), m2,
@@ -856,12 +925,34 @@ class TestVerboseCompareThemesMode:
         assert "None!" not in flips
         assert "church" in flips and "scripture" in flips
 
+    def test_grade_only_theme_flip_shown(self, capsys):
+        # Same theme KEY, grade changed present->emphasized between runs. Key-set
+        # equality hides the flip even though it moves the Emphasized F1 shown in
+        # the table; it must be listed with grade-aware detail (not "None!").
+        def row(grade):
+            r = _pred(story_id="s", expected_themes={"scripture": "present"},
+                      predicted_themes={"scripture": grade})
+            r.themes_raw = f"SCRIPTURE: {grade.upper()}"
+            return r
+
+        story1 = [row("present")]
+        story2 = [row("emphasized")]
+        m1 = compute_all_metrics(story1)
+        m2 = compute_all_metrics(story2)
+        print_comparison(_meta(mode="themes"), m1, _meta(mode="themes"), m2,
+                         verbose=True, story1=story1, story2=story2)
+        out = capsys.readouterr().out
+        flips = out.split("Per-story Flips")[1]
+        assert "None!" not in flips
+        assert "scripture" in flips
+        assert "present" in flips and "emphasized" in flips
+
 
 class TestTrendRows:
     def _write_two_runs(self, tmp_path):
         story = _pred(story_id="s", predicted_scores={"simple": 3},
                       expected_tier="good", predicted_tier="good",
-                      predicted_themes=["church"], expected_themes=["church"])
+                      predicted_themes={"church": "emphasized"}, expected_themes={"church": "emphasized"})
         # File names sort in the OPPOSITE order of their timestamps, so
         # chronological ordering must come from run_meta.timestamp.
         _write_results(
@@ -899,7 +990,8 @@ class TestJsonOutput:
     def _story_and_extraction(self):
         story = _pred(story_id="s", predicted_scores={"simple": 3},
                       expected_tier="good", predicted_tier="good",
-                      expected_themes=["church"], predicted_themes=["church"])
+                      expected_themes={"church": "emphasized"},
+                      predicted_themes={"church": "emphasized"})
         extraction = ExtractionPrediction(
             thread_id="A",
             golden_stories=[{"story_id": "A:0", "text": "alpha faith"}],
@@ -915,8 +1007,9 @@ class TestJsonOutput:
         assert set(data) == {"meta", "metrics"}
         assert data["meta"]["run_id"] == "abcdef0123456789"
         for key in ("story_count", "tier", "dimension_mae", "dimension_exact",
-                    "dimension_within1", "themes", "theme_anomalies", "extraction"):
+                    "themes", "themes_detection", "theme_anomalies", "extraction"):
             assert key in data["metrics"]
+        assert "dimension_within1" not in data["metrics"]  # dropped (#53)
         assert data["metrics"]["tier"]["accuracy"] == 1.0
         assert data["metrics"]["extraction"]["micro_f1"] == 1.0
 
@@ -964,7 +1057,7 @@ class TestCliJsonAndErrors:
     def _write_run(self, path, **meta_kwargs):
         story = _pred(story_id="s", predicted_scores={"simple": 3},
                       expected_tier="good", predicted_tier="good",
-                      predicted_themes=["church"], expected_themes=["church"])
+                      predicted_themes={"church": "emphasized"}, expected_themes={"church": "emphasized"})
         _write_results(path, _meta(**meta_kwargs), [story])
 
     def test_compare_format_json_emits_json(self, tmp_path, monkeypatch, capsys):
@@ -1101,10 +1194,11 @@ class TestComparisonDeltaSign:
     def test_compute_all_metrics_bundles_sections(self):
         results = [
             _pred(
-                expected_scores={"simple": 5, "concrete": 5, "personal": 5, "dynamic": 5},
-                predicted_scores={"simple": 5, "concrete": 5, "personal": 5, "dynamic": 5},
+                expected_scores={"simple": 3, "concrete": 3, "personal": 3, "dynamic": 3},
+                predicted_scores={"simple": 3, "concrete": 3, "personal": 3, "dynamic": 3},
                 expected_tier="excellent", predicted_tier="excellent",
-                expected_themes=["scripture"], predicted_themes=["scripture"],
+                expected_themes={"scripture": "emphasized"},
+                predicted_themes={"scripture": "emphasized"},
             ),
         ]
         extraction = [

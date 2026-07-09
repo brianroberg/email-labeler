@@ -376,7 +376,7 @@ class TestNewsletterApplyLabels:
         await newsletter_label_manager.apply_newsletter_classification(
             message_ids=["msg_001"],
             tier=NewsletterTier.EXCELLENT,
-            themes=["scripture", "christlikeness"],
+            themes={"scripture": "emphasized", "christlikeness": "present"},
         )
 
         mock_proxy.modify_message.assert_called_once()
@@ -385,9 +385,28 @@ class TestNewsletterApplyLabels:
         assert "Label_4" in add_ids  # processed
         assert "Label_10" in add_ids  # newsletter marker
         assert "Label_11" in add_ids  # excellent
-        assert "Label_20" in add_ids  # theme/scripture
-        assert "Label_21" in add_ids  # theme/christlikeness
+        assert "Label_20" in add_ids  # theme/scripture (emphasized -> labeled)
+        # christlikeness is only "present", not "emphasized" — issue #53 applies the
+        # Gmail theme label ONLY for emphasized themes.
+        assert "Label_21" not in add_ids
         assert "INBOX" in call_kwargs["remove_label_ids"]
+
+    async def test_present_theme_not_labeled(
+        self, newsletter_label_manager, mock_proxy, all_labels_with_newsletter
+    ):
+        mock_proxy.list_labels.return_value = all_labels_with_newsletter
+        await newsletter_label_manager.verify_labels()
+        mock_proxy.modify_message.return_value = {"id": "msg_001"}
+
+        await newsletter_label_manager.apply_newsletter_classification(
+            message_ids=["msg_001"],
+            tier=NewsletterTier.GOOD,
+            themes={"scripture": "present", "church": "present"},
+        )
+
+        add_ids = mock_proxy.modify_message.call_args.kwargs["add_label_ids"]
+        assert "Label_20" not in add_ids  # theme/scripture not emphasized
+        assert "Label_22" not in add_ids  # theme/church not emphasized
 
     async def test_apply_newsletter_no_stories(
         self, newsletter_label_manager, mock_proxy, all_labels_with_newsletter
@@ -399,7 +418,7 @@ class TestNewsletterApplyLabels:
         await newsletter_label_manager.apply_newsletter_classification(
             message_ids=["msg_001"],
             tier=None,
-            themes=[],
+            themes={},
         )
 
         call_kwargs = mock_proxy.modify_message.call_args.kwargs
@@ -419,6 +438,6 @@ class TestNewsletterApplyLabels:
         await newsletter_label_manager.apply_newsletter_classification(
             message_ids=["msg_001", "msg_002"],
             tier=NewsletterTier.GOOD,
-            themes=["church"],
+            themes={"church": "emphasized"},
         )
         assert mock_proxy.modify_message.call_count == 2

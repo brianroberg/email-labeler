@@ -181,14 +181,16 @@ class LabelManager:
         self,
         message_ids: list[str],
         tier: NewsletterTier | None,
-        themes: list[str],
+        themes: dict[str, str],
     ) -> None:
         """Apply newsletter classification labels to message(s).
 
         Args:
             message_ids: Message IDs to label.
             tier: Quality tier of the best story, or None for no-stories.
-            themes: List of theme keys (e.g. ["scripture", "church"]).
+            themes: Graded themes (theme key -> "present"/"emphasized"). Only
+                *emphasized* themes get a Gmail label (issue #53); merely-present
+                themes are recorded in the assessment JSONL but not labeled.
         """
         nl_labels = self.config["newsletter"]["labels"]
         processed_name = self.labels_config["processed"]
@@ -204,7 +206,9 @@ class LabelManager:
         else:
             add_label_ids.append(self.label_ids[nl_labels["no_stories"]])
 
-        for theme in themes:
+        for theme, grade in themes.items():
+            if grade != "emphasized":
+                continue
             theme_name = nl_labels["themes"].get(theme)
             if theme_name and theme_name in self.label_ids:
                 add_label_ids.append(self.label_ids[theme_name])

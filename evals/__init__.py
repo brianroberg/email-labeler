@@ -1,8 +1,35 @@
 """Classification evaluation suite for the email labeler."""
 
+import json
+import os
+import tempfile
+from pathlib import Path
+
 import httpx
 
 from proxy_client import ProxyAuthError, ProxyError, ProxyForbiddenError
+
+
+def atomic_write_jsonl(records, path) -> None:
+    """Write *records* to *path* as JSONL atomically (temp file + rename).
+
+    Each record must expose ``.to_dict()``. The temp file lives in the target's
+    directory so the rename is atomic on the same filesystem; on any error the
+    temp file is cleaned up and the original *path* is left untouched. Shared by
+    the golden-set editors (issue #50)."""
+    path = Path(path)
+    fd, tmp_path = tempfile.mkstemp(dir=path.parent, suffix=".jsonl.tmp")
+    try:
+        with os.fdopen(fd, "w") as f:
+            for record in records:
+                f.write(json.dumps(record.to_dict()) + "\n")
+        os.rename(tmp_path, path)
+    except BaseException:
+        try:
+            os.unlink(tmp_path)
+        except OSError:
+            pass
+        raise
 
 
 def plural(n: int, singular: str, plural_form: str | None = None) -> str:

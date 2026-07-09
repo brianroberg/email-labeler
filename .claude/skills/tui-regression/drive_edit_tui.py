@@ -103,13 +103,20 @@ async def s_unexclude(chk):
         chk.that(path.exists(), "unexclude saved")
 
 
-async def s_unexclude_noop_on_included(chk):
+async def s_exclude_toggle_on_included(chk):
+    # Issue #52: `e` is now a symmetric toggle — on an INCLUDED thread it excludes.
     ths = [t for t in _threads() if t.thread_id == "th-person-fyi"]
     app, path = _app(ths)
     async with app.run_test(size=SIZE) as pilot:
-        await pilot.press("enter", "e")     # e on a non-excluded thread: no-op
+        await pilot.press("enter")
+        chk.that(not ths[0].excluded, "starts included")
+        await pilot.press("e")
         await pilot.pause()
-        chk.that(not path.exists(), "e is a no-op (no save) when not excluded")
+        chk.that(ths[0].excluded, "e excludes an included thread")
+        chk.that(path.exists(), "exclude saved")
+        await pilot.press("e")              # toggle back
+        await pilot.pause()
+        chk.that(not ths[0].excluded, "second e un-excludes")
 
 
 async def s_scroll_detail(chk):
@@ -218,7 +225,7 @@ def scenarios():
         ("edit_label_and_collision", s_edit_label_and_collision),
         ("sender_cancel_no_save", s_sender_cancel_no_save),
         ("unexclude", s_unexclude),
-        ("unexclude_noop_on_included", s_unexclude_noop_on_included),
+        ("exclude_toggle_on_included", s_exclude_toggle_on_included),
         ("scroll_detail", s_scroll_detail),
         ("detail_renders_multimsg_and_notes", s_detail_renders_multimsg_and_notes),
         ("edit_to_person_and_fyi", s_edit_to_person_and_fyi),

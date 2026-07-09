@@ -117,16 +117,22 @@ so a schema break shows up here too.
 
 ## Coverage today
 
-62 scenarios across the four drivers (newsletter_label 16, review 18, edit_tui
-13, newsletter_review 15) exercise every binding/action in each module — browse
+69 scenarios across the four drivers (newsletter_label 16, review 18, edit_tui
+13, newsletter_review 22) exercise every binding/action in each module — browse
 + span sub-mode (with **exact committed-slice** assertions), blind + stage
-variants, the full filter matrix, every modal, Esc/cancel/decline/guard branches,
-undo (incl. empty-stack and undo-after-skip/exclude), scroll (asserting the
-offset, not just liveness), quit paths, and the auto-repeat/last-item guards —
-and each diverse data state is actually **opened and its rendered content
+variants, the full filter matrix (incl. the newsletter_review **date filter** —
+past-N-days window, since-prompt boundary, CANCEL-vs-clear, and the
+`--since`/`init_since` pre-filter), every modal, Esc/cancel/decline/guard
+branches, undo (incl. empty-stack and undo-after-skip/exclude), scroll (asserting
+the offset, not just liveness), quit paths, and the auto-repeat/last-item guards
+— and each diverse data state is actually **opened and its rendered content
 asserted** (emoji/CJK, CRLF, no-stories, multi-message, notes, reviewed, multi-
-story). When you add a binding or a workflow branch, add a scenario here in the
-same change and re-run `run_all.py`.
+story), including the send-date column's **LOCAL-timezone rendering** (an
+evening-UTC send shown on its prior local day) with newest-first sort/no-date-last
+ordering, and the `load_assessments` **old-scheme guard** (a list-valued
+`themes` rejected with a located `path:lineno` error). When you add a binding or
+a workflow branch, add a scenario here in the same change and re-run
+`run_all.py`.
 
 The harness was itself built adversarially: an automated coverage critic flagged
 every unopened data state and every liveness-only (`is_running`) assertion, and

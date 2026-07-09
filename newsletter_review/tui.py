@@ -6,6 +6,7 @@ including per-story quality scores, themes, and chain-of-thought reasoning.
 
 import json
 import textwrap
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from textual.app import App, ComposeResult
@@ -14,12 +15,23 @@ from textual.containers import VerticalScroll
 from textual.screen import Screen
 from textual.widgets import Label, ListItem, ListView, Static
 
-from tui_common import CANCEL, KeyMenuScreen, PageListView, PromptLineScreen
+from newsletter import _SCORE_TOKENS
+from tui_common import (
+    CANCEL,
+    HintScreen,
+    KeyMenuScreen,
+    PageListView,
+    PromptLineScreen,
+)
+from tui_common import (
+    truncate as _truncate,
+)
 
 # ---------------------------------------------------------------------------
 # Column widths for list view
 # ---------------------------------------------------------------------------
 
+_COL_DATE = 10  # "YYYY-MM-DD"
 _COL_TIER = 10
 _COL_SENDER = 30
 _COL_STORIES = 9  # "N stories"
@@ -31,9 +43,65 @@ _COL_GAP = 2
 # ---------------------------------------------------------------------------
 
 def load_assessments(path: Path) -> list[dict]:
-    """Load newsletter assessment records from a JSONL file."""
+    """Load newsletter assessment records from a JSONL file.
+
+    Fails fast on pre-#53 old-scheme records whose story ``themes`` are stored
+    as a LIST instead of a theme->grade dict: they would otherwise crash the
+    detail view mid-render (``build_detail_lines`` calls ``themes.items()``).
+    Backward-compatible tolerant reading was deliberately removed, so raise a
+    clear, located error naming the file + line so the reader knows to
+    re-migrate rather than seeing an opaque ``AttributeError`` (Finding 4)."""
+    records = []
     with open(path) as f:
-        return [json.loads(line) for line in f if line.strip()]
+        for lineno, line in enumerate(f, 1):
+            if not line.strip():
+                continue
+            record = json.loads(line)
+            for story in record.get("stories", []):
+                if isinstance(story.get("themes"), list):
+                    raise ValueError(
+                        f"{path}:{lineno}: old-scheme record — story themes are a "
+                        f"list ({story['themes']!r}), not a theme->grade dict. This "
+                        "file predates the #53 theme-dict migration and must be "
+                        "re-migrated before it can be browsed."
+                    )
+            records.append(record)
+    return records
+
+
+def sort_by_send_date(records: list[dict]) -> list[dict]:
+    """Sort records by send-date descending (newest first); records without a
+    send-date sort last. Stable, so equal-dated records keep their input order
+    (issue #36)."""
+    return sorted(records, key=lambda r: r.get("send_date") or "", reverse=True)
+
+
+def _local_date(send_date: str | None) -> str | None:
+    """Convert a stored UTC ISO send-date to the reader's LOCAL calendar date
+    (``YYYY-MM-DD``).
+
+    Records store ``send_date`` as a UTC-normalized ISO string, so a US-evening
+    send lands on the *next* UTC day; slicing the UTC string would display and
+    filter it a day ahead of the Date header. Parse and re-localize to the
+    machine's timezone before taking the date. Returns ``None`` for a missing or
+    unparseable send-date (callers render ``—`` / drop it from the since-filter)."""
+    if not send_date:
+        return None
+    try:
+        dt = datetime.fromisoformat(send_date)
+    except ValueError:
+        return None
+    return dt.astimezone().date().isoformat()
+
+
+def _days_ago_cutoff(days: int, *, now: datetime | None = None) -> str:
+    """The "past N days" since-cutoff as a LOCAL calendar date (``YYYY-MM-DD``).
+
+    *now* defaults to the current instant; it is converted to the reader's local
+    timezone before the date arithmetic so the cutoff lines up with the
+    local-date column (same off-by-one concern as :func:`_local_date`)."""
+    base = (now or datetime.now(timezone.utc)).astimezone().date()
+    return (base - timedelta(days=days)).isoformat()
 
 
 def apply_filters(
@@ -42,6 +110,7 @@ def apply_filters(
     tier: str | None = None,
     theme: str | None = None,
     sender: str | None = None,
+    since: str | None = None,
 ) -> list[dict]:
     """Filter assessment records. All active filters are ANDed."""
     result = records
@@ -59,14 +128,29 @@ def apply_filters(
     if sender is not None:
         sender_lower = sender.lower()
         result = [r for r in result if sender_lower in r.get("from", "").lower()]
+    if since is not None:
+        # Filter on the send-date's LOCAL calendar date, inclusive; records with
+        # no/unparseable send-date can't satisfy a positive date filter, so they
+        # drop out (#36).
+        result = [r for r in result if (_local_date(r.get("send_date")) or "") >= since]
     return result
 
 
-def _truncate(text: str, width: int) -> str:
-    """Truncate text to width chars, adding ``...`` if needed."""
-    if len(text) <= width:
-        return text
-    return text[: width - 3] + "..."
+# Dimension score int (1/2/3) -> display label (issue #53); ``.get(v, v)`` is a
+# defensive fallback so an unexpected value shows raw instead of crashing. Derived
+# from newsletter._SCORE_TOKENS (POOR/OK/GOOD) so the 1/2/3 <-> label mapping has a
+# single source of truth; "OK" is an acronym and stays upper-cased while the other
+# rubric words are title-cased.
+_SCORE_LABELS = {
+    num: (tok if tok == "OK" else tok.capitalize())
+    for tok, num in _SCORE_TOKENS.items()
+}
+
+
+def _format_themes(themes: dict) -> str:
+    """Render a story's graded themes (theme -> "present"/"emphasized") for the
+    detail view as ``name (grade)`` (issue #53)."""
+    return ", ".join(f"{name} ({grade})" for name, grade in themes.items())
 
 
 def wrap_text(text: str, width: int) -> list[str]:
@@ -88,6 +172,7 @@ def format_filter_summary(
     tier: str | None = None,
     theme: str | None = None,
     sender: str | None = None,
+    since: str | None = None,
 ) -> str:
     """Build a human-readable summary of active filters."""
     parts = []
@@ -97,22 +182,32 @@ def format_filter_summary(
         parts.append(f"theme:{theme}")
     if sender is not None:
         parts.append(f"sender:{sender}")
+    if since is not None:
+        parts.append(f"since:{since}")
     return "  ".join(parts)
+
+
+def _list_date(record: dict) -> str:
+    """The send-date's LOCAL calendar date for the list column, or ``—`` if
+    absent/unparseable (#36)."""
+    return _local_date(record.get("send_date")) or "—"
 
 
 def format_list_row(record: dict, max_x: int) -> str:
     """Format one assessment record as a list-view line."""
+    date = _list_date(record)
     tier = record.get("overall_tier") or "—"
     sender = _truncate(record.get("from", "?"), _COL_SENDER)
     story_count = len(record.get("stories", []))
     stories_str = f"{story_count} stor{'y' if story_count == 1 else 'ies'}"
 
-    fixed_width = _COL_TIER + _COL_SENDER + _COL_STORIES + _COL_GAP * 3
+    fixed_width = _COL_DATE + _COL_TIER + _COL_SENDER + _COL_STORIES + _COL_GAP * 4
     subject_width = max(10, max_x - fixed_width)
     subject = _truncate(record.get("subject", ""), subject_width)
 
     return (
-        f"{tier:<{_COL_TIER}}"
+        f"{date:<{_COL_DATE}}"
+        f"  {tier:<{_COL_TIER}}"
         f"  {sender:<{_COL_SENDER}}"
         f"  {stories_str:<{_COL_STORIES}}"
         f"  {subject}"
@@ -120,18 +215,30 @@ def format_list_row(record: dict, max_x: int) -> str:
 
 
 def build_detail_lines(record: dict, width: int = 80) -> list[str]:
-    """Build content lines for the detail view. Pure function, no UI."""
+    """Build content lines for the detail view. Pure function, no UI.
+
+    The header separates email-intrinsic data (subject, sender, send-date) from
+    classification data (processed date, model, tier, stories) with a blank line,
+    so the send-date is never confused with the processed date (issue #35).
+    """
     subject = record.get("subject", "")
     sender = record.get("from", "")
-    timestamp = record.get("timestamp", "")
+    send_date = record.get("send_date") or "unknown"
+    processed = record.get("timestamp", "")
+    model = record.get("model") or "—"
     overall_tier = record.get("overall_tier") or "—"
     stories = record.get("stories", [])
 
     lines = [
+        # Email-intrinsic block
         subject,
         "=" * min(60, width),
-        f"From:    {sender}",
-        f"Date:    {timestamp}",
+        f"From: {sender}",
+        f"Sent: {send_date}",
+        "",
+        # Classification block
+        f"Processed: {processed}",
+        f"Model: {model}",
         f"Overall: {overall_tier}",
         f"Stories: {len(stories)}",
         "",
@@ -152,7 +259,7 @@ def build_detail_lines(record: dict, width: int = 80) -> list[str]:
         lines.append(f"--- Story {i + 1}/{len(stories)}: {excerpt} [{tier}, avg: {avg_str}] ---")
 
         if themes:
-            lines.append(f"Themes: {', '.join(themes)}")
+            lines.append(f"Themes: {_format_themes(themes)}")
 
         lines.append("")
 
@@ -166,7 +273,7 @@ def build_detail_lines(record: dict, width: int = 80) -> list[str]:
         # Quality scores
         scores = story.get("scores")
         if scores:
-            parts = [f"{k}={v}" for k, v in scores.items()]
+            parts = [f"{k}={_SCORE_LABELS.get(v, v)}" for k, v in scores.items()]
             lines.append(f"Quality scores: {' '.join(parts)}")
         else:
             lines.append("Quality scores: —")
@@ -193,7 +300,16 @@ def build_detail_lines(record: dict, width: int = 80) -> list[str]:
 # Filter key maps
 # ---------------------------------------------------------------------------
 
-_FILTER_TYPE_KEYS = {"t": "tier", "h": "theme", "s": "sender"}
+_FILTER_TYPE_KEYS = {"t": "tier", "h": "theme", "s": "sender", "d": "date"}
+
+# Date-filter submenu: "Past N days" values plus a free-form "since" date (#36).
+_DATE_KEYS = {
+    "3": "30",
+    "9": "90",
+    "y": "365",
+    "s": "since",
+    "x": None,  # clear
+}
 
 _TIER_KEYS = {
     "e": "excellent",
@@ -217,9 +333,10 @@ _THEME_KEYS = {
 # Filter prompts (match the curses prompt text)
 # ---------------------------------------------------------------------------
 
-_FILTER_TYPE_PROMPT = "Filter: [t]ier  [h]eme  [s]ender  (other key cancels)"
+_FILTER_TYPE_PROMPT = "Filter: [t]ier  [h]eme  [s]ender  [d]ate  (other key cancels)"
 _TIER_PROMPT = "[e]xcellent  [g]ood  [f]air  [p]oor  [c]lear  (other cancels)"
 _THEME_PROMPT = "[s]cripture [c]hristlikeness [h]urch [v]ocation_family [d]isciple_making [x]clear"
+_DATE_PROMPT = "Past [3]0 days  [9]0 days  [y]ear  [s]ince…  [x]clear  (other cancels)"
 
 
 class DetailScreen(Screen):
@@ -307,18 +424,22 @@ class ReviewApp(App):
         init_tier: str | None = None,
         init_theme: str | None = None,
         init_sender: str | None = None,
+        init_since: str | None = None,
     ) -> None:
         super().__init__()
-        self.all_records = records
-        self.filtered = records
+        # Default ordering is send-date descending, newest first (issue #36).
+        self.all_records = sort_by_send_date(records)
+        self.filtered = self.all_records
         self.f_tier = init_tier
         self.f_theme = init_theme
         self.f_sender = init_sender
+        self.f_since = init_since
 
     def compose(self) -> ComposeResult:
         yield Static(id="title", markup=False)
         hdr = (
-            f"{'Tier':<{_COL_TIER}}"
+            f"{'Date':<{_COL_DATE}}"
+            f"  {'Tier':<{_COL_TIER}}"
             f"  {'Sender':<{_COL_SENDER}}"
             f"  {'Stories':<{_COL_STORIES}}"
             f"  Subject"
@@ -339,7 +460,7 @@ class ReviewApp(App):
     def _refresh_list(self, *, reset_cursor: bool = False, width: int | None = None) -> None:
         self.filtered = apply_filters(
             self.all_records,
-            tier=self.f_tier, theme=self.f_theme, sender=self.f_sender,
+            tier=self.f_tier, theme=self.f_theme, sender=self.f_sender, since=self.f_since,
         )
         width = max(40, width if width is not None else self.size.width)
         listview = self.query_one(ListView)
@@ -353,7 +474,7 @@ class ReviewApp(App):
             listview.index = min(cursor, len(self.filtered) - 1)
 
         filter_str = format_filter_summary(
-            tier=self.f_tier, theme=self.f_theme, sender=self.f_sender,
+            tier=self.f_tier, theme=self.f_theme, sender=self.f_sender, since=self.f_since,
         )
         if filter_str:
             count = f"{len(self.filtered)}/{len(self.all_records)} records"
@@ -391,6 +512,38 @@ class ReviewApp(App):
             self.f_sender = result or None  # empty string clears the filter
             self._refresh_list(reset_cursor=True)
 
+        def on_since(result) -> None:
+            if result is None:
+                return  # Esc = cancel
+            if not result:
+                self.f_since = None  # empty clears
+                self._refresh_list(reset_cursor=True)
+                return
+            try:
+                parsed = datetime.strptime(result, "%Y-%m-%d").date()
+            except ValueError:
+                self.push_screen(HintScreen(f"Invalid date '{result}' — use YYYY-MM-DD"))
+                return
+            # Normalize to zero-padded ISO so the lexicographic send-date compare
+            # is correct even for input like "2024-2-5".
+            self.f_since = parsed.isoformat()
+            self._refresh_list(reset_cursor=True)
+
+        def on_date(result) -> None:
+            if result == CANCEL:
+                return
+            if result is None:
+                self.f_since = None  # clear
+                self._refresh_list(reset_cursor=True)
+            elif result == "since":
+                self.push_screen(
+                    PromptLineScreen("Since date  (YYYY-MM-DD, empty=clear, Esc=cancel)"),
+                    on_since,
+                )
+            else:
+                self.f_since = _days_ago_cutoff(int(result))
+                self._refresh_list(reset_cursor=True)
+
         def on_type(result) -> None:
             if result == "tier":
                 self.push_screen(KeyMenuScreen(_TIER_PROMPT, _TIER_KEYS), on_tier)
@@ -401,6 +554,8 @@ class ReviewApp(App):
                     PromptLineScreen("Sender filter  (Enter=confirm, empty=clear, Esc=cancel)"),
                     on_sender,
                 )
+            elif result == "date":
+                self.push_screen(KeyMenuScreen(_DATE_PROMPT, _DATE_KEYS), on_date)
 
         self.push_screen(KeyMenuScreen(_FILTER_TYPE_PROMPT, _FILTER_TYPE_KEYS), on_type)
 
@@ -418,11 +573,12 @@ def run_review_tui(
     init_tier: str | None = None,
     init_theme: str | None = None,
     init_sender: str | None = None,
+    init_since: str | None = None,
 ) -> None:
     """Launch the newsletter review TUI.
 
     *records* is the full (unfiltered) set. Initial filter values from CLI
-    args are passed via init_tier/init_theme/init_sender.
+    args are passed via init_tier/init_theme/init_sender/init_since.
     """
     if not records:
         print("No assessment records to display.")
@@ -430,4 +586,5 @@ def run_review_tui(
     ReviewApp(
         records,
         init_tier=init_tier, init_theme=init_theme, init_sender=init_sender,
+        init_since=init_since,
     ).run()

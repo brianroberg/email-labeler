@@ -159,15 +159,39 @@ class TestEditActions:
             await pilot.press("escape")
             assert "X" not in str(app.query_one(ListView).children[0].query_one(Label).render())
 
-    async def test_e_is_ignored_when_not_excluded(self, tmp_path):
+    async def test_e_toggles_exclude_on_and_saves(self, tmp_path):
+        # Issue #52: `e` now EXCLUDES an included thread (symmetric toggle), not
+        # just un-excludes. The hint is always shown, state-dependent.
         thread = _golden("t1", excluded=False)
         app = _edit_app([thread], tmp_path)
         async with app.run_test(size=SIZE) as pilot:
             await pilot.press("enter")
-            assert "[e]unexclude" not in _screen_text(app)
+            assert "[e]exclude" in _screen_text(app)
+            await pilot.press("e")
+            assert thread.excluded is True
+            assert "[e]unexclude" in _screen_text(app)
+            saved = load_golden_set(tmp_path / "golden.jsonl")
+            assert saved[0].excluded is True
+
+    async def test_e_round_trip_toggle(self, tmp_path):
+        thread = _golden("t1", excluded=False)
+        app = _edit_app([thread], tmp_path)
+        async with app.run_test(size=SIZE) as pilot:
+            await pilot.press("enter")
+            await pilot.press("e")
+            assert thread.excluded is True
             await pilot.press("e")
             assert thread.excluded is False
-            assert not (tmp_path / "golden.jsonl").exists()  # no spurious save
+
+    async def test_e_leaves_reviewed_untouched(self, tmp_path):
+        # Parity with the newsletter toggle: excluding does not flip reviewed.
+        thread = _golden("t1", excluded=False, reviewed=True)
+        app = _edit_app([thread], tmp_path)
+        async with app.run_test(size=SIZE) as pilot:
+            await pilot.press("enter")
+            await pilot.press("e")
+            assert thread.excluded is True
+            assert thread.reviewed is True
 
     async def test_saves_all_threads_not_filtered_view(self, tmp_path):
         hidden = _golden("hidden", expected_label="low_priority")

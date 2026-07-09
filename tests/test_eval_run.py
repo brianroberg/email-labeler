@@ -304,17 +304,25 @@ class TestRequiredEndpoints:
 
 
 class _FakeClient:
-    def __init__(self, model, base_url, available):
+    def __init__(self, model, base_url, available, status_code=None, error=None):
         self.model = model
         self.base_url = base_url
         self._available = available
+        self._status_code = status_code
+        self._error = error
         self.checked = False
         self.last_timeout = "unset"
 
     async def is_available(self, timeout=None):
+        return (await self.probe(timeout)).ok
+
+    async def probe(self, timeout=None):
+        from llm_client import AvailabilityResult
         self.checked = True
         self.last_timeout = timeout
-        return self._available
+        return AvailabilityResult(
+            ok=self._available, status_code=self._status_code, error=self._error
+        )
 
 
 def _run(coro):
@@ -347,6 +355,50 @@ class TestPreflightCheck:
         errors = _run(preflight_check(cloud, local, False, True))
         assert errors == []
         assert cloud.checked is False  # never probed
+
+    def test_404_shows_model_mismatch_hint(self):
+        # Issue #41 item 7: the "model-name mismatch returns 404" hint appears
+        # only when the probe actually got a 404.
+        cloud = _FakeClient("c", "http://cloud", True)
+        local = _FakeClient("qwen3", "http://local", False, status_code=404)
+        errors = _run(preflight_check(cloud, local, False, True))
+        assert len(errors) == 1
+        assert "404" in errors[0]
+
+    def test_non_404_omits_model_mismatch_hint(self):
+        cloud = _FakeClient("c", "http://cloud", True)
+        local = _FakeClient("qwen3", "http://local", False, status_code=503)
+        errors = _run(preflight_check(cloud, local, False, True))
+        assert len(errors) == 1
+        assert "404" not in errors[0]
+
+    def test_unreachable_no_response_omits_hint(self):
+        # No HTTP response at all (status_code None) -> no 404 hint.
+        cloud = _FakeClient("c", "http://cloud", True)
+        local = _FakeClient("qwen3", "http://local", False)
+        errors = _run(preflight_check(cloud, local, False, True))
+        assert "404" not in errors[0]
+
+    def test_non_404_status_code_is_shown(self):
+        # Finding 1: a non-404 status (e.g. 401 bad key, 500 down) must be
+        # surfaced, not discarded, so the user can tell them apart.
+        cloud = _FakeClient("c", "http://cloud", True)
+        local = _FakeClient("qwen3", "http://local", False, status_code=401)
+        errors = _run(preflight_check(cloud, local, False, True))
+        assert len(errors) == 1
+        assert "401" in errors[0]
+
+    def test_connection_error_text_is_shown(self):
+        # Finding 1: probe()'s captured exception text (connect/timeout/
+        # UnsupportedProtocol) must appear so a down server / bad URL is
+        # distinguishable from a bad key.
+        cloud = _FakeClient("c", "http://cloud", True)
+        local = _FakeClient(
+            "qwen3", "http://local", False, error="ConnectError: Connection refused"
+        )
+        errors = _run(preflight_check(cloud, local, False, True))
+        assert len(errors) == 1
+        assert "ConnectError" in errors[0]
 
     def test_forwards_per_endpoint_timeouts_to_is_available(self):
         # Cloud and local get their own probe timeouts (cloud need not wait out
@@ -477,10 +529,11 @@ class TestMainPreflightWiring:
     def test_unreachable_local_endpoint_exits_1_before_evaluating(
         self, tmp_path, monkeypatch
     ):
-        async def _never_available(self, timeout=None):
-            return False
+        async def _down(self, timeout=None):
+            from llm_client import AvailabilityResult
+            return AvailabilityResult(ok=False)
 
-        monkeypatch.setattr(run_eval.LLMClient, "is_available", _never_available)
+        monkeypatch.setattr(run_eval.LLMClient, "probe", _down)
         path = tmp_path / "golden.jsonl"
         _write_golden_set(path, [
             _golden("person_thread", reviewed=True, expected_sender_type="person"),
@@ -495,13 +548,14 @@ class TestMainPreflightWiring:
     def test_skip_preflight_bypasses_the_check(self, tmp_path, monkeypatch):
         # With the endpoint "down" but --skip-preflight, main must get PAST preflight
         # (and then fail later trying to actually classify — proving preflight was skipped).
-        async def _never_available(self, timeout=None):
-            return False
+        async def _down(self, timeout=None):
+            from llm_client import AvailabilityResult
+            return AvailabilityResult(ok=False)
 
         async def _boom(*a, **k):
             raise RuntimeError("reached evaluation")
 
-        monkeypatch.setattr(run_eval.LLMClient, "is_available", _never_available)
+        monkeypatch.setattr(run_eval.LLMClient, "probe", _down)
         monkeypatch.setattr(run_eval, "run_evaluation", _boom)
         path = tmp_path / "golden.jsonl"
         _write_golden_set(path, [

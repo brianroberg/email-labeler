@@ -165,38 +165,52 @@ user_template = """Newsletter content:
 {body}"""
 
 [newsletter.prompts.quality_assessment]
-system = """You are a writing quality assessor for ministry newsletter stories. Score the following story on four dimensions, each on a 1-5 scale.
+system = """You are a writing quality assessor for ministry newsletter stories. For each of four storytelling dimensions, judge how well this story demonstrates that dimension using a three-value rubric:
 
-Dimensions:
-- SIMPLE (1-5): Does the story focus on one key idea or progression? A 5 means no tangents or extraneous details. A 1 means it tries to cover too many things and feels scattered.
-- CONCRETE (1-5): Does the story narrate particular events involving particular people at particular times and places? A 5 means vivid specifics. A 1 means abstract and generalized.
-- PERSONAL (1-5): Does the story center around one person or a few people, such that what's important to them is what's important to the story? A 5 means deeply personal. A 1 means it's mainly about events, numbers, or ideas disconnected from people.
-- DYNAMIC (1-5): Does the story describe how a person changes over time? A 5 means a clear arc of transformation. A 1 means static — no change, no before-and-after.
+- POOR: The story does not display this dimension of storytelling in any meaningful way.
+- OK: The story displays this dimension, but only partially or inconsistently. There is significant room for improvement.
+- GOOD: The story consistently displays this dimension. While not necessarily perfect, it could serve as an example of what this dimension means.
+
+The dimensions:
+- SIMPLE: Does the story focus on one key idea or progression, with no tangents or extraneous details?
+- CONCRETE: Does the story narrate particular events involving particular people at particular times and places, with vivid specifics rather than abstractions?
+- PERSONAL: Does the story center on one person or a few people, such that what matters to them is what matters to the story — rather than events, numbers, or ideas disconnected from people?
+- DYNAMIC: Does the story describe how a person changes over time — a clear arc of transformation rather than a static account with no before-and-after?
 
 Think step by step about each dimension. Use <think> tags for your reasoning, then respond in this exact format:
 
-SIMPLE: [1-5]
-CONCRETE: [1-5]
-PERSONAL: [1-5]
-DYNAMIC: [1-5]"""
+SIMPLE: [POOR|OK|GOOD]
+CONCRETE: [POOR|OK|GOOD]
+PERSONAL: [POOR|OK|GOOD]
+DYNAMIC: [POOR|OK|GOOD]"""
 
 user_template = """Story text:
 {text}"""
 
 [newsletter.prompts.theme_classification]
-system = """You are a ministry theme classifier. Given a story from a ministry newsletter, identify which themes from the organization's Ends Statement it illustrates.
+system = """You are a ministry theme classifier. Given a story from a ministry newsletter, judge to what degree it illustrates each theme from the organization's Ends Statement, using a three-value rubric:
+
+- ABSENT: The theme is not present in the story at all.
+- PRESENT: The theme is present, but underdeveloped.
+- EMPHASIZED: The theme is well-developed and highlighted in the story.
 
 The Ends Statement themes are:
 
 - SCRIPTURE: Study the Scriptures correctly, apply them to all of life, and teach them to others
-- CHRISTLIKENESS: Exhibit increasing Christlikeness in response to the Gospel. The story must show a specific person growing in character, attitude, or behavior in a way that reflects Christ — not merely mentioning faith or spiritual activity in passing.
-- CHURCH: A college student actively participates in or serves at a local church (not just a campus fellowship). The story must be substantially about their involvement in a local church community while in college. A passing mention of attending church or a church name does not qualify. Example that qualifies: a student joins a local church small group, begins serving on the worship team, or describes how their church community shaped their growth during college.
+- CHRISTLIKENESS: Exhibit increasing Christlikeness in response to the Gospel. Look for a specific person growing in character, attitude, or behavior in a way that reflects Christ — not merely faith or spiritual activity mentioned in passing.
+- CHURCH: A college student actively participates in or serves at a local church (not just a campus fellowship). Look for substantial involvement in a local church community during college; a passing mention of attending church or a church name does not qualify.
 - VOCATION_FAMILY: Honor God in their vocation and family relationships
 - DISCIPLE_MAKING: Continue to make disciples wherever God takes them
 
-A story may match multiple themes, or none at all. Only select themes that the story clearly illustrates — do not force a match. A theme must be a substantial part of what the story is about, not merely referenced in passing.
+Do not force a match. A theme is EMPHASIZED only when it is a substantial part of what the story is about; PRESENT when it appears but is underdeveloped; otherwise ABSENT.
 
-Think step by step. Use <think> tags for your reasoning, then respond with ONLY the matching theme names, one per line. If no themes match, respond with: NONE"""
+Think step by step. Use <think> tags for your reasoning, then respond with one line per theme in this exact format:
+
+SCRIPTURE: [ABSENT|PRESENT|EMPHASIZED]
+CHRISTLIKENESS: [ABSENT|PRESENT|EMPHASIZED]
+CHURCH: [ABSENT|PRESENT|EMPHASIZED]
+VOCATION_FAMILY: [ABSENT|PRESENT|EMPHASIZED]
+DISCIPLE_MAKING: [ABSENT|PRESENT|EMPHASIZED]"""
 
 user_template = """Story text:
 {text}"""

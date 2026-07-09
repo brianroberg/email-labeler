@@ -54,7 +54,7 @@ Interactive CLI for reviewing and correcting labels in the golden set. Saves ato
 **Setting an email aside.** Some threads aren't useful as test cases. Two options:
 
 - **Skip** (`k`) — render no judgment. The thread is left unreviewed and resurfaces in a later review session.
-- **Exclude** (`e`) — permanently set the thread aside. It is dropped from the review queue and never evaluated. Excluded threads are flagged with an `X` in the `--edit` list view; to bring one back, open `--edit`, select it, and press `e` to un-exclude.
+- **Exclude** (`e`) — permanently set the thread aside. It is dropped from the review queue and never evaluated. Excluded threads are flagged with an `X` in the `--edit` list view. In `--edit`, `e` is a **toggle**: press it on an included thread to exclude it, or on an excluded one to bring it back.
 
 Hotkeys: sender type `p`/`s` (person/service); label `r`/`f`/`l` (needs_response/fyi/low_priority); `n` notes; `z` undo; `k` skip; `e` exclude; `q` quit.
 
@@ -65,7 +65,7 @@ uv run python -m evals.review
 # Show existing labels while reviewing
 uv run python -m evals.review --show-labels
 
-# Textual TUI for editing reviewed threads (also where you un-exclude)
+# Textual TUI for editing reviewed threads (also where you toggle exclude/un-exclude)
 uv run python -m evals.review --edit
 
 # Review only sender classification (stage 1) or label classification (stage 2)
@@ -136,9 +136,10 @@ Navigate to `http://localhost:5000`. Features:
 
 The daemon's newsletter pipeline (active under `NEWSLETTER_ONLY=1`) grades
 ministry-newsletter stories: it **extracts** stories from a body, **scores** each
-on 4 quality dimensions (simple/concrete/personal/dynamic, 1–5) → a **tier**
-(excellent/good/fair/poor), and tags **themes** (scripture/christlikeness/church/
-vocation-family/disciple-making). This harness measures whether that grading is any
+on 4 quality dimensions (simple/concrete/personal/dynamic) as **Poor/OK/Good** → a
+**tier** (excellent/good/fair/poor, from the averaged scores), and grades **themes**
+(scripture/christlikeness/church/vocation-family/disciple-making) as
+**Absent/Present/Emphasized**. This harness measures whether that grading is any
 good, so you can **iterate on the prompts** and see the effect of each change.
 
 It mirrors the email eval's 4 stages, with newsletter-specific modules prefixed
@@ -236,8 +237,8 @@ The globs may also match each run's `.cot.jsonl` chain-of-thought sidecar —
 `--compare` ignores sidecars (with a stderr note), so this works as long as each
 glob matches exactly one real results file. The comparison renders
 tier/dimension/theme/extraction deltas and prints each run's `prompt_hash` + tag
-+ mode (warning when the modes differ); `--verbose` lists per-story flips and
-per-newsletter extraction diffs.
++ mode (warning when the modes differ); `--verbose` lists per-story flips
+(per-newsletter extraction diffs appear only in single-run `--results` reports).
 
 ## Typical Workflows
 

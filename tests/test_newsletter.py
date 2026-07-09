@@ -5,18 +5,53 @@ from unittest.mock import AsyncMock
 
 import pytest
 
-from llm_client import LLMUnavailableError
+from llm_client import LLMContentError, LLMUnavailableError
 from newsletter import (
     NewsletterClassifier,
     NewsletterTier,
     StoryResult,
+    aggregate_theme_grades,
+    classify_theme_line,
     compute_tier,
     is_newsletter,
     parse_quality_scores,
+    parse_send_date,
     parse_stories,
     parse_themes,
     write_assessment,
 )
+
+
+class TestParseSendDate:
+    # Normalize the email send-date to ISO-8601 UTC (issue #35/#36 enabler).
+    def test_rfc2822_header_to_iso_utc(self):
+        assert parse_send_date("Mon, 1 Jan 2024 12:00:00 +0000") == "2024-01-01T12:00:00+00:00"
+
+    def test_offset_converted_to_utc(self):
+        assert parse_send_date("Mon, 1 Jan 2024 12:00:00 +0500") == "2024-01-01T07:00:00+00:00"
+
+    def test_naive_header_assumed_utc(self):
+        assert parse_send_date("1 Jan 2024 12:00:00") == "2024-01-01T12:00:00+00:00"
+
+    def test_falls_back_to_internal_date_ms(self):
+        assert parse_send_date("", "1704067200000") == "2024-01-01T00:00:00+00:00"
+
+    def test_unparseable_header_falls_back_to_internal(self):
+        assert parse_send_date("not a date at all", "1704067200000") == "2024-01-01T00:00:00+00:00"
+
+    def test_none_when_nothing_usable(self):
+        assert parse_send_date("", None) is None
+        assert parse_send_date("garbage", None) is None
+
+    def test_extreme_year_offset_does_not_raise(self):
+        # A near-max-year date with a west offset overflows past year 9999 when
+        # shifted to UTC; the tz conversion must be guarded so this degrades to a
+        # fallback, not an uncaught OverflowError.
+        assert parse_send_date("Fri, 31 Dec 9999 23:59:59 -1200", None) is None
+        # ...and falls back to internalDate when available.
+        assert parse_send_date(
+            "Fri, 31 Dec 9999 23:59:59 -1200", "1704067200000"
+        ) == "2024-01-01T00:00:00+00:00"
 
 
 class TestParseStories:
@@ -99,103 +134,219 @@ class TestParseStories:
 
 
 class TestParseQualityScores:
-    def test_valid_scores(self):
-        raw = "SIMPLE: 4\nCONCRETE: 3\nPERSONAL: 5\nDYNAMIC: 2"
+    # Poor/OK/Good tokens map to 1/2/3 (issue #53).
+    def test_valid_tokens(self):
+        raw = "SIMPLE: GOOD\nCONCRETE: OK\nPERSONAL: GOOD\nDYNAMIC: POOR"
         scores = parse_quality_scores(raw)
-        assert scores == {"simple": 4, "concrete": 3, "personal": 5, "dynamic": 2}
+        assert scores == {"simple": 3, "concrete": 2, "personal": 3, "dynamic": 1}
 
-    def test_scores_with_extra_whitespace(self):
-        raw = "  SIMPLE:  4 \n CONCRETE: 3\n  PERSONAL:5\n DYNAMIC :2  "
+    def test_tokens_with_extra_whitespace(self):
+        raw = "  SIMPLE:  GOOD \n CONCRETE: OK\n  PERSONAL:GOOD\n DYNAMIC : POOR  "
         scores = parse_quality_scores(raw)
-        assert scores == {"simple": 4, "concrete": 3, "personal": 5, "dynamic": 2}
+        assert scores == {"simple": 3, "concrete": 2, "personal": 3, "dynamic": 1}
 
-    def test_scores_with_trailing_text(self):
-        raw = "SIMPLE: 4 - very focused\nCONCRETE: 3\nPERSONAL: 5\nDYNAMIC: 2"
+    def test_case_insensitive(self):
+        raw = "simple: good\nconcrete: ok\npersonal: Good\ndynamic: poor"
         scores = parse_quality_scores(raw)
-        assert scores == {"simple": 4, "concrete": 3, "personal": 5, "dynamic": 2}
+        assert scores == {"simple": 3, "concrete": 2, "personal": 3, "dynamic": 1}
+
+    def test_tokens_with_trailing_text(self):
+        raw = "SIMPLE: GOOD - very focused\nCONCRETE: OK\nPERSONAL: GOOD\nDYNAMIC: POOR"
+        scores = parse_quality_scores(raw)
+        assert scores == {"simple": 3, "concrete": 2, "personal": 3, "dynamic": 1}
 
     def test_missing_dimension_returns_none(self):
-        raw = "SIMPLE: 4\nCONCRETE: 3\nPERSONAL: 5"
+        raw = "SIMPLE: GOOD\nCONCRETE: OK\nPERSONAL: GOOD"
         scores = parse_quality_scores(raw)
         assert scores is None
 
-    def test_invalid_score_returns_none(self):
-        raw = "SIMPLE: 4\nCONCRETE: six\nPERSONAL: 5\nDYNAMIC: 2"
+    def test_unknown_token_returns_none(self):
+        raw = "SIMPLE: GREAT\nCONCRETE: OK\nPERSONAL: GOOD\nDYNAMIC: POOR"
         scores = parse_quality_scores(raw)
         assert scores is None
 
-    def test_score_out_of_range_clamped(self):
-        raw = "SIMPLE: 7\nCONCRETE: 0\nPERSONAL: 5\nDYNAMIC: 2"
+    def test_legacy_digit_value_returns_none(self):
+        # The old 1-5 numeric format is no longer accepted.
+        raw = "SIMPLE: 4\nCONCRETE: 3\nPERSONAL: 5\nDYNAMIC: 2"
         scores = parse_quality_scores(raw)
-        assert scores == {"simple": 5, "concrete": 1, "personal": 5, "dynamic": 2}
+        assert scores is None
 
     def test_empty_input_returns_none(self):
         assert parse_quality_scores("") is None
 
-    def test_last_line_fallback(self):
-        raw = "Here are my scores:\n\nSIMPLE: 4\nCONCRETE: 3\nPERSONAL: 5\nDYNAMIC: 2"
+    def test_scores_after_preamble(self):
+        raw = "Here are my scores:\n\nSIMPLE: GOOD\nCONCRETE: OK\nPERSONAL: GOOD\nDYNAMIC: POOR"
         scores = parse_quality_scores(raw)
-        assert scores == {"simple": 4, "concrete": 3, "personal": 5, "dynamic": 2}
+        assert scores == {"simple": 3, "concrete": 2, "personal": 3, "dynamic": 1}
 
 
 class TestParseThemes:
-    def test_single_theme(self):
-        themes = parse_themes("SCRIPTURE")
-        assert themes == ["scripture"]
+    # Themes are graded Absent/Present/Emphasized (issue #53); parse returns a
+    # dict theme->grade with Absent omitted.
+    def test_single_present_theme(self):
+        assert parse_themes("SCRIPTURE: PRESENT") == {"scripture": "present"}
 
-    def test_multiple_themes(self):
-        themes = parse_themes("SCRIPTURE\nCHRISTLIKENESS")
-        assert themes == ["scripture", "christlikeness"]
+    def test_emphasized_theme(self):
+        assert parse_themes("SCRIPTURE: EMPHASIZED") == {"scripture": "emphasized"}
 
-    def test_all_themes(self):
-        raw = "SCRIPTURE\nCHRISTLIKENESS\nCHURCH\nVOCATION_FAMILY\nDISCIPLE_MAKING"
-        themes = parse_themes(raw)
-        assert len(themes) == 5
+    def test_multiple_graded_themes(self):
+        raw = "SCRIPTURE: EMPHASIZED\nCHURCH: PRESENT"
+        assert parse_themes(raw) == {"scripture": "emphasized", "church": "present"}
+
+    def test_absent_is_omitted(self):
+        raw = "SCRIPTURE: ABSENT\nCHURCH: PRESENT"
+        assert parse_themes(raw) == {"church": "present"}
+
+    def test_all_absent_returns_empty(self):
+        raw = (
+            "SCRIPTURE: ABSENT\nCHRISTLIKENESS: ABSENT\nCHURCH: ABSENT\n"
+            "VOCATION_FAMILY: ABSENT\nDISCIPLE_MAKING: ABSENT"
+        )
+        assert parse_themes(raw) == {}
 
     def test_none_response(self):
-        themes = parse_themes("NONE")
-        assert themes == []
+        assert parse_themes("NONE") == {}
 
     def test_none_with_whitespace(self):
-        themes = parse_themes("  NONE  ")
-        assert themes == []
+        assert parse_themes("  NONE  ") == {}
 
-    def test_ignores_invalid_themes(self):
-        themes = parse_themes("SCRIPTURE\nINVALID_THEME\nCHURCH")
-        assert themes == ["scripture", "church"]
+    def test_ignores_invalid_theme_names(self):
+        raw = "SCRIPTURE: PRESENT\nINVALID_THEME: EMPHASIZED\nCHURCH: PRESENT"
+        assert parse_themes(raw) == {"scripture": "present", "church": "present"}
+
+    def test_ignores_unparseable_lines(self):
+        raw = "SCRIPTURE: PRESENT\nsome commentary\nCHURCH: EMPHASIZED"
+        assert parse_themes(raw) == {"scripture": "present", "church": "emphasized"}
+
+    def test_legacy_bare_theme_name_is_ignored(self):
+        # The old bare-name (present-only) format no longer conveys a grade.
+        assert parse_themes("SCRIPTURE\nCHURCH") == {}
 
     def test_empty_input(self):
-        themes = parse_themes("")
-        assert themes == []
+        assert parse_themes("") == {}
 
     def test_with_extra_whitespace(self):
-        themes = parse_themes("  SCRIPTURE \n  CHURCH  ")
-        assert themes == ["scripture", "church"]
+        raw = "  SCRIPTURE : PRESENT \n  CHURCH:EMPHASIZED  "
+        assert parse_themes(raw) == {"scripture": "present", "church": "emphasized"}
+
+    def test_tolerates_bulleted_prefixes(self):
+        # A list-marker/markdown prefix must not defeat matching (mirrors
+        # parse_quality_scores' unanchored tolerance). Finding 1.
+        raw = "- SCRIPTURE: EMPHASIZED\n- CHURCH: PRESENT\n- VOCATION_FAMILY: ABSENT"
+        assert parse_themes(raw) == {"scripture": "emphasized", "church": "present"}
+
+
+class TestClassifyThemeLine:
+    # classify_theme_line is the single shared per-line theme classifier that
+    # parse_themes AND the eval anomaly detectors all use, so their format
+    # knowledge cannot drift (Finding 2). A "flagged" line (off_taxonomy /
+    # anomalous) is one parse_themes does NOT store and the diagnostics must
+    # surface (Finding 3).
+    FLAGGED = {"off_taxonomy", "anomalous"}
+
+    def test_bulleted_valid_line_is_not_flagged(self):
+        # Coherence with Finding 1: a bulleted VALID line both parses and is not
+        # an anomaly.
+        kind, name, grade = classify_theme_line("- SCRIPTURE: EMPHASIZED")
+        assert (kind, name, grade) == ("theme", "scripture", "emphasized")
+        assert kind not in self.FLAGGED
+
+    def test_absent_valid_line_is_recognized_not_flagged(self):
+        # An all-ABSENT response is a valid empty result, so a valid-name ABSENT
+        # line must be recognized (kind "theme"), never flagged.
+        kind, name, grade = classify_theme_line("SCRIPTURE: ABSENT")
+        assert (kind, name, grade) == ("theme", "scripture", "absent")
+        assert kind not in self.FLAGGED
+
+    def test_blank_line_is_ignorable(self):
+        assert classify_theme_line("   ")[0] == "blank"
+
+    def test_near_miss_lines_are_flagged(self):
+        # The Finding 3 repro lines: parse_themes drops each, so each must be
+        # flagged (never silently a "theme"/"blank").
+        for line in (
+            "DISCIPLE-MAKING: EMPHASIZED",   # hyphen instead of underscore
+            "SCRIPTURE: EMPHASISED",         # misspelled grade
+            "VOCATION FAMILY: PRESENT",      # space instead of underscore
+        ):
+            assert classify_theme_line(line)[0] in self.FLAGGED, line
+
+    def test_agrees_with_parse_themes(self):
+        # Anti-drift invariant: a line parse_themes STORES classifies as "theme";
+        # a flagged line is never stored by parse_themes.
+        lines = [
+            "SCRIPTURE: PRESENT", "- CHURCH: EMPHASIZED", "SCRIPTURE: ABSENT",
+            "FELLOWSHIP: PRESENT", "SCRIPTURE: EMPHASISED",
+            "VOCATION FAMILY: PRESENT", "DISCIPLE-MAKING: EMPHASIZED",
+            "just some prose", "", "   ",
+        ]
+        for line in lines:
+            kind = classify_theme_line(line)[0]
+            stored = parse_themes(line)
+            if stored:
+                assert kind == "theme", f"{line!r} stored but kind={kind}"
+            if kind in self.FLAGGED:
+                assert stored == {}, f"{line!r} flagged but parse stored {stored}"
 
 
 class TestComputeTier:
-    def test_excellent(self):
-        scores = {"simple": 5, "concrete": 4, "personal": 4, "dynamic": 5}
+    # Poor/OK/Good -> 1/2/3; tier = mean of the 4 dimensions, banded (issue #53):
+    #   excellent >= 2.75, good >= 2.25, fair >= 1.75, poor < 1.75.
+    def test_excellent_all_good(self):
+        scores = {"simple": 3, "concrete": 3, "personal": 3, "dynamic": 3}
         assert compute_tier(scores) == NewsletterTier.EXCELLENT
 
-    def test_good(self):
-        assert compute_tier({"simple": 3, "concrete": 3, "personal": 4, "dynamic": 3}) == NewsletterTier.GOOD
-
-    def test_fair(self):
-        assert compute_tier({"simple": 2, "concrete": 2, "personal": 3, "dynamic": 2}) == NewsletterTier.FAIR
-
-    def test_poor(self):
-        assert compute_tier({"simple": 1, "concrete": 1, "personal": 2, "dynamic": 1}) == NewsletterTier.POOR
-
-    def test_boundary_excellent(self):
-        scores = {"simple": 4, "concrete": 4, "personal": 4, "dynamic": 4}
+    def test_excellent_boundary_three_good_one_ok(self):
+        # avg 2.75
+        scores = {"simple": 3, "concrete": 3, "personal": 3, "dynamic": 2}
         assert compute_tier(scores) == NewsletterTier.EXCELLENT
 
-    def test_boundary_good(self):
-        assert compute_tier({"simple": 3, "concrete": 3, "personal": 3, "dynamic": 3}) == NewsletterTier.GOOD
+    def test_good_two_good_two_ok(self):
+        # avg 2.5
+        assert compute_tier({"simple": 3, "concrete": 3, "personal": 2, "dynamic": 2}) == NewsletterTier.GOOD
 
-    def test_boundary_fair(self):
+    def test_good_tolerates_one_poor(self):
+        # 3,3,3,1 -> avg 2.5
+        assert compute_tier({"simple": 3, "concrete": 3, "personal": 3, "dynamic": 1}) == NewsletterTier.GOOD
+
+    def test_good_boundary(self):
+        # 3,3,2,1 -> avg 2.25
+        assert compute_tier({"simple": 3, "concrete": 3, "personal": 2, "dynamic": 1}) == NewsletterTier.GOOD
+
+    def test_fair_all_ok(self):
+        # avg 2.0
         assert compute_tier({"simple": 2, "concrete": 2, "personal": 2, "dynamic": 2}) == NewsletterTier.FAIR
+
+    def test_fair_boundary(self):
+        # 2,2,2,1 -> avg 1.75
+        assert compute_tier({"simple": 2, "concrete": 2, "personal": 2, "dynamic": 1}) == NewsletterTier.FAIR
+
+    def test_poor_two_ok_two_poor(self):
+        # 2,2,1,1 -> avg 1.5
+        assert compute_tier({"simple": 2, "concrete": 2, "personal": 1, "dynamic": 1}) == NewsletterTier.POOR
+
+    def test_poor_all_poor(self):
+        assert compute_tier({"simple": 1, "concrete": 1, "personal": 1, "dynamic": 1}) == NewsletterTier.POOR
+
+
+class TestAggregateThemeGrades:
+    # Cross-story theme merge takes the strongest grade per theme (issue #53).
+    def test_empty(self):
+        assert aggregate_theme_grades([]) == {}
+
+    def test_single_story(self):
+        s = StoryResult(text="a", themes={"scripture": "present", "church": "emphasized"})
+        assert aggregate_theme_grades([s]) == {"scripture": "present", "church": "emphasized"}
+
+    def test_takes_strongest_grade_across_stories(self):
+        s1 = StoryResult(text="a", themes={"scripture": "present"})
+        s2 = StoryResult(text="b", themes={"scripture": "emphasized", "church": "present"})
+        assert aggregate_theme_grades([s1, s2]) == {"scripture": "emphasized", "church": "present"}
+
+    def test_emphasized_not_downgraded_by_later_present(self):
+        s1 = StoryResult(text="a", themes={"scripture": "emphasized"})
+        s2 = StoryResult(text="b", themes={"scripture": "present"})
+        assert aggregate_theme_grades([s1, s2]) == {"scripture": "emphasized"}
 
 
 @pytest.fixture
@@ -259,11 +410,11 @@ class TestExtractStories:
 class TestAssessQuality:
     async def test_scores_story(self, nl_classifier, mock_cloud_llm):
         mock_cloud_llm.complete.return_value = (
-            "SIMPLE: 4\nCONCRETE: 3\nPERSONAL: 5\nDYNAMIC: 2",
+            "SIMPLE: GOOD\nCONCRETE: OK\nPERSONAL: GOOD\nDYNAMIC: POOR",
             "quality reasoning",
         )
         scores, cot = await nl_classifier.assess_quality("Story text")
-        assert scores == {"simple": 4, "concrete": 3, "personal": 5, "dynamic": 2}
+        assert scores == {"simple": 3, "concrete": 2, "personal": 3, "dynamic": 1}
         assert cot == "quality reasoning"
 
     async def test_returns_none_on_parse_failure(self, nl_classifier, mock_cloud_llm):
@@ -273,7 +424,7 @@ class TestAssessQuality:
 
     async def test_passes_text(self, nl_classifier, mock_cloud_llm):
         mock_cloud_llm.complete.return_value = (
-            "SIMPLE: 3\nCONCRETE: 3\nPERSONAL: 3\nDYNAMIC: 3",
+            "SIMPLE: OK\nCONCRETE: OK\nPERSONAL: OK\nDYNAMIC: OK",
             "",
         )
         await nl_classifier.assess_quality("My story text")
@@ -283,15 +434,18 @@ class TestAssessQuality:
 
 class TestClassifyThemes:
     async def test_classifies_themes(self, nl_classifier, mock_cloud_llm):
-        mock_cloud_llm.complete.return_value = ("SCRIPTURE\nCHURCH", "theme reasoning")
+        mock_cloud_llm.complete.return_value = (
+            "SCRIPTURE: EMPHASIZED\nCHURCH: PRESENT",
+            "theme reasoning",
+        )
         themes, cot = await nl_classifier.classify_themes("Story text")
-        assert themes == ["scripture", "church"]
+        assert themes == {"scripture": "emphasized", "church": "present"}
         assert cot == "theme reasoning"
 
     async def test_returns_empty_for_none(self, nl_classifier, mock_cloud_llm):
         mock_cloud_llm.complete.return_value = ("NONE", "")
         themes, cot = await nl_classifier.classify_themes("Story text")
-        assert themes == []
+        assert themes == {}
 
 
 class TestClassifyNewsletter:
@@ -299,16 +453,16 @@ class TestClassifyNewsletter:
         """Full pipeline: extract 1 story, score it, tag themes."""
         mock_cloud_llm.complete.side_effect = [
             ("STORY: A student named Jake...", ""),
-            ("SIMPLE: 4\nCONCRETE: 5\nPERSONAL: 4\nDYNAMIC: 3", "quality cot"),
-            ("CHRISTLIKENESS\nDISCIPLE_MAKING", "theme cot"),
+            ("SIMPLE: GOOD\nCONCRETE: GOOD\nPERSONAL: GOOD\nDYNAMIC: OK", "quality cot"),
+            ("CHRISTLIKENESS: PRESENT\nDISCIPLE_MAKING: EMPHASIZED", "theme cot"),
         ]
         results = await nl_classifier.classify_newsletter("newsletter body")
         assert len(results) == 1
         assert results[0].text == "A student named Jake..."
-        assert results[0].scores == {"simple": 4, "concrete": 5, "personal": 4, "dynamic": 3}
-        assert results[0].average_score == 4.0
+        assert results[0].scores == {"simple": 3, "concrete": 3, "personal": 3, "dynamic": 2}
+        assert results[0].average_score == 2.75
         assert results[0].tier == NewsletterTier.EXCELLENT
-        assert results[0].themes == ["christlikeness", "disciple_making"]
+        assert results[0].themes == {"christlikeness": "present", "disciple_making": "emphasized"}
         assert results[0].quality_cot == "quality cot"
         assert results[0].theme_cot == "theme cot"
         assert mock_cloud_llm.complete.call_count == 3
@@ -323,32 +477,32 @@ class TestClassifyNewsletter:
         mock_cloud_llm.complete.side_effect = [
             ("STORY: Content here", ""),
             ("garbled quality output", ""),
-            ("SCRIPTURE", "theme cot"),
+            ("SCRIPTURE: PRESENT", "theme cot"),
         ]
         results = await nl_classifier.classify_newsletter("body")
         assert len(results) == 1
         assert results[0].scores is None
         assert results[0].tier is None
-        assert results[0].themes == ["scripture"]
+        assert results[0].themes == {"scripture": "present"}
 
     async def test_theme_failure_preserves_quality(self, nl_classifier, mock_cloud_llm):
         mock_cloud_llm.complete.side_effect = [
             ("STORY: Content", ""),
-            ("SIMPLE: 3\nCONCRETE: 3\nPERSONAL: 3\nDYNAMIC: 3", "quality cot"),
+            ("SIMPLE: OK\nCONCRETE: OK\nPERSONAL: OK\nDYNAMIC: OK", "quality cot"),
             RuntimeError("LLM error"),
         ]
         results = await nl_classifier.classify_newsletter("body")
         assert len(results) == 1
         assert results[0].scores is not None
-        assert results[0].themes == []
+        assert results[0].themes == {}
 
     async def test_multiple_stories(self, nl_classifier, mock_cloud_llm):
         mock_cloud_llm.complete.side_effect = [
             ("STORY: Content A\n\nSTORY: Content B", ""),
-            ("SIMPLE: 5\nCONCRETE: 5\nPERSONAL: 5\nDYNAMIC: 5", ""),
-            ("SCRIPTURE", ""),
-            ("SIMPLE: 2\nCONCRETE: 2\nPERSONAL: 2\nDYNAMIC: 2", ""),
-            ("CHURCH", ""),
+            ("SIMPLE: GOOD\nCONCRETE: GOOD\nPERSONAL: GOOD\nDYNAMIC: GOOD", ""),
+            ("SCRIPTURE: PRESENT", ""),
+            ("SIMPLE: OK\nCONCRETE: OK\nPERSONAL: OK\nDYNAMIC: OK", ""),
+            ("CHURCH: PRESENT", ""),
         ]
         results = await nl_classifier.classify_newsletter("body")
         assert len(results) == 2
@@ -374,25 +528,48 @@ class TestClassifyNewsletterTransientOutage:
     async def test_transient_theme_outage_propagates(self, nl_classifier, mock_cloud_llm):
         """LLMUnavailableError during theme classification propagates too."""
         mock_cloud_llm.complete.side_effect = [
-            ("STORY: Content", ""),                                   # extract_stories
-            ("SIMPLE: 3\nCONCRETE: 3\nPERSONAL: 3\nDYNAMIC: 3", ""),  # assess_quality
-            LLMUnavailableError("cloud endpoint down"),               # classify_themes
+            ("STORY: Content", ""),                                        # extract_stories
+            ("SIMPLE: OK\nCONCRETE: OK\nPERSONAL: OK\nDYNAMIC: OK", ""),    # assess_quality
+            LLMUnavailableError("cloud endpoint down"),                    # classify_themes
         ]
         with pytest.raises(LLMUnavailableError):
             await nl_classifier.classify_newsletter("body")
 
+    async def test_content_error_during_quality_propagates(self, nl_classifier, mock_cloud_llm):
+        """A content-less LLMContentError during quality propagates (issue #30) so the
+        daemon routes the whole newsletter to give-up rather than committing an empty
+        grade indistinguishable from a genuine NO_STORIES."""
+        mock_cloud_llm.complete.side_effect = [
+            ("STORY: Content", ""),                       # extract_stories
+            LLMContentError("model returned no content"),  # assess_quality
+        ]
+        with pytest.raises(LLMContentError):
+            await nl_classifier.classify_newsletter("body")
+
+    async def test_content_error_during_theme_propagates(self, nl_classifier, mock_cloud_llm):
+        mock_cloud_llm.complete.side_effect = [
+            ("STORY: Content", ""),                                        # extract_stories
+            ("SIMPLE: OK\nCONCRETE: OK\nPERSONAL: OK\nDYNAMIC: OK", ""),    # assess_quality
+            LLMContentError("model returned no content"),                  # classify_themes
+        ]
+        with pytest.raises(LLMContentError):
+            await nl_classifier.classify_newsletter("body")
+
     async def test_non_transient_quality_error_stays_isolated(self, nl_classifier, mock_cloud_llm):
-        """A non-transient per-story error (RuntimeError) is still swallowed: the story
-        gets no scores but themes are still classified and the result is returned."""
+        """A non-transient per-story error (bare RuntimeError) is still swallowed: the
+        story gets no scores but themes are still classified and the result is returned.
+
+        (Issue #30 will add a dedicated LLMContentError subclass that DOES propagate; a
+        bare RuntimeError like this one must remain isolated.)"""
         mock_cloud_llm.complete.side_effect = [
             ("STORY: Content", ""),  # extract_stories
             RuntimeError("malformed story crashed scoring"),  # assess_quality
-            ("SCRIPTURE", "theme cot"),  # classify_themes still runs
+            ("SCRIPTURE: PRESENT", "theme cot"),  # classify_themes still runs
         ]
         results = await nl_classifier.classify_newsletter("body")
         assert len(results) == 1
         assert results[0].scores is None
-        assert results[0].themes == ["scripture"]
+        assert results[0].themes == {"scripture": "present"}
 
 
 class TestWriteAssessment:
@@ -401,10 +578,10 @@ class TestWriteAssessment:
         stories = [
             StoryResult(
                 text="Story content",
-                scores={"simple": 4, "concrete": 3, "personal": 5, "dynamic": 2},
-                average_score=3.5,
+                scores={"simple": 3, "concrete": 2, "personal": 3, "dynamic": 1},
+                average_score=2.25,
                 tier=NewsletterTier.GOOD,
-                themes=["scripture", "church"],
+                themes={"scripture": "present", "church": "emphasized"},
                 quality_cot="quality reasoning",
                 theme_cot="theme reasoning",
             )
@@ -430,10 +607,33 @@ class TestWriteAssessment:
         assert len(record["stories"]) == 1
         assert "title" not in record["stories"][0]
         assert record["stories"][0]["text"] == "Story content"
-        assert record["stories"][0]["scores"]["simple"] == 4
-        assert record["stories"][0]["themes"] == ["scripture", "church"]
+        assert record["stories"][0]["scores"]["simple"] == 3
+        assert record["stories"][0]["themes"] == {"scripture": "present", "church": "emphasized"}
         assert record["stories"][0]["quality_cot"] == "quality reasoning"
         assert "timestamp" in record
+
+    def test_writes_send_date_and_model(self, tmp_path):
+        output_file = tmp_path / "assessments.jsonl"
+        write_assessment(
+            output_file=str(output_file),
+            message_id="m", thread_id="t", sender="a@b.com", subject="Subj",
+            overall_tier=NewsletterTier.GOOD, stories=[StoryResult(text="x")],
+            send_date="2024-01-01T12:00:00+00:00", model="claude-sonnet-4-6",
+        )
+        record = json.loads(output_file.read_text().strip())
+        assert record["send_date"] == "2024-01-01T12:00:00+00:00"
+        assert record["model"] == "claude-sonnet-4-6"
+
+    def test_send_date_and_model_default_to_none(self, tmp_path):
+        output_file = tmp_path / "assessments.jsonl"
+        write_assessment(
+            output_file=str(output_file),
+            message_id="m", thread_id="t", sender="a@b.com", subject="Subj",
+            overall_tier=None, stories=[StoryResult(text="x")],
+        )
+        record = json.loads(output_file.read_text().strip())
+        assert record["send_date"] is None
+        assert record["model"] is None
 
     def test_appends_to_existing_file(self, tmp_path):
         output_file = tmp_path / "assessments.jsonl"
@@ -472,7 +672,7 @@ class TestWriteAssessment:
             scores=None,
             average_score=None,
             tier=None,
-            themes=["scripture"],
+            themes={"scripture": "present"},
         )
         write_assessment(
             output_file=str(output_file),

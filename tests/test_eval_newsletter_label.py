@@ -11,6 +11,7 @@ import sys
 import pytest
 
 from evals.newsletter_label import (
+    ScoreScreen,
     SpanEdit,
     accept_confirmation_message,
     add_story,
@@ -78,6 +79,24 @@ def _story(story_id="t1:0", **kw):
     return GoldenStory(**base)
 
 
+class TestScorePrompt:
+    def test_prompt_lists_the_three_rubric_options(self):
+        # The score prompt spells out the 1/2/3 <-> rubric mapping (issue #53).
+        assert "[1]poor [2]ok [3]good" in ScoreScreen()._prompt_text()
+
+    def test_score_options_derived_from_newsletter_tokens(self):
+        # Single source of truth: the option string is derived from
+        # newsletter._SCORE_TOKENS, not a hardcoded duplicate.
+        from evals.newsletter_label import _SCORE_OPTIONS
+        from newsletter import _SCORE_TOKENS
+
+        expected = " ".join(
+            f"[{num}]{tok.lower()}"
+            for tok, num in sorted(_SCORE_TOKENS.items(), key=lambda kv: kv[1])
+        )
+        assert _SCORE_OPTIONS == expected
+
+
 class TestSeedStories:
     def test_seeds_candidates_with_stable_ids_and_provenance(self):
         nl = _newsletter("tS")
@@ -114,21 +133,29 @@ class TestSeedStories:
 class TestAssignScoresAndThemes:
     def test_assigns_scores_themes_reviewed_and_derives_tier(self):
         story = _story()
-        scores = {"simple": 4, "concrete": 4, "personal": 4, "dynamic": 4}
+        scores = {"simple": 3, "concrete": 3, "personal": 3, "dynamic": 3}
 
-        assign_scores_and_themes(story, scores, ["scripture", "church"])
+        assign_scores_and_themes(story, scores, {"scripture": "emphasized", "church": "present"})
 
         assert story.expected_scores == scores
-        assert story.expected_themes == ["scripture", "church"]
+        assert story.expected_themes == {"scripture": "emphasized", "church": "present"}
         assert story.reviewed is True
         assert story.expected_tier == compute_tier(scores).value
         assert story.expected_tier == NewsletterTier.EXCELLENT.value
 
+    def test_assigns_graded_themes_dict(self):
+        story = _story()
+        assign_scores_and_themes(
+            story, _scores(), {"scripture": "emphasized", "church": "present"}
+        )
+        assert story.expected_themes == {"scripture": "emphasized", "church": "present"}
+
     def test_derives_fair_tier_for_midrange_scores(self):
         story = _story()
-        scores = {"simple": 2, "concrete": 3, "personal": 2, "dynamic": 3}
+        # all-OK -> avg 2.0 -> fair (issue #53 bands).
+        scores = {"simple": 2, "concrete": 2, "personal": 2, "dynamic": 2}
 
-        assign_scores_and_themes(story, scores, [])
+        assign_scores_and_themes(story, scores, {})
 
         assert story.expected_tier == "fair"
 
@@ -136,8 +163,8 @@ class TestAssignScoresAndThemes:
         story = _story()
         scores = {"simple": 1, "concrete": 1, "personal": 1, "dynamic": 1}
 
-        assign_scores_and_themes(story, scores, [])
-        scores["simple"] = 5
+        assign_scores_and_themes(story, scores, {})
+        scores["simple"] = 3
 
         assert story.expected_scores["simple"] == 1
 
@@ -222,8 +249,8 @@ class TestUndo:
 
         assign_scores_and_themes(
             nl.stories[0],
-            {"simple": 5, "concrete": 5, "personal": 5, "dynamic": 5},
-            ["scripture"],
+            {"simple": 3, "concrete": 3, "personal": 3, "dynamic": 3},
+            {"scripture": "emphasized"},
         )
         assert nl.stories[0].reviewed is True
 
@@ -231,7 +258,7 @@ class TestUndo:
 
         assert nl.stories[0].reviewed is False
         assert nl.stories[0].expected_scores is None
-        assert nl.stories[0].expected_themes == []
+        assert nl.stories[0].expected_themes == {}
 
     def test_snapshot_is_independent_of_later_mutations(self):
         nl = _newsletter("tU")
@@ -467,11 +494,11 @@ class TestFormatStoryStrip:
         nl = _newsletter("t", body="l0")
         nl.stories = [_story("t:0", text="l0")]
         assign_scores_and_themes(
-            nl.stories[0], {"simple": 4, "concrete": 4, "personal": 5, "dynamic": 3}, []
+            nl.stories[0], {"simple": 2, "concrete": 2, "personal": 3, "dynamic": 1}, {}
         )
         nl.stories[0].excluded = True
         lines = format_story_strip(nl, locate_story_spans(nl), selected=None, width=80)
-        assert "4/4/5/3" in lines[0]
+        assert "2/2/3/1" in lines[0]
         assert "EXCL" in lines[0]
 
     def test_no_stories_hint(self):
@@ -531,13 +558,13 @@ class TestCommitSpanEdit:
         nl = _newsletter("t", body="l0\nl1\nl2\nl3")
         nl.stories = [_story("t:5", text="l1")]
         assign_scores_and_themes(
-            nl.stories[0], {"simple": 4, "concrete": 4, "personal": 4, "dynamic": 4},
-            ["church"],
+            nl.stories[0], {"simple": 3, "concrete": 3, "personal": 3, "dynamic": 3},
+            {"church": "present"},
         )
         story = commit_span_edit(nl, SpanEdit(0, 1, 2, "adjust"))
         assert story.text == "l1\nl2"
         assert story.story_id == "t:5"  # id preserved
-        assert story.expected_themes == ["church"]  # labels preserved
+        assert story.expected_themes == {"church": "present"}  # labels preserved
         assert story.expected_scores is not None
 
 
@@ -546,7 +573,7 @@ class TestAcceptConfirmationMessage:
         nl = _newsletter("t")
         seed_stories(nl, ["a"])
         assign_scores_and_themes(
-            nl.stories[0], {"simple": 4, "concrete": 4, "personal": 4, "dynamic": 4}, []
+            nl.stories[0], {"simple": 3, "concrete": 3, "personal": 3, "dynamic": 3}, []
         )
         assert accept_confirmation_message(nl) is None
 
@@ -711,8 +738,8 @@ class TestLoadSaveRoundTrip:
         seed_stories(nl, ["a", "b"])
         assign_scores_and_themes(
             nl.stories[0],
-            {"simple": 4, "concrete": 4, "personal": 4, "dynamic": 4},
-            ["scripture"],
+            {"simple": 3, "concrete": 3, "personal": 3, "dynamic": 3},
+            {"scripture": "emphasized"},
         )
         confirm_story_list(nl)
 
@@ -777,7 +804,7 @@ class TestSeedConfirmationMessage:
         nl = _newsletter("t")
         seed_stories(nl, ["a", "b"])
         assign_scores_and_themes(
-            nl.stories[0], {"simple": 4, "concrete": 4, "personal": 4, "dynamic": 4}, []
+            nl.stories[0], {"simple": 3, "concrete": 3, "personal": 3, "dynamic": 3}, []
         )
         assert "1 labeled" in seed_confirmation_message(nl)
 
@@ -794,7 +821,7 @@ class TestConfirmStatusMessage:
         nl = _newsletter("t")
         seed_stories(nl, ["a"])
         assign_scores_and_themes(
-            nl.stories[0], {"simple": 4, "concrete": 4, "personal": 4, "dynamic": 4}, []
+            nl.stories[0], {"simple": 3, "concrete": 3, "personal": 3, "dynamic": 3}, []
         )
         assert confirm_status_message(nl) == "Story list confirmed."
 
@@ -907,13 +934,17 @@ class TestNewsletterExclusionVisibility:
 
 class TestFormatThemeLegend:
     def test_full_legend_when_it_fits(self):
-        legend = format_theme_legend([], 200)
+        legend = format_theme_legend({}, 200)
         assert "[s]scripture" in legend
         assert "[d]disciple_making" in legend
         assert "Enter=done" in legend
 
+    def test_shows_selected_theme_grade(self):
+        legend = format_theme_legend({"scripture": "emphasized"}, 200)
+        assert "scripture=E" in legend
+
     def test_narrow_terminal_gets_compact_legend_with_all_keys(self):
-        legend = format_theme_legend(["scripture"], 60)
+        legend = format_theme_legend({"scripture": "present"}, 60)
         assert len(legend) <= 60
         for key in "schvd":
             assert f"[{key}]" in legend
@@ -1005,7 +1036,7 @@ class TestBuildExtractorPreflight:
 SIZE = (100, 30)
 
 
-def _scores(n=4):
+def _scores(n=3):
     return {"simple": n, "concrete": n, "personal": n, "dynamic": n}
 
 
@@ -1106,7 +1137,7 @@ class TestDetailReseed:
     async def test_reseed_over_existing_stories_requires_confirmation(self, tmp_path):
         nl = _newsletter("tg", body="b0\nb1")
         seed_stories(nl, ["b0"])
-        assign_scores_and_themes(nl.stories[0], _scores(), ["scripture"])
+        assign_scores_and_themes(nl.stories[0], _scores(), {"scripture": "emphasized"})
         app = _label_app([nl], tmp_path, extract_fn=lambda body: "STORY: b1")
         async with app.run_test(size=SIZE) as pilot:
             await pilot.press("enter", "r")
@@ -1200,7 +1231,7 @@ class TestDetailUndo:
     async def test_cancelled_prompt_does_not_clobber_undo(self, tmp_path):
         nl = _newsletter("tU", body="b0")
         seed_stories(nl, ["a", "b"])
-        assign_scores_and_themes(nl.stories[1], _scores(), [])
+        assign_scores_and_themes(nl.stories[1], _scores(), {})
         app = _label_app([nl], tmp_path)
         async with app.run_test(size=SIZE) as pilot:
             await pilot.press("enter")
@@ -1221,7 +1252,7 @@ class TestDetailDelete:
     async def test_deleting_labeled_story_requires_confirmation(self, tmp_path):
         nl = _newsletter("tD", body="b0")
         seed_stories(nl, ["a"])
-        assign_scores_and_themes(nl.stories[0], _scores(), [])
+        assign_scores_and_themes(nl.stories[0], _scores(), {})
         app = _label_app([nl], tmp_path)
         async with app.run_test(size=SIZE) as pilot:
             await pilot.press("enter")
@@ -1231,7 +1262,7 @@ class TestDetailDelete:
     async def test_confirmed_delete_of_labeled_story_reports_what_was_deleted(self, tmp_path):
         nl = _newsletter("tD", body="b0")
         seed_stories(nl, ["a"])
-        assign_scores_and_themes(nl.stories[0], _scores(), [])
+        assign_scores_and_themes(nl.stories[0], _scores(), {})
         app = _label_app([nl], tmp_path)
         async with app.run_test(size=SIZE) as pilot:
             await pilot.press("enter")
@@ -1323,7 +1354,7 @@ class TestDetailSpanEdit:
     async def test_edit_extends_selected_story_end_preserving_labels(self, tmp_path):
         nl = _newsletter("tE", body="l0\nl1\nl2\nl3")
         seed_stories(nl, ["l1"])  # story spans body line 1 only
-        assign_scores_and_themes(nl.stories[0], _scores(), ["church"])
+        assign_scores_and_themes(nl.stories[0], _scores(), {"church": "emphasized"})
         app = _label_app([nl], tmp_path)
         async with app.run_test(size=SIZE) as pilot:
             await pilot.press("enter")
@@ -1332,7 +1363,7 @@ class TestDetailSpanEdit:
             await pilot.press("down")       # move end to body 2
             await pilot.press("enter")      # commit
             assert nl.stories[0].text == "l1\nl2"
-            assert nl.stories[0].expected_themes == ["church"]  # labels preserved
+            assert nl.stories[0].expected_themes == {"church": "emphasized"}  # labels preserved
             assert nl.stories[0].expected_scores == _scores()
 
     async def test_in_span_e_sets_end_not_start(self, tmp_path):
@@ -1567,10 +1598,10 @@ class TestDetailLabeling:
         async with app.run_test(size=SIZE) as pilot:
             await pilot.press("enter")
             await pilot.press("1", "l")           # select story 1, label
-            await pilot.press("4", "4", "5", "3")  # four dimension scores
+            await pilot.press("1", "2", "3", "2")  # four dimension scores (Poor/OK/Good=1/2/3)
             await pilot.press("enter")             # finish themes
             assert nl.stories[0].expected_scores == {
-                "simple": 4, "concrete": 4, "personal": 5, "dynamic": 3,
+                "simple": 1, "concrete": 2, "personal": 3, "dynamic": 2,
             }
             assert nl.stories[0].reviewed is True
 
@@ -1587,8 +1618,8 @@ class TestDetailLabeling:
         seed_stories(nl, ["a"])
         assign_scores_and_themes(
             nl.stories[0],
-            {"simple": 2, "concrete": 3, "personal": 4, "dynamic": 5},
-            [],
+            {"simple": 2, "concrete": 3, "personal": 3, "dynamic": 1},
+            {},
         )
         app = _label_app([nl], tmp_path)
         async with app.run_test(size=SIZE) as pilot:
@@ -1604,28 +1635,46 @@ class TestDetailLabeling:
         async with app.run_test(size=SIZE) as pilot:
             await pilot.press("enter")
             await pilot.press("1", "l")
-            await pilot.press("4", "x")  # any non-digit cancels everything
+            await pilot.press("1", "x")  # any out-of-range/other key cancels everything
             assert nl.stories[0].expected_scores is None
             assert "cancelled" in _status(app).lower()
 
-    async def test_theme_toggle_on_and_off(self, tmp_path):
+    async def test_legacy_score_key_4_is_rejected(self, tmp_path):
+        # The score scale narrowed from 1-5 to 1-3 (issue #53): '4' is no longer
+        # a valid score key and cancels entry like any other key.
         nl = _newsletter("tL", body="b0")
         seed_stories(nl, ["a"])
         app = _label_app([nl], tmp_path)
         async with app.run_test(size=SIZE) as pilot:
             await pilot.press("enter")
             await pilot.press("1", "l")
-            await pilot.press("4", "4", "4", "4")
-            await pilot.press("s", "c", "s")  # scripture on, christlikeness on, scripture off
+            await pilot.press("4")  # out of the 1-3 range -> cancels
+            assert nl.stories[0].expected_scores is None
+            assert "cancelled" in _status(app).lower()
+
+    async def test_theme_cycle_absent_present_emphasized(self, tmp_path):
+        nl = _newsletter("tL", body="b0")
+        seed_stories(nl, ["a"])
+        app = _label_app([nl], tmp_path)
+        async with app.run_test(size=SIZE) as pilot:
             await pilot.press("enter")
-            assert nl.stories[0].expected_themes == ["christlikeness"]
+            await pilot.press("1", "l")
+            await pilot.press("1", "2", "3", "2")   # dimension scores
+            # scripture cycles present->emphasized (2 presses); christlikeness present;
+            # church present->emphasized->absent (3 presses, removed).
+            await pilot.press("s", "s", "c", "h", "h", "h")
+            await pilot.press("enter")
+            assert nl.stories[0].expected_themes == {
+                "scripture": "emphasized",
+                "christlikeness": "present",
+            }
 
 
 class TestDetailAccept:
     async def test_accept_marks_reviewed_and_advances(self, tmp_path):
         nls = [_newsletter("t0", body="b0"), _newsletter("t1", body="b1")]
         seed_stories(nls[0], ["b0"])
-        assign_scores_and_themes(nls[0].stories[0], _scores(), [])
+        assign_scores_and_themes(nls[0].stories[0], _scores(), {})
         app = _label_app(nls, tmp_path)
         async with app.run_test(size=SIZE) as pilot:
             await pilot.press("enter")     # open t0
@@ -1661,7 +1710,7 @@ class TestDetailAccept:
 
         nl = _newsletter("t0", body="b0")
         seed_stories(nl, ["b0"])
-        assign_scores_and_themes(nl.stories[0], _scores(), [])
+        assign_scores_and_themes(nl.stories[0], _scores(), {})
         app = _label_app([nl], tmp_path)
         async with app.run_test(size=SIZE) as pilot:
             await pilot.press("enter", "c")
@@ -1678,7 +1727,7 @@ class TestDetailAccept:
         nls = [_newsletter(f"t{i}", body=f"b{i}") for i in range(3)]
         for nl in nls:
             seed_stories(nl, [f"b{nls.index(nl)}"])
-            assign_scores_and_themes(nl.stories[0], _scores(), [])
+            assign_scores_and_themes(nl.stories[0], _scores(), {})
         app = _label_app(nls, tmp_path)
         async with app.run_test(size=SIZE) as pilot:
             await pilot.press("enter")           # open t0
@@ -1707,7 +1756,7 @@ class TestDetailAccept:
         nls = [_newsletter(f"t{i}", body=f"b{i}") for i in range(3)]
         for i, nl in enumerate(nls):
             seed_stories(nl, [f"b{i}"])
-            assign_scores_and_themes(nl.stories[0], _scores(), [])
+            assign_scores_and_themes(nl.stories[0], _scores(), {})
         app = _label_app(nls, tmp_path)
         async with app.run_test(size=SIZE) as pilot:
             await pilot.press("enter")            # open t0 (fully labeled -> no confirm)
@@ -2029,7 +2078,7 @@ class TestModalRobustness:
 
         nl = _newsletter("tR", body="b0")
         seed_stories(nl, ["a", "b"])
-        assign_scores_and_themes(nl.stories[0], _scores(), [])
+        assign_scores_and_themes(nl.stories[0], _scores(), {})
         app = _label_app([nl], tmp_path)
         async with app.run_test(size=SIZE) as pilot:
             await pilot.press("enter", "1")   # select labeled story A

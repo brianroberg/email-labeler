@@ -18,7 +18,6 @@ import hashlib
 import json
 import logging
 import os
-import re
 import sys
 import time
 import tomllib
@@ -41,7 +40,7 @@ from evals.newsletter_schemas import (
     StoryPrediction,
 )
 from llm_client import LLMClient
-from newsletter import _VALID_THEMES, NewsletterClassifier, compute_tier
+from newsletter import NewsletterClassifier, classify_theme_line, compute_tier
 
 
 def load_golden_set(
@@ -241,7 +240,7 @@ async def evaluate_story(
         thread_id=thread_id,
         expected_scores=story.expected_scores,
         expected_tier=story.expected_tier,
-        expected_themes=list(story.expected_themes),
+        expected_themes=dict(story.expected_themes),
     )
     thinking = NewsletterThinkingEntry(story_id=story.story_id)
 
@@ -480,19 +479,40 @@ def write_thinking_sidecar(
     return sidecar_path
 
 
-def clamped_dimensions(scores_raw: str) -> list[str]:
-    """Dimensions whose raw model score was outside 1-5 (silently clamped).
+def _theme_line_anomalies(themes_raw: str) -> tuple[bool, list[str], list[str]]:
+    """Classify a raw theme response for the run summary (issue #53 format).
 
-    Re-reads the raw quality response with parse_quality_scores' own pattern:
-    an out-of-range score is strong evidence the model misread the rubric, so
-    the run summary must surface it rather than leave it buried in scores_raw.
+    Routes every line through the shared ``newsletter.classify_theme_line`` so
+    this diagnostic and the production parser cannot drift (Finding 2). Returns
+    ``(is_garbage, dropped_name_tokens, near_miss_lines)``:
+
+    - *is_garbage* — the response is neither NONE nor contains any recognizable
+      theme grading (prose masquerading as a confident answer). An all-ABSENT
+      response is a valid empty result, not garbage.
+    - *dropped_name_tokens* — off-taxonomy theme names the parser silently ignored.
+    - *near_miss_lines* — non-blank lines that are not a recognizable grading and
+      parse_themes silently skipped (a hyphenated/spaced name or a misspelled
+      grade that reads as a missed prediction). Surfacing them keeps a systematic
+      parser gap from masquerading as a genuine model miss (Finding 3).
     """
-    clamped = []
-    for dim in ("simple", "concrete", "personal", "dynamic"):
-        match = re.search(rf"{dim.upper()}\s*:\s*(\d+)", scores_raw, flags=re.IGNORECASE)
-        if match and not 1 <= int(match.group(1)) <= 5:
-            clamped.append(dim.upper())
-    return clamped
+    stripped = themes_raw.strip()
+    if not stripped or stripped.upper() == "NONE":
+        return False, [], []
+
+    graded_any = False
+    dropped: list[str] = []
+    near_miss: list[str] = []
+    for line in stripped.splitlines():
+        kind, name, _grade = classify_theme_line(line)
+        if kind == "blank":
+            continue
+        if kind == "anomalous":
+            near_miss.append(line.strip())
+            continue
+        graded_any = True  # "theme" or "off_taxonomy" is a recognizable grading
+        if kind == "off_taxonomy":
+            dropped.append(name)
+    return not graded_any, dropped, near_miss
 
 
 def summarize_rows(rows: list) -> dict:
@@ -503,45 +523,44 @@ def summarize_rows(rows: list) -> dict:
       parse_quality_scores returned None
     - theme_parse_failures: theme response was neither NONE nor parseable —
       garbage output masquerading as a confident "no themes"
-    - clamped: {story_id: [DIMS]} where raw scores were out of 1-5
-    - dropped_theme_tokens: {token: count} of off-taxonomy labels parse_themes
+    - dropped_theme_tokens: {token: count} of off-taxonomy theme names parse_themes
       silently dropped from otherwise-parsed responses
+    - theme_near_miss_lines: {line: count} of non-blank lines parse_themes silently
+      skipped (hyphenated/spaced name, misspelled grade) in an otherwise-parsed
+      response — a parser gap that would otherwise read as a model miss (Finding 3)
     """
     counts = {
         "rows": len(rows),
         "errors": 0,
         "quality_parse_failures": 0,
         "theme_parse_failures": 0,
-        "clamped": {},
         "dropped_theme_tokens": {},
+        "theme_near_miss_lines": {},
     }
     for r in rows:
         if getattr(r, "error", None):
             counts["errors"] += 1
             continue
         scores_raw = getattr(r, "scores_raw", None)
-        if scores_raw is not None:
-            if getattr(r, "predicted_scores", None) is None:
-                counts["quality_parse_failures"] += 1
-            else:
-                dims = clamped_dimensions(scores_raw)
-                if dims:
-                    counts["clamped"][r.story_id] = dims
+        if scores_raw is not None and getattr(r, "predicted_scores", None) is None:
+            counts["quality_parse_failures"] += 1
         themes_raw = getattr(r, "themes_raw", None)
         if themes_raw is not None:
-            stripped = themes_raw.strip()
-            if stripped and stripped.upper() != "NONE":
-                invalid = [
-                    line.strip() for line in stripped.splitlines()
-                    if line.strip() and line.strip().upper() not in _VALID_THEMES
-                ]
-                if not r.predicted_themes:
-                    counts["theme_parse_failures"] += 1
-                elif invalid:
-                    for token in invalid:
-                        counts["dropped_theme_tokens"][token] = (
-                            counts["dropped_theme_tokens"].get(token, 0) + 1
-                        )
+            is_garbage, dropped, near_miss = _theme_line_anomalies(themes_raw)
+            if is_garbage:
+                counts["theme_parse_failures"] += 1
+            else:
+                # A garbage response is already counted above and its lines are
+                # the prose; only tally near-misses when the response otherwise
+                # parsed, so the near-miss signal isn't double-reported.
+                for line in near_miss:
+                    counts["theme_near_miss_lines"][line] = (
+                        counts["theme_near_miss_lines"].get(line, 0) + 1
+                    )
+            for token in dropped:
+                counts["dropped_theme_tokens"][token] = (
+                    counts["dropped_theme_tokens"].get(token, 0) + 1
+                )
     return counts
 
 
@@ -573,6 +592,7 @@ def format_run_summary(rows: list) -> str:
     --report or grepping the results JSONL.
     """
     counts = summarize_rows(rows)
+    near_miss_total = sum(counts["theme_near_miss_lines"].values())
     problems = []
     if counts["errors"]:
         problems.append(plural(counts["errors"], "error"))
@@ -580,20 +600,20 @@ def format_run_summary(rows: list) -> str:
         problems.append(plural(counts["quality_parse_failures"], "quality parse failure"))
     if counts["theme_parse_failures"]:
         problems.append(plural(counts["theme_parse_failures"], "theme parse failure"))
+    if near_miss_total:
+        problems.append(plural(near_miss_total, "theme near-miss", "theme near-misses"))
     lines = [f"  Rows: {counts['rows']} ({', '.join(problems) if problems else 'no errors'})"]
-    if counts["clamped"]:
-        detail = "; ".join(
-            f"{sid}: {', '.join(dims)}" for sid, dims in counts["clamped"].items()
-        )
-        lines.append(
-            f"  Out-of-range scores clamped to 1-5 in "
-            f"{plural(len(counts['clamped']), 'story', 'stories')} ({detail})"
-        )
     if counts["dropped_theme_tokens"]:
         detail = ", ".join(
             f"{tok} x{n}" for tok, n in sorted(counts["dropped_theme_tokens"].items())
         )
         lines.append(f"  Unrecognized theme labels dropped by the parser: {detail}")
+    if counts["theme_near_miss_lines"]:
+        detail = ", ".join(
+            f'"{line}" x{n}'
+            for line, n in sorted(counts["theme_near_miss_lines"].items())
+        )
+        lines.append(f"  Theme lines the parser skipped (near-misses): {detail}")
     return "\n".join(lines)
 
 
@@ -755,13 +775,19 @@ async def main(args: argparse.Namespace) -> None:
     # Preflight: probe the newsletter endpoint once and fail fast on an
     # unreachable / name-mismatched one (skippable via --skip-preflight).
     if not args.skip_preflight:
-        if not await llm.is_available():
+        result = await llm.probe()
+        if not result.ok:
             base = config["newsletter"]["llm"]
+            # Surface probe()'s captured diagnosis (HTTP status / exception text /
+            # 404 model-mismatch hint) instead of discarding it (Finding 1). All
+            # wording lives on AvailabilityResult.detail() so this and run_eval's
+            # preflight can't drift (Finding 2).
+            detail = result.detail()
+            detail_part = f"\n{detail}" if detail else ""
             print(
                 f"Error: newsletter LLM '{base['model']}' not reachable at "
                 f"{describe_endpoint()}.\n"
-                "Check that the endpoint is up; a 404 can also mean the model "
-                "name does not match the served model.",
+                "Check that the endpoint is up." + detail_part,
                 file=sys.stderr,
             )
             sys.exit(1)

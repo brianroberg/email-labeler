@@ -5,7 +5,13 @@ from unittest.mock import AsyncMock, patch
 import httpx
 import pytest
 
-from llm_client import DEFAULT_AVAILABILITY_TIMEOUT, LLMClient, LLMUnavailableError
+from llm_client import (
+    DEFAULT_AVAILABILITY_TIMEOUT,
+    AvailabilityResult,
+    LLMClient,
+    LLMContentError,
+    LLMUnavailableError,
+)
 
 
 @pytest.fixture
@@ -325,6 +331,22 @@ class TestContentlessResponse:
             assert "test-cloud-model" in msg
             assert "max_tokens" in msg  # names the likely cause
 
+    async def test_content_less_raises_llm_content_error(self, cloud_client):
+        """The content-less guard raises the dedicated LLMContentError type so the
+        newsletter pipeline can re-raise it to the give-up path (issue #30). It must
+        subclass RuntimeError to preserve the email pipeline's give-up handler."""
+        assert issubclass(LLMContentError, RuntimeError)
+        mock_response = _mock_response(json_data={
+            "choices": [{"message": {"role": "assistant", "content": None}}]
+        })
+        with patch("llm_client.httpx.AsyncClient") as mock_client_cls:
+            mock_client = AsyncMock()
+            mock_client.post.return_value = mock_response
+            mock_client_cls.return_value.__aenter__ = AsyncMock(return_value=mock_client)
+            mock_client_cls.return_value.__aexit__ = AsyncMock(return_value=False)
+            with pytest.raises(LLMContentError, match="no content"):
+                await cloud_client.complete("sys", "user")
+
     async def test_none_content_raises_runtime_error(self, cloud_client):
         """An explicit `content: null` raises RuntimeError, not a downstream crash."""
         mock_response = _mock_response(json_data={
@@ -389,65 +411,57 @@ class TestContentlessResponse:
                 await glm_client.complete("sys", "user", include_thinking=True)
 
 
-class TestIsAvailable:
-    async def test_available_when_server_responds(self, local_client):
-        """is_available returns True when server returns 200."""
-        mock_response = _mock_response(json_data={
-            "choices": [{"message": {"content": "ok"}}]
-        })
+class TestProbe:
+    """probe() carries status detail so preflight can distinguish a 404
+    (model-name mismatch) from an unreachable endpoint (issue #41 item 7)."""
 
+    async def test_probe_ok_on_200(self, local_client):
+        mock_response = _mock_response(json_data={"choices": [{"message": {"content": "ok"}}]})
         with patch("llm_client.httpx.AsyncClient") as mock_client_cls:
             mock_client = AsyncMock()
             mock_client.post.return_value = mock_response
             mock_client_cls.return_value.__aenter__ = AsyncMock(return_value=mock_client)
             mock_client_cls.return_value.__aexit__ = AsyncMock(return_value=False)
+            result = await local_client.probe()
+            assert result.ok is True
+            assert result.status_code == 200
+            assert result.error is None
 
-            assert await local_client.is_available() is True
+    async def test_probe_reports_404_status(self, local_client):
+        mock_response = _mock_response(status_code=404, json_data={"error": "not found"})
+        with patch("llm_client.httpx.AsyncClient") as mock_client_cls:
+            mock_client = AsyncMock()
+            mock_client.post.return_value = mock_response
+            mock_client_cls.return_value.__aenter__ = AsyncMock(return_value=mock_client)
+            mock_client_cls.return_value.__aexit__ = AsyncMock(return_value=False)
+            result = await local_client.probe()
+            assert result.ok is False
+            assert result.status_code == 404
 
-    async def test_unavailable_on_connection_error(self, local_client):
-        """is_available returns False when server is unreachable."""
+    async def test_probe_error_on_connection_failure(self, local_client):
         with patch("llm_client.httpx.AsyncClient") as mock_client_cls:
             mock_client = AsyncMock()
             mock_client.post.side_effect = httpx.ConnectError("Connection refused")
             mock_client_cls.return_value.__aenter__ = AsyncMock(return_value=mock_client)
             mock_client_cls.return_value.__aexit__ = AsyncMock(return_value=False)
+            result = await local_client.probe()
+            assert result.ok is False
+            assert result.status_code is None
+            assert "ConnectError" in result.error
 
-            assert await local_client.is_available() is False
-
-    async def test_unavailable_on_timeout(self, local_client):
-        """is_available returns False on timeout."""
-        with patch("llm_client.httpx.AsyncClient") as mock_client_cls:
-            mock_client = AsyncMock()
-            mock_client.post.side_effect = httpx.TimeoutException("Timeout")
-            mock_client_cls.return_value.__aenter__ = AsyncMock(return_value=mock_client)
-            mock_client_cls.return_value.__aexit__ = AsyncMock(return_value=False)
-
-            assert await local_client.is_available() is False
-
-    async def test_unavailable_on_http_error(self, local_client):
-        """is_available returns False on non-200 response."""
-        mock_response = _mock_response(status_code=503, json_data={"error": "Service Unavailable"})
-
-        with patch("llm_client.httpx.AsyncClient") as mock_client_cls:
-            mock_client = AsyncMock()
-            mock_client.post.return_value = mock_response
-            mock_client_cls.return_value.__aenter__ = AsyncMock(return_value=mock_client)
-            mock_client_cls.return_value.__aexit__ = AsyncMock(return_value=False)
-
-            assert await local_client.is_available() is False
-
-    async def test_unavailable_on_unsupported_protocol(self, local_client):
-        """An unset/schemeless URL makes httpx raise UnsupportedProtocol; the
-        preflight relies on this being caught (returns False), not propagated."""
+    async def test_probe_error_on_unsupported_protocol(self, local_client):
+        """An unset/schemeless URL makes httpx raise UnsupportedProtocol; probe()
+        relies on this being caught (ok=False), not propagated."""
         with patch("llm_client.httpx.AsyncClient") as mock_client_cls:
             mock_client = AsyncMock()
             mock_client.post.side_effect = httpx.UnsupportedProtocol("missing scheme")
             mock_client_cls.return_value.__aenter__ = AsyncMock(return_value=mock_client)
             mock_client_cls.return_value.__aexit__ = AsyncMock(return_value=False)
 
-            assert await local_client.is_available() is False
+            result = await local_client.probe()
+            assert result.ok is False
 
-    async def test_default_availability_timeout_is_longer_than_10s(self, local_client):
+    async def test_probe_default_timeout_is_longer_than_10s(self, local_client):
         """The ping timeout defaults to DEFAULT_AVAILABILITY_TIMEOUT (>10s) so a
         cold on-demand model load is not mistaken for an unreachable server."""
         assert DEFAULT_AVAILABILITY_TIMEOUT > 10
@@ -458,11 +472,11 @@ class TestIsAvailable:
             mock_client_cls.return_value.__aenter__ = AsyncMock(return_value=mock_client)
             mock_client_cls.return_value.__aexit__ = AsyncMock(return_value=False)
 
-            await local_client.is_available()
+            await local_client.probe()
 
             assert mock_client_cls.call_args.kwargs["timeout"] == DEFAULT_AVAILABILITY_TIMEOUT
 
-    async def test_explicit_timeout_is_honored(self, local_client):
+    async def test_probe_explicit_timeout_is_honored(self, local_client):
         mock_response = _mock_response(json_data={"choices": [{"message": {"content": "ok"}}]})
         with patch("llm_client.httpx.AsyncClient") as mock_client_cls:
             mock_client = AsyncMock()
@@ -470,9 +484,42 @@ class TestIsAvailable:
             mock_client_cls.return_value.__aenter__ = AsyncMock(return_value=mock_client)
             mock_client_cls.return_value.__aexit__ = AsyncMock(return_value=False)
 
-            await local_client.is_available(timeout=123)
+            await local_client.probe(timeout=123)
 
             assert mock_client_cls.call_args.kwargs["timeout"] == 123
+
+
+class TestAvailabilityDetail:
+    """AvailabilityResult.detail() is the single place that composes a probe
+    failure's diagnosis (Findings 1 & 2): the HTTP status (with the 404
+    model-mismatch hint) or the exception text, so every preflight can surface it
+    instead of discarding it."""
+
+    def test_detail_empty_when_ok(self):
+        assert AvailabilityResult(ok=True, status_code=200).detail() == ""
+
+    def test_detail_includes_non_404_status_code(self):
+        detail = AvailabilityResult(ok=False, status_code=401).detail()
+        assert "401" in detail
+        # A non-404 status is not a model-mismatch, so no such hint.
+        assert "model name does not match" not in detail
+
+    def test_detail_404_includes_model_mismatch_hint(self):
+        detail = AvailabilityResult(ok=False, status_code=404).detail()
+        assert "404" in detail
+        assert "model name does not match" in detail
+
+    def test_detail_includes_error_text(self):
+        detail = AvailabilityResult(
+            ok=False, error="ConnectError: Connection refused"
+        ).detail()
+        assert "ConnectError" in detail
+        assert "Connection refused" in detail
+
+    def test_detail_empty_when_no_status_or_error(self):
+        # ok=False with neither a status nor an error (e.g. a bare down probe) has
+        # nothing specific to say.
+        assert AvailabilityResult(ok=False).detail() == ""
 
 
 class TestExtraBody:
@@ -541,7 +588,7 @@ class TestExtraBody:
             assert set(body.keys()) == {"model", "max_tokens", "temperature", "messages"}
 
     async def test_extra_body_in_availability_check(self):
-        """Extra body fields are included in is_available ping."""
+        """Extra body fields are included in the probe() ping."""
         client = LLMClient(
             base_url="http://localhost:8080/v1/chat/completions",
             api_key="",
@@ -558,7 +605,7 @@ class TestExtraBody:
             mock_client_cls.return_value.__aenter__ = AsyncMock(return_value=mock_client)
             mock_client_cls.return_value.__aexit__ = AsyncMock(return_value=False)
 
-            await client.is_available()
+            await client.probe()
 
             body = mock_client.post.call_args.kwargs["json"]
             assert body["enable_thinking"] is False

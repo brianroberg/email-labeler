@@ -10,11 +10,12 @@ import logging
 import re
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
+from email.utils import parsedate_to_datetime
 from enum import Enum
 from pathlib import Path
 
 from gmail_utils import get_header
-from llm_client import LLMClient, LLMUnavailableError
+from llm_client import LLMClient, LLMContentError, LLMUnavailableError
 
 log = logging.getLogger(__name__)
 
@@ -36,6 +37,57 @@ _VALID_THEMES = {
 
 _DIMENSIONS = ("simple", "concrete", "personal", "dynamic")
 
+# Storytelling dimensions are graded on a 3-value rubric (issue #53). The tokens
+# map to integers so the tier average and eval metrics stay simple arithmetic.
+_SCORE_TOKENS = {"POOR": 1, "OK": 2, "GOOD": 3}
+
+# Ends-Statement themes are graded on a 3-value rubric (issue #53). All three
+# grades are *recognized*; "absent" is represented by omission, so only present/
+# emphasized ever appear in a stored dict (see classify_theme_line / parse_themes).
+_THEME_GRADE_TOKENS = {"ABSENT": "absent", "PRESENT": "present", "EMPHASIZED": "emphasized"}
+
+# One-per-line theme matcher, single-sourced here so the production parser
+# (parse_themes) and the eval anomaly detectors share identical format knowledge
+# and cannot drift (Finding 2). Unanchored ``search`` tolerates leading list
+# markers/markdown (mirrors parse_quality_scores); ``([A-Za-z]+)`` captures ANY
+# grade word so a misspelled grade is still recognized as a line yet rejected as
+# a grade — surfacing it as a near-miss instead of being silently skipped.
+_THEME_LINE_RE = re.compile(r"([A-Za-z_]+)\s*:\s*([A-Za-z]+)")
+
+
+def classify_theme_line(line: str) -> tuple[str, str | None, str | None]:
+    """Classify one line of an LLM theme-grading reply. Returns ``(kind, name, grade)``.
+
+    The single shared theme-line classifier: ``parse_themes`` and the eval
+    anomaly detectors (``newsletter_run._theme_line_anomalies`` /
+    ``newsletter_report.theme_parse_anomalies``) all route through it, so the
+    response-format knowledge lives in one place (Finding 2).
+
+    Kinds:
+      - ``"blank"`` — whitespace-only line; ignore it.
+      - ``"theme"`` — an in-taxonomy grading. ``name`` is the lowercased theme,
+        ``grade`` one of "absent"/"present"/"emphasized". parse_themes stores it
+        iff the grade is not "absent".
+      - ``"off_taxonomy"`` — a ``NAME: GRADE`` line with a valid grade token but an
+        off-taxonomy ``name`` (returned UPPERCASE); parse_themes drops it.
+      - ``"anomalous"`` — a non-blank line that is not a recognizable grading (no
+        ``NAME: WORD`` pair, or a WORD that is not a grade token); parse_themes
+        skips it. Off-taxonomy and anomalous lines are exactly the non-blank lines
+        parse_themes does NOT accept — the diagnostics surface both (Finding 3).
+    """
+    if not line.strip():
+        return "blank", None, None
+    match = _THEME_LINE_RE.search(line)
+    if not match:
+        return "anomalous", None, None
+    name = match.group(1).upper()
+    grade = _THEME_GRADE_TOKENS.get(match.group(2).upper())
+    if grade is None:
+        return "anomalous", None, None
+    if name in _VALID_THEMES:
+        return "theme", name.lower(), grade
+    return "off_taxonomy", name, grade
+
 
 @dataclass
 class StoryResult:
@@ -43,7 +95,7 @@ class StoryResult:
     scores: dict[str, int] | None = None
     average_score: float | None = None
     tier: NewsletterTier | None = None
-    themes: list[str] = field(default_factory=list)
+    themes: dict[str, str] = field(default_factory=dict)
     quality_cot: str = ""
     theme_cot: str = ""
 
@@ -88,56 +140,108 @@ def parse_stories(raw: str) -> list[str]:
 def parse_quality_scores(raw: str) -> dict[str, int] | None:
     """Parse LLM quality assessment output into dimension scores.
 
-    Returns None if any dimension is missing or has an unparseable value.
-    Clamps scores to 1-5 range.
+    Each dimension is graded POOR/OK/GOOD (mapped to 1/2/3). Returns None if any
+    dimension is missing or its value is not one of those tokens (a legacy digit
+    or an unknown word is a parse failure, not a clamped score).
     """
     if not raw.strip():
         return None
 
     scores = {}
     for dim in _DIMENSIONS:
-        pattern = rf"{dim.upper()}\s*:\s*(\d+)"
+        pattern = rf"{dim.upper()}\s*:\s*(POOR|OK|GOOD)\b"
         match = re.search(pattern, raw, flags=re.IGNORECASE)
         if not match:
             return None
-        try:
-            value = int(match.group(1))
-        except ValueError:
-            return None
-        scores[dim] = max(1, min(5, value))
+        scores[dim] = _SCORE_TOKENS[match.group(1).upper()]
 
     return scores
 
 
-def parse_themes(raw: str) -> list[str]:
-    """Parse LLM theme classification output into theme labels.
+def parse_themes(raw: str) -> dict[str, str]:
+    """Parse LLM theme classification output into graded theme labels.
 
-    Returns list of lowercase theme names. Ignores unrecognized themes.
-    Returns empty list for NONE response.
+    Each recognized theme line is ``THEME: ABSENT|PRESENT|EMPHASIZED``. Returns a
+    dict mapping lowercase theme name -> "present"/"emphasized"; Absent themes and
+    unrecognized names are omitted. Returns an empty dict for a NONE response.
     """
     stripped = raw.strip()
     if not stripped or stripped.upper() == "NONE":
-        return []
+        return {}
 
-    themes = []
+    themes: dict[str, str] = {}
     for line in stripped.splitlines():
-        token = line.strip().upper()
-        if token in _VALID_THEMES:
-            themes.append(token.lower())
+        kind, name, grade = classify_theme_line(line)
+        # Store only in-taxonomy present/emphasized gradings; absent is omitted,
+        # off-taxonomy/anomalous lines are dropped (surfaced by the eval detectors).
+        if kind == "theme" and grade != "absent":
+            themes[name] = grade
 
     return themes
 
 
 def compute_tier(scores: dict[str, int]) -> NewsletterTier:
-    """Derive quality tier from dimension scores."""
+    """Derive quality tier from the 3-value dimension scores.
+
+    Dimensions are 1/2/3 (Poor/OK/Good); the tier is banded off their mean:
+    excellent >= 2.75, good >= 2.25, fair >= 1.75, else poor (issue #53).
+    """
     avg = sum(scores.values()) / len(scores)
-    if avg >= 4.0:
+    if avg >= 2.75:
         return NewsletterTier.EXCELLENT
-    if avg >= 3.0:
+    if avg >= 2.25:
         return NewsletterTier.GOOD
-    if avg >= 2.0:
+    if avg >= 1.75:
         return NewsletterTier.FAIR
     return NewsletterTier.POOR
+
+
+# Ordering of theme grades for cross-story aggregation (higher = stronger).
+THEME_GRADE_RANK = {"present": 1, "emphasized": 2}
+
+
+def aggregate_theme_grades(stories: list["StoryResult"]) -> dict[str, str]:
+    """Merge per-story graded themes into one dict for the whole newsletter.
+
+    Each theme takes the strongest grade seen across all stories
+    (emphasized > present); themes absent from every story are omitted.
+    """
+    merged: dict[str, str] = {}
+    for story in stories:
+        for theme, grade in story.themes.items():
+            if THEME_GRADE_RANK.get(grade, 0) > THEME_GRADE_RANK.get(merged.get(theme, ""), 0):
+                merged[theme] = grade
+    return merged
+
+
+def parse_send_date(date_header: str, internal_date_ms: str | None = None) -> str | None:
+    """Normalize an email's send date to an ISO-8601 UTC string.
+
+    Prefers the RFC-2822 ``Date`` header (a header with no timezone is assumed
+    UTC); falls back to Gmail's ``internalDate`` (epoch milliseconds) when the
+    header is missing or unparseable. Returns None if neither yields a valid date.
+    ISO-8601 UTC sorts lexicographically = chronologically, which the review TUI
+    relies on for date sorting/filtering (issue #35/#36).
+    """
+    if date_header:
+        try:
+            dt = parsedate_to_datetime(date_header)
+            if dt is not None:
+                if dt.tzinfo is None:
+                    dt = dt.replace(tzinfo=timezone.utc)
+                # astimezone can OverflowError near datetime's min/max year.
+                return dt.astimezone(timezone.utc).isoformat()
+        except (ValueError, TypeError, OverflowError):
+            pass
+
+    if internal_date_ms:
+        try:
+            seconds = int(internal_date_ms) / 1000
+            return datetime.fromtimestamp(seconds, tz=timezone.utc).isoformat()
+        except (ValueError, TypeError, OverflowError, OSError):
+            pass
+
+    return None
 
 
 def write_assessment(
@@ -148,14 +252,25 @@ def write_assessment(
     subject: str,
     overall_tier: NewsletterTier | None,
     stories: list[StoryResult],
+    *,
+    send_date: str | None = None,
+    model: str | None = None,
 ) -> None:
-    """Append a newsletter assessment record to the JSONL output file."""
+    """Append a newsletter assessment record to the JSONL output file.
+
+    ``timestamp`` is the *processed* time (UTC now). ``send_date`` is the email's
+    own send date (ISO-8601 UTC, email-intrinsic) and ``model`` is the classifier
+    model — both used by the review TUI (issue #35/#36). Old records lacking these
+    keys are read with ``.get()`` fallbacks by consumers.
+    """
     record = {
         "timestamp": datetime.now(timezone.utc).isoformat(),
         "message_id": message_id,
         "thread_id": thread_id,
         "from": sender,
         "subject": subject,
+        "send_date": send_date,
+        "model": model,
         "overall_tier": overall_tier.value if overall_tier else None,
         "stories": [
             {
@@ -223,8 +338,8 @@ class NewsletterClassifier:
         scores = parse_quality_scores(raw)
         return scores, cot
 
-    async def classify_themes(self, text: str) -> tuple[list[str], str]:
-        """Tag a story with Ends Statement themes."""
+    async def classify_themes(self, text: str) -> tuple[dict[str, str], str]:
+        """Tag a story with graded Ends Statement themes (theme -> grade)."""
         user_content = self.theme_config["user_template"].format(text=text)
         raw, cot = await self.cloud_llm.complete(
             self.theme_config["system"],
@@ -260,8 +375,11 @@ class NewsletterClassifier:
                     result.scores = scores
                     result.average_score = sum(scores.values()) / len(scores)
                     result.tier = compute_tier(scores)
-            except LLMUnavailableError:
-                raise  # transient — let the daemon retry the whole newsletter
+            except (LLMUnavailableError, LLMContentError):
+                # transient outage OR a content-less response (issue #30): both
+                # affect every story, so propagate to give-up rather than commit
+                # a permanently mis-graded (empty) newsletter.
+                raise
             except Exception:
                 log.warning("Quality assessment failed for story: %s", text[:60])
 
@@ -269,8 +387,8 @@ class NewsletterClassifier:
                 themes, theme_cot = await self.classify_themes(text)
                 result.themes = themes
                 result.theme_cot = theme_cot
-            except LLMUnavailableError:
-                raise  # transient — let the daemon retry the whole newsletter
+            except (LLMUnavailableError, LLMContentError):
+                raise
             except Exception:
                 log.warning("Theme classification failed for story: %s", text[:60])
 

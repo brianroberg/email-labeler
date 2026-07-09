@@ -15,6 +15,7 @@ JSONL files a real ``load_*`` path can read back:
 import base64
 import json
 import sys
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 # Repo modules (run from repo root).
@@ -38,6 +39,20 @@ def _msg(body: str, headers=None) -> dict:
 
 def _scores(simple, concrete, personal, dynamic):
     return {"simple": simple, "concrete": concrete, "personal": personal, "dynamic": dynamic}
+
+
+def _days_before_now_iso(days: int) -> str:
+    """A midday-UTC ``send_date`` *days* before the real current instant, as a
+    UTC ISO string.
+
+    The past-N-days date-filter scenarios compute their cutoff from the real
+    clock (``_days_ago_cutoff``), so the "recent" records must track ``now`` or
+    the harness would rot when the wall clock advances. Midday-UTC keeps the
+    local calendar date within one day of the offset regardless of the reader's
+    timezone, and the large offsets used (2/10 vs 45/200 days) leave a wide
+    margin around the 30-day boundary."""
+    dt = datetime.now(timezone.utc) - timedelta(days=days)
+    return dt.replace(hour=12, minute=0, second=0, microsecond=0).isoformat()
 
 
 # ---------------------------------------------------------------------------
@@ -97,8 +112,8 @@ def newsletters() -> list[GoldenNewsletter]:
         reviewed=True, seeded_from="parse_stories",
     )
     s = GoldenStory(story_id="nl-reviewed:0", text="Dana mentored three interns over the summer.",
-                    expected_scores=_scores(4, 4, 5, 4), expected_tier="excellent",
-                    expected_themes=["disciple_making"], reviewed=True)
+                    expected_scores=_scores(3, 3, 3, 3), expected_tier="excellent",
+                    expected_themes={"disciple_making": "emphasized"}, reviewed=True)
     reviewed.stories = [s]
     nls.append(reviewed)
 
@@ -151,8 +166,8 @@ def newsletters() -> list[GoldenNewsletter]:
         GoldenStory(
             story_id="nl-mixed:0",
             text="Paragraph one of the retreat story.\n\nParagraph two continues the same retreat story.",
-            expected_scores=_scores(3, 3, 3, 3), expected_tier="good",
-            expected_themes=["church"], reviewed=True),
+            expected_scores=_scores(3, 3, 2, 2), expected_tier="good",
+            expected_themes={"church": "present"}, reviewed=True),
         GoldenStory(story_id="nl-mixed:1", text="A separate short story about a baptism."),  # unlabeled
     ]
     nls.append(mixed)
@@ -233,69 +248,98 @@ def threads() -> list[GoldenThread]:
 # ---------------------------------------------------------------------------
 
 def _story_rec(text, scores=None, tier=None, themes=None, qcot="", tcot=""):
+    # Scores are 1/2/3 (Poor/OK/Good); themes are graded dicts (issue #53).
     avg = round(sum(scores.values()) / len(scores), 2) if scores else None
     return {"text": text, "scores": scores, "average_score": avg, "tier": tier,
-            "themes": themes or [], "quality_cot": qcot, "theme_cot": tcot}
+            "themes": {} if themes is None else themes, "quality_cot": qcot, "theme_cot": tcot}
 
 
 def assessment_records() -> list[dict]:
     recs: list[dict] = []
 
+    # a1/a2 are dynamically-RECENT (inside a past-30d window); a3/a4 are
+    # dynamically-OLD (outside it). Dates track the real clock so the past-N-days
+    # filter scenarios don't rot (issue #36).
     recs.append({
         "timestamp": "2026-01-05T10:00:00+00:00", "message_id": "a1", "thread_id": "a1",
+        "send_date": _days_before_now_iso(2),
         "from": "newsletter@dm.org", "subject": "Excellent edition", "overall_tier": "excellent",
         "stories": [_story_rec("Sarah led 5 students to a scripture retreat this weekend.",
-                               _scores(5, 5, 4, 4), "excellent", ["scripture", "disciple_making"],
+                               _scores(3, 3, 3, 3), "excellent",
+                               {"scripture": "emphasized", "disciple_making": "present"},
                                qcot="Concrete names and numbers throughout.", tcot="Clear scripture focus.")],
     })
     recs.append({
         "timestamp": "2026-01-06T11:00:00+00:00", "message_id": "a2", "thread_id": "a2",
+        "send_date": _days_before_now_iso(10),
         "from": "weekly@ministry.org", "subject": "Good update", "overall_tier": "good",
-        "stories": [_story_rec("The church hosted a community dinner.", _scores(3, 3, 3, 3),
-                               "good", ["church"], qcot="Solid but generic.", tcot="Church theme.")],
+        "stories": [_story_rec("The church hosted a community dinner.", _scores(3, 3, 2, 2),
+                               "good", {"church": "present"}, qcot="Solid but generic.",
+                               tcot="Church theme.")],
     })
     recs.append({
         "timestamp": "2026-01-07T12:00:00+00:00", "message_id": "a3", "thread_id": "a3",
+        "send_date": _days_before_now_iso(45),
         "from": "digest@dm.org", "subject": "Fair digest", "overall_tier": "fair",
-        "stories": [_story_rec("Some vocation and family news was shared.", _scores(2, 2, 2, 3),
-                               "fair", ["vocation_family"])],
+        "stories": [_story_rec("Some vocation and family news was shared.", _scores(2, 2, 2, 2),
+                               "fair", {"vocation_family": "present"})],
     })
     recs.append({
         "timestamp": "2026-01-08T13:00:00+00:00", "message_id": "a4", "thread_id": "a4",
+        "send_date": _days_before_now_iso(200),
         "from": "bulletin@church.net", "subject": "Poor bulletin", "overall_tier": "poor",
         "stories": [_story_rec("Announcements and administrative items only.", _scores(1, 1, 1, 2),
-                               "poor", [])],
+                               "poor", {})],
     })
-    # No-stories record.
+    # No-stories AND no-send_date record: list column renders "—" and it sorts
+    # last; a positive since-filter always drops it (issue #36).
     recs.append({
         "timestamp": "2026-01-09T14:00:00+00:00", "message_id": "a5", "thread_id": "a5",
         "from": "empty@dm.org", "subject": "No stories here", "overall_tier": None, "stories": [],
     })
+    # a6/a7/a8 carry FIXED midday-UTC send-dates (distinct calendar days) so the
+    # sort-order / init-since scenarios assert exact dates deterministically.
     # Multi-theme, multi-story, distinct sender for the sender filter.
     recs.append({
         "timestamp": "2026-01-10T15:00:00+00:00", "message_id": "a6", "thread_id": "a6",
+        "send_date": "2026-08-01T12:00:00+00:00",
         "from": "multi@partner-org.com", "subject": "Multi-theme edition", "overall_tier": "good",
         "stories": [
-            _story_rec("Christ-like service and scripture memorization combined.", _scores(4, 3, 4, 3),
-                       "good", ["christlikeness", "scripture"], qcot="A" * 400, tcot="B" * 400),
-            _story_rec("Disciple-making across three campuses.", _scores(3, 4, 3, 3),
-                       "good", ["disciple_making"]),
+            _story_rec("Christ-like service and scripture memorization combined.", _scores(3, 2, 3, 2),
+                       "good", {"christlikeness": "emphasized", "scripture": "present"},
+                       qcot="A" * 400, tcot="B" * 400),
+            _story_rec("Disciple-making across three campuses.", _scores(3, 2, 3, 2),
+                       "good", {"disciple_making": "emphasized"}),
         ],
     })
     # Emoji/wide subject.
     recs.append({
         "timestamp": "2026-01-11T16:00:00+00:00", "message_id": "a7", "thread_id": "a7",
+        "send_date": "2026-07-15T12:00:00+00:00",
         "from": "global@dm.org", "subject": "🌍 東京 global report", "overall_tier": "excellent",
-        "stories": [_story_rec("東京 team baptized 8 new believers 🙏.", _scores(5, 4, 5, 4),
-                               "excellent", ["church", "disciple_making"])],
+        "stories": [_story_rec("東京 team baptized 8 new believers 🙏.", _scores(3, 3, 3, 3),
+                               "excellent", {"church": "present", "disciple_making": "emphasized"})],
     })
     # Long CoT for detail scrolling.
     recs.append({
         "timestamp": "2026-01-12T17:00:00+00:00", "message_id": "a8", "thread_id": "a8",
+        "send_date": "2026-06-01T12:00:00+00:00",
         "from": "verbose@dm.org", "subject": "Long reasoning", "overall_tier": "fair",
-        "stories": [_story_rec("A modest story.", _scores(2, 3, 2, 2), "fair", ["scripture"],
+        "stories": [_story_rec("A modest story.", _scores(2, 2, 2, 2), "fair", {"scripture": "present"},
                                qcot="\n".join(f"reasoning line {i}" for i in range(30)),
                                tcot="\n".join(f"theme reasoning {i}" for i in range(30)))],
+    })
+    # Evening-UTC send that falls on the PREVIOUS calendar day west of UTC:
+    # 01:00 UTC on 07-05 is 20:00 CDT on 07-04. The list column and since-filter
+    # must show/compare the LOCAL date (2026-07-04), never the UTC slice
+    # (2026-07-05) (issue #36 + local-tz fix).
+    recs.append({
+        "timestamp": "2026-07-05T02:00:00+00:00", "message_id": "nd-evening", "thread_id": "nd-evening",
+        "send_date": "2026-07-05T01:00:00+00:00",
+        "from": "evening@dm.org", "subject": "Evening send lands prior local day",
+        "overall_tier": "good",
+        "stories": [_story_rec("An evening-sent story about outreach.", _scores(3, 2, 2, 3),
+                               "good", {"church": "present"})],
     })
 
     return recs

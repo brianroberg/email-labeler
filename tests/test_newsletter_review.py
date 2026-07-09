@@ -1,21 +1,46 @@
 """Tests for newsletter_review TUI — pure data functions + Pilot UI tests."""
 
 import json
+import os
+import sys
+import time
+from contextlib import contextmanager
+from datetime import datetime, timezone
 
 import pytest
-from textual.widgets import ListView, Static
+from textual.widgets import Label, ListView, Static
 
 from newsletter_review.tui import (
     DetailScreen,
     ReviewApp,
+    _days_ago_cutoff,
     apply_filters,
     build_detail_lines,
     format_filter_summary,
     format_list_row,
     load_assessments,
     run_review_tui,
+    sort_by_send_date,
     wrap_text,
 )
+
+
+@contextmanager
+def _use_tz(name: str):
+    """Run the body under a fixed local timezone (Linux ``tzset``), restoring the
+    previous ``TZ`` afterward. Lets date tests observe the local-calendar
+    conversion regardless of the machine's real timezone."""
+    old = os.environ.get("TZ")
+    os.environ["TZ"] = name
+    time.tzset()
+    try:
+        yield
+    finally:
+        if old is None:
+            os.environ.pop("TZ", None)
+        else:
+            os.environ["TZ"] = old
+        time.tzset()
 
 
 def _make_record(
@@ -27,28 +52,38 @@ def _make_record(
     thread_id="t_001",
     message_id="msg_001",
     timestamp="2026-02-20T12:00:00Z",
+    send_date="2026-02-19T09:00:00+00:00",
+    model="claude-sonnet-4-6",
 ):
     if stories is None:
         stories = [
             {
                 "text": "Once upon a time in a campus ministry...",
-                "scores": {"simple": 4, "concrete": 3, "personal": 5, "dynamic": 2},
-                "average_score": 3.5,
+                "scores": {"simple": 3, "concrete": 2, "personal": 3, "dynamic": 2},
+                "average_score": 2.5,
                 "tier": "good",
-                "themes": ["scripture", "church"],
+                "themes": {"scripture": "emphasized", "church": "present"},
                 "quality_cot": "The story focuses on one idea.",
                 "theme_cot": "This illustrates Scripture study.",
             }
         ]
-    return {
+    record = {
         "timestamp": timestamp,
         "message_id": message_id,
         "thread_id": thread_id,
         "from": sender,
         "subject": subject,
+        "send_date": send_date,
+        "model": model,
         "overall_tier": overall_tier,
         "stories": stories,
     }
+    # Old records predate these fields; pass None to omit (backward-compat tests).
+    if send_date is None:
+        del record["send_date"]
+    if model is None:
+        del record["model"]
+    return record
 
 
 # ---------------------------------------------------------------------------
@@ -86,6 +121,22 @@ class TestLoadAssessments:
         records = load_assessments(f)
         assert records == []
 
+    def test_rejects_old_scheme_list_themes(self, tmp_path):
+        # A pre-#53 record stores story themes as a LIST; build_detail_lines
+        # later does themes.items() and would crash mid-render. Fail fast at
+        # load with an actionable, located error instead (Finding 4).
+        f = tmp_path / "assessments.jsonl"
+        good = _make_record(thread_id="ok")
+        old = _make_record(thread_id="old")
+        old["stories"][0]["themes"] = ["scripture", "church"]
+        f.write_text(json.dumps(good) + "\n" + json.dumps(old) + "\n")
+
+        with pytest.raises(ValueError, match="old-scheme|re-migrat") as exc:
+            load_assessments(f)
+        msg = str(exc.value)
+        assert str(f) in msg  # names the file
+        assert ":2" in msg  # names the offending line number
+
 
 # ---------------------------------------------------------------------------
 # apply_filters
@@ -116,13 +167,13 @@ class TestApplyFilters:
             _make_record(stories=[{
                 "text": "T", "scores": None,
                 "average_score": None, "tier": None,
-                "themes": ["scripture", "church"],
+                "themes": {"scripture": "emphasized", "church": "present"},
                 "quality_cot": "", "theme_cot": "",
             }]),
             _make_record(stories=[{
                 "text": "T", "scores": None,
                 "average_score": None, "tier": None,
-                "themes": ["disciple_making"],
+                "themes": {"disciple_making": "emphasized"},
                 "quality_cot": "", "theme_cot": "",
             }]),
         ]
@@ -161,6 +212,80 @@ class TestApplyFilters:
         result = apply_filters([], tier="good")
         assert result == []
 
+    def test_since_filter_keeps_on_or_after_cutoff(self):
+        # Issue #36: date filter on the send-date, inclusive of the boundary.
+        records = [
+            _make_record(thread_id="old", send_date="2024-01-01T00:00:00+00:00"),
+            _make_record(thread_id="edge", send_date="2024-06-15T09:00:00+00:00"),
+            _make_record(thread_id="new", send_date="2024-12-31T00:00:00+00:00"),
+        ]
+        result = apply_filters(records, since="2024-06-15")
+        assert {r["thread_id"] for r in result} == {"edge", "new"}
+
+    def test_since_filter_excludes_records_without_send_date(self):
+        records = [
+            _make_record(thread_id="dated", send_date="2024-12-31T00:00:00+00:00"),
+            _make_record(thread_id="undated", send_date=None),
+        ]
+        result = apply_filters(records, since="2024-01-01")
+        assert [r["thread_id"] for r in result] == ["dated"]
+
+    def test_since_filter_uses_local_calendar_date(self):
+        # A US-evening send stored as UTC lands on the next UTC day; the since
+        # filter must compare the LOCAL calendar date, not the UTC string.
+        # 2026-07-05T01:00Z is 2026-07-04 20:00 in America/Chicago (CDT = UTC-5).
+        records = [_make_record(thread_id="eve", send_date="2026-07-05T01:00:00+00:00")]
+        with _use_tz("America/Chicago"):
+            # Local date is July 4 -> excluded by a July-5 cutoff...
+            assert apply_filters(records, since="2026-07-05") == []
+            # ...and included by a July-4 cutoff.
+            assert [r["thread_id"] for r in apply_filters(records, since="2026-07-04")] == ["eve"]
+
+
+class TestScoreLabels:
+    def test_labels_derived_from_newsletter_tokens(self):
+        # Single source of truth: the int->label map inverts newsletter._SCORE_TOKENS
+        # rather than re-hardcoding the 1/2/3 <-> Poor/OK/Good mapping.
+        from newsletter import _SCORE_TOKENS
+        from newsletter_review.tui import _SCORE_LABELS
+
+        assert set(_SCORE_LABELS) == set(_SCORE_TOKENS.values())
+        for tok, num in _SCORE_TOKENS.items():
+            assert _SCORE_LABELS[num].upper() == tok
+
+    def test_labels_render_expected_display_text(self):
+        # Byte-identical display text the detail view depends on (issue #53).
+        from newsletter_review.tui import _SCORE_LABELS
+
+        assert _SCORE_LABELS == {1: "Poor", 2: "OK", 3: "Good"}
+
+
+class TestDaysAgoCutoff:
+    def test_cutoff_is_local_calendar_date(self):
+        # The instant 2026-07-05T01:00Z is still 2026-07-04 in Chicago, so a
+        # "past 0 days" cutoff must be July 4 locally, not the UTC July 5.
+        instant = datetime(2026, 7, 5, 1, 0, 0, tzinfo=timezone.utc)
+        with _use_tz("America/Chicago"):
+            assert _days_ago_cutoff(0, now=instant) == "2026-07-04"
+            assert _days_ago_cutoff(2, now=instant) == "2026-07-02"
+
+
+class TestSortBySendDate:
+    def test_desc_newest_first(self):
+        recs = [
+            _make_record(thread_id="a", send_date="2024-01-01T00:00:00+00:00"),
+            _make_record(thread_id="b", send_date="2024-03-01T00:00:00+00:00"),
+            _make_record(thread_id="c", send_date="2024-02-01T00:00:00+00:00"),
+        ]
+        assert [r["thread_id"] for r in sort_by_send_date(recs)] == ["b", "c", "a"]
+
+    def test_missing_send_date_sorts_last(self):
+        recs = [
+            _make_record(thread_id="undated", send_date=None),
+            _make_record(thread_id="dated", send_date="2024-01-01T00:00:00+00:00"),
+        ]
+        assert [r["thread_id"] for r in sort_by_send_date(recs)] == ["dated", "undated"]
+
 
 # ---------------------------------------------------------------------------
 # _format_list_row
@@ -191,6 +316,26 @@ class TestFormatListRow:
         # Should not crash; should show a placeholder
         assert row  # non-empty string
 
+    def test_includes_send_date(self):
+        # Issue #36: the list date column shows the email SEND date (date part).
+        row = format_list_row(_make_record(send_date="2026-02-19T09:00:00+00:00"), 120)
+        assert "2026-02-19" in row
+
+    def test_missing_send_date_shows_placeholder(self):
+        row = format_list_row(_make_record(send_date=None), 120)
+        assert row.startswith("—")  # date column is first, placeholder for no send-date
+
+    def test_date_column_uses_local_calendar_date(self):
+        # 2026-07-05T01:00Z displays as its LOCAL date (2026-07-04 in Chicago),
+        # matching what Gmail and the Date header show, not the UTC day.
+        with _use_tz("America/Chicago"):
+            row = format_list_row(_make_record(send_date="2026-07-05T01:00:00+00:00"), 120)
+        assert row.startswith("2026-07-04")
+
+    def test_unparseable_send_date_shows_placeholder(self):
+        row = format_list_row(_make_record(send_date="not-a-date"), 120)
+        assert row.startswith("—")
+
 
 # ---------------------------------------------------------------------------
 # _build_detail_lines
@@ -208,6 +353,32 @@ class TestBuildDetailLines:
         text = "\n".join(lines)
         assert "excellent" in text
 
+    def test_header_shows_send_date_and_model_and_processed(self):
+        # Issue #35: email send-date grouped with email-intrinsic data, and a
+        # separate classification block with the processed date + model.
+        lines = build_detail_lines(_make_record(
+            send_date="2026-02-19T09:00:00+00:00",
+            model="claude-sonnet-4-6",
+            timestamp="2026-02-20T12:00:00+00:00",
+        ))
+        text = "\n".join(lines)
+        assert "Sent:" in text
+        assert "2026-02-19T09:00:00+00:00" in text  # send-date
+        assert "Processed:" in text
+        assert "2026-02-20T12:00:00+00:00" in text  # processed timestamp
+        assert "Model:" in text
+        assert "claude-sonnet-4-6" in text
+        # The processed date must NOT be presented under a bare "Date:" label
+        # (the exact #35 complaint).
+        assert "Date:" not in text
+
+    def test_header_missing_send_date_and_model_show_placeholders(self):
+        lines = build_detail_lines(_make_record(send_date=None, model=None))
+        text = "\n".join(lines)
+        # Missing send-date must not be misrepresented as the processed date.
+        assert "Sent: unknown" in text
+        assert "Model: —" in text
+
     def test_includes_story_text_excerpt_and_tier(self):
         record = _make_record()
         lines = build_detail_lines(record)
@@ -220,8 +391,20 @@ class TestBuildDetailLines:
         record = _make_record()
         lines = build_detail_lines(record)
         text = "\n".join(lines)
-        assert "simple" in text.lower()
-        assert "4" in text
+        assert "Quality scores:" in text
+        assert "simple=Good" in text  # default simple=3 -> Good (issue #53)
+
+    def test_dimension_scores_rendered_as_labels(self):
+        # 1/2/3 render as Poor/OK/Good in the detail view (issue #53).
+        record = _make_record(stories=[{
+            "text": "x", "scores": {"simple": 1, "concrete": 2, "personal": 3, "dynamic": 2},
+            "average_score": 2.0, "tier": "fair", "themes": {},
+            "quality_cot": "", "theme_cot": "",
+        }])
+        text = "\n".join(build_detail_lines(record))
+        assert "simple=Poor" in text
+        assert "concrete=OK" in text
+        assert "personal=Good" in text
 
     def test_includes_quality_cot(self):
         record = _make_record()
@@ -241,11 +424,23 @@ class TestBuildDetailLines:
         text = "\n".join(lines)
         assert "scripture" in text
 
+    def test_graded_themes_show_grade(self):
+        # New records carry graded themes (theme -> present/emphasized); the
+        # detail view shows the grade (issue #53).
+        record = _make_record(stories=[{
+            "text": "Content", "scores": None, "average_score": None, "tier": None,
+            "themes": {"scripture": "emphasized", "church": "present"},
+            "quality_cot": "", "theme_cot": "",
+        }])
+        text = "\n".join(build_detail_lines(record))
+        assert "scripture (emphasized)" in text
+        assert "church (present)" in text
+
     def test_handles_missing_scores(self):
         record = _make_record(stories=[{
             "text": "Content without any scores",
             "scores": None, "average_score": None, "tier": None,
-            "themes": [], "quality_cot": "", "theme_cot": "",
+            "themes": {}, "quality_cot": "", "theme_cot": "",
         }])
         lines = build_detail_lines(record)
         text = "\n".join(lines)
@@ -255,15 +450,15 @@ class TestBuildDetailLines:
         stories = [
             {
                 "text": "Content A about a student",
-                "scores": {"simple": 5, "concrete": 5, "personal": 5, "dynamic": 5},
+                "scores": {"simple": 3, "concrete": 3, "personal": 3, "dynamic": 3},
                 "average_score": 5.0, "tier": "excellent",
-                "themes": ["scripture"], "quality_cot": "cot A", "theme_cot": "theme A",
+                "themes": {"scripture": "emphasized"}, "quality_cot": "cot A", "theme_cot": "theme A",
             },
             {
                 "text": "Content B about a mentor",
                 "scores": {"simple": 2, "concrete": 2, "personal": 2, "dynamic": 2},
                 "average_score": 2.0, "tier": "fair",
-                "themes": ["church"], "quality_cot": "cot B", "theme_cot": "theme B",
+                "themes": {"church": "emphasized"}, "quality_cot": "cot B", "theme_cot": "theme B",
             },
         ]
         record = _make_record(stories=stories)
@@ -310,6 +505,10 @@ class TestFormatFilterSummary:
         assert "tier:poor" in result
         assert "theme:church" in result
         assert "sender:john" in result
+
+    def test_since_filter(self):
+        result = format_filter_summary(since="2024-06-15")
+        assert "since:2024-06-15" in result
 
     def test_returns_empty_for_all_none(self):
         assert format_filter_summary() == ""
@@ -362,7 +561,7 @@ def _ui_records():
             stories=[{
                 "text": "T", "scores": None,
                 "average_score": None, "tier": None,
-                "themes": ["vocation_family"], "quality_cot": "", "theme_cot": "",
+                "themes": {"vocation_family": "emphasized"}, "quality_cot": "", "theme_cot": "",
             }],
         ),
         _make_record(subject="Subject four", overall_tier="fair", sender="erin@other.org"),
@@ -561,6 +760,30 @@ class TestRunReviewTui:
         assert "No assessment records" in capsys.readouterr().out
 
 
+class TestCli:
+    def test_since_flag_wired_and_normalized(self, monkeypatch, tmp_path):
+        # --since is passed through to the TUI, normalized to zero-padded ISO the
+        # same way the in-TUI since input is.
+        from newsletter_review import __main__ as main_mod
+
+        f = tmp_path / "a.jsonl"
+        f.write_text("")  # exists + empty -> load_assessments returns []
+        captured = {}
+        monkeypatch.setattr(main_mod, "run_review_tui", lambda records, **kw: captured.update(kw))
+        monkeypatch.setattr(sys, "argv", ["prog", "--file", str(f), "--since", "2026-7-4"])
+        main_mod.cli()
+        assert captured["init_since"] == "2026-07-04"
+
+    def test_since_flag_rejects_invalid_date(self, monkeypatch, capsys):
+        from newsletter_review import __main__ as main_mod
+
+        monkeypatch.setattr(sys, "argv", ["prog", "--since", "not-a-date"])
+        with pytest.raises(SystemExit):
+            main_mod.cli()
+        err = capsys.readouterr().err.lower()
+        assert "yyyy-mm-dd" in err or "invalid date" in err
+
+
 class TestReviewAppRobustness:
     async def test_filter_menu_survives_key_auto_repeat(self):
         # Two back-to-back keys (terminal auto-repeat) must not double-dismiss
@@ -676,3 +899,72 @@ class TestReviewAppReviewFindings:
             assert len(app.screen_stack) == 2  # base + ONE detail
             await pilot.press("escape")
             assert not isinstance(app.screen, DetailScreen)
+
+
+def _dated_records():
+    """Records with distinct fixed send-dates (all in 2024) for sort/date tests."""
+    return [
+        _make_record(subject="Jan", send_date="2024-01-10T00:00:00+00:00"),
+        _make_record(subject="Mar", send_date="2024-03-10T00:00:00+00:00"),
+        _make_record(subject="Feb", send_date="2024-02-10T00:00:00+00:00"),
+    ]
+
+
+class TestReviewAppSort:
+    async def test_default_sort_by_send_date_desc(self):
+        app = ReviewApp(_dated_records())
+        async with app.run_test(size=SIZE):
+            # Newest send-date first.
+            assert [r["subject"] for r in app.filtered] == ["Mar", "Feb", "Jan"]
+            first_row = str(app.query_one(ListView).children[0].query_one(Label).render())
+            assert first_row.startswith("2024-03-10")
+
+
+class TestReviewAppDateFilter:
+    async def test_non_padded_since_date_is_normalized(self):
+        # strptime accepts "2024-2-15" but the lexicographic filter needs a
+        # zero-padded ISO cutoff, else it silently mis-filters (issue #36 fix).
+        app = ReviewApp(_dated_records())
+        async with app.run_test(size=SIZE) as pilot:
+            await pilot.press("f", "d", "s")
+            await pilot.press(*"2024-2-15")
+            await pilot.press("enter")
+            assert app.f_since == "2024-02-15"
+            assert [r["subject"] for r in app.filtered] == ["Mar"]
+
+    async def test_since_via_date_menu_narrows(self):
+        app = ReviewApp(_dated_records())
+        async with app.run_test(size=SIZE) as pilot:
+            await pilot.press("f", "d", "s")            # filter -> date -> since…
+            await pilot.press(*"2024-02-15")            # type the date
+            await pilot.press("enter")
+            assert "since:2024-02-15" in _title(app)
+            # Only Mar (2024-03-10) is on/after the cutoff.
+            assert [r["subject"] for r in app.filtered] == ["Mar"]
+
+    async def test_past_30_days_excludes_old_fixed_dates(self):
+        # The fixture's 2024 dates are far older than 30 days from "now", so a
+        # "Past 30 days" filter empties the list — deterministic regardless of clock.
+        app = ReviewApp(_dated_records())
+        async with app.run_test(size=SIZE) as pilot:
+            await pilot.press("f", "d", "3")
+            assert "since:" in _title(app)
+            assert len(app.query_one(ListView)) == 0
+
+    async def test_clear_date_filter_restores_all(self):
+        app = ReviewApp(_dated_records())
+        async with app.run_test(size=SIZE) as pilot:
+            await pilot.press("f", "d", "3")
+            assert len(app.query_one(ListView)) == 0
+            await pilot.press("f", "d", "x")            # clear
+            assert len(app.query_one(ListView)) == 3
+            assert "since:" not in _title(app)
+
+    async def test_invalid_since_date_shows_hint_and_keeps_filter(self):
+        app = ReviewApp(_dated_records())
+        async with app.run_test(size=SIZE) as pilot:
+            await pilot.press("f", "d", "s")
+            await pilot.press(*"not-a-date")
+            await pilot.press("enter")
+            assert app.f_since is None            # rejected
+            assert len(app.query_one(ListView)) == 3  # unfiltered

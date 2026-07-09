@@ -25,7 +25,8 @@ Phase A — curate stories / extraction truth.
     A committed story's text is the verbatim inclusive body slice.
 
 Phase B — per-story labels: with a story selected, ``l`` assigns the 4 dimension
-scores (simple/concrete/personal/dynamic, 1-5) and multi-select themes; on save
+scores (simple/concrete/personal/dynamic) each graded Poor/OK/Good (keys 1/2/3)
+and graded themes (each key cycles Absent/Present/Emphasized); on save
 ``expected_tier`` is derived via ``newsletter.compute_tier``.
 
 The state transitions are factored into PURE functions (below) so they can be
@@ -37,9 +38,7 @@ import argparse
 import asyncio
 import copy
 import json
-import os
 import sys
-import tempfile
 import unicodedata
 from dataclasses import dataclass, replace
 from pathlib import Path
@@ -51,12 +50,19 @@ from textual.binding import Binding
 from textual.screen import Screen
 from textual.widgets import Label, ListItem, ListView, Static
 
-from evals import plural
+from evals import atomic_write_jsonl, plural
 from evals.newsletter_schemas import GoldenNewsletter, GoldenStory
-from newsletter import compute_tier, parse_stories
+from newsletter import _SCORE_TOKENS, compute_tier, parse_stories
 from tui_common import BottomModal, HintScreen, PageListView, PromptLineScreen
 
 _DIMENSIONS = ("simple", "concrete", "personal", "dynamic")
+
+# The score-entry prompt's rubric options, derived from newsletter._SCORE_TOKENS so
+# the 1/2/3 <-> POOR/OK/GOOD mapping lives in one place; renders "[1]poor [2]ok [3]good".
+_SCORE_OPTIONS = " ".join(
+    f"[{num}]{tok.lower()}"
+    for tok, num in sorted(_SCORE_TOKENS.items(), key=lambda kv: kv[1])
+)
 
 # Theme hotkeys mirror newsletter_review's convention (s/c/h/v/d).
 _THEME_KEYS = {
@@ -66,6 +72,11 @@ _THEME_KEYS = {
     "v": "vocation_family",
     "d": "disciple_making",
 }
+
+# Themes are graded (issue #53): each key cycles Absent -> Present -> Emphasized
+# -> Absent. Absent is represented by omission from the selected dict.
+_THEME_CYCLE = {None: "present", "present": "emphasized", "emphasized": None}
+_GRADE_ABBR = {"present": "P", "emphasized": "E"}
 
 
 # ---------------------------------------------------------------------------
@@ -85,19 +96,7 @@ def load_golden_set(path: Path) -> list[GoldenNewsletter]:
 
 def save_golden_set(newsletters: list[GoldenNewsletter], path: Path) -> None:
     """Save the golden set atomically (temp file + rename)."""
-    path = Path(path)
-    fd, tmp_path = tempfile.mkstemp(dir=path.parent, suffix=".jsonl.tmp")
-    try:
-        with os.fdopen(fd, "w") as f:
-            for nl in newsletters:
-                f.write(json.dumps(nl.to_dict()) + "\n")
-        os.rename(tmp_path, path)
-    except BaseException:
-        try:
-            os.unlink(tmp_path)
-        except OSError:
-            pass
-        raise
+    atomic_write_jsonl(newsletters, path)
 
 
 # ---------------------------------------------------------------------------
@@ -234,14 +233,15 @@ def confirm_story_list(newsletter):
 # ---------------------------------------------------------------------------
 
 def assign_scores_and_themes(story, scores, themes):
-    """Assign the 4 dimension scores + themes to a story and confirm it.
+    """Assign the 4 dimension scores + graded themes to a story and confirm it.
 
-    ``expected_tier`` is auto-derived from *scores* via ``compute_tier``; the
-    story is marked reviewed. *scores*/*themes* are copied so later mutation of
-    the caller's objects does not alias into the golden set.
+    *themes* is the graded dict (theme -> "present"/"emphasized") produced by
+    ThemeScreen. ``expected_tier`` is auto-derived from *scores* via
+    ``compute_tier``; the story is marked reviewed. *scores*/*themes* are copied
+    so later mutation of the caller's objects does not alias into the golden set.
     """
     story.expected_scores = dict(scores)
-    story.expected_themes = list(themes)
+    story.expected_themes = dict(themes)
     story.expected_tier = compute_tier(scores).value
     story.reviewed = True
 
@@ -634,13 +634,18 @@ def format_story_strip(newsletter, spans, selected, width: int) -> list[str]:
 
 
 def format_theme_legend(selected, width: int) -> str:
-    """Theme-picker prompt line; falls back to a compact form on narrow screens."""
+    """Theme-picker prompt line; falls back to a compact form on narrow screens.
+
+    *selected* is the graded dict (theme -> "present"/"emphasized"); each theme
+    is shown with its grade abbreviation (P/E), and each key cycles A/P/E.
+    """
+    sel = ", ".join(f"{t}={_GRADE_ABBR[g]}" for t, g in sorted(selected.items())) or "-"
     full_legend = "  ".join(f"[{k}]{v}" for k, v in _THEME_KEYS.items())
-    full = f"Themes {sorted(selected)}: {full_legend}  Enter=done"
+    full = f"Themes {sel}: {full_legend}  (key cycles A/P/E)  Enter=done"
     if len(full) <= width:
         return full
     compact_legend = " ".join(f"[{k}]{v[:3]}" for k, v in _THEME_KEYS.items())
-    compact = f"Themes {','.join(selected) or '-'}: {compact_legend} Enter=done"
+    compact = f"Themes {sel}: {compact_legend} Enter=done"
     if len(compact) <= width:
         return compact
     return f"Themes({len(selected)}): {compact_legend} Enter=done"
@@ -893,10 +898,11 @@ class ConfirmScreen(BottomModal):
 
 
 class ScoreScreen(BottomModal):
-    """The 4 dimension scores, one keypress each; any non-1-5 key cancels all.
+    """The 4 dimension scores, one keypress each (1=Poor, 2=OK, 3=Good); any
+    other key cancels all (issue #53).
 
     When re-labeling, *current* shows the value already assigned per dimension;
-    accepted digits are echoed in the prompt so entry is verifiable.
+    accepted scores are echoed in the prompt so entry is verifiable.
     """
 
     def __init__(self, current=None) -> None:
@@ -909,7 +915,7 @@ class ScoreScreen(BottomModal):
         now = f" (now {self._current[dim]})" if self._current and dim in self._current else ""
         entered = "/".join(str(self._scores[d]) for d in _DIMENSIONS if d in self._scores)
         so_far = f"[{entered}] " if entered else ""
-        return f"{so_far}{dim}{now} [1-5] (other cancels): "
+        return f"{so_far}{dim}{now} {_SCORE_OPTIONS} (other cancels): "
 
     def compose(self) -> ComposeResult:
         yield Static(self._prompt_text(), id="score-prompt", markup=False)
@@ -918,7 +924,7 @@ class ScoreScreen(BottomModal):
         event.stop()
         if self._dismissed:
             return  # key queued behind the dismissal (auto-repeat)
-        if event.key not in ("1", "2", "3", "4", "5"):
+        if event.key not in ("1", "2", "3"):
             self.dismiss_once(None)
             return
         self._scores[_DIMENSIONS[len(self._scores)]] = int(event.key)
@@ -929,15 +935,16 @@ class ScoreScreen(BottomModal):
 
 
 class ThemeScreen(BottomModal):
-    """Multi-select themes by toggling s/c/h/v/d; Enter finishes (no cancel).
+    """Grade themes by cycling s/c/h/v/d through Absent -> Present -> Emphasized
+    -> Absent; Enter finishes (no cancel); issue #53.
 
-    Starts from *initial* (the story's current themes) so re-labeling edits
-    rather than restarts; toggles preserve insertion order.
+    Starts from *initial* (the story's current graded themes) so re-labeling
+    edits rather than restarts.
     """
 
     def __init__(self, initial=None) -> None:
         super().__init__()
-        self._selected: list[str] = list(initial or [])
+        self._selected: dict[str, str] = dict(initial or {})
 
     def _legend(self) -> str:
         return format_theme_legend(self._selected, max(10, self.app.size.width - 1))
@@ -950,14 +957,15 @@ class ThemeScreen(BottomModal):
         if self._dismissed:
             return  # key queued behind the dismissal (auto-repeat)
         if event.key == "enter":
-            self.dismiss_once(list(self._selected))
+            self.dismiss_once(dict(self._selected))
             return
         theme = _THEME_KEYS.get(event.key.lower())
         if theme is not None:
-            if theme in self._selected:
-                self._selected.remove(theme)
+            nxt = _THEME_CYCLE[self._selected.get(theme)]
+            if nxt is None:
+                self._selected.pop(theme, None)
             else:
-                self._selected.append(theme)
+                self._selected[theme] = nxt
             self.query_one("#theme-legend", Static).update(self._legend())
 
 

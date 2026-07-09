@@ -2,6 +2,7 @@
 
 import asyncio
 import base64
+import json
 import logging
 from unittest.mock import AsyncMock, MagicMock
 
@@ -955,10 +956,10 @@ class TestNewsletterRouting:
         mock_newsletter_classifier.classify_newsletter.return_value = [
             StoryResult(
                 text="Content",
-                scores={"simple": 4, "concrete": 4, "personal": 4, "dynamic": 4},
-                average_score=4.0,
+                scores={"simple": 3, "concrete": 3, "personal": 3, "dynamic": 3},
+                average_score=3.0,
                 tier=NewsletterTier.EXCELLENT,
-                themes=["scripture"],
+                themes={"scripture": "emphasized"},
             )
         ]
 
@@ -981,6 +982,113 @@ class TestNewsletterRouting:
         mock_classifier.classify.assert_not_called()
         mock_newsletter_classifier.classify_newsletter.assert_called_once()
         mock_label_manager.apply_newsletter_classification.assert_called_once()
+
+    async def test_assessment_records_send_date_and_model(
+        self,
+        mock_proxy,
+        mock_classifier,
+        mock_label_manager,
+        mock_newsletter_classifier,
+        cloud_sem,
+        local_sem,
+        newsletter_thread_response,
+        tmp_path,
+    ):
+        """The assessment record persists the email send-date (from the Date header,
+        ISO-8601 UTC) and the classifier model, distinct from the processed timestamp
+        (shared enabler for #35/#36)."""
+        mock_proxy.get_thread.return_value = newsletter_thread_response
+        mock_newsletter_classifier.classify_newsletter.return_value = [
+            StoryResult(
+                text="Content",
+                scores={"simple": 3, "concrete": 3, "personal": 3, "dynamic": 3},
+                average_score=3.0,
+                tier=NewsletterTier.EXCELLENT,
+                themes={"scripture": "emphasized"},
+            )
+        ]
+        # The classifier's cloud LLM reports the model that actually ran.
+        mock_newsletter_classifier.cloud_llm.model = "claude-sonnet-4-6"
+        out = tmp_path / "assessments.jsonl"
+
+        result = await process_single_thread(
+            "thread_nl",
+            ["msg_nl_001"],
+            mock_proxy,
+            mock_classifier,
+            mock_label_manager,
+            cloud_sem,
+            local_sem,
+            max_thread_chars=50000,
+            newsletter_classifier=mock_newsletter_classifier,
+            newsletter_recipient="newsletters@dm.org",
+            newsletter_output_file=str(out),
+        )
+
+        assert result is True
+        record = json.loads(out.read_text().strip())
+        # newsletter_thread_response's Date header is "Mon, 1 Jan 2024 12:00:00 +0000".
+        assert record["send_date"] == "2024-01-01T12:00:00+00:00"
+        assert record["model"] == "claude-sonnet-4-6"
+        # send-date (email-intrinsic) is distinct from the processed timestamp.
+        assert record["timestamp"] != record["send_date"]
+
+    async def test_content_error_routes_to_give_up_not_empty_commit(
+        self,
+        mock_proxy,
+        mock_classifier,
+        mock_label_manager,
+        cloud_sem,
+        local_sem,
+        newsletter_thread_response,
+        tmp_path,
+    ):
+        """#30 end-to-end: a content-less grade error must route the newsletter to
+        the give-up path — it must NOT commit an empty no-stories label/assessment
+        (which would be indistinguishable from a genuine NO_STORIES newsletter)."""
+        from llm_client import LLMContentError
+        from newsletter import NewsletterClassifier
+
+        mock_proxy.get_thread.return_value = newsletter_thread_response
+        fake_llm = AsyncMock()
+        fake_llm.model = "test-model"
+        fake_llm.complete.side_effect = [
+            ("STORY: A real story about ministry work.", ""),  # extract_stories
+            LLMContentError("model returned no content"),      # assess_quality
+        ]
+        nl_config = {
+            "newsletter": {
+                "prompts": {
+                    "story_extraction": {"system": "s", "user_template": "{body}"},
+                    "quality_assessment": {"system": "s", "user_template": "{text}"},
+                    "theme_classification": {"system": "s", "user_template": "{text}"},
+                }
+            }
+        }
+        classifier = NewsletterClassifier(cloud_llm=fake_llm, config=nl_config)
+        out = tmp_path / "assessments.jsonl"
+        tracker = FailureTracker(max_failures=3)  # below threshold -> retry, not commit
+
+        result = await process_single_thread(
+            "thread_nl",
+            ["msg_nl_001"],
+            mock_proxy,
+            mock_classifier,
+            mock_label_manager,
+            cloud_sem,
+            local_sem,
+            max_thread_chars=50000,
+            newsletter_classifier=classifier,
+            newsletter_recipient="newsletters@dm.org",
+            newsletter_output_file=str(out),
+            failure_tracker=tracker,
+        )
+
+        # Routed to give-up (below threshold -> return False for a later retry),
+        # NOT committed as a (false) no-stories outcome.
+        assert result is False
+        mock_label_manager.apply_newsletter_classification.assert_not_called()
+        assert not out.exists()  # no empty assessment record written
 
     async def test_non_newsletter_uses_priority_pipeline(
         self,
@@ -1043,7 +1151,7 @@ class TestNewsletterRouting:
         assert result is True
         call_kwargs = mock_label_manager.apply_newsletter_classification.call_args.kwargs
         assert call_kwargs["tier"] is None
-        assert call_kwargs["themes"] == []
+        assert call_kwargs["themes"] == {}
 
     async def test_newsletter_only_skips_non_newsletter(
         self,
@@ -1091,10 +1199,10 @@ class TestNewsletterRouting:
         mock_newsletter_classifier.classify_newsletter.return_value = [
             StoryResult(
                 text="Content",
-                scores={"simple": 4, "concrete": 4, "personal": 4, "dynamic": 4},
-                average_score=4.0,
+                scores={"simple": 3, "concrete": 3, "personal": 3, "dynamic": 3},
+                average_score=3.0,
                 tier=NewsletterTier.EXCELLENT,
-                themes=["scripture"],
+                themes={"scripture": "emphasized"},
             )
         ]
 

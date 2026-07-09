@@ -123,18 +123,34 @@ async def preflight_check(
     that loads the requested model on demand, so a cold load is not read as "down".
     """
     errors = []
-    if need_cloud and not await cloud_base.is_available(cloud_timeout):
-        errors.append(
-            f"cloud LLM '{cloud_base.model}' not reachable at "
-            f"{cloud_base.base_url or '<unset CLOUD_LLM_URL>'}"
-        )
-    if need_local and not await local_base.is_available(local_timeout):
-        errors.append(
-            f"local LLM '{local_base.model}' not reachable at "
-            f"{local_base.base_url or '<unset MLX_URL>'} "
-            "(a model-name mismatch with the served model returns 404)"
-        )
+    if need_cloud:
+        result = await cloud_base.probe(cloud_timeout)
+        if not result.ok:
+            errors.append(
+                f"cloud LLM '{cloud_base.model}' not reachable at "
+                f"{cloud_base.base_url or '<unset CLOUD_LLM_URL>'}"
+                + _detail_suffix(result)
+            )
+    if need_local:
+        result = await local_base.probe(local_timeout)
+        if not result.ok:
+            errors.append(
+                f"local LLM '{local_base.model}' not reachable at "
+                f"{local_base.base_url or '<unset MLX_URL>'}"
+                + _detail_suffix(result)
+            )
     return errors
+
+
+def _detail_suffix(result) -> str:
+    """Parenthesized probe-failure detail for a preflight message, or "" if none.
+
+    Finding 1: surfaces probe()'s captured diagnosis (HTTP status / exception
+    text / 404 model-mismatch hint) instead of discarding it. All wording lives on
+    AvailabilityResult.detail() so this and newsletter_run's preflight can't drift
+    (Finding 2)."""
+    detail = result.detail()
+    return f" ({detail})" if detail else ""
 
 
 def resolve_parallelism(cli_value: int | None, config: dict) -> int:

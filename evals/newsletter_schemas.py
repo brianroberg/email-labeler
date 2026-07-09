@@ -7,6 +7,76 @@ older golden sets and result files keep loading as the schema grows.
 
 from dataclasses import dataclass, field
 
+# Grades that ever appear in a stored theme dict. Kept in lockstep with
+# newsletter.parse_themes (which only stores present/emphasized; absent is
+# omitted) and evals.newsletter_label._THEME_CYCLE / _GRADE_ABBR (which only
+# cycle through / abbreviate exactly these). "absent" and case variants are
+# NOT valid stored grades.
+_VALID_THEME_GRADES = frozenset({"present", "emphasized"})
+
+# Valid dimension scores after the 1-3 (Poor/OK/Good) migration; legacy 1-5
+# exports are out of range and must be re-migrated (issue #53).
+_VALID_SCORES = frozenset({1, 2, 3})
+
+
+def _coerce_themes(value, *, story_id: str = "", field_name: str = "themes") -> dict[str, str]:
+    """Normalize a stored themes value to a grade dict (theme -> "present"/
+    "emphasized"), defaulting a missing/empty value to ``{}`` (issue #53).
+
+    Backward compatibility with the pre-#53 schema was deliberately removed, so
+    this raises a clear, actionable ValueError (rather than silently coercing or
+    dying with an opaque dict-update error) when it meets old-scheme data:
+
+    * ``value`` is a list — the pre-migration theme scheme stored themes as a
+      list of names; the file must be re-migrated to the theme->grade dict
+      scheme (Finding 1).
+    * a grade is anything other than exactly "present"/"emphasized" — a case
+      variant, "absent", or junk would later KeyError the labeling TUI mid
+      session (Finding 2).
+
+    ``story_id``/``field_name`` are woven into the message so the offending
+    record and field are locatable.
+    """
+    where = f"{field_name} for story {story_id!r}" if story_id else field_name
+    if isinstance(value, list):
+        raise ValueError(
+            f"{where} is an old-scheme list {value!r}; this file predates the "
+            "theme-dict migration (issue #53) and must be re-migrated to the new "
+            "theme->grade dict scheme (theme -> 'present'/'emphasized')."
+        )
+    if not value:
+        return {}
+    coerced = dict(value)
+    for theme, grade in coerced.items():
+        if grade not in _VALID_THEME_GRADES:
+            raise ValueError(
+                f"{where}: theme {theme!r} has invalid grade {grade!r}; expected "
+                "exactly 'present' or 'emphasized' ('absent' is represented by "
+                "omitting the theme). Re-migrate this file to the new theme-grade "
+                "scheme (issue #53)."
+            )
+    return coerced
+
+
+def _coerce_scores(value, *, story_id: str = "", field_name: str = "scores"):
+    """Validate a stored dimension-score dict: every value must be an int in
+    1..3 (Poor/OK/Good) after the #53 migration. A missing/None value is passed
+    through unchanged (unlabeled). Legacy 1-5 scores are rejected loudly at load
+    rather than silently corrupting report metrics / the labeling TUI (Finding
+    3). ``story_id``/``field_name`` locate the offending record and field."""
+    if value is None:
+        return None
+    where = f"{field_name} for story {story_id!r}" if story_id else field_name
+    for dimension, score in value.items():
+        if isinstance(score, bool) or not isinstance(score, int) or score not in _VALID_SCORES:
+            raise ValueError(
+                f"{where}: dimension {dimension!r} has invalid value {score!r}; "
+                "expected an int in 1..3 (Poor/OK/Good). This file may be an "
+                "old-scheme (1-5) export needing re-migration to the 1-3 scale "
+                "(issue #53)."
+            )
+    return value
+
 
 @dataclass
 class GoldenStory:
@@ -14,9 +84,9 @@ class GoldenStory:
 
     story_id: str  # stable, f"{thread_id}:{index}"
     text: str
-    expected_scores: dict[str, int] | None = None  # simple/concrete/personal/dynamic, 1-5
+    expected_scores: dict[str, int] | None = None  # simple/concrete/personal/dynamic, 1-3 (Poor/OK/Good)
     expected_tier: str | None = None  # "excellent" / "good" / "fair" / "poor"
-    expected_themes: list[str] = field(default_factory=list)  # lowercase theme names
+    expected_themes: dict[str, str] = field(default_factory=dict)  # theme -> "present"/"emphasized"
     reviewed: bool = False
     notes: str = ""
     excluded: bool = False  # drop from quality/theme scoring, keep as extraction truth
@@ -37,12 +107,17 @@ class GoldenStory:
     def from_dict(cls, d: dict) -> "GoldenStory":
         # ``title`` was dropped from the schema; older golden sets that still
         # carry it load fine because the extra key is simply ignored here.
+        sid = d.get("story_id", "")
         return cls(
             story_id=d["story_id"],
             text=d["text"],
-            expected_scores=d.get("expected_scores"),
+            expected_scores=_coerce_scores(
+                d.get("expected_scores"), story_id=sid, field_name="expected_scores"
+            ),
             expected_tier=d.get("expected_tier"),
-            expected_themes=d.get("expected_themes", []),
+            expected_themes=_coerce_themes(
+                d.get("expected_themes"), story_id=sid, field_name="expected_themes"
+            ),
             reviewed=d.get("reviewed", False),
             notes=d.get("notes", ""),
             excluded=d.get("excluded", False),
@@ -109,10 +184,10 @@ class StoryPrediction:
     thread_id: str
     expected_scores: dict[str, int] | None = None
     expected_tier: str | None = None
-    expected_themes: list[str] = field(default_factory=list)
+    expected_themes: dict[str, str] = field(default_factory=dict)
     predicted_scores: dict[str, int] | None = None
     predicted_tier: str | None = None
-    predicted_themes: list[str] = field(default_factory=list)
+    predicted_themes: dict[str, str] = field(default_factory=dict)
     scores_raw: str | None = None
     themes_raw: str | None = None
     duration_seconds: float = 0.0
@@ -137,15 +212,24 @@ class StoryPrediction:
 
     @classmethod
     def from_dict(cls, d: dict) -> "StoryPrediction":
+        sid = d.get("story_id", "")
         return cls(
             story_id=d["story_id"],
             thread_id=d["thread_id"],
-            expected_scores=d.get("expected_scores"),
+            expected_scores=_coerce_scores(
+                d.get("expected_scores"), story_id=sid, field_name="expected_scores"
+            ),
             expected_tier=d.get("expected_tier"),
-            expected_themes=d.get("expected_themes", []),
-            predicted_scores=d.get("predicted_scores"),
+            expected_themes=_coerce_themes(
+                d.get("expected_themes"), story_id=sid, field_name="expected_themes"
+            ),
+            predicted_scores=_coerce_scores(
+                d.get("predicted_scores"), story_id=sid, field_name="predicted_scores"
+            ),
             predicted_tier=d.get("predicted_tier"),
-            predicted_themes=d.get("predicted_themes", []),
+            predicted_themes=_coerce_themes(
+                d.get("predicted_themes"), story_id=sid, field_name="predicted_themes"
+            ),
             scores_raw=d.get("scores_raw"),
             themes_raw=d.get("themes_raw"),
             duration_seconds=d.get("duration_seconds", 0.0),
