@@ -15,7 +15,6 @@ from evals.newsletter_report import (
     compute_all_metrics,
     compute_dimension_exact_match,
     compute_dimension_mae,
-    compute_dimension_within1,
     compute_extraction_metrics,
     compute_multilabel_metrics,
     compute_tier_metrics,
@@ -198,24 +197,25 @@ class TestTierMetrics:
 
 
 class TestDimensionMetrics:
-    def test_mae_and_exact_and_within1(self):
+    def test_mae_and_exact(self):
+        # 1-3 (Poor/OK/Good) scores; within-1 was dropped (#53) as degenerate.
         results = [
             _pred(
-                expected_scores={"simple": 5, "concrete": 3, "personal": 4, "dynamic": 2},
-                predicted_scores={"simple": 5, "concrete": 1, "personal": 5, "dynamic": 2},
+                expected_scores={"simple": 3, "concrete": 2, "personal": 3, "dynamic": 1},
+                predicted_scores={"simple": 3, "concrete": 1, "personal": 1, "dynamic": 1},
             ),
             _pred(
-                expected_scores={"simple": 2, "concrete": 2, "personal": 2, "dynamic": 2},
-                predicted_scores={"simple": 4, "concrete": 2, "personal": 2, "dynamic": 2},
+                expected_scores={"simple": 1, "concrete": 2, "personal": 2, "dynamic": 2},
+                predicted_scores={"simple": 3, "concrete": 2, "personal": 2, "dynamic": 2},
             ),
         ]
         mae = compute_dimension_mae(results)
-        # simple: |5-5|=0, |2-4|=2 -> mean 1.0
+        # simple: |3-3|=0, |1-3|=2 -> mean 1.0
         assert abs(mae["simple"] - 1.0) < 1e-9
-        # concrete: |3-1|=2, |2-2|=0 -> mean 1.0
-        assert abs(mae["concrete"] - 1.0) < 1e-9
-        # personal: |4-5|=1, |2-2|=0 -> mean 0.5
-        assert abs(mae["personal"] - 0.5) < 1e-9
+        # concrete: |2-1|=1, |2-2|=0 -> mean 0.5
+        assert abs(mae["concrete"] - 0.5) < 1e-9
+        # personal: |3-1|=2, |2-2|=0 -> mean 1.0
+        assert abs(mae["personal"] - 1.0) < 1e-9
         # dynamic: 0, 0 -> 0.0
         assert abs(mae["dynamic"] - 0.0) < 1e-9
 
@@ -226,12 +226,6 @@ class TestDimensionMetrics:
         assert abs(exact["dynamic"] - 1.0) < 1e-9
         # concrete: row1 wrong, row2 exact -> 1/2
         assert abs(exact["concrete"] - 0.5) < 1e-9
-
-        within1 = compute_dimension_within1(results)
-        # personal: diff 1 and 0 both within 1 -> 1.0
-        assert abs(within1["personal"] - 1.0) < 1e-9
-        # simple: diff 0 (within) and 2 (not) -> 1/2
-        assert abs(within1["simple"] - 0.5) < 1e-9
 
     def test_only_over_stories_with_both_scores(self):
         results = [
@@ -253,49 +247,70 @@ class TestDimensionMetrics:
 
 
 class TestMultilabelThemeMetrics:
+    # The default (PRIMARY) metric is positive=emphasized — what earns a Gmail
+    # label (issue #53 / A′). "detection" (>=Present) is the secondary metric.
     def test_per_theme_micro_macro_and_exact_set(self):
-        # Story 1: expected {scripture, church}, predicted {scripture}
+        # Story 1: expected {scripture, church} emphasized, predicted {scripture}
         #   scripture: TP; church: FN
         # Story 2: expected {christlikeness}, predicted {christlikeness, church}
         #   christlikeness: TP; church: FP
         results = [
-            _pred(expected_themes=["scripture", "church"], predicted_themes=["scripture"],
+            _pred(expected_themes={"scripture": "emphasized", "church": "emphasized"},
+                  predicted_themes={"scripture": "emphasized"},
                   predicted_scores={"simple": 3}),
-            _pred(expected_themes=["christlikeness"],
-                  predicted_themes=["christlikeness", "church"],
+            _pred(expected_themes={"christlikeness": "emphasized"},
+                  predicted_themes={"christlikeness": "emphasized", "church": "emphasized"},
                   predicted_scores={"simple": 3}),
         ]
         m = compute_multilabel_metrics(results, THEMES)
 
-        # scripture: TP=1, FP=0, FN=0 -> P=R=F1=1
         assert m["per_theme"]["scripture"]["f1"] == 1.0
-        # church: TP=0, FP=1, FN=1 -> P=0, R=0, F1=0
         assert m["per_theme"]["church"]["precision"] == 0.0
         assert m["per_theme"]["church"]["recall"] == 0.0
-        # christlikeness: TP=1 -> F1=1
         assert m["per_theme"]["christlikeness"]["f1"] == 1.0
-
-        # Micro: TP=2, FP=1, FN=1 -> P=2/3, R=2/3, F1=2/3
+        # Micro: TP=2, FP=1, FN=1 -> F1=2/3
         assert abs(m["micro_f1"] - (2 / 3)) < 1e-9
-
-        # Macro F1: mean over 5 themes.
-        # scripture=1, christlikeness=1, church=0, vocation_family=0(no support->0),
-        # disciple_making=0 -> (1+1+0+0+0)/5 = 0.4
+        # Macro F1: (1+1+0+0+0)/5 = 0.4
         assert abs(m["macro_f1"] - 0.4) < 1e-9
-
-        # Exact set match: neither story matches exactly -> 0/2
         assert m["exact_set_match"] == 0.0
 
     def test_exact_set_match_positive(self):
         results = [
-            _pred(expected_themes=["scripture"], predicted_themes=["scripture"],
+            _pred(expected_themes={"scripture": "emphasized"},
+                  predicted_themes={"scripture": "emphasized"},
                   predicted_scores={"simple": 3}),
-            _pred(expected_themes=["church", "scripture"],
-                  predicted_themes=["scripture", "church"],  # order-insensitive
+            _pred(expected_themes={"church": "emphasized", "scripture": "emphasized"},
+                  predicted_themes={"scripture": "emphasized", "church": "emphasized"},
                   predicted_scores={"simple": 3}),
         ]
         m = compute_multilabel_metrics(results, THEMES)
         assert m["exact_set_match"] == 1.0
+
+    def test_emphasized_vs_detection_positive(self):
+        # Golden PRESENT, predicted EMPHASIZED: an over-grade.
+        results = [
+            _pred(expected_themes={"scripture": "present"},
+                  predicted_themes={"scripture": "emphasized"},
+                  predicted_scores={"simple": 3}),
+        ]
+        # Emphasized (primary): expected is not emphasized -> a false positive.
+        emph = compute_multilabel_metrics(results, THEMES, positive="emphasized")
+        assert emph["per_theme"]["scripture"]["precision"] == 0.0
+        # Detection (secondary): both are >=Present -> a true positive.
+        det = compute_multilabel_metrics(results, THEMES, positive="detection")
+        assert det["per_theme"]["scripture"]["f1"] == 1.0
+
+    def test_legacy_list_themes_are_present_not_emphasized(self):
+        # Old records store a present-only list; it counts as detected (Present)
+        # but never as Emphasized.
+        results = [
+            _pred(expected_themes=["scripture"], predicted_themes=["scripture"],
+                  predicted_scores={"simple": 3}),
+        ]
+        det = compute_multilabel_metrics(results, THEMES, positive="detection")
+        assert det["per_theme"]["scripture"]["f1"] == 1.0
+        emph = compute_multilabel_metrics(results, THEMES, positive="emphasized")
+        assert emph["per_theme"]["scripture"]["f1"] == 0.0
 
 
 
@@ -783,11 +798,11 @@ class TestDimTableAlignment:
     def test_data_rows_align_with_header(self):
         mae = {d: 0.5 for d in ["simple", "concrete", "personal", "dynamic"]}
         exact = {d: 0.5 for d in mae}
-        within = {d: 1.0 for d in mae}
-        lines = _format_dim_table(mae, exact, within).splitlines()
+        lines = _format_dim_table(mae, exact).splitlines()
         header, first_row = lines[0], lines[2]
         # The MAE column must start at the same offset in header and data rows.
         assert first_row.index("0.50") == header.index("MAE")
+        assert "Within-1" not in header
 
 
 class TestPrintComparisonModes:
@@ -907,7 +922,8 @@ class TestJsonOutput:
     def _story_and_extraction(self):
         story = _pred(story_id="s", predicted_scores={"simple": 3},
                       expected_tier="good", predicted_tier="good",
-                      expected_themes=["church"], predicted_themes=["church"])
+                      expected_themes={"church": "emphasized"},
+                      predicted_themes={"church": "emphasized"})
         extraction = ExtractionPrediction(
             thread_id="A",
             golden_stories=[{"story_id": "A:0", "text": "alpha faith"}],
@@ -923,8 +939,9 @@ class TestJsonOutput:
         assert set(data) == {"meta", "metrics"}
         assert data["meta"]["run_id"] == "abcdef0123456789"
         for key in ("story_count", "tier", "dimension_mae", "dimension_exact",
-                    "dimension_within1", "themes", "theme_anomalies", "extraction"):
+                    "themes", "themes_detection", "theme_anomalies", "extraction"):
             assert key in data["metrics"]
+        assert "dimension_within1" not in data["metrics"]  # dropped (#53)
         assert data["metrics"]["tier"]["accuracy"] == 1.0
         assert data["metrics"]["extraction"]["micro_f1"] == 1.0
 
@@ -1109,10 +1126,11 @@ class TestComparisonDeltaSign:
     def test_compute_all_metrics_bundles_sections(self):
         results = [
             _pred(
-                expected_scores={"simple": 5, "concrete": 5, "personal": 5, "dynamic": 5},
-                predicted_scores={"simple": 5, "concrete": 5, "personal": 5, "dynamic": 5},
+                expected_scores={"simple": 3, "concrete": 3, "personal": 3, "dynamic": 3},
+                predicted_scores={"simple": 3, "concrete": 3, "personal": 3, "dynamic": 3},
                 expected_tier="excellent", predicted_tier="excellent",
-                expected_themes=["scripture"], predicted_themes=["scripture"],
+                expected_themes={"scripture": "emphasized"},
+                predicted_themes={"scripture": "emphasized"},
             ),
         ]
         extraction = [

@@ -322,9 +322,16 @@ per-row LLM errors name the resolved endpoint URL and its source env var.
 | `--match-threshold` | `SequenceMatcher` ratio threshold for the extraction one-to-one match (default: `0.6`). Applies to **text** similarity (see below) |
 
 Report computes tier accuracy + confusion matrix + P/R/F1 (excellent/good/fair/
-poor), per-dimension MAE and exact/within-1 agreement, per-theme + micro/macro
-multi-label F1 + exact-set-match, and extraction precision/recall/F1 from a greedy
-one-to-one `SequenceMatcher` match.
+poor), per-dimension MAE (0–2) and exact-match agreement (within-1 was dropped in
+the 3-value migration — degenerate on a 1–3 scale), theme multi-label metrics, and
+extraction precision/recall/F1 from a greedy one-to-one `SequenceMatcher` match.
+
+Theme metrics are computed at two thresholds (issue #53): the **primary**
+(`metrics["themes"]`) is **Emphasized-positive** — exactly what the daemon labels
+in Gmail, so it is production-aligned — reported as per-theme + micro/macro F1 +
+exact-set-match; a **secondary** detection metric (`metrics["themes_detection"]`,
+positive = Present-or-Emphasized) reports a single micro-F1 "did we notice the
+theme at all". `theme_micro_f1` in the trend view is the primary (Emphasized) one.
 
 Metric semantics:
 

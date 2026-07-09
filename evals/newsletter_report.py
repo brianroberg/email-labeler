@@ -79,9 +79,9 @@ def compute_dimension_exact_match(results: list[StoryPrediction]) -> dict[str, f
     return _dimension_mean(results, lambda e, p: e == p)
 
 
-def compute_dimension_within1(results: list[StoryPrediction]) -> dict[str, float]:
-    """Fraction of predictions within 1 point of expected per dimension."""
-    return _dimension_mean(results, lambda e, p: abs(e - p) <= 1)
+# NB: a "within-1" dimension metric was dropped in the 3-value migration (#53):
+# on a 1-3 scale the only pair NOT within 1 is a Poor<->Good confusion, so it was
+# ~always 1.0 and added no signal beyond MAE (now 0-2) + exact-match.
 
 
 def format_metric_delta(a: float | None, b: float | None) -> str:
@@ -122,8 +122,10 @@ def compute_all_metrics(
         "tier": compute_tier_metrics(story_results, mode),
         "dimension_mae": compute_dimension_mae(story_results),
         "dimension_exact": compute_dimension_exact_match(story_results),
-        "dimension_within1": compute_dimension_within1(story_results),
-        "themes": compute_multilabel_metrics(story_results, THEMES),
+        # Primary, production-aligned: only Emphasized earns a Gmail label (#53).
+        "themes": compute_multilabel_metrics(story_results, THEMES, positive="emphasized"),
+        # Secondary: whether the theme was detected at all (Present or Emphasized).
+        "themes_detection": compute_multilabel_metrics(story_results, THEMES, positive="detection"),
         "theme_anomalies": theme_parse_anomalies(story_results),
         "extraction": compute_extraction_metrics(
             extraction_results or [], threshold=match_threshold
@@ -229,19 +231,44 @@ def _theme_scored(r: StoryPrediction) -> bool:
     return r.themes_raw is not None or bool(r.predicted_themes)
 
 
+def _theme_grade(themes_val, theme: str) -> str | None:
+    """A theme's stored grade, tolerating the legacy present-only list form."""
+    if isinstance(themes_val, dict):
+        return themes_val.get(theme)
+    return "present" if theme in (themes_val or []) else None
+
+
+# What counts as a positive theme label for the multilabel metric (issue #53):
+_POSITIVE_TESTS = {
+    "emphasized": lambda g: g == "emphasized",              # what earns a Gmail label
+    "detection": lambda g: g in ("present", "emphasized"),  # theme present at all
+}
+
+
+def _positive_theme_set(themes_val, themes: list[str], is_pos) -> set[str]:
+    return {t for t in themes if is_pos(_theme_grade(themes_val, t))}
+
+
 def compute_multilabel_metrics(
     results: list[StoryPrediction],
     themes: list[str],
+    positive: str = "emphasized",
 ) -> dict:
-    """Multi-label theme metrics.
+    """Multi-label theme metrics at a chosen positive threshold (issue #53).
 
-    Each theme is an independent binary label (present/absent) derived from the
-    expected_themes vs predicted_themes sets. Rows whose own theme call failed
-    (see _theme_scored) are excluded; a quality-parse failure alone is not.
-    Returns per-theme P/R/F1, micro-F1, macro-F1, and exact-set-match (fraction
-    where set(expected) == set(predicted)). Aggregates are None when no rows
-    were scored, so empty sections render as N/A rather than a fake 0.0%.
+    *positive* selects what counts as a positive label per theme:
+    - ``"emphasized"`` (default, PRIMARY): only Emphasized — this is exactly what
+      the daemon labels in Gmail, so it is the production-aligned headline metric.
+    - ``"detection"``: Present OR Emphasized — a secondary "did we notice the
+      theme at all" signal.
+
+    Rows whose own theme call failed (see _theme_scored) are excluded; a
+    quality-parse failure alone is not. Returns per-theme P/R/F1, micro-F1,
+    macro-F1, and exact-set-match (fraction where the positive expected set ==
+    the positive predicted set). Aggregates are None when no rows were scored, so
+    empty sections render as N/A rather than a fake 0.0%.
     """
+    is_pos = _POSITIVE_TESTS[positive]
     scored = [r for r in results if _theme_scored(r)]
 
     if not scored:
@@ -262,8 +289,8 @@ def compute_multilabel_metrics(
     for theme in themes:
         tp = fp = fn = 0
         for r in scored:
-            exp = theme in set(r.expected_themes or [])
-            pred = theme in set(r.predicted_themes or [])
+            exp = is_pos(_theme_grade(r.expected_themes, theme))
+            pred = is_pos(_theme_grade(r.predicted_themes, theme))
             if exp and pred:
                 tp += 1
             elif pred and not exp:
@@ -286,7 +313,9 @@ def compute_multilabel_metrics(
     macro_f1 = sum(per_theme[t]["f1"] for t in themes) / len(themes) if themes else 0.0
 
     exact = sum(
-        1 for r in scored if set(r.expected_themes or []) == set(r.predicted_themes or [])
+        1 for r in scored
+        if _positive_theme_set(r.expected_themes, themes, is_pos)
+        == _positive_theme_set(r.predicted_themes, themes, is_pos)
     )
     exact_set_match = exact / len(scored) if scored else None
 
@@ -544,17 +573,16 @@ def load_story_excerpts(golden_set_path: str) -> dict[str, str]:
 def _format_dim_table(
     mae: dict[str, float | None],
     exact: dict[str, float | None],
-    within1: dict[str, float | None],
 ) -> str:
-    widths = [max(len("Dimension"), *(len(d) for d in DIMENSIONS)), 10, 12, 12]
+    widths = [max(len("Dimension"), *(len(d) for d in DIMENSIONS)), 10, 12]
     lines = []
-    lines.append("  " + format_table_row(["Dimension", "MAE", "Exact", "Within-1"], widths))
+    lines.append("  " + format_table_row(["Dimension", "MAE", "Exact"], widths))
     lines.append("  " + "-" * sum(w + 2 for w in widths))
     for dim in DIMENSIONS:
         m = mae.get(dim)
         mae_s = "N/A" if m is None else f"{m:.2f}"
         lines.append("  " + format_table_row(
-            [dim, mae_s, format_pct(exact.get(dim)), format_pct(within1.get(dim))],
+            [dim, mae_s, format_pct(exact.get(dim))],
             widths,
         ))
     return "\n".join(lines)
@@ -625,14 +653,16 @@ def print_report(
         print("\n--- Quality Dimensions ---")
         print(_format_dim_table(
             metrics["dimension_mae"], metrics["dimension_exact"],
-            metrics["dimension_within1"],
         ))
 
         themes = metrics["themes"]
-        print("\n--- Themes (multi-label) ---")
+        print("\n--- Themes (Emphasized — what gets labeled) ---")
         print(f"  Micro-F1: {format_pct(themes['micro_f1'])}   "
               f"Macro-F1: {format_pct(themes['macro_f1'])}   "
               f"Exact-set match: {format_pct(themes['exact_set_match'])}")
+        detection = metrics.get("themes_detection")
+        if detection:
+            print(f"  Detection (≥Present) Micro-F1: {format_pct(detection['micro_f1'])}")
         anomalies = metrics.get("theme_anomalies", [])
         if anomalies:
             print(f"  Parse anomalies: {plural(len(anomalies), 'story', 'stories')} "

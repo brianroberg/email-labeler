@@ -63,14 +63,19 @@ are already open.
   Daemon cross-story aggregation = max grade per theme (emphasized > present > absent).
 - **Gmail theme label** (owner decision: Emphasized-only) → the daemon applies
   `agent/newsletter/theme/<name>` only for themes whose aggregated grade is `emphasized`.
-- **Report metrics**: LEFT AS-IS for the scheme switch and functions correctly — the
-  report reads the graded dicts as sets of theme *keys*, so its multilabel P/R/F1
-  measures **≥Present detection**, and dimension MAE/exact/within-1 still compute on the
-  1–3 scale. Two refinements are **deferred as follow-up** (not required for the switch;
-  the report is not broken): (a) collapse the theme metric at **positive = Emphasized**
-  to align the headline number with production labeling; (b) **drop within-1** (coarse on
-  a 3-point scale — MAE + exact-match suffice). Both are small, isolated report-only
-  changes.
+- **Report metrics** (post-#53 follow-up):
+  - **(b) within-1: DONE** — dropped from the dimension table + metrics bundle; on a 1–3
+    scale the only non-within-1 pair is a Poor↔Good confusion, so it was ~always 1.0 and
+    added nothing over MAE (now 0–2) + exact-match.
+  - **(a) theme metric: DONE — chose A′ (hybrid).** The **primary** metric
+    (`metrics["themes"]`) is now **Emphasized-positive** (per-theme + micro/macro F1 +
+    exact-set-match) — exactly what earns a Gmail label, so it is production-aligned; a
+    **secondary** `metrics["themes_detection"]` micro-F1 (positive = ≥Present) preserves
+    the "did we detect the theme at all" signal (owner: present detection is
+    secondary-but-not-nothing). Pure A was rejected because it makes Present detection
+    entirely invisible. **Option C** (full 3-class per-theme with the downgrade-vs-miss
+    confusion) is deferred to a filed issue — take it up if A′'s two aggregate F1s stop
+    being enough to explain *how* emphasized detection fails during prompt-tuning.
 
 ## #41 triage outcome (verified against HEAD)
 
