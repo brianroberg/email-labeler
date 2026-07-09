@@ -440,7 +440,11 @@ def format_stats_summary(threads: list[GoldenThread]) -> str:
 
 
 def select_review_threads(
-    threads: list[GoldenThread], *, unreviewed_only: bool = False, filter_label: str | None = None
+    threads: list[GoldenThread],
+    *,
+    unreviewed_only: bool = False,
+    filter_label: str | None = None,
+    sender_type: str | None = None,
 ) -> list[GoldenThread]:
     """Threads to queue for review.
 
@@ -452,6 +456,8 @@ def select_review_threads(
         result = [t for t in result if not t.reviewed]
     if filter_label:
         result = [t for t in result if t.expected_label == filter_label]
+    if sender_type:
+        result = [t for t in result if t.expected_sender_type == sender_type]
     return result
 
 
@@ -480,6 +486,10 @@ def cli():
     )
     parser.add_argument("--unreviewed-only", action="store_true", help="Show only unreviewed threads")
     parser.add_argument("--filter-label", choices=LABELS, help="Show only threads with this label")
+    parser.add_argument(
+        "--sender-type", choices=SENDER_TYPES,
+        help="Show only threads with this expected sender type",
+    )
     parser.add_argument(
         "--start-at", type=int, default=0,
         help="Start at this index into the review queue (0-based, after excluded "
@@ -516,11 +526,13 @@ def cli():
         threads = all_threads
         if args.unreviewed_only:
             threads = [t for t in threads if not t.reviewed]
-        elif not args.filter_label:
-            # Default: show only reviewed threads
+        elif not args.filter_label and not args.sender_type:
+            # Default: show only reviewed threads (an explicit filter replaces it)
             threads = [t for t in threads if t.reviewed]
         if args.filter_label:
             threads = [t for t in threads if t.expected_label == args.filter_label]
+        if args.sender_type:
+            threads = [t for t in threads if t.expected_sender_type == args.sender_type]
 
         if not threads:
             print("No threads match the filters.", file=sys.stderr)
@@ -531,7 +543,10 @@ def cli():
 
     # Regular review mode. Excluded threads are never queued; un-exclude via --edit.
     threads = select_review_threads(
-        all_threads, unreviewed_only=args.unreviewed_only, filter_label=args.filter_label
+        all_threads,
+        unreviewed_only=args.unreviewed_only,
+        filter_label=args.filter_label,
+        sender_type=args.sender_type,
     )
 
     if not threads:

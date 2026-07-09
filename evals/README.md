@@ -75,6 +75,10 @@ uv run python -m evals.review --stage 2
 # Only review unreviewed threads
 uv run python -m evals.review --unreviewed-only
 
+# Drain the unreviewed backlog toward a thin cell in the crosstab, e.g.
+# person threads only (--sender-type also combines with --filter-label)
+uv run python -m evals.review --unreviewed-only --sender-type person
+
 # Where does the set stand? Composition dashboard (read-only, no TUI):
 # total / excluded / pending counts plus a sender × label crosstab of the
 # reviewed & unexcluded threads — the set run_eval actually scores.

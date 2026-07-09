@@ -27,6 +27,7 @@ Harvest always appends to `--output`, deduplicating by thread ID. There is no ov
 | `--stage` | Review only stage 1 (sender) or stage 2 (label) |
 | `--unreviewed-only` | Show only threads not yet reviewed |
 | `--filter-label` | Show only threads with this label |
+| `--sender-type` | Show only threads with this expected sender type (`person` or `service`). In `--edit` mode, like `--filter-label`, an explicit filter replaces the reviewed-only default |
 | `--start-at` | Start at thread index (0-based) |
 | `--stats` | Print a composition summary and exit (read-only, no TUI): total / excluded / unreviewed-pending / reviewed-&-unexcluded counts, plus a sender × label crosstab of the reviewed-&-unexcluded set (what `run_eval` scores) |
 

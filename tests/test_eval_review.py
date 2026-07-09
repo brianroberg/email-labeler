@@ -385,6 +385,23 @@ class TestSelectReviewThreads:
         selected = select_review_threads(threads, filter_label="needs_response")
         assert [t.thread_id for t in selected] == ["b"]
 
+    def test_sender_type_filter_applies(self):
+        threads = [
+            _golden("a", expected_sender_type="person"),
+            _golden("b", expected_sender_type="service"),
+        ]
+        selected = select_review_threads(threads, sender_type="service")
+        assert [t.thread_id for t in selected] == ["b"]
+
+    def test_sender_type_combines_with_unreviewed_only(self):
+        threads = [
+            _golden("a", expected_sender_type="person", reviewed=False),
+            _golden("b", expected_sender_type="person", reviewed=True),
+            _golden("c", expected_sender_type="service", reviewed=False),
+        ]
+        selected = select_review_threads(threads, unreviewed_only=True, sender_type="person")
+        assert [t.thread_id for t in selected] == ["a"]
+
 
 # ---------------------------------------------------------------------------
 # --stats: golden-set composition summary (issue #13)
@@ -527,6 +544,54 @@ class TestCliPreservesExcluded:
         dup_labels = sorted(t.expected_label for t in saved if t.thread_id == "dup")
         assert dup_labels == ["fyi", "needs_response"]  # both judgments kept
         assert all(t.reviewed for t in saved if t.thread_id == "dup")
+
+
+class TestCliSenderType:
+    def _write(self, path):
+        import json
+
+        path.write_text(
+            "".join(json.dumps(t.to_dict()) + "\n" for t in [
+                _golden("p_rev", expected_sender_type="person", reviewed=True),
+                _golden("p_unrev", expected_sender_type="person", reviewed=False),
+                _golden("s_rev", expected_sender_type="service", reviewed=True),
+            ])
+        )
+
+    def test_sender_type_limits_review_queue(self, tmp_path, monkeypatch):
+        path = tmp_path / "golden.jsonl"
+        self._write(path)
+        seen = {}
+
+        def fake_review_loop(threads, **kwargs):
+            seen["ids"] = [t.thread_id for t in threads]
+
+        monkeypatch.setattr(review, "review_loop", fake_review_loop)
+        monkeypatch.setattr(
+            sys, "argv", ["review", "--golden-set", str(path), "--sender-type", "person"]
+        )
+        review.cli()
+        assert seen["ids"] == ["p_rev", "p_unrev"]
+
+    def test_edit_mode_sender_type_drops_reviewed_only_default(self, tmp_path, monkeypatch):
+        # Mirrors --filter-label: an explicit filter replaces the edit-mode
+        # "reviewed threads only" default, so both reviewed and unreviewed
+        # person threads are shown.
+        import evals.edit_tui as edit_tui
+
+        path = tmp_path / "golden.jsonl"
+        self._write(path)
+        seen = {}
+
+        def fake_run_edit_tui(threads, all_threads, p):
+            seen["ids"] = [t.thread_id for t in threads]
+
+        monkeypatch.setattr(edit_tui, "run_edit_tui", fake_run_edit_tui)
+        monkeypatch.setattr(
+            sys, "argv", ["review", "--golden-set", str(path), "--edit", "--sender-type", "person"]
+        )
+        review.cli()
+        assert seen["ids"] == ["p_rev", "p_unrev"]
 
 
 class TestScrollAndStages:
