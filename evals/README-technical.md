@@ -303,12 +303,15 @@ schema.
 Run output: the golden-set load prints a kept/unreviewed/excluded breakdown (with
 actionable hints when nothing is evaluable); `[k/N]` progress lines print during
 evaluation; the end-of-run summary line is
-`Rows: N (X errors, Y quality parse failures, Z theme parse failures)` plus
-optional clamped-score and dropped-theme-token lines; a
+`Rows: N (X errors, Y quality parse failures, Z theme parse failures, W theme
+near-misses)` plus optional `Unrecognized theme labels dropped by the parser:`
+and `Theme lines the parser skipped (near-misses):` detail lines; a
 `Chain-of-thought written to <path>.cot.jsonl` line appears when the sidecar is
 written; httpx request logging is quieted to WARNING. Missing/malformed config,
 `--prompts`, and golden-set files exit 1 with one-line errors, and preflight and
-per-row LLM errors name the resolved endpoint URL and its source env var.
+per-row LLM errors name the resolved endpoint URL and its source env var —
+preflight failures also append `probe()`'s captured detail (HTTP status or
+exception text, plus a model-mismatch hint on 404).
 
 ### newsletter_report
 
@@ -317,7 +320,7 @@ per-row LLM errors name the resolved endpoint URL and its source env var.
 | `--results` | Path to a single results JSONL file |
 | `--compare` | Two result file paths for side-by-side comparison. `.cot.jsonl` sidecars matched by a glob are ignored (with a stderr note), so `*<tag>*.jsonl` globs work |
 | `--results-dir` | Directory of results for trend view (`.cot.jsonl` sidecars skipped) |
-| `--verbose` | Show per-story flips and per-newsletter extraction diffs (no effect with `--results-dir`; a stderr note says so) |
+| `--verbose` | Show per-story disagreements/flips and, in single-run mode only, per-newsletter extraction diffs (no effect with `--results-dir`; a stderr note says so) |
 | `--format` | `table` (default) or `json`. JSON works in all three modes: single run (`{meta, metrics}`), `--compare` (`{"run_a": {meta, metrics}, "run_b": {...}}`), and `--results-dir` (array of summary rows: file, run_id, timestamp, mode, tag, prompt_hash, tier_accuracy, theme_micro_f1, mae_simple, extraction_micro_f1 — `null` for absent sections) |
 | `--match-threshold` | `SequenceMatcher` ratio threshold for the extraction one-to-one match (default: `0.6`). Applies to **text** similarity (see below) |
 
@@ -361,7 +364,8 @@ Metric semantics:
 Single-run report output: the header shows `Golden set:`; the tier section
 pluralizes correctly and lists `Failed stories (quality parse/network): <ids>`;
 the themes section shows a `Parse anomalies: N` line when theme responses
-contained invalid tokens or unparseable output; the extraction section shows
+contained invalid tokens, near-miss lines the parser skipped, or unparseable
+output; the extraction section shows
 `(<N> newsletters, <M> errors, match threshold <t>)` and renders even when every
 extraction call errored (count 0), listing the failed newsletters — extraction
 metrics carry `errors`/`error_threads` alongside the scored counts. Bad
@@ -369,15 +373,17 @@ metrics carry `errors`/`error_threads` alongside the scored counts. Bad
 any `OSError`) exit with a one-line error instead of a traceback.
 
 `--verbose` detail: per-story flips in `--compare` gate the tier diff on both
-runs having quality scores but compare theme sets whenever both rows' theme call
-succeeded — two `--mode themes` runs show their theme flips. Story
+runs having quality scores but compare theme grades (a present -> emphasized
+change counts as a flip) whenever both rows' theme call succeeded — two
+`--mode themes` runs show their theme flips. Story
 Disagreements lines append a story text excerpt (best-effort
 lookup from the run's recorded `golden_set_path`; degrades to bare ids if the
 file moved) and include stories whose quality parse failed but whose themes
 disagree; a `Parse/Network Failures` section prints each failed story with its
 raw quality response (`scores_raw`) or error; a `Theme Parse Anomalies` section
 prints `themes_raw` for stories whose theme output was invalid
-(`invalid tokens dropped: ...`) or unparseable (`parsed to []`); Extraction Diffs
+(`invalid tokens dropped: ...`), contained near-miss lines the parser skipped
+(`near-miss lines skipped: ...`), or was unparseable (`parsed to []`); Extraction Diffs
 honor `--match-threshold` (header says `threshold <t>`) and, for any newsletter
 that isn't a perfect match, list matched pairs with their `SequenceMatcher` ratio
 plus each unmatched predicted / unmatched golden story by a text excerpt.

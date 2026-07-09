@@ -35,12 +35,12 @@ Newsletter labels (see [Newsletter Classification](#newsletter-classification)):
 | Label | Purpose |
 |---|---|
 | `agent/newsletter` | Marker applied to all newsletter emails |
-| `agent/newsletter/excellent` | Best story scored >= 4.0 average |
-| `agent/newsletter/good` | Best story scored >= 3.0 average |
-| `agent/newsletter/fair` | Best story scored >= 2.0 average |
-| `agent/newsletter/poor` | Best story scored < 2.0 average |
+| `agent/newsletter/excellent` | Best story averaged >= 2.75 (dimensions scored Poor/OK/Good as 1/2/3) |
+| `agent/newsletter/good` | Best story averaged >= 2.25 |
+| `agent/newsletter/fair` | Best story averaged >= 1.75 |
+| `agent/newsletter/poor` | Best story averaged < 1.75 |
 | `agent/newsletter/no-stories` | No extractable stories found |
-| `agent/newsletter/theme/*` | Theme tags: `scripture`, `christlikeness`, `church`, `vocation-family`, `disciple-making` |
+| `agent/newsletter/theme/*` | Theme tags: `scripture`, `christlikeness`, `church`, `vocation-family`, `disciple-making` — applied only when a story grades the theme Emphasized (merely-Present themes are recorded in the assessment JSONL but not labeled) |
 
 ## Architecture
 

@@ -66,7 +66,7 @@ Newsletter uses its own `[newsletter.llm]` config (currently Sonnet 4.6) indepen
 - `agent/newsletter` — Marker (always applied)
 - `agent/newsletter/excellent|good|fair|poor` — Overall quality tier
 - `agent/newsletter/no-stories` — Newsletter contained no extractable stories
-- `agent/newsletter/theme/*` — Per-story theme labels (scripture, christlikeness, church, vocation-family, disciple-making); applied **only when the theme is graded Emphasized** (Present/Absent are recorded in the assessment JSONL but not labeled)
+- `agent/newsletter/theme/*` — Per-story theme labels (scripture, christlikeness, church, vocation-family, disciple-making); applied **only when the theme is graded Emphasized** (merely-Present themes are recorded in the assessment JSONL but not labeled; Absent themes are omitted from the record entirely)
 
 ### Newsletter Review TUI
 

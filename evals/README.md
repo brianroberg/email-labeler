@@ -237,8 +237,8 @@ The globs may also match each run's `.cot.jsonl` chain-of-thought sidecar —
 `--compare` ignores sidecars (with a stderr note), so this works as long as each
 glob matches exactly one real results file. The comparison renders
 tier/dimension/theme/extraction deltas and prints each run's `prompt_hash` + tag
-+ mode (warning when the modes differ); `--verbose` lists per-story flips and
-per-newsletter extraction diffs.
++ mode (warning when the modes differ); `--verbose` lists per-story flips
+(per-newsletter extraction diffs appear only in single-run `--results` reports).
 
 ## Typical Workflows
 

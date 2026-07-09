@@ -5,6 +5,7 @@ Usage::
     python -m newsletter_review
     python -m newsletter_review --tier poor
     python -m newsletter_review --theme scripture --sender dm.org
+    python -m newsletter_review --since 2026-06-01
     python -m newsletter_review --file path/to/assessments.jsonl
 """
 
