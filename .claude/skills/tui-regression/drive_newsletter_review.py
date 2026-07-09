@@ -46,6 +46,11 @@ def _row_date(row: str) -> str:
     return row.split()[0]
 
 
+def _row_tier(row: str) -> str:
+    """The Tier column (second whitespace-delimited token) of a rendered row."""
+    return row.split()[1]
+
+
 def _title(app) -> str:
     from textual.widgets import Static
     return str(app.query_one("#title", Static).render())
@@ -265,7 +270,7 @@ async def s_detail_no_stories(chk):
     async with app.run_test(size=SIZE) as pilot:
         row = str(app.query_one(ListView).children[0].query_one(Label).render())
         chk.that("0 stories" in row, "list row shows '0 stories' for a no-story record")
-        chk.that(row.strip().startswith("—"), "list row shows '—' tier for None")
+        chk.eq(_row_tier(row), "—", "list row shows '—' tier for None")
         await pilot.press("enter")
         c = _detail_content(app)
         chk.that("No stories extracted" in c, "no-stories detail branch rendered")
