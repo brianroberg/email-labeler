@@ -74,10 +74,10 @@ def _pred(
         thread_id="t",
         expected_scores=expected_scores,
         expected_tier=expected_tier,
-        expected_themes=expected_themes or [],
+        expected_themes=expected_themes or {},
         predicted_scores=predicted_scores,
         predicted_tier=predicted_tier,
-        predicted_themes=predicted_themes or [],
+        predicted_themes=predicted_themes or {},
         error=error,
     )
 
@@ -148,9 +148,9 @@ class TestMatchStories:
 class TestTierMetrics:
     def test_confusion_and_prf(self):
         results = [
-            _pred(predicted_scores={"simple": 5}, expected_tier="excellent",
+            _pred(predicted_scores={"simple": 3}, expected_tier="excellent",
                   predicted_tier="excellent"),
-            _pred(predicted_scores={"simple": 4}, expected_tier="excellent",
+            _pred(predicted_scores={"simple": 2}, expected_tier="excellent",
                   predicted_tier="good"),  # off-diagonal
             _pred(predicted_scores={"simple": 3}, expected_tier="good",
                   predicted_tier="good"),
@@ -179,7 +179,7 @@ class TestTierMetrics:
         failed = _pred(predicted_scores=None, expected_tier="good", predicted_tier="good")
         failed.scores_raw = "garbage the parser rejected"
         results = [
-            _pred(predicted_scores={"simple": 5}, expected_tier="excellent",
+            _pred(predicted_scores={"simple": 3}, expected_tier="excellent",
                   predicted_tier="excellent"),
             failed,
         ]
@@ -230,8 +230,8 @@ class TestDimensionMetrics:
     def test_only_over_stories_with_both_scores(self):
         results = [
             _pred(
-                expected_scores={"simple": 4, "concrete": 4, "personal": 4, "dynamic": 4},
-                predicted_scores={"simple": 4, "concrete": 4, "personal": 4, "dynamic": 4},
+                expected_scores={"simple": 2, "concrete": 2, "personal": 2, "dynamic": 2},
+                predicted_scores={"simple": 2, "concrete": 2, "personal": 2, "dynamic": 2},
             ),
             # parse failure -> excluded entirely
             _pred(expected_scores={"simple": 1}, predicted_scores=None),
@@ -299,18 +299,6 @@ class TestMultilabelThemeMetrics:
         # Detection (secondary): both are >=Present -> a true positive.
         det = compute_multilabel_metrics(results, THEMES, positive="detection")
         assert det["per_theme"]["scripture"]["f1"] == 1.0
-
-    def test_legacy_list_themes_are_present_not_emphasized(self):
-        # Old records store a present-only list; it counts as detected (Present)
-        # but never as Emphasized.
-        results = [
-            _pred(expected_themes=["scripture"], predicted_themes=["scripture"],
-                  predicted_scores={"simple": 3}),
-        ]
-        det = compute_multilabel_metrics(results, THEMES, positive="detection")
-        assert det["per_theme"]["scripture"]["f1"] == 1.0
-        emph = compute_multilabel_metrics(results, THEMES, positive="emphasized")
-        assert emph["per_theme"]["scripture"]["f1"] == 0.0
 
 
 
@@ -460,11 +448,12 @@ class TestThemeMetricsGating:
         # Story with malformed quality response (predicted_scores None) but a
         # perfectly parsed theme prediction must still count in theme metrics.
         results = [
-            _pred(story_id="ok", expected_themes=["church"], predicted_themes=["church"],
+            _pred(story_id="ok", expected_themes={"church": "emphasized"},
+                  predicted_themes={"church": "emphasized"},
                   predicted_scores={"simple": 3}),
         ]
-        failed = _pred(story_id="priya", expected_themes=["christlikeness"],
-                       predicted_themes=[], predicted_scores=None)
+        failed = _pred(story_id="priya", expected_themes={"christlikeness": "emphasized"},
+                       predicted_themes={}, predicted_scores=None)
         failed.themes_raw = "NONE"
         results.append(failed)
         m = compute_multilabel_metrics(results, THEMES)
@@ -473,7 +462,7 @@ class TestThemeMetricsGating:
         assert m["per_theme"]["christlikeness"]["recall"] == 0.0
 
     def test_error_rows_still_excluded(self):
-        errored = _pred(story_id="down", expected_themes=["church"],
+        errored = _pred(story_id="down", expected_themes={"church": "emphasized"},
                         error="connection refused")
         m = compute_multilabel_metrics([errored], THEMES)
         assert m["count"] == 0
@@ -506,7 +495,7 @@ class TestTierQualityNotAttempted:
         # scores_raw=None. Those rows are "quality not attempted", not parse
         # failures — the tier section must not render as "0 stories, N errors".
         row = _pred(story_id="t:0", expected_tier="good",
-                    expected_themes=["church"], predicted_themes=["church"])
+                    expected_themes={"church": "emphasized"}, predicted_themes={"church": "emphasized"})
         row.themes_raw = "CHURCH"
         m = compute_tier_metrics([row])
         assert m["errors"] == 0
@@ -527,7 +516,7 @@ class TestTierQualityNotAttempted:
         # In a --mode themes run the quality call is never in play, so a theme
         # call's network error must not render a misleading tier section
         # ("0 stories, 1 error"). The run's mode comes from RunMeta.
-        errored = _pred(story_id="down", expected_themes=["church"],
+        errored = _pred(story_id="down", expected_themes={"church": "emphasized"},
                         error="connection refused")
         path = tmp_path / "themes_run.jsonl"
         _write_results(path, _meta(mode="themes"), [errored])
@@ -539,8 +528,8 @@ class TestTierQualityNotAttempted:
         assert "Tier Classification" not in out
 
     def test_verbose_failures_section_excludes_not_attempted(self, capsys):
-        row = _pred(story_id="t:0", expected_themes=["church"],
-                    predicted_themes=["church"])
+        row = _pred(story_id="t:0", expected_themes={"church": "emphasized"},
+                    predicted_themes={"church": "emphasized"})
         row.themes_raw = "CHURCH"
         metrics = compute_all_metrics([row])
         print_report(_meta(mode="themes"), metrics, verbose=True, story_results=[row])
@@ -580,7 +569,7 @@ class TestThemeParseAnomalies:
 
     def test_rows_without_raw_are_skipped(self):
         # Legacy rows / error rows carry no themes_raw -> no anomaly.
-        anomalies = theme_parse_anomalies([_pred(story_id="x", predicted_themes=[])])
+        anomalies = theme_parse_anomalies([_pred(story_id="x", predicted_themes={})])
         assert anomalies == []
 
 
@@ -661,7 +650,7 @@ class TestPrintReportSections:
         assert "storys" not in out
 
     def test_theme_anomaly_count_shown(self, capsys):
-        row = _pred(story_id="g:0", predicted_themes=["church"],
+        row = _pred(story_id="g:0", predicted_themes={"church": "emphasized"},
                     predicted_scores={"simple": 3})
         row.themes_raw = "FELLOWSHIP\nCHURCH"
         metrics = compute_all_metrics([row])
@@ -745,7 +734,7 @@ class TestPrintReportVerbose:
         # Quality parse failed but themes parsed fine and disagree -> the story
         # must still appear in Story Disagreements.
         failed = _pred(story_id="g:2", predicted_scores=None,
-                       expected_themes=["christlikeness"], predicted_themes=[])
+                       expected_themes={"christlikeness": "emphasized"}, predicted_themes={})
         failed.themes_raw = "NONE"
         metrics = compute_all_metrics([failed])
         print_report(_meta(), metrics, verbose=True, story_results=[failed])
@@ -755,7 +744,7 @@ class TestPrintReportVerbose:
         assert "christlikeness" in section
 
     def test_verbose_shows_theme_anomaly_raw(self, capsys):
-        row = _pred(story_id="g:1", predicted_themes=[],
+        row = _pred(story_id="g:1", predicted_themes={},
                     predicted_scores={"simple": 3})
         row.themes_raw = "The themes of hope and belonging shine through."
         metrics = compute_all_metrics([row])
@@ -810,7 +799,7 @@ class TestPrintComparisonModes:
         results = [
             _pred(story_id="s", predicted_scores={"simple": 3},
                   expected_tier="good", predicted_tier="good",
-                  expected_themes=["church"], predicted_themes=["church"]),
+                  expected_themes={"church": "emphasized"}, predicted_themes={"church": "emphasized"}),
         ]
         return compute_all_metrics(results)
 
@@ -863,13 +852,14 @@ class TestVerboseCompareThemesMode:
     def test_theme_flip_shown_when_quality_never_ran(self, capsys):
         # --mode themes rows never have predicted_scores; a theme flip between
         # runs must still be listed (not "None!") under Per-story Flips.
-        def row(themes):
-            r = _pred(story_id="s", expected_themes=["church"],
+        def row(themes):  # themes: {name: grade}
+            r = _pred(story_id="s", expected_themes={"church": "emphasized"},
                       predicted_themes=themes)
-            r.themes_raw = "\n".join(t.upper() for t in themes) or "NONE"
+            r.themes_raw = "\n".join(f"{t.upper()}: EMPHASIZED" for t in themes) or "NONE"
             return r
 
-        story1, story2 = [row(["church"])], [row(["scripture"])]
+        story1 = [row({"church": "emphasized"})]
+        story2 = [row({"scripture": "emphasized"})]
         m1 = compute_all_metrics(story1)
         m2 = compute_all_metrics(story2)
         print_comparison(_meta(mode="themes"), m1, _meta(mode="themes"), m2,
@@ -884,7 +874,7 @@ class TestTrendRows:
     def _write_two_runs(self, tmp_path):
         story = _pred(story_id="s", predicted_scores={"simple": 3},
                       expected_tier="good", predicted_tier="good",
-                      predicted_themes=["church"], expected_themes=["church"])
+                      predicted_themes={"church": "emphasized"}, expected_themes={"church": "emphasized"})
         # File names sort in the OPPOSITE order of their timestamps, so
         # chronological ordering must come from run_meta.timestamp.
         _write_results(
@@ -989,7 +979,7 @@ class TestCliJsonAndErrors:
     def _write_run(self, path, **meta_kwargs):
         story = _pred(story_id="s", predicted_scores={"simple": 3},
                       expected_tier="good", predicted_tier="good",
-                      predicted_themes=["church"], expected_themes=["church"])
+                      predicted_themes={"church": "emphasized"}, expected_themes={"church": "emphasized"})
         _write_results(path, _meta(**meta_kwargs), [story])
 
     def test_compare_format_json_emits_json(self, tmp_path, monkeypatch, capsys):

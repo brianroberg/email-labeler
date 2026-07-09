@@ -59,8 +59,12 @@ are already open.
 - **Themes** stored as **`dict[str,str]`** mapping theme→`"present"`/`"emphasized"`,
   Absent omitted. `parse_themes`, `StoryResult.themes`, `expected_themes`/
   `predicted_themes`, the assessment JSONL, and the golden set all take this shape.
-  `from_dict` coerces a legacy `list[str]` → `{name: "present"}` so old files still load.
   Daemon cross-story aggregation = max grade per theme (emphasized > present > absent).
+  **No backward-compat to the old scheme** (owner decision): the readers assume the
+  new dict/1–3 shapes (no list→present coercion, no 1–5 fallback) and the golden set /
+  assessment JSONL are regenerated under the new scheme. The parsers still *reject* old-
+  format LLM output (a bare theme name or a digit score → parse failure), which is
+  robustness against a misbehaving model, not data backward-compat.
 - **Gmail theme label** (owner decision: Emphasized-only) → the daemon applies
   `agent/newsletter/theme/<name>` only for themes whose aggregated grade is `emphasized`.
 - **Report metrics** (post-#53 follow-up):

@@ -50,14 +50,6 @@ class TestGoldenStory:
         assert s.notes == ""
         assert s.excluded is False
 
-    def test_legacy_list_themes_coerced_to_present(self):
-        # Golden sets written under the old boolean scheme carry a present-only
-        # list; loading them coerces each to grade "present" (issue #53).
-        s = GoldenStory.from_dict(
-            {"story_id": "x:0", "text": "B", "expected_themes": ["scripture", "church"]}
-        )
-        assert s.expected_themes == {"scripture": "present", "church": "present"}
-
     def test_legacy_title_key_is_tolerated(self):
         # Golden sets written before titles were removed still carry a "title"
         # key; loading them must ignore the extra key, not crash.
@@ -184,18 +176,6 @@ class TestStoryPrediction:
         assert p.themes_raw is None
         assert p.duration_seconds == 0.0
         assert p.error is None
-
-    def test_legacy_list_themes_coerced_to_present(self):
-        p = StoryPrediction.from_dict(
-            {
-                "story_id": "x:0",
-                "thread_id": "x",
-                "expected_themes": ["scripture"],
-                "predicted_themes": ["scripture", "church"],
-            }
-        )
-        assert p.expected_themes == {"scripture": "present"}
-        assert p.predicted_themes == {"scripture": "present", "church": "present"}
 
 
 class TestExtractionPrediction:

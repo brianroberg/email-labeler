@@ -251,11 +251,11 @@ def assessment_records() -> list[dict]:
                                qcot="Concrete names and numbers throughout.", tcot="Clear scripture focus.")],
     })
     recs.append({
-        # Legacy record: present-only LIST themes — exercises backward-compat rendering.
         "timestamp": "2026-01-06T11:00:00+00:00", "message_id": "a2", "thread_id": "a2",
         "from": "weekly@ministry.org", "subject": "Good update", "overall_tier": "good",
         "stories": [_story_rec("The church hosted a community dinner.", _scores(3, 3, 2, 2),
-                               "good", ["church"], qcot="Solid but generic.", tcot="Church theme.")],
+                               "good", {"church": "present"}, qcot="Solid but generic.",
+                               tcot="Church theme.")],
     })
     recs.append({
         "timestamp": "2026-01-07T12:00:00+00:00", "message_id": "a3", "thread_id": "a3",

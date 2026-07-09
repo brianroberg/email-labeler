@@ -9,16 +9,9 @@ from dataclasses import dataclass, field
 
 
 def _coerce_themes(value) -> dict[str, str]:
-    """Normalize a stored themes value to a grade dict (issue #53).
-
-    Accepts the current dict form (theme -> "present"/"emphasized"), a legacy
-    present-only ``list[str]`` (each coerced to grade "present"), or None/empty.
-    """
-    if not value:
-        return {}
-    if isinstance(value, dict):
-        return dict(value)
-    return {name: "present" for name in value}
+    """Normalize a stored themes value to a grade dict (theme -> "present"/
+    "emphasized"), defaulting a missing/empty value to ``{}`` (issue #53)."""
+    return dict(value) if value else {}
 
 
 @dataclass

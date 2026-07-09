@@ -232,10 +232,8 @@ def _theme_scored(r: StoryPrediction) -> bool:
 
 
 def _theme_grade(themes_val, theme: str) -> str | None:
-    """A theme's stored grade, tolerating the legacy present-only list form."""
-    if isinstance(themes_val, dict):
-        return themes_val.get(theme)
-    return "present" if theme in (themes_val or []) else None
+    """A theme's stored grade (theme -> "present"/"emphasized"), or None if absent."""
+    return (themes_val or {}).get(theme)
 
 
 # What counts as a positive theme label for the multilabel metric (issue #53):
@@ -726,7 +724,7 @@ def _print_verbose_single(
             continue
         tier_diff = r.predicted_scores is not None and r.expected_tier != r.predicted_tier
         theme_diff = _theme_scored(r) and (
-            set(r.expected_themes or []) != set(r.predicted_themes or [])
+            set(r.expected_themes or {}) != set(r.predicted_themes or {})
         )
         if tier_diff or theme_diff:
             disagreements.append((r, tier_diff, theme_diff))
@@ -737,8 +735,8 @@ def _print_verbose_single(
         if tier_diff:
             parts.append(f"tier={r.expected_tier}->{r.predicted_tier}")
         if theme_diff:
-            parts.append(f"themes={sorted(set(r.expected_themes or []))}"
-                         f"->{sorted(set(r.predicted_themes or []))}")
+            parts.append(f"themes={sorted(set(r.expected_themes or {}))}"
+                         f"->{sorted(set(r.predicted_themes or {}))}")
         print(" ".join(parts))
 
     # "Never attempted" rows (e.g. --mode themes: no error, no scores_raw) are
@@ -893,7 +891,7 @@ def _print_verbose_compare(
                 parts.append(f"tier: {r1.predicted_tier}->{r2.predicted_tier} "
                              f"(expected {r1.expected_tier}){flag}")
         if _theme_scored(r1) and _theme_scored(r2):
-            s1, s2 = set(r1.predicted_themes or []), set(r2.predicted_themes or [])
+            s1, s2 = set(r1.predicted_themes or {}), set(r2.predicted_themes or {})
             if s1 != s2:
                 parts.append(f"themes: {sorted(s1)}->{sorted(s2)}")
         if parts:

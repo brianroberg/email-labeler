@@ -85,21 +85,15 @@ def apply_filters(
     return result
 
 
-# Dimension score int (1/2/3) -> display label (issue #53); old out-of-range
-# values (legacy 1-5 records) fall back to their raw int.
+# Dimension score int (1/2/3) -> display label (issue #53); ``.get(v, v)`` is a
+# defensive fallback so an unexpected value shows raw instead of crashing.
 _SCORE_LABELS = {1: "Poor", 2: "OK", 3: "Good"}
 
 
-def _format_themes(themes) -> str:
-    """Render a story's themes for the detail view.
-
-    New records store a graded dict (theme -> "present"/"emphasized"), shown as
-    ``name (grade)``; legacy records store a present-only list, shown as plain
-    names (issue #53).
-    """
-    if isinstance(themes, dict):
-        return ", ".join(f"{name} ({grade})" for name, grade in themes.items())
-    return ", ".join(themes)
+def _format_themes(themes: dict) -> str:
+    """Render a story's graded themes (theme -> "present"/"emphasized") for the
+    detail view as ``name (grade)`` (issue #53)."""
+    return ", ".join(f"{name} ({grade})" for name, grade in themes.items())
 
 
 def wrap_text(text: str, width: int) -> list[str]:

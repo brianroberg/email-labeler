@@ -228,16 +228,13 @@ def confirm_story_list(newsletter):
 def assign_scores_and_themes(story, scores, themes):
     """Assign the 4 dimension scores + graded themes to a story and confirm it.
 
-    ``expected_tier`` is auto-derived from *scores* via ``compute_tier``; the
-    story is marked reviewed. *scores*/*themes* are copied so later mutation of
-    the caller's objects does not alias into the golden set. *themes* may be the
-    graded dict (theme -> "present"/"emphasized") produced by ThemeScreen, or a
-    legacy present-only list (coerced to grade "present"); issue #53.
+    *themes* is the graded dict (theme -> "present"/"emphasized") produced by
+    ThemeScreen. ``expected_tier`` is auto-derived from *scores* via
+    ``compute_tier``; the story is marked reviewed. *scores*/*themes* are copied
+    so later mutation of the caller's objects does not alias into the golden set.
     """
     story.expected_scores = dict(scores)
-    story.expected_themes = (
-        dict(themes) if isinstance(themes, dict) else {t: "present" for t in themes}
-    )
+    story.expected_themes = dict(themes)
     story.expected_tier = compute_tier(scores).value
     story.reviewed = True
 

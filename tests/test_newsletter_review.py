@@ -35,10 +35,10 @@ def _make_record(
         stories = [
             {
                 "text": "Once upon a time in a campus ministry...",
-                "scores": {"simple": 4, "concrete": 3, "personal": 5, "dynamic": 2},
-                "average_score": 3.5,
+                "scores": {"simple": 3, "concrete": 2, "personal": 3, "dynamic": 2},
+                "average_score": 2.5,
                 "tier": "good",
-                "themes": ["scripture", "church"],
+                "themes": {"scripture": "emphasized", "church": "present"},
                 "quality_cot": "The story focuses on one idea.",
                 "theme_cot": "This illustrates Scripture study.",
             }
@@ -127,13 +127,13 @@ class TestApplyFilters:
             _make_record(stories=[{
                 "text": "T", "scores": None,
                 "average_score": None, "tier": None,
-                "themes": ["scripture", "church"],
+                "themes": {"scripture": "emphasized", "church": "present"},
                 "quality_cot": "", "theme_cot": "",
             }]),
             _make_record(stories=[{
                 "text": "T", "scores": None,
                 "average_score": None, "tier": None,
-                "themes": ["disciple_making"],
+                "themes": {"disciple_making": "emphasized"},
                 "quality_cot": "", "theme_cot": "",
             }]),
         ]
@@ -301,8 +301,8 @@ class TestBuildDetailLines:
         record = _make_record()
         lines = build_detail_lines(record)
         text = "\n".join(lines)
-        assert "simple" in text.lower()
-        assert "4" in text
+        assert "Quality scores:" in text
+        assert "simple=Good" in text  # default simple=3 -> Good (issue #53)
 
     def test_dimension_scores_rendered_as_labels(self):
         # 1/2/3 render as Poor/OK/Good in the detail view (issue #53).
@@ -346,21 +346,11 @@ class TestBuildDetailLines:
         assert "scripture (emphasized)" in text
         assert "church (present)" in text
 
-    def test_legacy_list_themes_still_render(self):
-        # Old records store a present-only list; still render as plain names.
-        record = _make_record(stories=[{
-            "text": "Content", "scores": None, "average_score": None, "tier": None,
-            "themes": ["scripture", "church"], "quality_cot": "", "theme_cot": "",
-        }])
-        text = "\n".join(build_detail_lines(record))
-        assert "scripture" in text
-        assert "church" in text
-
     def test_handles_missing_scores(self):
         record = _make_record(stories=[{
             "text": "Content without any scores",
             "scores": None, "average_score": None, "tier": None,
-            "themes": [], "quality_cot": "", "theme_cot": "",
+            "themes": {}, "quality_cot": "", "theme_cot": "",
         }])
         lines = build_detail_lines(record)
         text = "\n".join(lines)
@@ -370,15 +360,15 @@ class TestBuildDetailLines:
         stories = [
             {
                 "text": "Content A about a student",
-                "scores": {"simple": 5, "concrete": 5, "personal": 5, "dynamic": 5},
+                "scores": {"simple": 3, "concrete": 3, "personal": 3, "dynamic": 3},
                 "average_score": 5.0, "tier": "excellent",
-                "themes": ["scripture"], "quality_cot": "cot A", "theme_cot": "theme A",
+                "themes": {"scripture": "emphasized"}, "quality_cot": "cot A", "theme_cot": "theme A",
             },
             {
                 "text": "Content B about a mentor",
                 "scores": {"simple": 2, "concrete": 2, "personal": 2, "dynamic": 2},
                 "average_score": 2.0, "tier": "fair",
-                "themes": ["church"], "quality_cot": "cot B", "theme_cot": "theme B",
+                "themes": {"church": "emphasized"}, "quality_cot": "cot B", "theme_cot": "theme B",
             },
         ]
         record = _make_record(stories=stories)
@@ -481,7 +471,7 @@ def _ui_records():
             stories=[{
                 "text": "T", "scores": None,
                 "average_score": None, "tier": None,
-                "themes": ["vocation_family"], "quality_cot": "", "theme_cot": "",
+                "themes": {"vocation_family": "emphasized"}, "quality_cot": "", "theme_cot": "",
             }],
         ),
         _make_record(subject="Subject four", overall_tier="fair", sender="erin@other.org"),
