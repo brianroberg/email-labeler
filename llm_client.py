@@ -11,7 +11,7 @@ import httpx
 
 from retry import retry_with_backoff
 
-# Default timeout (seconds) for the lightweight is_available() ping. Longer than
+# Default timeout (seconds) for the lightweight probe() ping. Longer than
 # a typical liveness probe because a server that loads models on demand only
 # loads the requested model on the first request — a cold load of a large model
 # routinely exceeds 10s, and timing out would wrongly report it unreachable.
@@ -245,10 +245,6 @@ class LLMClient:
             # timeout, but also UnsupportedProtocol (unset/schemeless URL) and
             # read/protocol errors (e.g. a dropped connection mid cold-load).
             return AvailabilityResult(ok=False, error=f"{type(exc).__name__}: {exc}")
-
-    async def is_available(self, timeout: float | None = None) -> bool:
-        """Whether the endpoint is reachable (a thin bool wrapper over probe())."""
-        return (await self.probe(timeout)).ok
 
     # Matches <think>...</think> and <<think>>...</<think>> (DeepSeek variant)
     _THINK_PATTERN = re.compile(r"<<?think>>?.*?</<?think>>?", flags=re.DOTALL)

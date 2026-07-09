@@ -519,24 +519,6 @@ class TestThinking:
         assert thinking == "deep reasoning"
 
 
-class TestIsAvailable:
-    async def test_delegates_to_inner(self, tmp_path: Path):
-        inner = _make_inner()
-        inner.is_available.return_value = True
-        cached = CachedLLMClient(inner, tmp_path / "cache.jsonl")
-
-        assert await cached.is_available() is True
-        inner.is_available.assert_awaited_once()
-
-    async def test_forwards_timeout_to_inner(self, tmp_path: Path):
-        inner = _make_inner()
-        inner.is_available.return_value = True
-        cached = CachedLLMClient(inner, tmp_path / "cache.jsonl")
-
-        await cached.is_available(timeout=42)
-        inner.is_available.assert_awaited_once_with(42)
-
-
 class TestProbe:
     async def test_delegates_probe_to_inner(self, tmp_path: Path):
         # The cache wraps the real client that eval preflights probe(); it must
