@@ -59,7 +59,16 @@ class LLMUnavailableError(Exception):
     timeout means the *request* is the problem (too-large input, bad payload) and
     is eligible for the daemon's give-up logic, whereas an unavailable endpoint is
     a transient outage that should simply be retried next cycle.
+
+    ``tier`` identifies the raising client ("cloud" / "local" / None when the
+    client didn't declare one). Both tiers raise this same type; the tier is what
+    lets the daemon treat a routine local outage (the MLX laptop is offline for
+    hours at a time) as INFO-grade while a cloud outage stays WARNING (issue #24).
     """
+
+    def __init__(self, message: str, *, tier: str | None = None):
+        super().__init__(message)
+        self.tier = tier
 
 
 class LLMContentError(RuntimeError):
@@ -87,6 +96,7 @@ class LLMClient:
         temperature: float = 0.2,
         timeout: int = 60,
         extra_body: dict | None = None,
+        tier: str | None = None,
     ):
         self.base_url = base_url
         self.api_key = api_key
@@ -95,6 +105,9 @@ class LLMClient:
         self.temperature = temperature
         self.timeout = timeout
         self.extra_body = extra_body or {}
+        # "cloud" / "local" — carried on LLMUnavailableError so callers can tell
+        # a routine local outage from a surprising cloud one (issue #24).
+        self.tier = tier
 
     def _is_glm_model(self) -> bool:
         """Check if model uses GLM-style reasoning_content instead of inline think tags."""
@@ -171,7 +184,8 @@ class LLMClient:
             # up on a thread. NOTE: ConnectTimeout/PoolTimeout subclass
             # TimeoutException, so they must be caught before the timeout clause.
             raise LLMUnavailableError(
-                f"LLM endpoint {self.model} unavailable ({type(exc).__name__}): {exc}"
+                f"LLM endpoint {self.model} unavailable ({type(exc).__name__}): {exc}",
+                tier=self.tier,
             ) from exc
         except httpx.TimeoutException:
             # Connection established but the response was too slow (read/write
@@ -187,7 +201,8 @@ class LLMClient:
             # or flapped — an availability event, also transient. (Some of these
             # stringify to ""; the wrapper guarantees an informative, non-empty msg.)
             raise LLMUnavailableError(
-                f"LLM connection to {self.model} dropped ({type(exc).__name__}): {exc}"
+                f"LLM connection to {self.model} dropped ({type(exc).__name__}): {exc}",
+                tier=self.tier,
             ) from exc
 
         if response.status_code != 200:

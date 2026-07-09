@@ -285,6 +285,7 @@ async def process_single_thread(
     failure_tracker: "FailureTracker | None" = None,
     fetch_sem: asyncio.Semaphore | None = None,
     write_sem: asyncio.Semaphore | None = None,
+    local_deferrals: list[str] | None = None,
 ) -> bool:
     """Process a single thread through the classification pipeline.
 
@@ -495,7 +496,18 @@ async def process_single_thread(
         # LLM endpoint unreachable or dropped mid-request (server down, connect
         # timeout, reset) — transient. Don't count it toward give-up; just retry
         # next cycle (preserves graceful degradation of the privacy invariant).
-        log.warning("LLM unavailable processing thread %s: %s", thread_id, exc)
+        #
+        # The LOCAL tier being down is a routine operating condition (the MLX
+        # laptop is deliberately offline for hours at a time), not an incident:
+        # log per-thread detail at DEBUG and count the deferral so the poll loop
+        # can emit a single per-cycle INFO summary instead of N warnings
+        # (issue #24). A cloud (or tier-less) outage stays a WARNING.
+        if exc.tier == "local":
+            log.debug("Local LLM unavailable processing thread %s: %s", thread_id, exc)
+            if local_deferrals is not None:
+                local_deferrals.append(thread_id)
+        else:
+            log.warning("LLM unavailable processing thread %s: %s", thread_id, exc)
         return False
     except ProxyUnavailableError as exc:
         # api-proxy unavailable for THIS thread's call — connection refused, a timeout,
@@ -559,6 +571,20 @@ def summarize_cycle(
     return processed, given_up
 
 
+def log_local_deferrals(deferred: list[str]) -> None:
+    """One INFO line per cycle when person threads deferred on a local-LLM outage.
+
+    The per-thread handler logs each deferral at DEBUG (issue #24: a closed
+    laptop with N person emails used to emit N WARNINGs every cycle for hours);
+    this summary is the single visible trace of a routine local outage.
+    """
+    if deferred:
+        log.info(
+            "Local LLM offline — deferred %d person email thread(s) this cycle",
+            len(deferred),
+        )
+
+
 async def verify_labels_with_retry(
     label_manager: LabelManager,
     initial_backoff: int = 5,
@@ -620,6 +646,7 @@ async def run_daemon() -> None:
         temperature=config["llm"]["cloud"]["temperature"],
         timeout=config["llm"]["cloud"]["timeout"],
         extra_body=config["llm"]["cloud"].get("extra_body"),
+        tier="cloud",
     )
     local_llm = LLMClient(
         base_url=os.environ.get("MLX_URL", ""),
@@ -629,6 +656,7 @@ async def run_daemon() -> None:
         temperature=config["llm"]["local"]["temperature"],
         timeout=config["llm"]["local"]["timeout"],
         extra_body=config["llm"]["local"].get("extra_body"),
+        tier="local",
     )
 
     classifier = EmailClassifier(
@@ -655,6 +683,7 @@ async def run_daemon() -> None:
                 temperature=nl_llm_config.get("temperature", 0),
                 timeout=nl_llm_config.get("timeout", 60),
                 extra_body=nl_llm_config.get("extra_body"),
+                tier="cloud",
             )
         else:
             nl_llm = cloud_llm
@@ -726,6 +755,7 @@ async def run_daemon() -> None:
 
             max_thread_chars = daemon_config.get("max_thread_chars", DEFAULT_MAX_THREAD_CHARS)
             thread_items = list(threads.items())
+            local_deferrals: list[str] = []
             results = await asyncio.gather(
                 *(
                     process_single_thread(
@@ -744,12 +774,14 @@ async def run_daemon() -> None:
                         failure_tracker=failure_tracker,
                         fetch_sem=fetch_sem,
                         write_sem=write_sem,
+                        local_deferrals=local_deferrals,
                     )
                     for tid, msg_ids in thread_items
                 ),
                 return_exceptions=True,
             )
             processed, given_up = summarize_cycle(thread_items, results, failure_tracker)
+            log_local_deferrals(local_deferrals)
             if threads:
                 if given_up:
                     log.info(

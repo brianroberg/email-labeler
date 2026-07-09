@@ -304,6 +304,58 @@ class TestComplete:
             mock_client_cls.assert_called_once_with(timeout=60)
 
 
+class TestTier:
+    """LLMUnavailableError carries the raising client's tier (issue #24).
+
+    Cloud and local clients raise the same exception type; the tier attribute is
+    what lets the daemon log a routine local outage (laptop offline for hours)
+    at a lower level than a surprising cloud outage.
+    """
+
+    def _down_client(self, exc, **client_kwargs):
+        client = LLMClient(
+            base_url="http://localhost:8080/v1/chat/completions",
+            api_key="", model="test-model", timeout=60, **client_kwargs,
+        )
+        patcher = patch("llm_client.httpx.AsyncClient")
+        mock_client_cls = patcher.start()
+        mock_client = AsyncMock()
+        mock_client.post.side_effect = exc
+        mock_client_cls.return_value.__aenter__ = AsyncMock(return_value=mock_client)
+        mock_client_cls.return_value.__aexit__ = AsyncMock(return_value=False)
+        return client, patcher
+
+    async def test_connect_error_carries_client_tier(self):
+        client, patcher = self._down_client(httpx.ConnectError("refused"), tier="local")
+        try:
+            with pytest.raises(LLMUnavailableError) as exc_info:
+                await client.complete("sys", "user")
+        finally:
+            patcher.stop()
+        assert exc_info.value.tier == "local"
+
+    async def test_mid_request_drop_carries_client_tier(self):
+        client, patcher = self._down_client(httpx.ReadError("reset"), tier="local")
+        try:
+            with pytest.raises(LLMUnavailableError) as exc_info:
+                await client.complete("sys", "user")
+        finally:
+            patcher.stop()
+        assert exc_info.value.tier == "local"
+
+    async def test_tier_defaults_to_none(self, cloud_client):
+        """Clients that don't declare a tier (evals, older call sites) stay tier-less."""
+        with patch("llm_client.httpx.AsyncClient") as mock_client_cls:
+            mock_client = AsyncMock()
+            mock_client.post.side_effect = httpx.ConnectError("refused")
+            mock_client_cls.return_value.__aenter__ = AsyncMock(return_value=mock_client)
+            mock_client_cls.return_value.__aexit__ = AsyncMock(return_value=False)
+
+            with pytest.raises(LLMUnavailableError) as exc_info:
+                await cloud_client.complete("sys", "user")
+        assert exc_info.value.tier is None
+
+
 class TestContentlessResponse:
     """A response message lacking usable content must raise a clear, non-KeyError error.
 

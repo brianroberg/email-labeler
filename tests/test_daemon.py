@@ -19,6 +19,7 @@ from daemon import (
     FailureTracker,
     format_thread_transcript,
     load_config,
+    log_local_deferrals,
     process_single_thread,
     resolve_int_env,
     summarize_cycle,
@@ -409,6 +410,55 @@ class TestProcessSingleThread:
 
         mock_label_manager.mark_processed.assert_not_called()
 
+    async def test_local_tier_outage_defers_quietly_and_is_counted(
+        self, mock_proxy, mock_classifier, mock_label_manager, cloud_sem, local_sem,
+        mock_thread_response, caplog,
+    ):
+        """A LOCAL-tier LLM outage is a routine condition (issue #24): the laptop
+        serving MLX is expected to be offline for hours. The per-thread handler must
+        log below WARNING and count the deferral for the one-line cycle summary,
+        while still deferring the thread (no give-up, no cloud fallback).
+        """
+        mock_proxy.get_thread.return_value = mock_thread_response
+        mock_classifier.classify_sender.side_effect = LLMUnavailableError(
+            "MLX endpoint down", tier="local"
+        )
+        deferrals = []
+
+        with caplog.at_level(logging.DEBUG, logger="email-labeler"):
+            result = await process_single_thread(
+                "thread_local", ["msg_1"], mock_proxy, mock_classifier, mock_label_manager,
+                cloud_sem, local_sem, max_thread_chars=16000, local_deferrals=deferrals,
+            )
+
+        assert result is False
+        assert deferrals == ["thread_local"]
+        outage_logs = [r for r in caplog.records if "unavailable" in r.getMessage().lower()]
+        assert outage_logs, "expected the outage to still be logged (at DEBUG)"
+        assert all(r.levelno < logging.WARNING for r in outage_logs)
+        mock_label_manager.mark_processed.assert_not_called()
+
+    async def test_cloud_or_tierless_outage_still_warns(
+        self, mock_proxy, mock_classifier, mock_label_manager, cloud_sem, local_sem,
+        mock_thread_response, caplog,
+    ):
+        """Cloud (and tier-less) LLM outages remain surprising: keep the WARNING
+        and don't count them as local deferrals."""
+        mock_proxy.get_thread.return_value = mock_thread_response
+        mock_classifier.classify_sender.side_effect = LLMUnavailableError("cloud down")
+        deferrals = []
+
+        with caplog.at_level(logging.DEBUG, logger="email-labeler"):
+            result = await process_single_thread(
+                "thread_cloud", ["msg_1"], mock_proxy, mock_classifier, mock_label_manager,
+                cloud_sem, local_sem, max_thread_chars=16000, local_deferrals=deferrals,
+            )
+
+        assert result is False
+        assert deferrals == []
+        outage_logs = [r for r in caplog.records if "unavailable" in r.getMessage().lower()]
+        assert any(r.levelno == logging.WARNING for r in outage_logs)
+
     async def test_proxy_unavailable_is_give_up_eligible_per_thread(
         self, mock_proxy, mock_classifier, mock_label_manager, cloud_sem, local_sem,
     ):
@@ -755,6 +805,24 @@ class TestSummarizeCycle:
         # This cycle only has "active"; "stale" is gone from the query.
         summarize_cycle([("active", ["1"])], [False], t)
         assert t.should_give_up("stale") is False  # pruned
+
+
+class TestLogLocalDeferrals:
+    """One INFO summary per cycle for local-LLM deferrals (issue #24) — the
+    per-thread handler stays below WARNING, this is the single visible line."""
+
+    def test_emits_one_info_line_with_the_count(self, caplog):
+        with caplog.at_level(logging.INFO, logger="email-labeler"):
+            log_local_deferrals(["t1", "t2", "t3"])
+        lines = [r for r in caplog.records if "Local LLM offline" in r.getMessage()]
+        assert len(lines) == 1
+        assert lines[0].levelno == logging.INFO
+        assert "3" in lines[0].getMessage()
+
+    def test_silent_when_nothing_deferred(self, caplog):
+        with caplog.at_level(logging.DEBUG, logger="email-labeler"):
+            log_local_deferrals([])
+        assert caplog.records == []
 
 
 class TestLoadConfig:
