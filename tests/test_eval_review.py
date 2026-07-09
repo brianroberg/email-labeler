@@ -385,6 +385,103 @@ class TestSelectReviewThreads:
         selected = select_review_threads(threads, filter_label="needs_response")
         assert [t.thread_id for t in selected] == ["b"]
 
+    def test_sender_type_filter_applies(self):
+        threads = [
+            _golden("a", expected_sender_type="person"),
+            _golden("b", expected_sender_type="service"),
+        ]
+        selected = select_review_threads(threads, sender_type="service")
+        assert [t.thread_id for t in selected] == ["b"]
+
+    def test_sender_type_combines_with_unreviewed_only(self):
+        threads = [
+            _golden("a", expected_sender_type="person", reviewed=False),
+            _golden("b", expected_sender_type="person", reviewed=True),
+            _golden("c", expected_sender_type="service", reviewed=False),
+        ]
+        selected = select_review_threads(threads, unreviewed_only=True, sender_type="person")
+        assert [t.thread_id for t in selected] == ["a"]
+
+
+# ---------------------------------------------------------------------------
+# --stats: golden-set composition summary (issue #13)
+# ---------------------------------------------------------------------------
+
+def _crosstab_row(summary: str, row_name: str) -> list[int]:
+    """Ints from the crosstab row whose first token is *row_name*."""
+    for line in summary.splitlines():
+        tokens = line.split()
+        if tokens and tokens[0] == row_name and all(t.isdigit() for t in tokens[1:]) and len(tokens) > 1:
+            return [int(t) for t in tokens[1:]]
+    raise AssertionError(f"no crosstab row {row_name!r} in:\n{summary}")
+
+
+class TestFormatStatsSummary:
+    def _threads(self):
+        return [
+            # Scored set (reviewed & unexcluded): the crosstab population
+            _golden("a", reviewed=True, expected_sender_type="person", expected_label="needs_response"),
+            _golden("b", reviewed=True, expected_sender_type="person", expected_label="fyi"),
+            _golden("c", reviewed=True, expected_sender_type="service", expected_label="fyi"),
+            _golden("d", reviewed=True, expected_sender_type="service", expected_label="low_priority"),
+            _golden("e", reviewed=True, expected_sender_type="service", expected_label="low_priority"),
+            # Pending (unreviewed, unexcluded)
+            _golden("p1", reviewed=False),
+            _golden("p2", reviewed=False),
+            # Excluded — counted as excluded regardless of reviewed state
+            _golden("x1", reviewed=True, excluded=True),
+            _golden("x2", reviewed=False, excluded=True),
+        ]
+
+    def test_header_counts_partition_the_set(self):
+        import re
+
+        summary = review.format_stats_summary(self._threads())
+        assert re.search(r"Total records:\s+9\b", summary)
+        assert re.search(r"Excluded:\s+2\b", summary)
+        assert re.search(r"Unreviewed \(pending\):\s+2\b", summary)
+        assert re.search(r"Reviewed & unexcluded[^:]*:\s+5\b", summary)
+
+    def test_crosstab_covers_only_the_scored_set(self):
+        summary = review.format_stats_summary(self._threads())
+        assert _crosstab_row(summary, "person") == [1, 1, 0, 2]
+        assert _crosstab_row(summary, "service") == [0, 1, 2, 3]
+        assert _crosstab_row(summary, "total") == [1, 2, 2, 5]
+
+    def test_crosstab_columns_follow_canonical_label_order(self):
+        import re
+
+        summary = review.format_stats_summary(self._threads())
+        assert re.search(r"needs_response\s+fyi\s+low_priority\s+total", summary)
+
+    def test_unexpected_values_get_their_own_bucket(self):
+        threads = [
+            _golden("a", reviewed=True, expected_sender_type="person", expected_label="fyi"),
+            _golden("b", reviewed=True, expected_sender_type="bot", expected_label="weird"),
+        ]
+        summary = review.format_stats_summary(threads)
+        assert "bot" in summary and "weird" in summary
+        assert _crosstab_row(summary, "total")[-1] == 2  # nothing silently dropped
+
+
+class TestCliStats:
+    def test_stats_prints_and_exits_without_tui_or_save(self, tmp_path, monkeypatch, capsys):
+        import json
+
+        path = tmp_path / "golden.jsonl"
+        path.write_text(json.dumps(_golden("a", reviewed=True).to_dict()) + "\n")
+
+        def boom(*args, **kwargs):
+            raise AssertionError("--stats must not launch the TUI or save")
+
+        monkeypatch.setattr(review, "review_loop", boom)
+        monkeypatch.setattr(review, "save_golden_set", boom)
+        monkeypatch.setattr(sys, "argv", ["review", "--golden-set", str(path), "--stats"])
+        review.cli()
+
+        out = capsys.readouterr().out
+        assert "Total records:" in out
+
 
 # ---------------------------------------------------------------------------
 # cli() integration — excluded threads stay in the file, never queued
@@ -447,6 +544,54 @@ class TestCliPreservesExcluded:
         dup_labels = sorted(t.expected_label for t in saved if t.thread_id == "dup")
         assert dup_labels == ["fyi", "needs_response"]  # both judgments kept
         assert all(t.reviewed for t in saved if t.thread_id == "dup")
+
+
+class TestCliSenderType:
+    def _write(self, path):
+        import json
+
+        path.write_text(
+            "".join(json.dumps(t.to_dict()) + "\n" for t in [
+                _golden("p_rev", expected_sender_type="person", reviewed=True),
+                _golden("p_unrev", expected_sender_type="person", reviewed=False),
+                _golden("s_rev", expected_sender_type="service", reviewed=True),
+            ])
+        )
+
+    def test_sender_type_limits_review_queue(self, tmp_path, monkeypatch):
+        path = tmp_path / "golden.jsonl"
+        self._write(path)
+        seen = {}
+
+        def fake_review_loop(threads, **kwargs):
+            seen["ids"] = [t.thread_id for t in threads]
+
+        monkeypatch.setattr(review, "review_loop", fake_review_loop)
+        monkeypatch.setattr(
+            sys, "argv", ["review", "--golden-set", str(path), "--sender-type", "person"]
+        )
+        review.cli()
+        assert seen["ids"] == ["p_rev", "p_unrev"]
+
+    def test_edit_mode_sender_type_drops_reviewed_only_default(self, tmp_path, monkeypatch):
+        # Mirrors --filter-label: an explicit filter replaces the edit-mode
+        # "reviewed threads only" default, so both reviewed and unreviewed
+        # person threads are shown.
+        import evals.edit_tui as edit_tui
+
+        path = tmp_path / "golden.jsonl"
+        self._write(path)
+        seen = {}
+
+        def fake_run_edit_tui(threads, all_threads, p):
+            seen["ids"] = [t.thread_id for t in threads]
+
+        monkeypatch.setattr(edit_tui, "run_edit_tui", fake_run_edit_tui)
+        monkeypatch.setattr(
+            sys, "argv", ["review", "--golden-set", str(path), "--edit", "--sender-type", "person"]
+        )
+        review.cli()
+        assert seen["ids"] == ["p_rev", "p_unrev"]
 
 
 class TestScrollAndStages:

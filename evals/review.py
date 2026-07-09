@@ -384,8 +384,67 @@ class ReviewApp(App):
         self.push_screen(PromptLineScreen("Notes:", initial=thread.notes), apply)
 
 
+def format_stats_summary(threads: list[GoldenThread]) -> str:
+    """Composition dashboard for the golden set (issue #13).
+
+    Header counts partition the whole file: excluded (regardless of reviewed
+    state), unreviewed pending, and reviewed & unexcluded — the last being the
+    set ``run_eval`` actually scores, so it is the number the ≥N growth target
+    tracks. The sender × label crosstab covers only that scored set. Values
+    outside the canonical SENDER_TYPES/LABELS get their own row/column so the
+    totals always account for every scored thread.
+    """
+    total = len(threads)
+    excluded = sum(1 for t in threads if t.excluded)
+    pending = sum(1 for t in threads if not t.excluded and not t.reviewed)
+    scored = [t for t in threads if t.reviewed and not t.excluded]
+
+    sender_types = SENDER_TYPES + sorted(
+        {t.expected_sender_type for t in scored} - set(SENDER_TYPES)
+    )
+    labels = LABELS + sorted({t.expected_label for t in scored} - set(LABELS))
+
+    counts = {(s, label): 0 for s in sender_types for label in labels}
+    for t in scored:
+        counts[(t.expected_sender_type, t.expected_label)] += 1
+
+    rows = []
+    for s in sender_types:
+        row = [counts[(s, label)] for label in labels]
+        rows.append((s, row + [sum(row)]))
+    col_totals = [sum(counts[(s, label)] for s in sender_types) for label in labels]
+    rows.append(("total", col_totals + [len(scored)]))
+
+    headers = labels + ["total"]
+    name_width = max(len(name) for name, _ in rows)
+    col_widths = [
+        max(len(h), *(len(str(row[i])) for _, row in rows)) for i, h in enumerate(headers)
+    ]
+
+    lines = [
+        f"Total records:           {total}",
+        f"  Excluded:              {excluded}",
+        f"  Unreviewed (pending):  {pending}",
+        f"  Reviewed & unexcluded: {len(scored)}  (the set run_eval scores)",
+        "",
+        "Reviewed & unexcluded, sender type × label:",
+        "",
+        "  " + " " * name_width + "  " + "  ".join(h.rjust(w) for h, w in zip(headers, col_widths)),
+    ]
+    for name, row in rows:
+        lines.append(
+            "  " + name.rjust(name_width) + "  "
+            + "  ".join(str(v).rjust(w) for v, w in zip(row, col_widths))
+        )
+    return "\n".join(lines)
+
+
 def select_review_threads(
-    threads: list[GoldenThread], *, unreviewed_only: bool = False, filter_label: str | None = None
+    threads: list[GoldenThread],
+    *,
+    unreviewed_only: bool = False,
+    filter_label: str | None = None,
+    sender_type: str | None = None,
 ) -> list[GoldenThread]:
     """Threads to queue for review.
 
@@ -397,6 +456,8 @@ def select_review_threads(
         result = [t for t in result if not t.reviewed]
     if filter_label:
         result = [t for t in result if t.expected_label == filter_label]
+    if sender_type:
+        result = [t for t in result if t.expected_sender_type == sender_type]
     return result
 
 
@@ -426,11 +487,20 @@ def cli():
     parser.add_argument("--unreviewed-only", action="store_true", help="Show only unreviewed threads")
     parser.add_argument("--filter-label", choices=LABELS, help="Show only threads with this label")
     parser.add_argument(
+        "--sender-type", choices=SENDER_TYPES,
+        help="Show only threads with this expected sender type",
+    )
+    parser.add_argument(
         "--start-at", type=int, default=0,
         help="Start at this index into the review queue (0-based, after excluded "
              "threads and any --filter-label/--unreviewed-only filters are applied)",
     )
     parser.add_argument("--edit", action="store_true", help="TUI for editing reviewed threads")
+    parser.add_argument(
+        "--stats", action="store_true",
+        help="Print a golden-set composition summary (counts + sender × label "
+             "crosstab of the reviewed & unexcluded set) and exit — no TUI, no writes",
+    )
     args = parser.parse_args()
 
     path = Path(args.golden_set)
@@ -444,6 +514,11 @@ def cli():
         print("Golden set is empty.", file=sys.stderr)
         sys.exit(1)
 
+    # Stats mode: read-only composition dashboard, then out.
+    if args.stats:
+        print(format_stats_summary(all_threads))
+        return
+
     # Edit mode: default to reviewed-only, but respect explicit filters
     if args.edit:
         from evals.edit_tui import run_edit_tui
@@ -451,11 +526,13 @@ def cli():
         threads = all_threads
         if args.unreviewed_only:
             threads = [t for t in threads if not t.reviewed]
-        elif not args.filter_label:
-            # Default: show only reviewed threads
+        elif not args.filter_label and not args.sender_type:
+            # Default: show only reviewed threads (an explicit filter replaces it)
             threads = [t for t in threads if t.reviewed]
         if args.filter_label:
             threads = [t for t in threads if t.expected_label == args.filter_label]
+        if args.sender_type:
+            threads = [t for t in threads if t.expected_sender_type == args.sender_type]
 
         if not threads:
             print("No threads match the filters.", file=sys.stderr)
@@ -466,7 +543,10 @@ def cli():
 
     # Regular review mode. Excluded threads are never queued; un-exclude via --edit.
     threads = select_review_threads(
-        all_threads, unreviewed_only=args.unreviewed_only, filter_label=args.filter_label
+        all_threads,
+        unreviewed_only=args.unreviewed_only,
+        filter_label=args.filter_label,
+        sender_type=args.sender_type,
     )
 
     if not threads:

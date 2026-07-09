@@ -11,7 +11,7 @@ Background daemon that continuously polls Gmail for unclassified emails and appl
 
 ## Privacy Invariant
 
-Person email bodies NEVER leave the local network. Cloud LLM only sees metadata (sender, subject, snippet) for Stage 1 classification. Person email bodies are processed by local MLX/Qwen3 only.
+Person email bodies NEVER leave the local network. Cloud LLM only sees metadata (sender, subject, snippet) for Stage 1 classification. Person email bodies are processed by local MLX/Qwen3.6 only.
 
 ## Package Management
 

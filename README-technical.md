@@ -183,6 +183,7 @@ mlx_lm.server --model <mlx-model> --host 0.0.0.0 --port 8080 --temp 0 \
 - The request's `model` field must match the loaded `--model`, or mlx_lm.server returns `404 Not Found`. So `MLX_MODEL` must name the served model.
 - `--prompt-cache-size N` bounds how many past request KV caches are retained for reuse. The default (10) accumulates several GB of KV across distinct emails (which share no prefix) and can exhaust GPU memory; **2 is recommended** for this workload.
 - `--decode-concurrency` sizes the continuous-batching slots; it only matters when the daemon sends concurrent requests (`local_parallel` > 1).
+- To verify continuous batching actually engages, run `scripts/smoke_concurrency.py` (stdlib-only) against the server: it times N concurrent requests vs. one — with batching working, N concurrent finish in roughly the wall time of a single request; ~1× throughput means requests are serializing.
 
 ### The GPU memory ceiling (why it OOM-crashes)
 
