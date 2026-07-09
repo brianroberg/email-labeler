@@ -496,6 +496,34 @@ class TestFormatRunSummary:
         )]
         assert "FELLOWSHIP" in format_run_summary(rows)
 
+    def test_theme_near_miss_line_surfaced(self):
+        # A near-miss line (misspelled grade) that parse_themes silently drops
+        # must surface — otherwise a systematic parser gap reads as a model miss
+        # (Finding 3). The response otherwise looks fine (one valid grading), so
+        # it is NOT a garbage/empty parse.
+        from evals.newsletter_run import format_run_summary
+        rows = [self._story_row(
+            scores_raw="SIMPLE: OK\nCONCRETE: OK\nPERSONAL: OK\nDYNAMIC: OK",
+            predicted_scores={"simple": 2, "concrete": 2, "personal": 2, "dynamic": 2},
+            themes_raw="SCRIPTURE: PRESENT\nCHURCH: EMPHASISED",
+            predicted_themes={"scripture": "present"},
+        )]
+        summary = format_run_summary(rows)
+        assert "EMPHASISED" in summary
+        assert "theme parse failure" not in summary  # not garbage: it had a grading
+
+    def test_bulleted_valid_themes_are_not_a_near_miss(self):
+        # Coherence with Finding 1: once parse_themes tolerates bullets, a bulleted
+        # VALID response must be clean — no near-miss, no parse failure.
+        from evals.newsletter_run import format_run_summary
+        rows = [self._story_row(
+            scores_raw="SIMPLE: OK\nCONCRETE: OK\nPERSONAL: OK\nDYNAMIC: OK",
+            predicted_scores={"simple": 2, "concrete": 2, "personal": 2, "dynamic": 2},
+            themes_raw="- SCRIPTURE: PRESENT\n- CHURCH: EMPHASIZED",
+            predicted_themes={"scripture": "present", "church": "emphasized"},
+        )]
+        assert "no errors" in format_run_summary(rows)
+
     def test_error_grammar_is_singular(self):
         from evals.newsletter_run import format_run_summary
         rows = [self._story_row(error="boom")]

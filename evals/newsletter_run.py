@@ -18,7 +18,6 @@ import hashlib
 import json
 import logging
 import os
-import re
 import sys
 import time
 import tomllib
@@ -41,7 +40,7 @@ from evals.newsletter_schemas import (
     StoryPrediction,
 )
 from llm_client import LLMClient
-from newsletter import _VALID_THEMES, NewsletterClassifier, compute_tier
+from newsletter import NewsletterClassifier, classify_theme_line, compute_tier
 
 
 def load_golden_set(
@@ -480,38 +479,40 @@ def write_thinking_sidecar(
     return sidecar_path
 
 
-_THEME_LINE_RE = re.compile(r"^\s*([A-Za-z_]+)\s*:\s*([A-Za-z]+)")
-
-
-def _theme_line_anomalies(themes_raw: str) -> tuple[bool, list[str]]:
+def _theme_line_anomalies(themes_raw: str) -> tuple[bool, list[str], list[str]]:
     """Classify a raw theme response for the run summary (issue #53 format).
 
-    Each theme line is ``NAME: ABSENT|PRESENT|EMPHASIZED``. Returns
-    ``(is_garbage, dropped_name_tokens)`` where *is_garbage* is True when the
-    response is neither NONE nor contains any recognizable theme grading (prose
-    masquerading as a confident answer), and *dropped_name_tokens* lists any
-    off-taxonomy theme names the parser silently ignored. An all-ABSENT response
-    is a valid empty result, not garbage.
+    Routes every line through the shared ``newsletter.classify_theme_line`` so
+    this diagnostic and the production parser cannot drift (Finding 2). Returns
+    ``(is_garbage, dropped_name_tokens, near_miss_lines)``:
+
+    - *is_garbage* — the response is neither NONE nor contains any recognizable
+      theme grading (prose masquerading as a confident answer). An all-ABSENT
+      response is a valid empty result, not garbage.
+    - *dropped_name_tokens* — off-taxonomy theme names the parser silently ignored.
+    - *near_miss_lines* — non-blank lines that are not a recognizable grading and
+      parse_themes silently skipped (a hyphenated/spaced name or a misspelled
+      grade that reads as a missed prediction). Surfacing them keeps a systematic
+      parser gap from masquerading as a genuine model miss (Finding 3).
     """
     stripped = themes_raw.strip()
     if not stripped or stripped.upper() == "NONE":
-        return False, []
+        return False, [], []
 
-    valid_grades = {"ABSENT", "PRESENT", "EMPHASIZED"}
     graded_any = False
     dropped: list[str] = []
+    near_miss: list[str] = []
     for line in stripped.splitlines():
-        match = _THEME_LINE_RE.match(line)
-        if not match:
+        kind, name, _grade = classify_theme_line(line)
+        if kind == "blank":
             continue
-        name, grade = match.group(1).upper(), match.group(2).upper()
-        if grade not in valid_grades:
-            continue  # not a theme grading line
-        graded_any = True
-        if name not in _VALID_THEMES:
+        if kind == "anomalous":
+            near_miss.append(line.strip())
+            continue
+        graded_any = True  # "theme" or "off_taxonomy" is a recognizable grading
+        if kind == "off_taxonomy":
             dropped.append(name)
-    is_garbage = not graded_any
-    return is_garbage, dropped
+    return not graded_any, dropped, near_miss
 
 
 def summarize_rows(rows: list) -> dict:
@@ -524,6 +525,9 @@ def summarize_rows(rows: list) -> dict:
       garbage output masquerading as a confident "no themes"
     - dropped_theme_tokens: {token: count} of off-taxonomy theme names parse_themes
       silently dropped from otherwise-parsed responses
+    - theme_near_miss_lines: {line: count} of non-blank lines parse_themes silently
+      skipped (hyphenated/spaced name, misspelled grade) in an otherwise-parsed
+      response — a parser gap that would otherwise read as a model miss (Finding 3)
     """
     counts = {
         "rows": len(rows),
@@ -531,6 +535,7 @@ def summarize_rows(rows: list) -> dict:
         "quality_parse_failures": 0,
         "theme_parse_failures": 0,
         "dropped_theme_tokens": {},
+        "theme_near_miss_lines": {},
     }
     for r in rows:
         if getattr(r, "error", None):
@@ -541,9 +546,17 @@ def summarize_rows(rows: list) -> dict:
             counts["quality_parse_failures"] += 1
         themes_raw = getattr(r, "themes_raw", None)
         if themes_raw is not None:
-            is_garbage, dropped = _theme_line_anomalies(themes_raw)
+            is_garbage, dropped, near_miss = _theme_line_anomalies(themes_raw)
             if is_garbage:
                 counts["theme_parse_failures"] += 1
+            else:
+                # A garbage response is already counted above and its lines are
+                # the prose; only tally near-misses when the response otherwise
+                # parsed, so the near-miss signal isn't double-reported.
+                for line in near_miss:
+                    counts["theme_near_miss_lines"][line] = (
+                        counts["theme_near_miss_lines"].get(line, 0) + 1
+                    )
             for token in dropped:
                 counts["dropped_theme_tokens"][token] = (
                     counts["dropped_theme_tokens"].get(token, 0) + 1
@@ -579,6 +592,7 @@ def format_run_summary(rows: list) -> str:
     --report or grepping the results JSONL.
     """
     counts = summarize_rows(rows)
+    near_miss_total = sum(counts["theme_near_miss_lines"].values())
     problems = []
     if counts["errors"]:
         problems.append(plural(counts["errors"], "error"))
@@ -586,12 +600,20 @@ def format_run_summary(rows: list) -> str:
         problems.append(plural(counts["quality_parse_failures"], "quality parse failure"))
     if counts["theme_parse_failures"]:
         problems.append(plural(counts["theme_parse_failures"], "theme parse failure"))
+    if near_miss_total:
+        problems.append(plural(near_miss_total, "theme near-miss", "theme near-misses"))
     lines = [f"  Rows: {counts['rows']} ({', '.join(problems) if problems else 'no errors'})"]
     if counts["dropped_theme_tokens"]:
         detail = ", ".join(
             f"{tok} x{n}" for tok, n in sorted(counts["dropped_theme_tokens"].items())
         )
         lines.append(f"  Unrecognized theme labels dropped by the parser: {detail}")
+    if counts["theme_near_miss_lines"]:
+        detail = ", ".join(
+            f'"{line}" x{n}'
+            for line, n in sorted(counts["theme_near_miss_lines"].items())
+        )
+        lines.append(f"  Theme lines the parser skipped (near-misses): {detail}")
     return "\n".join(lines)
 
 

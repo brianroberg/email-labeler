@@ -572,6 +572,28 @@ class TestThemeParseAnomalies:
         anomalies = theme_parse_anomalies([_pred(story_id="x", predicted_themes={})])
         assert anomalies == []
 
+    def test_near_miss_line_flagged(self):
+        # A near-miss line (misspelled grade) parse_themes silently drops must
+        # surface even though the response otherwise parsed — else a systematic
+        # parser gap reads as a genuine model miss (Finding 3).
+        row = _pred(story_id="n:0", predicted_themes={"scripture": "present"},
+                    predicted_scores={"simple": 3})
+        row.themes_raw = "SCRIPTURE: PRESENT\nCHURCH: EMPHASISED"
+        anomalies = theme_parse_anomalies([row])
+        assert len(anomalies) == 1
+        assert anomalies[0]["story_id"] == "n:0"
+        assert anomalies[0]["kind"] == "near_miss"
+        assert "CHURCH: EMPHASISED" in anomalies[0]["near_miss_lines"]
+
+    def test_bulleted_valid_response_is_not_flagged(self):
+        # Coherence with Finding 1: once parse_themes tolerates bullets, a bulleted
+        # VALID response must not be an anomaly.
+        row = _pred(story_id="b:0",
+                    predicted_themes={"scripture": "present", "church": "emphasized"},
+                    predicted_scores={"simple": 3})
+        row.themes_raw = "- SCRIPTURE: PRESENT\n- CHURCH: EMPHASIZED"
+        assert theme_parse_anomalies([row]) == []
+
 
 class TestThemeListSingleSource:
     def test_report_themes_match_newsletter_valid_themes(self):

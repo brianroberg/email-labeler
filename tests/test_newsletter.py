@@ -11,6 +11,7 @@ from newsletter import (
     NewsletterTier,
     StoryResult,
     aggregate_theme_grades,
+    classify_theme_line,
     compute_tier,
     is_newsletter,
     parse_quality_scores,
@@ -227,6 +228,65 @@ class TestParseThemes:
     def test_with_extra_whitespace(self):
         raw = "  SCRIPTURE : PRESENT \n  CHURCH:EMPHASIZED  "
         assert parse_themes(raw) == {"scripture": "present", "church": "emphasized"}
+
+    def test_tolerates_bulleted_prefixes(self):
+        # A list-marker/markdown prefix must not defeat matching (mirrors
+        # parse_quality_scores' unanchored tolerance). Finding 1.
+        raw = "- SCRIPTURE: EMPHASIZED\n- CHURCH: PRESENT\n- VOCATION_FAMILY: ABSENT"
+        assert parse_themes(raw) == {"scripture": "emphasized", "church": "present"}
+
+
+class TestClassifyThemeLine:
+    # classify_theme_line is the single shared per-line theme classifier that
+    # parse_themes AND the eval anomaly detectors all use, so their format
+    # knowledge cannot drift (Finding 2). A "flagged" line (off_taxonomy /
+    # anomalous) is one parse_themes does NOT store and the diagnostics must
+    # surface (Finding 3).
+    FLAGGED = {"off_taxonomy", "anomalous"}
+
+    def test_bulleted_valid_line_is_not_flagged(self):
+        # Coherence with Finding 1: a bulleted VALID line both parses and is not
+        # an anomaly.
+        kind, name, grade = classify_theme_line("- SCRIPTURE: EMPHASIZED")
+        assert (kind, name, grade) == ("theme", "scripture", "emphasized")
+        assert kind not in self.FLAGGED
+
+    def test_absent_valid_line_is_recognized_not_flagged(self):
+        # An all-ABSENT response is a valid empty result, so a valid-name ABSENT
+        # line must be recognized (kind "theme"), never flagged.
+        kind, name, grade = classify_theme_line("SCRIPTURE: ABSENT")
+        assert (kind, name, grade) == ("theme", "scripture", "absent")
+        assert kind not in self.FLAGGED
+
+    def test_blank_line_is_ignorable(self):
+        assert classify_theme_line("   ")[0] == "blank"
+
+    def test_near_miss_lines_are_flagged(self):
+        # The Finding 3 repro lines: parse_themes drops each, so each must be
+        # flagged (never silently a "theme"/"blank").
+        for line in (
+            "DISCIPLE-MAKING: EMPHASIZED",   # hyphen instead of underscore
+            "SCRIPTURE: EMPHASISED",         # misspelled grade
+            "VOCATION FAMILY: PRESENT",      # space instead of underscore
+        ):
+            assert classify_theme_line(line)[0] in self.FLAGGED, line
+
+    def test_agrees_with_parse_themes(self):
+        # Anti-drift invariant: a line parse_themes STORES classifies as "theme";
+        # a flagged line is never stored by parse_themes.
+        lines = [
+            "SCRIPTURE: PRESENT", "- CHURCH: EMPHASIZED", "SCRIPTURE: ABSENT",
+            "FELLOWSHIP: PRESENT", "SCRIPTURE: EMPHASISED",
+            "VOCATION FAMILY: PRESENT", "DISCIPLE-MAKING: EMPHASIZED",
+            "just some prose", "", "   ",
+        ]
+        for line in lines:
+            kind = classify_theme_line(line)[0]
+            stored = parse_themes(line)
+            if stored:
+                assert kind == "theme", f"{line!r} stored but kind={kind}"
+            if kind in self.FLAGGED:
+                assert stored == {}, f"{line!r} flagged but parse stored {stored}"
 
 
 class TestComputeTier:

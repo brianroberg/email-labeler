@@ -41,9 +41,52 @@ _DIMENSIONS = ("simple", "concrete", "personal", "dynamic")
 # map to integers so the tier average and eval metrics stay simple arithmetic.
 _SCORE_TOKENS = {"POOR": 1, "OK": 2, "GOOD": 3}
 
-# Ends-Statement themes are graded on a 3-value rubric (issue #53). "absent" is
-# represented by omission, so only these two grades ever appear in a stored dict.
-_THEME_GRADES = {"PRESENT": "present", "EMPHASIZED": "emphasized"}
+# Ends-Statement themes are graded on a 3-value rubric (issue #53). All three
+# grades are *recognized*; "absent" is represented by omission, so only present/
+# emphasized ever appear in a stored dict (see classify_theme_line / parse_themes).
+_THEME_GRADE_TOKENS = {"ABSENT": "absent", "PRESENT": "present", "EMPHASIZED": "emphasized"}
+
+# One-per-line theme matcher, single-sourced here so the production parser
+# (parse_themes) and the eval anomaly detectors share identical format knowledge
+# and cannot drift (Finding 2). Unanchored ``search`` tolerates leading list
+# markers/markdown (mirrors parse_quality_scores); ``([A-Za-z]+)`` captures ANY
+# grade word so a misspelled grade is still recognized as a line yet rejected as
+# a grade — surfacing it as a near-miss instead of being silently skipped.
+_THEME_LINE_RE = re.compile(r"([A-Za-z_]+)\s*:\s*([A-Za-z]+)")
+
+
+def classify_theme_line(line: str) -> tuple[str, str | None, str | None]:
+    """Classify one line of an LLM theme-grading reply. Returns ``(kind, name, grade)``.
+
+    The single shared theme-line classifier: ``parse_themes`` and the eval
+    anomaly detectors (``newsletter_run._theme_line_anomalies`` /
+    ``newsletter_report.theme_parse_anomalies``) all route through it, so the
+    response-format knowledge lives in one place (Finding 2).
+
+    Kinds:
+      - ``"blank"`` — whitespace-only line; ignore it.
+      - ``"theme"`` — an in-taxonomy grading. ``name`` is the lowercased theme,
+        ``grade`` one of "absent"/"present"/"emphasized". parse_themes stores it
+        iff the grade is not "absent".
+      - ``"off_taxonomy"`` — a ``NAME: GRADE`` line with a valid grade token but an
+        off-taxonomy ``name`` (returned UPPERCASE); parse_themes drops it.
+      - ``"anomalous"`` — a non-blank line that is not a recognizable grading (no
+        ``NAME: WORD`` pair, or a WORD that is not a grade token); parse_themes
+        skips it. Off-taxonomy and anomalous lines are exactly the non-blank lines
+        parse_themes does NOT accept — the diagnostics surface both (Finding 3).
+    """
+    if not line.strip():
+        return "blank", None, None
+    match = _THEME_LINE_RE.search(line)
+    if not match:
+        return "anomalous", None, None
+    name = match.group(1).upper()
+    grade = _THEME_GRADE_TOKENS.get(match.group(2).upper())
+    if grade is None:
+        return "anomalous", None, None
+    if name in _VALID_THEMES:
+        return "theme", name.lower(), grade
+    return "off_taxonomy", name, grade
 
 
 @dataclass
@@ -128,17 +171,11 @@ def parse_themes(raw: str) -> dict[str, str]:
 
     themes: dict[str, str] = {}
     for line in stripped.splitlines():
-        match = re.match(
-            r"\s*([A-Za-z_]+)\s*:\s*(ABSENT|PRESENT|EMPHASIZED)\b",
-            line,
-            flags=re.IGNORECASE,
-        )
-        if not match:
-            continue
-        name = match.group(1).upper()
-        grade = match.group(2).upper()
-        if name in _VALID_THEMES and grade in _THEME_GRADES:
-            themes[name.lower()] = _THEME_GRADES[grade]
+        kind, name, grade = classify_theme_line(line)
+        # Store only in-taxonomy present/emphasized gradings; absent is omitted,
+        # off-taxonomy/anomalous lines are dropped (surfaced by the eval detectors).
+        if kind == "theme" and grade != "absent":
+            themes[name] = grade
 
     return themes
 

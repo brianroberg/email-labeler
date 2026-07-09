@@ -29,7 +29,7 @@ from evals.report import (
     format_per_class_table,
     format_table_row,
 )
-from newsletter import _VALID_THEMES
+from newsletter import _VALID_THEMES, classify_theme_line
 
 TIERS = ["excellent", "good", "fair", "poor"]
 DIMENSIONS = ["simple", "concrete", "personal", "dynamic"]
@@ -471,21 +471,24 @@ def match_stories(
     return len(detail["matched"]), len(predicted), len(golden)
 
 
-_THEME_LINE_RE = re.compile(r"^\s*([A-Za-z_]+)\s*:\s*([A-Za-z]+)")
-_THEME_GRADE_TOKENS = {"ABSENT", "PRESENT", "EMPHASIZED"}
-
-
 def theme_parse_anomalies(results: list[StoryPrediction]) -> list[dict]:
-    """Detect theme responses that parse_themes silently normalized.
+    """Detect theme responses that parse_themes silently normalized or skipped.
 
-    Mirrors the current ``NAME: ABSENT|PRESENT|EMPHASIZED`` per-theme format
-    (issue #53) and its run-side twin ``newsletter_run._theme_line_anomalies``.
-    Two kinds:
+    Routes every line through the shared ``newsletter.classify_theme_line`` so
+    this report diagnostic and its run-side twin
+    (``newsletter_run._theme_line_anomalies``) share one source of the response
+    format and cannot drift (Finding 2). At most one anomaly per story; every
+    anomaly dict carries both an ``invalid_tokens`` and a ``near_miss_lines``
+    list. Kinds, by precedence:
 
     - "empty_parse": themes_raw is non-empty and not NONE, yet no line is a
       recognizable theme grading — the model emitted unusable prose.
     - "invalid_tokens": at least one line grades an off-taxonomy theme NAME
       (e.g. FELLOWSHIP) that parse_themes silently drops.
+    - "near_miss": the response otherwise parsed, but a non-blank line is not a
+      recognizable grading (hyphenated/spaced name, misspelled grade) and
+      parse_themes silently skipped it — a parser gap that would otherwise read
+      as a genuine model miss (Finding 3).
 
     An all-ABSENT response is a valid empty result, not an anomaly. Rows without
     themes_raw (legacy files, error rows) are skipped.
@@ -499,30 +502,32 @@ def theme_parse_anomalies(results: list[StoryPrediction]) -> list[dict]:
             continue
         graded_any = False
         invalid: list[str] = []
+        near_miss: list[str] = []
         for line in raw.splitlines():
-            match = _THEME_LINE_RE.match(line)
-            if not match:
+            kind, name, _grade = classify_theme_line(line)
+            if kind == "blank":
                 continue
-            name, grade = match.group(1).upper(), match.group(2).upper()
-            if grade not in _THEME_GRADE_TOKENS:
-                continue  # not a theme grading line
+            if kind == "anomalous":
+                near_miss.append(line.strip())
+                continue
             graded_any = True
-            if name not in _VALID_THEMES:
+            if kind == "off_taxonomy":
                 invalid.append(name)
         if not graded_any:
-            anomalies.append({
-                "story_id": r.story_id,
-                "kind": "empty_parse",
-                "invalid_tokens": invalid,
-                "themes_raw": r.themes_raw,
-            })
+            kind = "empty_parse"  # prose subsumes the near-miss lines
         elif invalid:
-            anomalies.append({
-                "story_id": r.story_id,
-                "kind": "invalid_tokens",
-                "invalid_tokens": invalid,
-                "themes_raw": r.themes_raw,
-            })
+            kind = "invalid_tokens"
+        elif near_miss:
+            kind = "near_miss"
+        else:
+            continue  # fully parsed — nothing dropped or skipped
+        anomalies.append({
+            "story_id": r.story_id,
+            "kind": kind,
+            "invalid_tokens": invalid,
+            "near_miss_lines": near_miss if graded_any else [],
+            "themes_raw": r.themes_raw,
+        })
     return anomalies
 
 
@@ -782,8 +787,17 @@ def _print_verbose_single(
     if anomalies:
         print("\n--- Theme Parse Anomalies ---")
         for a in anomalies:
-            what = ("unparseable output (parsed to [])" if a["kind"] == "empty_parse"
-                    else f"invalid tokens dropped: {', '.join(a['invalid_tokens'])}")
+            if a["kind"] == "empty_parse":
+                what = "unparseable output (parsed to [])"
+            else:
+                parts = []
+                if a["invalid_tokens"]:
+                    parts.append(f"invalid tokens dropped: {', '.join(a['invalid_tokens'])}")
+                if a.get("near_miss_lines"):
+                    parts.append(
+                        f"near-miss lines skipped: {', '.join(a['near_miss_lines'])}"
+                    )
+                what = "; ".join(parts)
             print(f"  {label(a['story_id'])}: {what}")
             raw = "\n".join(f"    | {ln}" for ln in a["themes_raw"].splitlines())
             print(raw)
