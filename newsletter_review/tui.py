@@ -43,9 +43,30 @@ _COL_GAP = 2
 # ---------------------------------------------------------------------------
 
 def load_assessments(path: Path) -> list[dict]:
-    """Load newsletter assessment records from a JSONL file."""
+    """Load newsletter assessment records from a JSONL file.
+
+    Fails fast on pre-#53 old-scheme records whose story ``themes`` are stored
+    as a LIST instead of a theme->grade dict: they would otherwise crash the
+    detail view mid-render (``build_detail_lines`` calls ``themes.items()``).
+    Backward-compatible tolerant reading was deliberately removed, so raise a
+    clear, located error naming the file + line so the reader knows to
+    re-migrate rather than seeing an opaque ``AttributeError`` (Finding 4)."""
+    records = []
     with open(path) as f:
-        return [json.loads(line) for line in f if line.strip()]
+        for lineno, line in enumerate(f, 1):
+            if not line.strip():
+                continue
+            record = json.loads(line)
+            for story in record.get("stories", []):
+                if isinstance(story.get("themes"), list):
+                    raise ValueError(
+                        f"{path}:{lineno}: old-scheme record — story themes are a "
+                        f"list ({story['themes']!r}), not a theme->grade dict. This "
+                        "file predates the #53 theme-dict migration and must be "
+                        "re-migrated before it can be browsed."
+                    )
+            records.append(record)
+    return records
 
 
 def sort_by_send_date(records: list[dict]) -> list[dict]:

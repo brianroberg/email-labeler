@@ -121,6 +121,22 @@ class TestLoadAssessments:
         records = load_assessments(f)
         assert records == []
 
+    def test_rejects_old_scheme_list_themes(self, tmp_path):
+        # A pre-#53 record stores story themes as a LIST; build_detail_lines
+        # later does themes.items() and would crash mid-render. Fail fast at
+        # load with an actionable, located error instead (Finding 4).
+        f = tmp_path / "assessments.jsonl"
+        good = _make_record(thread_id="ok")
+        old = _make_record(thread_id="old")
+        old["stories"][0]["themes"] = ["scripture", "church"]
+        f.write_text(json.dumps(good) + "\n" + json.dumps(old) + "\n")
+
+        with pytest.raises(ValueError, match="old-scheme|re-migrat") as exc:
+            load_assessments(f)
+        msg = str(exc.value)
+        assert str(f) in msg  # names the file
+        assert ":2" in msg  # names the offending line number
+
 
 # ---------------------------------------------------------------------------
 # apply_filters

@@ -2,6 +2,8 @@
 
 import json
 
+import pytest
+
 from evals.newsletter_schemas import (
     ExtractionPrediction,
     GoldenNewsletter,
@@ -56,6 +58,114 @@ class TestGoldenStory:
         s = GoldenStory.from_dict({"story_id": "x:0", "title": "Old Title", "text": "B"})
         assert s.text == "B"
         assert not hasattr(s, "title")
+
+
+class TestOldSchemeThemeGuard:
+    """Loading old-scheme (pre-#53) theme LISTS or invalid grades must raise a
+    clear, actionable error naming the record — not an opaque dict-update
+    ValueError (Finding 1) or a silently-accepted junk grade that crashes the
+    labeling TUI mid-session (Finding 2)."""
+
+    def test_golden_list_themes_raise_actionable_error(self):
+        with pytest.raises(ValueError, match="old-scheme") as exc:
+            GoldenStory.from_dict(
+                {"story_id": "t_001:2", "text": "B", "expected_themes": ["church"]}
+            )
+        msg = str(exc.value)
+        assert "t_001:2" in msg  # story_id so the record is locatable
+        assert "church" in msg  # the offending value
+
+    def test_prediction_list_themes_raise_actionable_error(self):
+        with pytest.raises(ValueError, match="old-scheme") as exc:
+            StoryPrediction.from_dict(
+                {
+                    "story_id": "t_001:3",
+                    "thread_id": "t_001",
+                    "predicted_themes": ["scripture"],
+                }
+            )
+        assert "t_001:3" in str(exc.value)
+
+    def test_invalid_theme_grade_rejected(self):
+        # Case variant: _THEME_CYCLE/_GRADE_ABBR/parse_themes only ever produce
+        # exactly "present"/"emphasized"; "Present" would KeyError the TUI.
+        with pytest.raises(ValueError, match="present.*emphasized|grade") as exc:
+            GoldenStory.from_dict(
+                {
+                    "story_id": "t_001:4",
+                    "text": "B",
+                    "expected_themes": {"scripture": "Present"},
+                }
+            )
+        msg = str(exc.value)
+        assert "t_001:4" in msg
+        assert "scripture" in msg
+        assert "Present" in msg
+
+    def test_absent_grade_rejected(self):
+        # "absent" is represented by omission and is never stored as a grade.
+        with pytest.raises(ValueError):
+            GoldenStory.from_dict(
+                {
+                    "story_id": "t_001:5",
+                    "text": "B",
+                    "expected_themes": {"scripture": "absent"},
+                }
+            )
+
+    def test_prediction_invalid_predicted_grade_rejected(self):
+        with pytest.raises(ValueError):
+            StoryPrediction.from_dict(
+                {
+                    "story_id": "t_001:6",
+                    "thread_id": "t_001",
+                    "predicted_themes": {"church": "maybe"},
+                }
+            )
+
+
+class TestOldSchemeScoreGuard:
+    """Legacy 1-5 scores must be rejected loudly at load, not accepted silently
+    (Finding 3) — otherwise the report computes MAE against the wrong scale and
+    the TUI shows out-of-range keys."""
+
+    def test_out_of_range_expected_score_rejected(self):
+        with pytest.raises(ValueError, match="1..3|old-scheme|re-migrat") as exc:
+            GoldenStory.from_dict(
+                {
+                    "story_id": "t_001:7",
+                    "text": "B",
+                    "expected_scores": {"simple": 3, "concrete": 5},
+                }
+            )
+        msg = str(exc.value)
+        assert "t_001:7" in msg
+        assert "concrete" in msg  # the offending dimension
+        assert "5" in msg  # the offending value
+
+    def test_out_of_range_predicted_score_rejected(self):
+        with pytest.raises(ValueError) as exc:
+            StoryPrediction.from_dict(
+                {
+                    "story_id": "t_001:8",
+                    "thread_id": "t_001",
+                    "predicted_scores": {"simple": 4},
+                }
+            )
+        assert "t_001:8" in str(exc.value)
+
+    def test_valid_scores_and_missing_scores_still_load(self):
+        # 1-3 scores pass; None/missing stays None (unchanged behavior).
+        s = GoldenStory.from_dict(
+            {
+                "story_id": "t_001:9",
+                "text": "B",
+                "expected_scores": {"simple": 1, "concrete": 2, "personal": 3},
+            }
+        )
+        assert s.expected_scores == {"simple": 1, "concrete": 2, "personal": 3}
+        s2 = GoldenStory.from_dict({"story_id": "t_001:10", "text": "B"})
+        assert s2.expected_scores is None
 
 
 class TestGoldenNewsletter:
