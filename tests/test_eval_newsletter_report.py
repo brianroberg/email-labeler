@@ -743,6 +743,23 @@ class TestPrintReportVerbose:
         assert "g:2" in section
         assert "christlikeness" in section
 
+    def test_verbose_disagreements_show_grade_only_theme_mismatch(self, capsys):
+        # Same theme KEY, different grade (present vs emphasized): an FP/FN in the
+        # primary Emphasized metric. Key-set equality hides it, so the story must
+        # still be listed under Story Disagreements with grade-aware detail.
+        row = _pred(story_id="g:5", predicted_scores={"simple": 3},
+                    expected_tier="good", predicted_tier="good",
+                    expected_themes={"scripture": "present"},
+                    predicted_themes={"scripture": "emphasized"})
+        metrics = compute_all_metrics([row])
+        print_report(_meta(), metrics, verbose=True, story_results=[row])
+        out = capsys.readouterr().out
+        section = out.split("Story Disagreements")[1]
+        assert "g:5" in section
+        assert "scripture" in section
+        assert "present" in section
+        assert "emphasized" in section
+
     def test_verbose_shows_theme_anomaly_raw(self, capsys):
         row = _pred(story_id="g:1", predicted_themes={},
                     predicted_scores={"simple": 3})
@@ -847,6 +864,23 @@ class TestPrintComparisonModes:
         good_row = next(ln for ln in out.splitlines() if "good F1" in ln)
         assert "N/A" in good_row
 
+    def test_themes_section_shows_detection_f1_rows(self, capsys):
+        # print_report shows a detection (>=Present) line for each single run;
+        # compare mode must too, or a detection-level regression between runs is
+        # invisible. Build a run where detection F1 (100%) differs from the
+        # Emphasized F1 (0%) so the detection rows are distinguishable.
+        row = _pred(story_id="s", predicted_scores={"simple": 3},
+                    expected_themes={"scripture": "present"},
+                    predicted_themes={"scripture": "present"})
+        m = compute_all_metrics([row])
+        print_comparison(_meta(mode="all"), m, _meta(mode="all"), m)
+        out = capsys.readouterr().out
+        themes_section = out.split("--- Themes ---")[1].split("--- Extraction ---")[0]
+        assert "Detection" in themes_section
+        # Detection micro-F1 = 100% (scripture Present in both), while the
+        # Emphasized micro-F1 above it is 0%.
+        assert "100.0%" in themes_section
+
 
 class TestVerboseCompareThemesMode:
     def test_theme_flip_shown_when_quality_never_ran(self, capsys):
@@ -868,6 +902,28 @@ class TestVerboseCompareThemesMode:
         flips = out.split("Per-story Flips")[1]
         assert "None!" not in flips
         assert "church" in flips and "scripture" in flips
+
+    def test_grade_only_theme_flip_shown(self, capsys):
+        # Same theme KEY, grade changed present->emphasized between runs. Key-set
+        # equality hides the flip even though it moves the Emphasized F1 shown in
+        # the table; it must be listed with grade-aware detail (not "None!").
+        def row(grade):
+            r = _pred(story_id="s", expected_themes={"scripture": "present"},
+                      predicted_themes={"scripture": grade})
+            r.themes_raw = f"SCRIPTURE: {grade.upper()}"
+            return r
+
+        story1 = [row("present")]
+        story2 = [row("emphasized")]
+        m1 = compute_all_metrics(story1)
+        m2 = compute_all_metrics(story2)
+        print_comparison(_meta(mode="themes"), m1, _meta(mode="themes"), m2,
+                         verbose=True, story1=story1, story2=story2)
+        out = capsys.readouterr().out
+        flips = out.split("Per-story Flips")[1]
+        assert "None!" not in flips
+        assert "scripture" in flips
+        assert "present" in flips and "emphasized" in flips
 
 
 class TestTrendRows:

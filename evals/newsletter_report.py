@@ -236,6 +236,26 @@ def _theme_grade(themes_val, theme: str) -> str | None:
     return (themes_val or {}).get(theme)
 
 
+def _theme_grade_diffs(before, after) -> list[str]:
+    """Grade-aware per-theme diff lines between two theme dicts.
+
+    For each theme in the union of keys, a missing key reads as "absent"; when
+    the grade changed, emit ``"<theme>: <before>-><after>"`` (themes sorted).
+    Unchanged themes are omitted. Verbose disagreement/flip output uses this so a
+    grade-only change (e.g. present -> emphasized) — invisible to a key-set
+    compare but scored as an FP/FN by the Emphasized metric — is still shown.
+    """
+    before = before or {}
+    after = after or {}
+    parts: list[str] = []
+    for theme in sorted(set(before) | set(after)):
+        b = before.get(theme, "absent")
+        a = after.get(theme, "absent")
+        if b != a:
+            parts.append(f"{theme}: {b}->{a}")
+    return parts
+
+
 # What counts as a positive theme label for the multilabel metric (issue #53):
 _POSITIVE_TESTS = {
     "emphasized": lambda g: g == "emphasized",              # what earns a Gmail label
@@ -724,7 +744,7 @@ def _print_verbose_single(
             continue
         tier_diff = r.predicted_scores is not None and r.expected_tier != r.predicted_tier
         theme_diff = _theme_scored(r) and (
-            set(r.expected_themes or {}) != set(r.predicted_themes or {})
+            (r.expected_themes or {}) != (r.predicted_themes or {})
         )
         if tier_diff or theme_diff:
             disagreements.append((r, tier_diff, theme_diff))
@@ -735,8 +755,9 @@ def _print_verbose_single(
         if tier_diff:
             parts.append(f"tier={r.expected_tier}->{r.predicted_tier}")
         if theme_diff:
-            parts.append(f"themes={sorted(set(r.expected_themes or {}))}"
-                         f"->{sorted(set(r.predicted_themes or {}))}")
+            parts.append("themes: " + ", ".join(
+                _theme_grade_diffs(r.expected_themes, r.predicted_themes)
+            ))
         print(" ".join(parts))
 
     # "Never attempted" rows (e.g. --mode themes: no error, no scores_raw) are
@@ -846,11 +867,16 @@ def print_comparison(
         b_s = "N/A" if b is None else f"{b:.2f}"
         print("  " + format_table_row([dim, a_s, b_s, format_mae_delta(a, b)], widths))
 
-    # Themes
+    # Themes — primary Emphasized rows, then the secondary detection (>=Present)
+    # rows so a detection-level regression between runs is visible here too
+    # (print_report shows the detection line for each single run).
     tha, thb = metrics1["themes"], metrics2["themes"]
+    dta, dtb = metrics1["themes_detection"], metrics2["themes_detection"]
     header("Themes")
     pct_row("Micro-F1", tha["micro_f1"], thb["micro_f1"])
     pct_row("Macro-F1", tha["macro_f1"], thb["macro_f1"])
+    pct_row("Detection Micro-F1", dta["micro_f1"], dtb["micro_f1"])
+    pct_row("Detection Macro-F1", dta["macro_f1"], dtb["macro_f1"])
 
     # Extraction
     ea, eb = metrics1["extraction"], metrics2["extraction"]
@@ -891,9 +917,10 @@ def _print_verbose_compare(
                 parts.append(f"tier: {r1.predicted_tier}->{r2.predicted_tier} "
                              f"(expected {r1.expected_tier}){flag}")
         if _theme_scored(r1) and _theme_scored(r2):
-            s1, s2 = set(r1.predicted_themes or {}), set(r2.predicted_themes or {})
-            if s1 != s2:
-                parts.append(f"themes: {sorted(s1)}->{sorted(s2)}")
+            if (r1.predicted_themes or {}) != (r2.predicted_themes or {}):
+                parts.append("themes: " + ", ".join(
+                    _theme_grade_diffs(r1.predicted_themes, r2.predicted_themes)
+                ))
         if parts:
             flips.append((r1.story_id, parts))
     if not flips:
