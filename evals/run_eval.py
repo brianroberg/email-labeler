@@ -129,7 +129,7 @@ async def preflight_check(
             errors.append(
                 f"cloud LLM '{cloud_base.model}' not reachable at "
                 f"{cloud_base.base_url or '<unset CLOUD_LLM_URL>'}"
-                + _model_mismatch_hint(result.status_code)
+                + _detail_suffix(result)
             )
     if need_local:
         result = await local_base.probe(local_timeout)
@@ -137,18 +137,20 @@ async def preflight_check(
             errors.append(
                 f"local LLM '{local_base.model}' not reachable at "
                 f"{local_base.base_url or '<unset MLX_URL>'}"
-                + _model_mismatch_hint(result.status_code)
+                + _detail_suffix(result)
             )
     return errors
 
 
-def _model_mismatch_hint(status_code: int | None) -> str:
-    """The 404-only hint (issue #41 item 7): a 404 usually means the requested
-    model name doesn't match the served model, distinct from an endpoint that is
-    simply down."""
-    if status_code == 404:
-        return " (HTTP 404 — the model name likely doesn't match the served model)"
-    return ""
+def _detail_suffix(result) -> str:
+    """Parenthesized probe-failure detail for a preflight message, or "" if none.
+
+    Finding 1: surfaces probe()'s captured diagnosis (HTTP status / exception
+    text / 404 model-mismatch hint) instead of discarding it. All wording lives on
+    AvailabilityResult.detail() so this and newsletter_run's preflight can't drift
+    (Finding 2)."""
+    detail = result.detail()
+    return f" ({detail})" if detail else ""
 
 
 def resolve_parallelism(cli_value: int | None, config: dict) -> int:

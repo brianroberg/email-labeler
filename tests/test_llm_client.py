@@ -7,6 +7,7 @@ import pytest
 
 from llm_client import (
     DEFAULT_AVAILABILITY_TIMEOUT,
+    AvailabilityResult,
     LLMClient,
     LLMContentError,
     LLMUnavailableError,
@@ -486,6 +487,39 @@ class TestProbe:
             await local_client.probe(timeout=123)
 
             assert mock_client_cls.call_args.kwargs["timeout"] == 123
+
+
+class TestAvailabilityDetail:
+    """AvailabilityResult.detail() is the single place that composes a probe
+    failure's diagnosis (Findings 1 & 2): the HTTP status (with the 404
+    model-mismatch hint) or the exception text, so every preflight can surface it
+    instead of discarding it."""
+
+    def test_detail_empty_when_ok(self):
+        assert AvailabilityResult(ok=True, status_code=200).detail() == ""
+
+    def test_detail_includes_non_404_status_code(self):
+        detail = AvailabilityResult(ok=False, status_code=401).detail()
+        assert "401" in detail
+        # A non-404 status is not a model-mismatch, so no such hint.
+        assert "model name does not match" not in detail
+
+    def test_detail_404_includes_model_mismatch_hint(self):
+        detail = AvailabilityResult(ok=False, status_code=404).detail()
+        assert "404" in detail
+        assert "model name does not match" in detail
+
+    def test_detail_includes_error_text(self):
+        detail = AvailabilityResult(
+            ok=False, error="ConnectError: Connection refused"
+        ).detail()
+        assert "ConnectError" in detail
+        assert "Connection refused" in detail
+
+    def test_detail_empty_when_no_status_or_error(self):
+        # ok=False with neither a status nor an error (e.g. a bare down probe) has
+        # nothing specific to say.
+        assert AvailabilityResult(ok=False).detail() == ""
 
 
 class TestExtraBody:

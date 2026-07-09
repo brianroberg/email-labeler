@@ -932,6 +932,48 @@ class TestEndpointNaming:
             )))
         assert "model name does not match" in capsys.readouterr().err
 
+    def test_preflight_non_404_status_shown(self, tmp_path, monkeypatch, capsys):
+        # Finding 1: a non-404 status (e.g. 401 bad key) must be surfaced so the
+        # user can distinguish a bad key from a down server or a name mismatch.
+        class BadKey(FakeLLM):
+            async def probe(self, timeout=None):
+                from llm_client import AvailabilityResult
+                return AvailabilityResult(ok=False, status_code=401)
+
+        def fake_build(config, no_cache):
+            llm = BadKey([])
+            return NewsletterClassifier(cloud_llm=llm, config=config), llm
+        monkeypatch.setattr(newsletter_run, "build_classifier", fake_build)
+        golden = tmp_path / "g.jsonl"
+        _write_golden(golden, [_newsletter("nl1", reviewed=True, stories=[_story("nl1:0", text="b")])])
+        with pytest.raises(SystemExit):
+            asyncio.run(newsletter_run.main(_main_args(
+                golden_set=str(golden), output_dir=str(tmp_path / "r"), skip_preflight=False,
+            )))
+        err = capsys.readouterr().err
+        assert "401" in err
+        assert "model name does not match" not in err
+
+    def test_preflight_connection_error_shown(self, tmp_path, monkeypatch, capsys):
+        # Finding 1: probe()'s captured exception text must appear so a down
+        # server / bad URL is distinguishable from a bad key.
+        class Refused(FakeLLM):
+            async def probe(self, timeout=None):
+                from llm_client import AvailabilityResult
+                return AvailabilityResult(ok=False, error="ConnectError: Connection refused")
+
+        def fake_build(config, no_cache):
+            llm = Refused([])
+            return NewsletterClassifier(cloud_llm=llm, config=config), llm
+        monkeypatch.setattr(newsletter_run, "build_classifier", fake_build)
+        golden = tmp_path / "g.jsonl"
+        _write_golden(golden, [_newsletter("nl1", reviewed=True, stories=[_story("nl1:0", text="b")])])
+        with pytest.raises(SystemExit):
+            asyncio.run(newsletter_run.main(_main_args(
+                golden_set=str(golden), output_dir=str(tmp_path / "r"), skip_preflight=False,
+            )))
+        assert "ConnectError" in capsys.readouterr().err
+
     def test_preflight_down_omits_model_mismatch_hint(self, tmp_path, monkeypatch, capsys):
         # No HTTP response (status None) -> plain unreachable, no model-mismatch hint.
         class Down(FakeLLM):

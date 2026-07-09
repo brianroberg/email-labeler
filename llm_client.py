@@ -31,6 +31,26 @@ class AvailabilityResult:
     status_code: int | None = None
     error: str | None = None
 
+    def detail(self) -> str:
+        """One-line failure diagnosis for a preflight message (issue #41 item 7).
+
+        The single place that composes a failed probe's specific reason so every
+        consumer surfaces it rather than discarding it (Findings 1 & 2): the HTTP
+        status when a response arrived — with the 404-means-model-name-mismatch
+        hint, distinct from a merely-down endpoint — or the exception text when no
+        response arrived at all (connect/timeout/UnsupportedProtocol). Returns ""
+        when ``ok`` or when there is nothing specific to report.
+        """
+        if self.ok:
+            return ""
+        if self.status_code is not None:
+            if self.status_code == 404:
+                return "HTTP 404 — likely the model name does not match the served model"
+            return f"HTTP {self.status_code}"
+        if self.error:
+            return self.error
+        return ""
+
 
 class LLMUnavailableError(Exception):
     """The LLM endpoint is unreachable or dropped the connection (transient).

@@ -304,11 +304,12 @@ class TestRequiredEndpoints:
 
 
 class _FakeClient:
-    def __init__(self, model, base_url, available, status_code=None):
+    def __init__(self, model, base_url, available, status_code=None, error=None):
         self.model = model
         self.base_url = base_url
         self._available = available
         self._status_code = status_code
+        self._error = error
         self.checked = False
         self.last_timeout = "unset"
 
@@ -319,7 +320,9 @@ class _FakeClient:
         from llm_client import AvailabilityResult
         self.checked = True
         self.last_timeout = timeout
-        return AvailabilityResult(ok=self._available, status_code=self._status_code)
+        return AvailabilityResult(
+            ok=self._available, status_code=self._status_code, error=self._error
+        )
 
 
 def _run(coro):
@@ -375,6 +378,27 @@ class TestPreflightCheck:
         local = _FakeClient("qwen3", "http://local", False)
         errors = _run(preflight_check(cloud, local, False, True))
         assert "404" not in errors[0]
+
+    def test_non_404_status_code_is_shown(self):
+        # Finding 1: a non-404 status (e.g. 401 bad key, 500 down) must be
+        # surfaced, not discarded, so the user can tell them apart.
+        cloud = _FakeClient("c", "http://cloud", True)
+        local = _FakeClient("qwen3", "http://local", False, status_code=401)
+        errors = _run(preflight_check(cloud, local, False, True))
+        assert len(errors) == 1
+        assert "401" in errors[0]
+
+    def test_connection_error_text_is_shown(self):
+        # Finding 1: probe()'s captured exception text (connect/timeout/
+        # UnsupportedProtocol) must appear so a down server / bad URL is
+        # distinguishable from a bad key.
+        cloud = _FakeClient("c", "http://cloud", True)
+        local = _FakeClient(
+            "qwen3", "http://local", False, error="ConnectError: Connection refused"
+        )
+        errors = _run(preflight_check(cloud, local, False, True))
+        assert len(errors) == 1
+        assert "ConnectError" in errors[0]
 
     def test_forwards_per_endpoint_timeouts_to_is_available(self):
         # Cloud and local get their own probe timeouts (cloud need not wait out

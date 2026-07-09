@@ -778,15 +778,16 @@ async def main(args: argparse.Namespace) -> None:
         result = await llm.probe()
         if not result.ok:
             base = config["newsletter"]["llm"]
-            # Show the model-mismatch hint only on an actual 404 (issue #41 item 7).
-            hint = (
-                "\nAn HTTP 404 usually means the model name does not match the served model."
-                if result.status_code == 404 else ""
-            )
+            # Surface probe()'s captured diagnosis (HTTP status / exception text /
+            # 404 model-mismatch hint) instead of discarding it (Finding 1). All
+            # wording lives on AvailabilityResult.detail() so this and run_eval's
+            # preflight can't drift (Finding 2).
+            detail = result.detail()
+            detail_part = f"\n{detail}" if detail else ""
             print(
                 f"Error: newsletter LLM '{base['model']}' not reachable at "
                 f"{describe_endpoint()}.\n"
-                "Check that the endpoint is up." + hint,
+                "Check that the endpoint is up." + detail_part,
                 file=sys.stderr,
             )
             sys.exit(1)
