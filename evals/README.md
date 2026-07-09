@@ -104,7 +104,7 @@ uv run python -m evals.run_eval --stages stage1_only
 uv run python -m evals.run_eval --stages stage2_only
 
 # Override model without editing config.toml
-uv run python -m evals.run_eval --local-model qwen/qwen3.6-27b --tag qwen3.6-27b
+uv run python -m evals.run_eval --local-model mlx-community/Qwen3.6-27B-8bit --tag qwen3.6-27b
 
 # Per-endpoint request overrides, also without touching config.toml:
 # a longer timeout for slow prefills, or arbitrary request-body JSON

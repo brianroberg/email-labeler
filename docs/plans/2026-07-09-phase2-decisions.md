@@ -89,8 +89,8 @@ never give up** —
   the GLM-native note and the cache-key independence point).
 - `scripts/smoke_concurrency.py` referenced from README-technical's Local Model
   Serving section.
-- Stale model example: `qwen/qwen3-14b` → **`qwen/qwen3.6-27b`** in README.md
-  and `.env.example` ("MLX/Qwen3" mentions → "MLX/Qwen3.6"). ⚠ The exact HF id
-  was inferred from issue #15's "Qwen3.6-27B actually in use" — owner should
-  confirm it matches the id the server actually serves (`MLX_MODEL` must equal
-  the served model name or mlx_lm.server 404s).
+- Stale model example: `qwen/qwen3-14b` → **`mlx-community/Qwen3.6-27B-8bit`**
+  in README.md, `.env.example`, and the evals/README.md `--local-model` example
+  ("MLX/Qwen3" mentions → "MLX/Qwen3.6"). The id was confirmed by the owner from
+  the deployed `.env` (2026-07-09); `MLX_MODEL` must equal the served model name
+  or mlx_lm.server 404s.

@@ -123,7 +123,7 @@ PROXY_API_KEY=aproxy_your_key_here
 CLOUD_LLM_URL=https://your-llm-provider.com/v1/chat/completions
 CLOUD_LLM_API_KEY=your_api_key_here
 MLX_URL=http://macbook:8080/v1/chat/completions
-MLX_MODEL=qwen/qwen3.6-27b
+MLX_MODEL=mlx-community/Qwen3.6-27B-8bit
 ```
 
 See [README-technical.md](README-technical.md#environment-variables) for the full variable reference.
