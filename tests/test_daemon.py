@@ -1033,6 +1033,63 @@ class TestNewsletterRouting:
         # send-date (email-intrinsic) is distinct from the processed timestamp.
         assert record["timestamp"] != record["send_date"]
 
+    async def test_content_error_routes_to_give_up_not_empty_commit(
+        self,
+        mock_proxy,
+        mock_classifier,
+        mock_label_manager,
+        cloud_sem,
+        local_sem,
+        newsletter_thread_response,
+        tmp_path,
+    ):
+        """#30 end-to-end: a content-less grade error must route the newsletter to
+        the give-up path — it must NOT commit an empty no-stories label/assessment
+        (which would be indistinguishable from a genuine NO_STORIES newsletter)."""
+        from llm_client import LLMContentError
+        from newsletter import NewsletterClassifier
+
+        mock_proxy.get_thread.return_value = newsletter_thread_response
+        fake_llm = AsyncMock()
+        fake_llm.model = "test-model"
+        fake_llm.complete.side_effect = [
+            ("STORY: A real story about ministry work.", ""),  # extract_stories
+            LLMContentError("model returned no content"),      # assess_quality
+        ]
+        nl_config = {
+            "newsletter": {
+                "prompts": {
+                    "story_extraction": {"system": "s", "user_template": "{body}"},
+                    "quality_assessment": {"system": "s", "user_template": "{text}"},
+                    "theme_classification": {"system": "s", "user_template": "{text}"},
+                }
+            }
+        }
+        classifier = NewsletterClassifier(cloud_llm=fake_llm, config=nl_config)
+        out = tmp_path / "assessments.jsonl"
+        tracker = FailureTracker(max_failures=3)  # below threshold -> retry, not commit
+
+        result = await process_single_thread(
+            "thread_nl",
+            ["msg_nl_001"],
+            mock_proxy,
+            mock_classifier,
+            mock_label_manager,
+            cloud_sem,
+            local_sem,
+            max_thread_chars=50000,
+            newsletter_classifier=classifier,
+            newsletter_recipient="newsletters@dm.org",
+            newsletter_output_file=str(out),
+            failure_tracker=tracker,
+        )
+
+        # Routed to give-up (below threshold -> return False for a later retry),
+        # NOT committed as a (false) no-stories outcome.
+        assert result is False
+        mock_label_manager.apply_newsletter_classification.assert_not_called()
+        assert not out.exists()  # no empty assessment record written
+
     async def test_non_newsletter_uses_priority_pipeline(
         self,
         mock_proxy,

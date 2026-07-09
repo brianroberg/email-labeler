@@ -42,6 +42,16 @@ class TestParseSendDate:
         assert parse_send_date("", None) is None
         assert parse_send_date("garbage", None) is None
 
+    def test_extreme_year_offset_does_not_raise(self):
+        # A near-max-year date with a west offset overflows past year 9999 when
+        # shifted to UTC; the tz conversion must be guarded so this degrades to a
+        # fallback, not an uncaught OverflowError.
+        assert parse_send_date("Fri, 31 Dec 9999 23:59:59 -1200", None) is None
+        # ...and falls back to internalDate when available.
+        assert parse_send_date(
+            "Fri, 31 Dec 9999 23:59:59 -1200", "1704067200000"
+        ) == "2024-01-01T00:00:00+00:00"
+
 
 class TestParseStories:
     def test_single_story(self):

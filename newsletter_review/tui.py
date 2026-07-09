@@ -85,6 +85,11 @@ def apply_filters(
     return result
 
 
+# Dimension score int (1/2/3) -> display label (issue #53); old out-of-range
+# values (legacy 1-5 records) fall back to their raw int.
+_SCORE_LABELS = {1: "Poor", 2: "OK", 3: "Good"}
+
+
 def _format_themes(themes) -> str:
     """Render a story's themes for the detail view.
 
@@ -217,7 +222,7 @@ def build_detail_lines(record: dict, width: int = 80) -> list[str]:
         # Quality scores
         scores = story.get("scores")
         if scores:
-            parts = [f"{k}={v}" for k, v in scores.items()]
+            parts = [f"{k}={_SCORE_LABELS.get(v, v)}" for k, v in scores.items()]
             lines.append(f"Quality scores: {' '.join(parts)}")
         else:
             lines.append("Quality scores: —")
@@ -464,11 +469,13 @@ class ReviewApp(App):
                 self._refresh_list(reset_cursor=True)
                 return
             try:
-                datetime.strptime(result, "%Y-%m-%d")
+                parsed = datetime.strptime(result, "%Y-%m-%d").date()
             except ValueError:
                 self.push_screen(HintScreen(f"Invalid date '{result}' — use YYYY-MM-DD"))
                 return
-            self.f_since = result
+            # Normalize to zero-padded ISO so the lexicographic send-date compare
+            # is correct even for input like "2024-2-5".
+            self.f_since = parsed.isoformat()
             self._refresh_list(reset_cursor=True)
 
         def on_date(result) -> None:

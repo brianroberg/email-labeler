@@ -189,12 +189,13 @@ def parse_send_date(date_header: str, internal_date_ms: str | None = None) -> st
     if date_header:
         try:
             dt = parsedate_to_datetime(date_header)
-        except (ValueError, TypeError):
-            dt = None
-        if dt is not None:
-            if dt.tzinfo is None:
-                dt = dt.replace(tzinfo=timezone.utc)
-            return dt.astimezone(timezone.utc).isoformat()
+            if dt is not None:
+                if dt.tzinfo is None:
+                    dt = dt.replace(tzinfo=timezone.utc)
+                # astimezone can OverflowError near datetime's min/max year.
+                return dt.astimezone(timezone.utc).isoformat()
+        except (ValueError, TypeError, OverflowError):
+            pass
 
     if internal_date_ms:
         try:

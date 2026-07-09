@@ -2,6 +2,8 @@
 
 import json
 
+import pytest
+
 from evals import atomic_write_jsonl, plural
 
 
@@ -35,6 +37,22 @@ class TestAtomicWriteJsonl:
         path = tmp_path / "out.jsonl"
         atomic_write_jsonl([_Rec(1)], path)
         assert [p.name for p in tmp_path.iterdir()] == ["out.jsonl"]
+
+    def test_write_failure_cleans_temp_and_leaves_original(self, tmp_path):
+        # A mid-write failure must unlink the temp file and leave the original
+        # file untouched (the rename never happens).
+        path = tmp_path / "out.jsonl"
+        atomic_write_jsonl([_Rec("original")], path)
+
+        class _Bad:
+            def to_dict(self):
+                raise ValueError("boom")
+
+        with pytest.raises(ValueError):
+            atomic_write_jsonl([_Rec("new"), _Bad()], path)
+
+        assert json.loads(path.read_text().strip()) == {"value": "original"}
+        assert [p.name for p in tmp_path.iterdir()] == ["out.jsonl"]  # no temp left
 
 
 class TestPlural:

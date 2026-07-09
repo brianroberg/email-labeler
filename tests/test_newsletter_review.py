@@ -304,6 +304,18 @@ class TestBuildDetailLines:
         assert "simple" in text.lower()
         assert "4" in text
 
+    def test_dimension_scores_rendered_as_labels(self):
+        # 1/2/3 render as Poor/OK/Good in the detail view (issue #53).
+        record = _make_record(stories=[{
+            "text": "x", "scores": {"simple": 1, "concrete": 2, "personal": 3, "dynamic": 2},
+            "average_score": 2.0, "tier": "fair", "themes": {},
+            "quality_cot": "", "theme_cot": "",
+        }])
+        text = "\n".join(build_detail_lines(record))
+        assert "simple=Poor" in text
+        assert "concrete=OK" in text
+        assert "personal=Good" in text
+
     def test_includes_quality_cot(self):
         record = _make_record()
         lines = build_detail_lines(record)
@@ -805,6 +817,17 @@ class TestReviewAppSort:
 
 
 class TestReviewAppDateFilter:
+    async def test_non_padded_since_date_is_normalized(self):
+        # strptime accepts "2024-2-15" but the lexicographic filter needs a
+        # zero-padded ISO cutoff, else it silently mis-filters (issue #36 fix).
+        app = ReviewApp(_dated_records())
+        async with app.run_test(size=SIZE) as pilot:
+            await pilot.press("f", "d", "s")
+            await pilot.press(*"2024-2-15")
+            await pilot.press("enter")
+            assert app.f_since == "2024-02-15"
+            assert [r["subject"] for r in app.filtered] == ["Mar"]
+
     async def test_since_via_date_menu_narrows(self):
         app = ReviewApp(_dated_records())
         async with app.run_test(size=SIZE) as pilot:

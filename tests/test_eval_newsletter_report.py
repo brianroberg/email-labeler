@@ -535,20 +535,28 @@ class TestTierQualityNotAttempted:
 
 class TestThemeParseAnomalies:
     def test_invalid_token_and_empty_parse_detected(self):
-        marcus = _pred(story_id="g:0", predicted_themes=["church"],
+        # Graded NAME: GRADE format (issue #53).
+        marcus = _pred(story_id="g:0", predicted_themes={"church": "emphasized"},
                        predicted_scores={"simple": 3})
-        marcus.themes_raw = "FELLOWSHIP\nCHURCH"
-        alina = _pred(story_id="g:1", predicted_themes=[],
+        marcus.themes_raw = "FELLOWSHIP: PRESENT\nCHURCH: EMPHASIZED"
+        alina = _pred(story_id="g:1", predicted_themes={},
                       predicted_scores={"simple": 3})
         alina.themes_raw = "The themes of hope and belonging shine through this piece."
-        clean_none = _pred(story_id="g:2", predicted_themes=[],
+        clean_none = _pred(story_id="g:2", predicted_themes={},
                            predicted_scores={"simple": 3})
         clean_none.themes_raw = "NONE"
-        clean = _pred(story_id="g:3", predicted_themes=["scripture"],
+        clean = _pred(story_id="g:3", predicted_themes={"scripture": "present"},
                       predicted_scores={"simple": 3})
-        clean.themes_raw = "SCRIPTURE"
-        anomalies = theme_parse_anomalies([marcus, alina, clean_none, clean])
+        clean.themes_raw = "SCRIPTURE: PRESENT"
+        all_absent = _pred(story_id="g:4", predicted_themes={},
+                           predicted_scores={"simple": 3})
+        all_absent.themes_raw = (
+            "SCRIPTURE: ABSENT\nCHRISTLIKENESS: ABSENT\nCHURCH: ABSENT\n"
+            "VOCATION_FAMILY: ABSENT\nDISCIPLE_MAKING: ABSENT"
+        )
+        anomalies = theme_parse_anomalies([marcus, alina, clean_none, clean, all_absent])
         by_id = {a["story_id"]: a for a in anomalies}
+        # g:2 (NONE), g:3 (valid), g:4 (all-ABSENT = valid empty) are NOT anomalies.
         assert set(by_id) == {"g:0", "g:1"}
         assert by_id["g:0"]["kind"] == "invalid_tokens"
         assert by_id["g:0"]["invalid_tokens"] == ["FELLOWSHIP"]

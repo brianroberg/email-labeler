@@ -155,6 +155,10 @@ class CachedLLMClient:
         """Delegate to inner client."""
         return await self.inner.is_available(timeout)
 
+    async def probe(self, timeout: float | None = None):
+        """Delegate to inner client (eval preflights probe the wrapped client)."""
+        return await self.inner.probe(timeout)
+
     def flush(self) -> None:
         """Append pending cache entries to disk."""
         if not self._pending:

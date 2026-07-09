@@ -25,7 +25,8 @@ Phase A — curate stories / extraction truth.
     A committed story's text is the verbatim inclusive body slice.
 
 Phase B — per-story labels: with a story selected, ``l`` assigns the 4 dimension
-scores (simple/concrete/personal/dynamic, 1-5) and multi-select themes; on save
+scores (simple/concrete/personal/dynamic) each graded Poor/OK/Good (keys 1/2/3)
+and graded themes (each key cycles Absent/Present/Emphasized); on save
 ``expected_tier`` is derived via ``newsletter.compute_tier``.
 
 The state transitions are factored into PURE functions (below) so they can be

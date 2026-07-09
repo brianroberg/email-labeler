@@ -424,20 +424,25 @@ def match_stories(
     return len(detail["matched"]), len(predicted), len(golden)
 
 
+_THEME_LINE_RE = re.compile(r"^\s*([A-Za-z_]+)\s*:\s*([A-Za-z]+)")
+_THEME_GRADE_TOKENS = {"ABSENT", "PRESENT", "EMPHASIZED"}
+
+
 def theme_parse_anomalies(results: list[StoryPrediction]) -> list[dict]:
     """Detect theme responses that parse_themes silently normalized.
 
-    Two kinds, mirroring newsletter.parse_themes (one uppercase token per line,
-    unrecognized lines dropped, NONE -> []):
+    Mirrors the current ``NAME: ABSENT|PRESENT|EMPHASIZED`` per-theme format
+    (issue #53) and its run-side twin ``newsletter_run._theme_line_anomalies``.
+    Two kinds:
 
-    - "empty_parse": themes_raw is non-empty and not NONE, yet nothing parsed —
-      the model's output was unusable prose, not a genuine NONE.
-    - "invalid_tokens": some lines were not valid theme names and were silently
-      dropped (e.g. FELLOWSHIP) even though other lines parsed.
+    - "empty_parse": themes_raw is non-empty and not NONE, yet no line is a
+      recognizable theme grading — the model emitted unusable prose.
+    - "invalid_tokens": at least one line grades an off-taxonomy theme NAME
+      (e.g. FELLOWSHIP) that parse_themes silently drops.
 
-    Rows without themes_raw (legacy files, error rows) are skipped.
+    An all-ABSENT response is a valid empty result, not an anomaly. Rows without
+    themes_raw (legacy files, error rows) are skipped.
     """
-    valid_upper = _VALID_THEMES
     anomalies: list[dict] = []
     for r in results:
         if r.error is not None or r.themes_raw is None:
@@ -445,11 +450,19 @@ def theme_parse_anomalies(results: list[StoryPrediction]) -> list[dict]:
         raw = r.themes_raw.strip()
         if not raw or raw.upper() == "NONE":
             continue
-        invalid = [
-            line.strip() for line in raw.splitlines()
-            if line.strip() and line.strip().upper() not in valid_upper
-        ]
-        if not r.predicted_themes:
+        graded_any = False
+        invalid: list[str] = []
+        for line in raw.splitlines():
+            match = _THEME_LINE_RE.match(line)
+            if not match:
+                continue
+            name, grade = match.group(1).upper(), match.group(2).upper()
+            if grade not in _THEME_GRADE_TOKENS:
+                continue  # not a theme grading line
+            graded_any = True
+            if name not in _VALID_THEMES:
+                invalid.append(name)
+        if not graded_any:
             anomalies.append({
                 "story_id": r.story_id,
                 "kind": "empty_parse",

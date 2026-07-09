@@ -535,3 +535,17 @@ class TestIsAvailable:
 
         await cached.is_available(timeout=42)
         inner.is_available.assert_awaited_once_with(42)
+
+
+class TestProbe:
+    async def test_delegates_probe_to_inner(self, tmp_path: Path):
+        # The cache wraps the real client that eval preflights probe(); it must
+        # forward probe() or the default (cached) newsletter run crashes.
+        from llm_client import AvailabilityResult
+        inner = _make_inner()
+        inner.probe.return_value = AvailabilityResult(ok=False, status_code=404)
+        cached = CachedLLMClient(inner, tmp_path / "cache.jsonl")
+
+        result = await cached.probe(timeout=7)
+        assert result.status_code == 404
+        inner.probe.assert_awaited_once_with(7)

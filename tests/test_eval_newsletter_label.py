@@ -1621,6 +1621,19 @@ class TestDetailLabeling:
             assert nl.stories[0].expected_scores is None
             assert "cancelled" in _status(app).lower()
 
+    async def test_legacy_score_key_4_is_rejected(self, tmp_path):
+        # The score scale narrowed from 1-5 to 1-3 (issue #53): '4' is no longer
+        # a valid score key and cancels entry like any other key.
+        nl = _newsletter("tL", body="b0")
+        seed_stories(nl, ["a"])
+        app = _label_app([nl], tmp_path)
+        async with app.run_test(size=SIZE) as pilot:
+            await pilot.press("enter")
+            await pilot.press("1", "l")
+            await pilot.press("4")  # out of the 1-3 range -> cancels
+            assert nl.stories[0].expected_scores is None
+            assert "cancelled" in _status(app).lower()
+
     async def test_theme_cycle_absent_present_emphasized(self, tmp_path):
         nl = _newsletter("tL", body="b0")
         seed_stories(nl, ["a"])

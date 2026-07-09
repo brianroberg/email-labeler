@@ -53,7 +53,9 @@ are already open.
   tokens — preserves `average_score`, the mean-based tier, and eval MAE math with minimal
   churn. Prompt emits `POOR|OK|GOOD` tokens; `parse_quality_scores` maps tokens→ints (a
   digit or unknown token is a parse failure — the old 1–5 clamp / `clamped_dimensions`
-  feature becomes obsolete). TUIs render ints→labels. `_DIMENSIONS` unchanged.
+  feature becomes obsolete). The read-only review **detail** view renders ints→labels
+  (Poor/OK/Good); the labeling TUI's compact story strip keeps the dense `2/3/1/2` int
+  form (space-constrained editor grid). `_DIMENSIONS` unchanged.
 - **Themes** stored as **`dict[str,str]`** mapping theme→`"present"`/`"emphasized"`,
   Absent omitted. `parse_themes`, `StoryResult.themes`, `expected_themes`/
   `predicted_themes`, the assessment JSONL, and the golden set all take this shape.
