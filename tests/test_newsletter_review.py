@@ -1,6 +1,11 @@
 """Tests for newsletter_review TUI — pure data functions + Pilot UI tests."""
 
 import json
+import os
+import sys
+import time
+from contextlib import contextmanager
+from datetime import datetime, timezone
 
 import pytest
 from textual.widgets import Label, ListView, Static
@@ -8,6 +13,7 @@ from textual.widgets import Label, ListView, Static
 from newsletter_review.tui import (
     DetailScreen,
     ReviewApp,
+    _days_ago_cutoff,
     apply_filters,
     build_detail_lines,
     format_filter_summary,
@@ -17,6 +23,24 @@ from newsletter_review.tui import (
     sort_by_send_date,
     wrap_text,
 )
+
+
+@contextmanager
+def _use_tz(name: str):
+    """Run the body under a fixed local timezone (Linux ``tzset``), restoring the
+    previous ``TZ`` afterward. Lets date tests observe the local-calendar
+    conversion regardless of the machine's real timezone."""
+    old = os.environ.get("TZ")
+    os.environ["TZ"] = name
+    time.tzset()
+    try:
+        yield
+    finally:
+        if old is None:
+            os.environ.pop("TZ", None)
+        else:
+            os.environ["TZ"] = old
+        time.tzset()
 
 
 def _make_record(
@@ -190,6 +214,45 @@ class TestApplyFilters:
         result = apply_filters(records, since="2024-01-01")
         assert [r["thread_id"] for r in result] == ["dated"]
 
+    def test_since_filter_uses_local_calendar_date(self):
+        # A US-evening send stored as UTC lands on the next UTC day; the since
+        # filter must compare the LOCAL calendar date, not the UTC string.
+        # 2026-07-05T01:00Z is 2026-07-04 20:00 in America/Chicago (CDT = UTC-5).
+        records = [_make_record(thread_id="eve", send_date="2026-07-05T01:00:00+00:00")]
+        with _use_tz("America/Chicago"):
+            # Local date is July 4 -> excluded by a July-5 cutoff...
+            assert apply_filters(records, since="2026-07-05") == []
+            # ...and included by a July-4 cutoff.
+            assert [r["thread_id"] for r in apply_filters(records, since="2026-07-04")] == ["eve"]
+
+
+class TestScoreLabels:
+    def test_labels_derived_from_newsletter_tokens(self):
+        # Single source of truth: the int->label map inverts newsletter._SCORE_TOKENS
+        # rather than re-hardcoding the 1/2/3 <-> Poor/OK/Good mapping.
+        from newsletter import _SCORE_TOKENS
+        from newsletter_review.tui import _SCORE_LABELS
+
+        assert set(_SCORE_LABELS) == set(_SCORE_TOKENS.values())
+        for tok, num in _SCORE_TOKENS.items():
+            assert _SCORE_LABELS[num].upper() == tok
+
+    def test_labels_render_expected_display_text(self):
+        # Byte-identical display text the detail view depends on (issue #53).
+        from newsletter_review.tui import _SCORE_LABELS
+
+        assert _SCORE_LABELS == {1: "Poor", 2: "OK", 3: "Good"}
+
+
+class TestDaysAgoCutoff:
+    def test_cutoff_is_local_calendar_date(self):
+        # The instant 2026-07-05T01:00Z is still 2026-07-04 in Chicago, so a
+        # "past 0 days" cutoff must be July 4 locally, not the UTC July 5.
+        instant = datetime(2026, 7, 5, 1, 0, 0, tzinfo=timezone.utc)
+        with _use_tz("America/Chicago"):
+            assert _days_ago_cutoff(0, now=instant) == "2026-07-04"
+            assert _days_ago_cutoff(2, now=instant) == "2026-07-02"
+
 
 class TestSortBySendDate:
     def test_desc_newest_first(self):
@@ -245,6 +308,17 @@ class TestFormatListRow:
     def test_missing_send_date_shows_placeholder(self):
         row = format_list_row(_make_record(send_date=None), 120)
         assert row.startswith("—")  # date column is first, placeholder for no send-date
+
+    def test_date_column_uses_local_calendar_date(self):
+        # 2026-07-05T01:00Z displays as its LOCAL date (2026-07-04 in Chicago),
+        # matching what Gmail and the Date header show, not the UTC day.
+        with _use_tz("America/Chicago"):
+            row = format_list_row(_make_record(send_date="2026-07-05T01:00:00+00:00"), 120)
+        assert row.startswith("2026-07-04")
+
+    def test_unparseable_send_date_shows_placeholder(self):
+        row = format_list_row(_make_record(send_date="not-a-date"), 120)
+        assert row.startswith("—")
 
 
 # ---------------------------------------------------------------------------
@@ -668,6 +742,30 @@ class TestRunReviewTui:
     def test_empty_records_prints_and_returns(self, capsys):
         run_review_tui([])
         assert "No assessment records" in capsys.readouterr().out
+
+
+class TestCli:
+    def test_since_flag_wired_and_normalized(self, monkeypatch, tmp_path):
+        # --since is passed through to the TUI, normalized to zero-padded ISO the
+        # same way the in-TUI since input is.
+        from newsletter_review import __main__ as main_mod
+
+        f = tmp_path / "a.jsonl"
+        f.write_text("")  # exists + empty -> load_assessments returns []
+        captured = {}
+        monkeypatch.setattr(main_mod, "run_review_tui", lambda records, **kw: captured.update(kw))
+        monkeypatch.setattr(sys, "argv", ["prog", "--file", str(f), "--since", "2026-7-4"])
+        main_mod.cli()
+        assert captured["init_since"] == "2026-07-04"
+
+    def test_since_flag_rejects_invalid_date(self, monkeypatch, capsys):
+        from newsletter_review import __main__ as main_mod
+
+        monkeypatch.setattr(sys, "argv", ["prog", "--since", "not-a-date"])
+        with pytest.raises(SystemExit):
+            main_mod.cli()
+        err = capsys.readouterr().err.lower()
+        assert "yyyy-mm-dd" in err or "invalid date" in err
 
 
 class TestReviewAppRobustness:

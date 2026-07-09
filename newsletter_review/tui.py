@@ -15,6 +15,7 @@ from textual.containers import VerticalScroll
 from textual.screen import Screen
 from textual.widgets import Label, ListItem, ListView, Static
 
+from newsletter import _SCORE_TOKENS
 from tui_common import (
     CANCEL,
     HintScreen,
@@ -54,6 +55,34 @@ def sort_by_send_date(records: list[dict]) -> list[dict]:
     return sorted(records, key=lambda r: r.get("send_date") or "", reverse=True)
 
 
+def _local_date(send_date: str | None) -> str | None:
+    """Convert a stored UTC ISO send-date to the reader's LOCAL calendar date
+    (``YYYY-MM-DD``).
+
+    Records store ``send_date`` as a UTC-normalized ISO string, so a US-evening
+    send lands on the *next* UTC day; slicing the UTC string would display and
+    filter it a day ahead of the Date header. Parse and re-localize to the
+    machine's timezone before taking the date. Returns ``None`` for a missing or
+    unparseable send-date (callers render ``—`` / drop it from the since-filter)."""
+    if not send_date:
+        return None
+    try:
+        dt = datetime.fromisoformat(send_date)
+    except ValueError:
+        return None
+    return dt.astimezone().date().isoformat()
+
+
+def _days_ago_cutoff(days: int, *, now: datetime | None = None) -> str:
+    """The "past N days" since-cutoff as a LOCAL calendar date (``YYYY-MM-DD``).
+
+    *now* defaults to the current instant; it is converted to the reader's local
+    timezone before the date arithmetic so the cutoff lines up with the
+    local-date column (same off-by-one concern as :func:`_local_date`)."""
+    base = (now or datetime.now(timezone.utc)).astimezone().date()
+    return (base - timedelta(days=days)).isoformat()
+
+
 def apply_filters(
     records: list[dict],
     *,
@@ -79,15 +108,22 @@ def apply_filters(
         sender_lower = sender.lower()
         result = [r for r in result if sender_lower in r.get("from", "").lower()]
     if since is not None:
-        # Filter on the send-date (date part), inclusive; records with no
-        # send-date can't satisfy a positive date filter, so they drop out (#36).
-        result = [r for r in result if (r.get("send_date") or "")[:10] >= since]
+        # Filter on the send-date's LOCAL calendar date, inclusive; records with
+        # no/unparseable send-date can't satisfy a positive date filter, so they
+        # drop out (#36).
+        result = [r for r in result if (_local_date(r.get("send_date")) or "") >= since]
     return result
 
 
 # Dimension score int (1/2/3) -> display label (issue #53); ``.get(v, v)`` is a
-# defensive fallback so an unexpected value shows raw instead of crashing.
-_SCORE_LABELS = {1: "Poor", 2: "OK", 3: "Good"}
+# defensive fallback so an unexpected value shows raw instead of crashing. Derived
+# from newsletter._SCORE_TOKENS (POOR/OK/GOOD) so the 1/2/3 <-> label mapping has a
+# single source of truth; "OK" is an acronym and stays upper-cased while the other
+# rubric words are title-cased.
+_SCORE_LABELS = {
+    num: (tok if tok == "OK" else tok.capitalize())
+    for tok, num in _SCORE_TOKENS.items()
+}
 
 
 def _format_themes(themes: dict) -> str:
@@ -131,9 +167,9 @@ def format_filter_summary(
 
 
 def _list_date(record: dict) -> str:
-    """The send-date's date part for the list column, or ``—`` if absent (#36)."""
-    send_date = record.get("send_date")
-    return send_date[:10] if send_date else "—"
+    """The send-date's LOCAL calendar date for the list column, or ``—`` if
+    absent/unparseable (#36)."""
+    return _local_date(record.get("send_date")) or "—"
 
 
 def format_list_row(record: dict, max_x: int) -> str:
@@ -484,8 +520,7 @@ class ReviewApp(App):
                     on_since,
                 )
             else:
-                cutoff = datetime.now(timezone.utc).date() - timedelta(days=int(result))
-                self.f_since = cutoff.isoformat()
+                self.f_since = _days_ago_cutoff(int(result))
                 self._refresh_list(reset_cursor=True)
 
         def on_type(result) -> None:

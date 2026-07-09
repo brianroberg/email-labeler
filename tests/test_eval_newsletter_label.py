@@ -11,6 +11,7 @@ import sys
 import pytest
 
 from evals.newsletter_label import (
+    ScoreScreen,
     SpanEdit,
     accept_confirmation_message,
     add_story,
@@ -76,6 +77,24 @@ def _story(story_id="t1:0", **kw):
     base = dict(story_id=story_id, text="Text")
     base.update(kw)
     return GoldenStory(**base)
+
+
+class TestScorePrompt:
+    def test_prompt_lists_the_three_rubric_options(self):
+        # The score prompt spells out the 1/2/3 <-> rubric mapping (issue #53).
+        assert "[1]poor [2]ok [3]good" in ScoreScreen()._prompt_text()
+
+    def test_score_options_derived_from_newsletter_tokens(self):
+        # Single source of truth: the option string is derived from
+        # newsletter._SCORE_TOKENS, not a hardcoded duplicate.
+        from evals.newsletter_label import _SCORE_OPTIONS
+        from newsletter import _SCORE_TOKENS
+
+        expected = " ".join(
+            f"[{num}]{tok.lower()}"
+            for tok, num in sorted(_SCORE_TOKENS.items(), key=lambda kv: kv[1])
+        )
+        assert _SCORE_OPTIONS == expected
 
 
 class TestSeedStories:

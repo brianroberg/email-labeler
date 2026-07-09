@@ -52,10 +52,17 @@ from textual.widgets import Label, ListItem, ListView, Static
 
 from evals import atomic_write_jsonl, plural
 from evals.newsletter_schemas import GoldenNewsletter, GoldenStory
-from newsletter import compute_tier, parse_stories
+from newsletter import _SCORE_TOKENS, compute_tier, parse_stories
 from tui_common import BottomModal, HintScreen, PageListView, PromptLineScreen
 
 _DIMENSIONS = ("simple", "concrete", "personal", "dynamic")
+
+# The score-entry prompt's rubric options, derived from newsletter._SCORE_TOKENS so
+# the 1/2/3 <-> POOR/OK/GOOD mapping lives in one place; renders "[1]poor [2]ok [3]good".
+_SCORE_OPTIONS = " ".join(
+    f"[{num}]{tok.lower()}"
+    for tok, num in sorted(_SCORE_TOKENS.items(), key=lambda kv: kv[1])
+)
 
 # Theme hotkeys mirror newsletter_review's convention (s/c/h/v/d).
 _THEME_KEYS = {
@@ -908,7 +915,7 @@ class ScoreScreen(BottomModal):
         now = f" (now {self._current[dim]})" if self._current and dim in self._current else ""
         entered = "/".join(str(self._scores[d]) for d in _DIMENSIONS if d in self._scores)
         so_far = f"[{entered}] " if entered else ""
-        return f"{so_far}{dim}{now} [1]poor [2]ok [3]good (other cancels): "
+        return f"{so_far}{dim}{now} {_SCORE_OPTIONS} (other cancels): "
 
     def compose(self) -> ComposeResult:
         yield Static(self._prompt_text(), id="score-prompt", markup=False)

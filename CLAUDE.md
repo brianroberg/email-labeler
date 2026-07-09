@@ -75,6 +75,7 @@ python -m newsletter_review                          # Browse all assessments
 python -m newsletter_review --tier poor              # Filter by tier
 python -m newsletter_review --theme scripture        # Filter by theme
 python -m newsletter_review --sender dm.org          # Filter by sender
+python -m newsletter_review --since 2026-01-01       # Filter to sends on/after a local date (YYYY-MM-DD)
 python -m newsletter_review --file path/to/file.jsonl  # Custom JSONL path
 ```
 
