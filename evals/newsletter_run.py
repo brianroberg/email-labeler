@@ -16,7 +16,6 @@ import asyncio
 import copy
 import hashlib
 import json
-import logging
 import os
 import sys
 import time
@@ -28,7 +27,7 @@ from pathlib import Path
 import httpx
 
 from config_utils import substitute_env_vars
-from daemon import resolve_newsletter_llm_endpoint
+from daemon import quiet_http_logging, resolve_newsletter_llm_endpoint
 from evals import format_network_error, plural
 from evals.llm_cache import CachedLLMClient
 from evals.newsletter_schemas import (
@@ -885,7 +884,7 @@ def cli():
         parser.error(f"--parallelism must be >= 1 (got {args.parallelism})")
     # httpx logs one INFO line per request; at eval volume that drowns the
     # run's own progress output.
-    logging.getLogger("httpx").setLevel(logging.WARNING)
+    quiet_http_logging()
     asyncio.run(main(args))
 
 

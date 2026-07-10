@@ -155,9 +155,10 @@ manually.
 
 A successful run ends with a next-step hint pointing at
 `uv run python -m evals.newsletter_label --golden-set <output>`. Per-request
-httpx/httpcore INFO logs are silenced (public helper
-`evals.newsletter_harvest.quiet_http_logging()`), and a missing `PROXY_API_KEY`
-exits 1 with a one-line message instead of a traceback.
+httpx/httpcore INFO logs are silenced via the shared `daemon.quiet_http_logging()`
+helper (each entry point calls it explicitly — importing daemon alone silences
+nothing), and a missing `PROXY_API_KEY` exits 1 with a one-line message instead
+of a traceback.
 
 ### newsletter_label
 

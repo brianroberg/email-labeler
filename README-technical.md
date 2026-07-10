@@ -79,6 +79,7 @@ All operational parameters are in `config.toml`. The daemon reads this file on s
 ```toml
 [daemon]
 poll_interval_seconds = 60     # How often to poll Gmail
+status_interval_seconds = 900  # How often to log a "still idle" heartbeat when caught up (default 15m)
 max_emails_per_cycle = 10      # Max threads per poll (override: MAX_EMAILS_PER_CYCLE)
 gmail_query = "in:inbox -label:agent/processed -label:agent/attempted"  # Gmail search query
 max_thread_chars = 16000       # Cap on transcript chars sent to the classifier
