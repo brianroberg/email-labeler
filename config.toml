@@ -1,5 +1,6 @@
 [daemon]
 poll_interval_seconds = 60
+status_interval_seconds = 900   # How often to log a "still idle" heartbeat when caught up (default 15m)
 max_emails_per_cycle = 10       # Override per-run with the MAX_EMAILS_PER_CYCLE env var
 gmail_query = "in:inbox -label:agent/processed -label:agent/attempted"
 # Max characters of thread transcript sent to the classifier. Kept modest

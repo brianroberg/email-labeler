@@ -17,11 +17,14 @@ from classifier import (
 )
 from daemon import (
     FailureTracker,
+    IdleState,
     format_thread_transcript,
+    idle_report,
     load_config,
     log_local_deferrals,
     process_single_thread,
     resolve_int_env,
+    should_log_reconnect,
     summarize_cycle,
 )
 from labeler import _get_priority
@@ -823,6 +826,78 @@ class TestLogLocalDeferrals:
         with caplog.at_level(logging.DEBUG, logger="email-labeler"):
             log_local_deferrals([])
         assert caplog.records == []
+
+
+class TestIdleReport:
+    """Pure decision helper for the idle transition + heartbeat lines (issue #58).
+    One call per successful poll cycle; mutates IdleState and returns the line
+    to log (or None)."""
+
+    def test_busy_cycle_returns_none_and_clears_idle_state(self):
+        state = IdleState(idle_since=100.0, last_heartbeat=100.0)
+        line = idle_report(had_work=True, now=200.0, state=state, status_interval=900)
+        assert line is None
+        assert state.idle_since is None
+        assert state.last_heartbeat is None
+
+    def test_first_idle_cycle_logs_caught_up_and_stamps_state(self):
+        state = IdleState()
+        line = idle_report(had_work=False, now=100.0, state=state, status_interval=900)
+        assert line == "Inbox caught up — nothing to process"
+        assert state.idle_since == 100.0
+        assert state.last_heartbeat == 100.0
+
+    def test_idle_before_interval_stays_silent(self):
+        state = IdleState(idle_since=100.0, last_heartbeat=100.0)
+        line = idle_report(had_work=False, now=100.0 + 899, state=state, status_interval=900)
+        assert line is None
+        assert state.last_heartbeat == 100.0  # unchanged — heartbeat not consumed
+
+    def test_idle_past_interval_logs_heartbeat_with_minute_math(self):
+        state = IdleState(idle_since=100.0, last_heartbeat=100.0)
+        line = idle_report(had_work=False, now=100.0 + 900, state=state, status_interval=900)
+        assert line == "Still idle (15m) — last poll ok"
+        assert state.last_heartbeat == 100.0 + 900
+
+    def test_heartbeat_minutes_measure_total_idle_time_not_interval(self):
+        # Two heartbeats in: idle_since is 30m ago even though the last
+        # heartbeat was only 15m ago.
+        state = IdleState(idle_since=100.0, last_heartbeat=100.0 + 900)
+        line = idle_report(had_work=False, now=100.0 + 1800, state=state, status_interval=900)
+        assert line == "Still idle (30m) — last poll ok"
+
+    def test_work_after_idle_resets_so_next_idle_logs_caught_up_again(self):
+        state = IdleState(idle_since=100.0, last_heartbeat=100.0)
+        assert idle_report(had_work=True, now=200.0, state=state, status_interval=900) is None
+        line = idle_report(had_work=False, now=300.0, state=state, status_interval=900)
+        assert line == "Inbox caught up — nothing to process"
+        assert state.idle_since == 300.0
+
+
+class TestQuietHttpLogging:
+    def test_quiet_http_logging_raises_httpx_loggers_to_warning(self, monkeypatch):
+        """quiet_http_logging() must set the httpx AND httpcore logger levels to
+        WARNING so per-poll 'HTTP Request: … 200 OK' INFO lines are suppressed
+        (their URLs embed -label:agent/processed and read as false alarms)."""
+        for name in ("httpx", "httpcore"):
+            monkeypatch.setattr(logging.getLogger(name), "level", logging.NOTSET)
+        daemon.quiet_http_logging()
+        assert logging.getLogger("httpx").level == logging.WARNING
+        assert logging.getLogger("httpcore").level == logging.WARNING
+
+    def test_daemon_logger_stays_at_info(self, monkeypatch):
+        monkeypatch.setattr(logging.getLogger("email-labeler"), "level", logging.INFO)
+        daemon.quiet_http_logging()
+        assert logging.getLogger("email-labeler").level == logging.INFO
+
+
+class TestShouldLogReconnect:
+    def test_true_when_backing_off(self):
+        assert should_log_reconnect(backoff=120, poll_interval=60) is True
+
+    def test_false_on_normal_polling(self):
+        # First cycle (and every healthy cycle) has backoff == poll_interval.
+        assert should_log_reconnect(backoff=60, poll_interval=60) is False
 
 
 class TestLoadConfig:
