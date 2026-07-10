@@ -2,8 +2,12 @@
 
 import asyncio
 import base64
+import copy
 import json
 import logging
+import subprocess
+import sys
+from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock
 
 import httpx
@@ -24,7 +28,6 @@ from daemon import (
     log_local_deferrals,
     process_single_thread,
     resolve_int_env,
-    should_log_reconnect,
     summarize_cycle,
 )
 from labeler import _get_priority
@@ -885,19 +888,155 @@ class TestQuietHttpLogging:
         assert logging.getLogger("httpx").level == logging.WARNING
         assert logging.getLogger("httpcore").level == logging.WARNING
 
-    def test_daemon_logger_stays_at_info(self, monkeypatch):
-        monkeypatch.setattr(logging.getLogger("email-labeler"), "level", logging.INFO)
+    def test_daemon_logger_still_emits_info_after_quieting(self, monkeypatch):
+        """Production shape: 'email-labeler' has no explicit level and inherits
+        INFO from basicConfig's root logger. Quieting the HTTP libraries must
+        not suppress the daemon's own INFO lines — e.g. via a future edit that
+        widens the tuple to "" (the root logger)."""
+        monkeypatch.setattr(logging.getLogger("email-labeler"), "level", logging.NOTSET)
+        monkeypatch.setattr(logging.getLogger(), "level", logging.INFO)
         daemon.quiet_http_logging()
-        assert logging.getLogger("email-labeler").level == logging.INFO
+        assert logging.getLogger("email-labeler").isEnabledFor(logging.INFO)
+
+    def test_importing_daemon_does_not_quiet_httpx(self):
+        """The evals import daemon for shared helpers; that import must not
+        mutate process-wide logging. Quieting is applied by entry points
+        (daemon.main, the eval CLIs), never at import."""
+        code = (
+            "import logging, daemon; "
+            "print(logging.getLogger('httpx').level, logging.getLogger('httpcore').level)"
+        )
+        proc = subprocess.run(
+            [sys.executable, "-c", code],
+            capture_output=True, text=True,
+            cwd=Path(daemon.__file__).parent,
+        )
+        assert proc.returncode == 0, proc.stderr
+        assert proc.stdout.strip() == f"{logging.NOTSET} {logging.NOTSET}"
+
+    def test_main_entry_point_quiets_http_logging(self, monkeypatch):
+        for name in ("httpx", "httpcore"):
+            monkeypatch.setattr(logging.getLogger(name), "level", logging.NOTSET)
+
+        async def noop_daemon():
+            return None
+
+        monkeypatch.setattr(daemon, "run_daemon", noop_daemon)
+        daemon.main()
+        assert logging.getLogger("httpx").level == logging.WARNING
+        assert logging.getLogger("httpcore").level == logging.WARNING
 
 
-class TestShouldLogReconnect:
-    def test_true_when_backing_off(self):
-        assert should_log_reconnect(backoff=120, poll_interval=60) is True
+class _StopLoop(Exception):
+    """Raised by the mocked inter-cycle sleep to break run_daemon's while True."""
 
-    def test_false_on_normal_polling(self):
-        # First cycle (and every healthy cycle) has backoff == poll_interval.
-        assert should_log_reconnect(backoff=60, poll_interval=60) is False
+
+async def run_poll_cycles(monkeypatch, tmp_path, poll_outcomes):
+    """Drive run_daemon through len(poll_outcomes) poll cycles, then stop.
+
+    Each element is either a list_messages response dict or an exception
+    instance to raise from that cycle's poll. All collaborators (proxy, LLMs,
+    label verification, thread processing) are mocked; the inter-cycle
+    asyncio.sleep is replaced with a counter that breaks the loop once every
+    scripted outcome has been consumed.
+    """
+    config = copy.deepcopy(load_config())
+    config.pop("newsletter", None)  # keep the loop on the plain email pipeline
+    config["daemon"]["healthcheck_file"] = str(tmp_path / "healthcheck")
+    monkeypatch.setattr(daemon, "load_config", lambda: config)
+
+    proxy = MagicMock()
+    proxy.proxy_url = "http://proxy.test"
+    proxy.list_messages = AsyncMock(side_effect=poll_outcomes)
+    monkeypatch.setattr(daemon, "GmailProxyClient", MagicMock(return_value=proxy))
+    monkeypatch.setattr(daemon, "LLMClient", MagicMock())
+    monkeypatch.setattr(daemon, "EmailClassifier", MagicMock())
+    monkeypatch.setattr(daemon, "LabelManager", MagicMock())
+    monkeypatch.setattr(daemon, "verify_labels_with_retry", AsyncMock(return_value=[]))
+    monkeypatch.setattr(daemon, "process_single_thread", AsyncMock(return_value=True))
+
+    remaining = len(poll_outcomes)
+
+    async def cycle_sleep(_seconds):
+        nonlocal remaining
+        remaining -= 1
+        if remaining <= 0:
+            raise _StopLoop
+
+    monkeypatch.setattr(daemon.asyncio, "sleep", cycle_sleep)
+    with pytest.raises(_StopLoop):
+        await daemon.run_daemon()
+
+
+class TestPollLoopObservability:
+    """Wiring tests for the issue #58 log lines: drive run_daemon through a
+    scripted sequence of poll outcomes and assert on the log narrative."""
+
+    async def test_reconnect_logged_after_connection_loss_recovery(
+        self, monkeypatch, tmp_path, caplog
+    ):
+        with caplog.at_level(logging.INFO, logger="email-labeler"):
+            await run_poll_cycles(
+                monkeypatch, tmp_path,
+                [ProxyUnavailableError("connection refused"), {"messages": []}],
+            )
+        assert any("Reconnected to api-proxy" in r.getMessage() for r in caplog.records)
+
+    async def test_no_reconnect_line_when_connection_was_never_lost(
+        self, monkeypatch, tmp_path, caplog
+    ):
+        # 4xx responses and in-cycle bugs grow the backoff too, but the proxy
+        # stayed reachable — recovery from them must not claim a reconnect.
+        with caplog.at_level(logging.INFO, logger="email-labeler"):
+            await run_poll_cycles(
+                monkeypatch, tmp_path,
+                [
+                    ProxyError("400 malformed query"),
+                    {"messages": []},
+                    ValueError("bug in the cycle"),
+                    {"messages": []},
+                ],
+            )
+        assert not any("Reconnected" in r.getMessage() for r in caplog.records)
+
+    async def test_reconnect_line_precedes_the_recovery_cycle_work(
+        self, monkeypatch, tmp_path, caplog
+    ):
+        # The narrative must read lost → reconnected → found/processed, not
+        # have the reconnect line trail the work it explains.
+        with caplog.at_level(logging.INFO, logger="email-labeler"):
+            await run_poll_cycles(
+                monkeypatch, tmp_path,
+                [
+                    ProxyUnavailableError("connection refused"),
+                    {"messages": [{"id": "m1", "threadId": "t1"}]},
+                ],
+            )
+        lines = [r.getMessage() for r in caplog.records]
+        reconnect = next(i for i, m in enumerate(lines) if "Reconnected to api-proxy" in m)
+        found = next(i for i, m in enumerate(lines) if "Found 1 unprocessed message(s)" in m)
+        assert reconnect < found
+
+    async def test_failed_cycle_resets_the_idle_heartbeat_clock(
+        self, monkeypatch, tmp_path, caplog
+    ):
+        # idle → outage → idle: the second quiet cycle starts a fresh idle
+        # stretch ("caught up" again) instead of extending one interrupted by
+        # the outage — heartbeat minutes must never include downtime.
+        with caplog.at_level(logging.INFO, logger="email-labeler"):
+            await run_poll_cycles(
+                monkeypatch, tmp_path,
+                [
+                    {"messages": []},
+                    ProxyUnavailableError("connection refused"),
+                    {"messages": []},
+                ],
+            )
+        caught_up = [
+            r for r in caplog.records
+            if r.getMessage() == "Inbox caught up — nothing to process"
+        ]
+        assert len(caught_up) == 2
 
 
 class TestLoadConfig:

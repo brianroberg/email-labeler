@@ -4,7 +4,10 @@ import argparse
 import asyncio
 import copy
 import json
+import logging
+import sys
 from pathlib import Path
+from unittest.mock import AsyncMock
 
 import pytest
 
@@ -1273,3 +1276,17 @@ class TestMainReport:
         err = capsys.readouterr().err
         assert "1 story" in err
         assert "unlabeled" in err or "never labeled" in err
+
+
+class TestCliQuietsHttpLogging:
+    def test_cli_quiets_httpx_and_httpcore(self, monkeypatch):
+        """cli() must silence BOTH httpx and httpcore per-request INFO logs
+        (via the shared daemon.quiet_http_logging helper — the inline copy it
+        replaced missed httpcore)."""
+        for name in ("httpx", "httpcore"):
+            monkeypatch.setattr(logging.getLogger(name), "level", logging.NOTSET)
+        monkeypatch.setattr(newsletter_run, "main", AsyncMock())
+        monkeypatch.setattr(sys, "argv", ["newsletter_run"])
+        newsletter_run.cli()
+        assert logging.getLogger("httpx").level == logging.WARNING
+        assert logging.getLogger("httpcore").level == logging.WARNING

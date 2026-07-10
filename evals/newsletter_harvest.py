@@ -18,14 +18,13 @@ Usage:
 import argparse
 import asyncio
 import json
-import logging
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
 
 import httpx
 
-from daemon import DEFAULT_MAX_THREAD_CHARS, format_thread_transcript
+from daemon import DEFAULT_MAX_THREAD_CHARS, format_thread_transcript, quiet_http_logging
 from evals import format_network_error
 from evals.harvest import load_eval_config
 from evals.newsletter_schemas import GoldenNewsletter
@@ -195,19 +194,9 @@ def write_golden_set(newsletters: list[GoldenNewsletter], output_path: Path) -> 
             f.write(json.dumps(newsletter.to_dict()) + "\n")
 
 
-def quiet_http_logging() -> None:
-    """Silence httpx/httpcore per-request INFO logs.
-
-    Importing daemon (for format_thread_transcript) runs its module-level
-    logging.basicConfig(level=INFO), which makes httpx print a timestamped
-    'HTTP Request: ...' line for every proxy call — noise that drowns out the
-    harvest's own progress messages.
-    """
-    for name in ("httpx", "httpcore"):
-        logging.getLogger(name).setLevel(logging.WARNING)
-
-
 async def main(args: argparse.Namespace) -> None:
+    # daemon's module-level logging.basicConfig(INFO) would otherwise let httpx
+    # print an 'HTTP Request: ...' line per proxy call, drowning harvest output.
     quiet_http_logging()
     config = load_eval_config(args.config)
     try:

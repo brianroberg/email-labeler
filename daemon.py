@@ -61,14 +61,14 @@ def quiet_http_logging() -> None:
     httpx logs 'HTTP Request: … 200 OK' at INFO for every poll, and the URL
     embeds the gmail_query ('-label:agent/processed -label:agent/attempted') —
     healthy polls read as alarms to anyone scanning the log. Only these library
-    loggers are raised; the email-labeler logger stays at INFO. (Defined locally
-    rather than imported from evals/ — the daemon must not depend on evals.)
+    loggers are raised; the email-labeler logger stays at INFO. Canonical copy —
+    the eval CLIs import it (evals may depend on daemon, never the reverse).
+    Each entry point calls it explicitly rather than at import, so merely
+    importing daemon's helpers never mutates process-wide logging.
     """
     for name in ("httpx", "httpcore"):
         logging.getLogger(name).setLevel(logging.WARNING)
 
-
-quiet_http_logging()
 
 # Default cap on transcript chars sent to the classifier when config.toml omits
 # max_thread_chars. Shared with the eval harness (evals/run_eval.py) so the two
@@ -609,36 +609,32 @@ class IdleState:
     idle_since: float | None = None
     last_heartbeat: float | None = None
 
+    def reset(self) -> None:
+        """Forget the current idle stretch (work arrived, or a cycle failed)."""
+        self.idle_since = None
+        self.last_heartbeat = None
+
 
 def idle_report(had_work: bool, now: float, state: IdleState, status_interval: float) -> str | None:
     """One call per successful poll cycle. Mutates state; returns a line to log or None.
 
     Busy → idle logs a one-shot "caught up"; a continuing idle stretch logs a
     heartbeat every status_interval seconds so "healthy and caught up" stays
-    distinguishable from "hung". Only called on the success path — the except
-    arms log their own state and must not reset the idle clock.
+    distinguishable from "hung". Failed cycles reset the stretch (the except
+    arms call state.reset()) so the heartbeat's minute count never includes
+    outage time — "Still idle (Nm) — last poll ok" only measures healthy idling.
     """
     if had_work:
-        state.idle_since = None
-        state.last_heartbeat = None
+        state.reset()
         return None
     if state.idle_since is None:
         state.idle_since = now
         state.last_heartbeat = now
         return "Inbox caught up — nothing to process"
-    if state.last_heartbeat is None or now - state.last_heartbeat >= status_interval:
+    if now - state.last_heartbeat >= status_interval:
         state.last_heartbeat = now
         return f"Still idle ({int((now - state.idle_since) / 60)}m) — last poll ok"
     return None
-
-
-def should_log_reconnect(backoff: float, poll_interval: float) -> bool:
-    """True when a successful poll ends a backoff stretch (issue #58).
-
-    backoff only exceeds poll_interval after a failed cycle grew it, so this
-    marks proxy-lost → recovered without a false positive on the first cycle.
-    """
-    return backoff > poll_interval
 
 
 async def verify_labels_with_retry(
@@ -793,11 +789,18 @@ async def run_daemon() -> None:
     backoff = poll_interval
     status_interval = daemon_config.get("status_interval_seconds", 900)
     idle_state = IdleState()
+    proxy_lost = False  # set by the lost-connection arm, cleared on the next good poll
 
     while True:
         try:
             response = await proxy_client.list_messages(q=gmail_query, max_results=max_emails)
             messages = response.get("messages", [])
+
+            if proxy_lost:
+                # Logged before the cycle's work so the narrative reads
+                # lost → reconnected → found/processed (issue #58).
+                log.info("Reconnected to api-proxy — resuming normal polling")
+                proxy_lost = False
 
             if messages:
                 log.info("Found %d unprocessed message(s)", len(messages))
@@ -852,8 +855,6 @@ async def run_daemon() -> None:
             # Update healthcheck
             healthcheck_file.write_text(str(asyncio.get_event_loop().time()))
 
-            if should_log_reconnect(backoff, poll_interval):
-                log.info("Reconnected to api-proxy — resuming normal polling")
             # Reset backoff on success
             backoff = poll_interval
 
@@ -873,7 +874,11 @@ async def run_daemon() -> None:
                 type(exc).__name__,
                 backoff,
             )
+            proxy_lost = True
             backoff = min(backoff * 2, poll_interval * 10)
+            # A failed cycle breaks the idle stretch: the next quiet poll logs
+            # "caught up" afresh, so heartbeat minutes never include downtime.
+            idle_state.reset()
         except ProxyError as exc:
             # A request-specific proxy fault from the cycle-level list_messages call:
             # a 4xx, e.g. a malformed gmail_query 400. It won't fix itself, but it's a
@@ -886,15 +891,18 @@ async def run_daemon() -> None:
                 type(exc).__name__, exc, backoff,
             )
             backoff = min(backoff * 2, poll_interval * 10)
+            idle_state.reset()
         except Exception:
             log.exception("Error in poll cycle")
             backoff = min(backoff * 2, poll_interval * 10)
+            idle_state.reset()
 
         await asyncio.sleep(backoff)
 
 
 def main():
     """Entry point."""
+    quiet_http_logging()
     asyncio.run(run_daemon())
 
 
