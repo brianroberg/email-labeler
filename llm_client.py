@@ -84,6 +84,30 @@ class LLMContentError(RuntimeError):
     """
 
 
+# Bodies that mean "the account is out of funds/credit", across providers:
+# Novita (NOT_ENOUGH_BALANCE), DeepSeek-style ("Insufficient Balance"),
+# OpenAI-style (insufficient_quota / "You exceeded your current quota").
+# Matched against any non-200 body; a match is account-wide → LLMBalanceError.
+_BALANCE_SIGNATURE = re.compile(
+    r"not_enough_balance|insufficient[ _]balance|insufficient[ _]quota"
+    r"|exceeded your current quota",
+    re.IGNORECASE,
+)
+
+
+class LLMBalanceError(RuntimeError):
+    """The provider account is out of funds/credit (e.g. Novita's 403 NOT_ENOUGH_BALANCE).
+
+    Account-wide, not request-specific: if one request fails for lack of balance,
+    every subsequent request to the same provider will too. The daemon therefore
+    treats this as a halt condition (stop processing, tell the admin to add funds
+    and restart) rather than a per-thread give-up — the failing thread is left
+    unprocessed so it's retried after restart. Subclasses ``RuntimeError`` so
+    callers unaware of it (evals) still see a generic LLM failure; the daemon must
+    catch it *before* its ``except RuntimeError`` arm.
+    """
+
+
 class LLMClient:
     """Client for OpenAI-compatible chat completion endpoints."""
 
@@ -108,6 +132,11 @@ class LLMClient:
         # "cloud" / "local" — carried on LLMUnavailableError so callers can tell
         # a routine local outage from a surprising cloud one (issue #24).
         self.tier = tier
+
+    def _provider(self) -> str:
+        """Identify this client in error messages: which of the (up to 3) LLMClient
+        instances — cloud, local MLX, newsletter — a failure came from."""
+        return f"tier={self.tier or '-'} model={self.model} url={self.base_url}"
 
     def _is_glm_model(self) -> bool:
         """Check if model uses GLM-style reasoning_content instead of inline think tags."""
@@ -146,7 +175,10 @@ class LLMClient:
             LLMUnavailableError: If the endpoint is unreachable (connection refused
                 or connect/pool timeout) or the connection drops mid-request —
                 transient unavailability.
-            RuntimeError: If the LLM returns a non-200 response.
+            LLMBalanceError: If the non-200 response says the provider account is
+                out of funds (402, or a balance/quota signature in the body) —
+                account-wide; the daemon halts rather than giving up per-thread.
+            RuntimeError: If the LLM returns any other non-200 response.
         """
         headers = {"Content-Type": "application/json"}
         if self.api_key:
@@ -208,8 +240,14 @@ class LLMClient:
         if response.status_code != 200:
             prompt_chars = len(system_prompt) + len(user_content)
             resp_body = response.text[:500]
+            if response.status_code == 402 or _BALANCE_SIGNATURE.search(response.text):
+                raise LLMBalanceError(
+                    f"LLM provider out of funds — status {response.status_code} "
+                    f"[{self._provider()}]: {resp_body}"
+                )
             raise RuntimeError(
                 f"LLM request failed with status {response.status_code} "
+                f"[{self._provider()}] "
                 f"(prompt ~{prompt_chars // 4} tokens, {prompt_chars} chars): {resp_body}"
             )
 
