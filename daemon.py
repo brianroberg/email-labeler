@@ -802,6 +802,10 @@ async def run_daemon() -> None:
     # a few attempts. Session-scoped — counts reset on restart.
     failure_tracker = FailureTracker()
 
+    # Account-level fault switch (provider out of funds): once tripped the poll
+    # loop stands down until the admin adds funds and restarts. Session-scoped.
+    halt = DaemonHalt()
+
     # Wait for a transiently-unreachable api-proxy to come up, then verify labels.
     missing = await verify_labels_with_retry(label_manager)
     if missing:
@@ -824,6 +828,20 @@ async def run_daemon() -> None:
     proxy_lost = False  # set by the lost-connection arm, cleared on the next good poll
 
     while True:
+        if halt.tripped:
+            # An out-of-funds provider fails EVERY request — polling on would
+            # only burn the backlog into agent/attempted. Stand down but stay
+            # alive: the heartbeat stays fresh (deliberately halted, not hung),
+            # and the instruction repeats at ERROR every cycle so it can't
+            # scroll out of the logs. Restarting the daemon is the only reset.
+            log.error(
+                "Daemon halted — %s. Add funds to the provider account, "
+                "then restart the daemon to resume processing.",
+                halt.reason,
+            )
+            healthcheck_file.write_text(str(asyncio.get_event_loop().time()))
+            await asyncio.sleep(poll_interval)
+            continue
         try:
             response = await proxy_client.list_messages(q=gmail_query, max_results=max_emails)
             messages = response.get("messages", [])
@@ -868,6 +886,7 @@ async def run_daemon() -> None:
                         fetch_sem=fetch_sem,
                         write_sem=write_sem,
                         local_deferrals=local_deferrals,
+                        halt=halt,
                     )
                     for tid, msg_ids in thread_items
                 ),

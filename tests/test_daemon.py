@@ -994,14 +994,16 @@ class _StopLoop(Exception):
     """Raised by the mocked inter-cycle sleep to break run_daemon's while True."""
 
 
-async def run_poll_cycles(monkeypatch, tmp_path, poll_outcomes):
-    """Drive run_daemon through len(poll_outcomes) poll cycles, then stop.
+async def run_poll_cycles(monkeypatch, tmp_path, poll_outcomes, process_mock=None, cycles=None):
+    """Drive run_daemon through poll cycles, then stop; returns the proxy mock.
 
-    Each element is either a list_messages response dict or an exception
-    instance to raise from that cycle's poll. All collaborators (proxy, LLMs,
-    label verification, thread processing) are mocked; the inter-cycle
-    asyncio.sleep is replaced with a counter that breaks the loop once every
-    scripted outcome has been consumed.
+    Each poll_outcomes element is either a list_messages response dict or an
+    exception instance to raise from that cycle's poll. All collaborators
+    (proxy, LLMs, label verification, thread processing) are mocked; the
+    inter-cycle asyncio.sleep is replaced with a counter that breaks the loop
+    after `cycles` sleeps (default: one per scripted outcome). `process_mock`
+    replaces the default always-succeeds process_single_thread stub — halted
+    cycles sleep without polling, so cycles may exceed len(poll_outcomes).
     """
     config = copy.deepcopy(load_config())
     config.pop("newsletter", None)  # keep the loop on the plain email pipeline
@@ -1016,9 +1018,12 @@ async def run_poll_cycles(monkeypatch, tmp_path, poll_outcomes):
     monkeypatch.setattr(daemon, "EmailClassifier", MagicMock())
     monkeypatch.setattr(daemon, "LabelManager", MagicMock())
     monkeypatch.setattr(daemon, "verify_labels_with_retry", AsyncMock(return_value=[]))
-    monkeypatch.setattr(daemon, "process_single_thread", AsyncMock(return_value=True))
+    monkeypatch.setattr(
+        daemon, "process_single_thread",
+        process_mock if process_mock is not None else AsyncMock(return_value=True),
+    )
 
-    remaining = len(poll_outcomes)
+    remaining = cycles if cycles is not None else len(poll_outcomes)
 
     async def cycle_sleep(_seconds):
         nonlocal remaining
@@ -1029,6 +1034,7 @@ async def run_poll_cycles(monkeypatch, tmp_path, poll_outcomes):
     monkeypatch.setattr(daemon.asyncio, "sleep", cycle_sleep)
     with pytest.raises(_StopLoop):
         await daemon.run_daemon()
+    return proxy
 
 
 class TestPollLoopObservability:
@@ -1100,6 +1106,65 @@ class TestPollLoopObservability:
             if r.getMessage() == "Inbox caught up — nothing to process"
         ]
         assert len(caught_up) == 2
+
+
+async def _out_of_funds_process(*args, **kwargs):
+    """process_single_thread stand-in: every thread hits an out-of-funds provider."""
+    kwargs["halt"].trip("LLM provider out of funds — status 403 [tier=cloud]: NOT_ENOUGH_BALANCE")
+    return False
+
+
+class TestOutOfFundsHalt:
+    """Once a balance error trips the halt, the poll loop must stand down: no more
+    polling or processing, a recurring admin instruction at ERROR, and a fresh
+    heartbeat (the daemon is alive by design, not hung). Restart-only reset."""
+
+    async def test_halt_stops_polling(self, monkeypatch, tmp_path):
+        proxy = await run_poll_cycles(
+            monkeypatch, tmp_path,
+            [{"messages": [{"id": "m1", "threadId": "t1"}]}],
+            process_mock=_out_of_funds_process,
+            cycles=3,
+        )
+        # Cycle 1 polls and trips the halt; cycles 2–3 must not poll again.
+        assert proxy.list_messages.call_count == 1
+
+    async def test_halt_logs_admin_instruction_every_cycle(self, monkeypatch, tmp_path, caplog):
+        with caplog.at_level(logging.ERROR, logger="email-labeler"):
+            await run_poll_cycles(
+                monkeypatch, tmp_path,
+                [{"messages": [{"id": "m1", "threadId": "t1"}]}],
+                process_mock=_out_of_funds_process,
+                cycles=3,
+            )
+        halted = [r for r in caplog.records if "restart the daemon" in r.getMessage()]
+        # One line per halted cycle (2 of the 3) — outage-severity, must not
+        # scroll out of a long-running container's logs.
+        assert len(halted) == 2
+        assert all(r.levelno == logging.ERROR for r in halted)
+        assert all("add funds" in r.getMessage().lower() for r in halted)
+        # The reason (provider identity included) is carried into the line.
+        assert all("out of funds" in r.getMessage() for r in halted)
+
+    async def test_halt_keeps_heartbeat_fresh(self, monkeypatch, tmp_path):
+        heartbeat = MagicMock()
+        real_path = daemon.Path
+
+        def spy_path(arg):
+            # Only the healthcheck file gets the spy; load_config still needs
+            # a real Path to find config.toml.
+            return heartbeat if "healthcheck" in str(arg) else real_path(arg)
+
+        monkeypatch.setattr(daemon, "Path", spy_path)
+        await run_poll_cycles(
+            monkeypatch, tmp_path,
+            [{"messages": [{"id": "m1", "threadId": "t1"}]}],
+            process_mock=_out_of_funds_process,
+            cycles=3,
+        )
+        # One write per cycle, halted or not: a stale heartbeat would misreport
+        # a deliberately-halted daemon as hung.
+        assert heartbeat.write_text.call_count == 3
 
 
 class TestLoadConfig:
