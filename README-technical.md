@@ -159,6 +159,38 @@ top_p = 0.9
 frequency_penalty = 0.5
 ```
 
+### Newsletter settings
+
+```toml
+[newsletter]
+recipient = "newsletters@example.org"                # To/Cc match that routes a thread to the newsletter pipeline
+output_file = "data/newsletter_assessments.jsonl"    # Assessment record sink (JSONL, appended)
+
+[newsletter.llm]
+model = "claude-sonnet-4-6"   # endpoint/key via NEWSLETTER_LLM_URL / NEWSLETTER_LLM_API_KEY (defaults to the cloud LLM's)
+```
+
+**`output_file` is relative to the process working directory** and the daemon
+`mkdir`s it silently if missing. In Docker (`WORKDIR /app`) that means
+`/app/data/newsletter_assessments.jsonl` **inside the container's writable
+layer** — no error, no warning, and the records are destroyed the next time the
+container is recreated. Running in Docker therefore **requires a volume mount**
+for the data directory, pointed at the host path you browse with
+`python -m newsletter_review`:
+
+```yaml
+services:
+  email-labeler:
+    volumes:
+      - ./data:/app/data
+```
+
+The daemon logs the resolved absolute destination at startup —
+`Newsletter assessments append to: /app/data/newsletter_assessments.jsonl (persist
+this path via a volume mount when running in Docker)` — so a missing mount is
+diagnosable from the first log lines: verify the logged path is covered by a
+mount in `docker inspect <container> --format '{{json .Mounts}}'`.
+
 ### Prompt templates
 
 The `[prompts.sender_classification]` and `[prompts.email_classification]` sections contain the system prompts and user message templates used for each classification stage. Templates use Python format strings with `{sender}`, `{subject}`, `{snippet}`, and `{body}` placeholders.

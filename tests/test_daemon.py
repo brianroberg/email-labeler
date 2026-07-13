@@ -1033,7 +1033,10 @@ class _StopLoop(Exception):
     """Raised by the mocked inter-cycle sleep to break run_daemon's while True."""
 
 
-async def run_poll_cycles(monkeypatch, tmp_path, poll_outcomes, process_mock=None, cycles=None):
+async def run_poll_cycles(
+    monkeypatch, tmp_path, poll_outcomes, process_mock=None, cycles=None,
+    keep_newsletter=False,
+):
     """Drive run_daemon through poll cycles, then stop; returns the proxy mock.
 
     Each poll_outcomes element is either a list_messages response dict or an
@@ -1043,9 +1046,13 @@ async def run_poll_cycles(monkeypatch, tmp_path, poll_outcomes, process_mock=Non
     after `cycles` sleeps (default: one per scripted outcome). `process_mock`
     replaces the default always-succeeds process_single_thread stub — halted
     cycles sleep without polling, so cycles may exceed len(poll_outcomes).
+    `keep_newsletter` retains the [newsletter] config so startup wiring (e.g.
+    the assessments-path log line) can be exercised; NEWSLETTER_ONLY stays
+    unset so the loop itself remains on the plain email pipeline.
     """
     config = copy.deepcopy(load_config())
-    config.pop("newsletter", None)  # keep the loop on the plain email pipeline
+    if not keep_newsletter:
+        config.pop("newsletter", None)  # keep the loop on the plain email pipeline
     config["daemon"]["healthcheck_file"] = str(tmp_path / "healthcheck")
     monkeypatch.setattr(daemon, "load_config", lambda: config)
 
@@ -1229,6 +1236,22 @@ class TestOutOfFundsHalt:
         # Both halted cycles survived the failed write and still logged the line.
         halted = [r for r in caplog.records if "restart the daemon" in r.getMessage()]
         assert len(halted) == 2
+
+
+class TestNewsletterOutputPathLogging:
+    async def test_startup_logs_resolved_assessments_path(self, monkeypatch, tmp_path, caplog):
+        """Startup must log the RESOLVED absolute assessments path: output_file is
+        relative to the process working directory, so in Docker a missing bind
+        mount silently strands records in the container layer (lost on recreate).
+        The destination must be visible in the first log lines."""
+        with caplog.at_level(logging.INFO, logger="email-labeler"):
+            await run_poll_cycles(
+                monkeypatch, tmp_path, [{"messages": []}], keep_newsletter=True
+            )
+        expected = str(Path(load_config()["newsletter"]["output_file"]).resolve())
+        assert any(expected in r.getMessage() for r in caplog.records), (
+            f"no startup log line contains the resolved assessments path {expected}"
+        )
 
 
 class TestLoadConfig:
