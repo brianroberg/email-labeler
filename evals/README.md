@@ -178,10 +178,9 @@ newsletter_harvest → newsletter_label → newsletter_run → newsletter_report
 - **label** — A Textual tool to build ground truth by hand (quality is
   subjective, so there are no auto-labels). The detail screen shows the
   newsletter **body with each story highlighted in place** plus a story strip
-  and a mode bar. Phase A curates the story list: opening an unreviewed
-  newsletter **auto-seeds** candidate stories from the production extractor (a
-  fresh LLM call; `r` re-seeds, asking for confirmation over an existing list).
-  You then refine boundaries in two modes — in **browse mode** pick a story with
+  and a mode bar. Phase A curates the story list by hand (issue #59 removed the
+  LLM auto-seeding — it never sped curation up), defining story boundaries in
+  two modes — in **browse mode** pick a story with
   `n`/`p` or a number key; in **span mode** (`a` for a new story, `e` to
   re-bound the selected one) mark the first line then the last line to define a
   story from that verbatim body slice. `d` deletes, `C` clears all,
@@ -189,18 +188,17 @@ newsletter_harvest → newsletter_label → newsletter_run → newsletter_report
   skips. Phase B (`l`) assigns per-story dimension scores + themes; the tier is
   auto-derived from scores. `X` excludes a whole newsletter from the queue and
   eval runs (toggle; relaunch with `--include-excluded` to see and restore
-  excluded ones). `--edit` disables the LLM seeding for manual-only curation
-  (no LLM endpoint needed).
+  excluded ones). No LLM endpoint is needed.
 - **run** — Replay the golden set through the real classifier (LLM-cached) and
   write timestamped results.
 - **report** — Compute tier/dimension/theme/extraction metrics, compare two runs,
   or show a trend across runs.
 
-**Environment.** `newsletter_label` (Phase-A seeding) and `newsletter_run` call
-the `[newsletter.llm]` endpoint resolved from `NEWSLETTER_LLM_URL` /
-`NEWSLETTER_LLM_API_KEY`, falling back to `CLOUD_LLM_URL` / `CLOUD_LLM_API_KEY`;
-`newsletter_harvest` needs `PROXY_API_KEY` (and `PROXY_URL` or `--proxy-url`).
-Both tools fail fast with a message naming the missing variable. Default data
+**Environment.** `newsletter_run` calls the `[newsletter.llm]` endpoint resolved
+from `NEWSLETTER_LLM_URL` / `NEWSLETTER_LLM_API_KEY`, falling back to
+`CLOUD_LLM_URL` / `CLOUD_LLM_API_KEY`; `newsletter_harvest` needs
+`PROXY_API_KEY` (and `PROXY_URL` or `--proxy-url`). Both tools fail fast with a
+message naming the missing variable (`newsletter_label` needs no LLM). Default data
 paths are CWD-relative, so run the tools from the repo root (only `--config`
 defaults to the repo-root `config.toml` regardless of CWD).
 
@@ -218,7 +216,6 @@ uv run python -m evals.newsletter_harvest --proxy-url http://localhost:8000 --ma
 # 2. Label them: curate stories, then score dimensions + themes
 uv run python -m evals.newsletter_label
 uv run python -m evals.newsletter_label --unreviewed-only   # only unlabeled
-uv run python -m evals.newsletter_label --edit              # manual-only (no LLM seeding)
 
 # 3. Run the whole pipeline and print a report
 uv run python -m evals.newsletter_run --mode all --tag baseline --report

@@ -186,7 +186,6 @@ class TestGoldenNewsletter:
             ],
             source="harvested",
             harvested_at="2026-07-01T00:00:00+00:00",
-            seeded_from="parse_stories",
             reviewed=True,
             notes="good newsletter",
             excluded=False,
@@ -201,7 +200,6 @@ class TestGoldenNewsletter:
         assert restored.body == "raw body verbatim"
         assert restored.source == "harvested"
         assert restored.harvested_at == "2026-07-01T00:00:00+00:00"
-        assert restored.seeded_from == "parse_stories"
         assert restored.reviewed is True
         assert restored.notes == "good newsletter"
         assert restored.excluded is False
@@ -226,7 +224,6 @@ class TestGoldenNewsletter:
         assert nl.stories == []
         assert nl.source == "harvested"
         assert nl.harvested_at == ""
-        assert nl.seeded_from == ""
         assert nl.reviewed is False
         assert nl.notes == ""
         assert nl.excluded is False
@@ -383,7 +380,6 @@ class TestNewsletterRunMeta:
             extra_body={"top_p": 0.9},
             parallelism=4,
             tag="baseline",
-            seeded_from="parse_stories",
             extraction_system_prompt="extract prompt",
             quality_system_prompt="quality prompt",
             theme_system_prompt="theme prompt",
@@ -406,7 +402,6 @@ class TestNewsletterRunMeta:
         assert restored.extra_body == {"top_p": 0.9}
         assert restored.parallelism == 4
         assert restored.tag == "baseline"
-        assert restored.seeded_from == "parse_stories"
         assert restored.extraction_system_prompt == "extract prompt"
         assert restored.quality_system_prompt == "quality prompt"
         assert restored.theme_system_prompt == "theme prompt"
@@ -431,7 +426,43 @@ class TestNewsletterRunMeta:
         assert meta.extra_body is None
         assert meta.parallelism == 1
         assert meta.tag == ""
-        assert meta.seeded_from == ""
         assert meta.extraction_system_prompt == ""
         assert meta.quality_system_prompt == ""
         assert meta.theme_system_prompt == ""
+
+
+class TestSeededFromRemoved:
+    """Issue #59: seeding is gone, so the provenance field no longer serializes.
+    Old JSONL containing the key stays readable (from_dict ignores unknown keys)."""
+
+    def test_golden_newsletter_omits_seeded_from(self):
+        nl = GoldenNewsletter(
+            thread_id="t", message_id="m", sender="s", subject="sub", body="b"
+        )
+        assert "seeded_from" not in nl.to_dict()
+
+    def test_run_meta_omits_seeded_from(self):
+        meta = NewsletterRunMeta(
+            run_id="r1",
+            timestamp="2026-07-13T00:00:00+00:00",
+            config_hash="h",
+            config_path="config.toml",
+            newsletter_model="model",
+            golden_set_path="golden.jsonl",
+            golden_set_count=1,
+            story_count=1,
+        )
+        assert "seeded_from" not in meta.to_dict()
+
+    def test_old_scheme_key_is_ignored_on_load(self):
+        nl = GoldenNewsletter.from_dict(
+            {
+                "thread_id": "t",
+                "message_id": "m",
+                "sender": "s",
+                "subject": "sub",
+                "body": "b",
+                "seeded_from": "parse_stories",
+            }
+        )
+        assert not hasattr(nl, "seeded_from")

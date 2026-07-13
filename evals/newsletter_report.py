@@ -648,8 +648,6 @@ def print_report(
     print(f"  Prompt hash:  {meta.prompt_hash}")
     if meta.tag:
         print(f"  Tag:          {meta.tag}")
-    if meta.seeded_from:
-        print(f"  Seeded from:  {meta.seeded_from}")
     print(f"  Golden set:   {meta.golden_set_path}")
     print(f"  Newsletters:  {meta.golden_set_count}")
     print(f"  Stories:      {meta.story_count}")

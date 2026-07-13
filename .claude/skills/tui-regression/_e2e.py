@@ -22,7 +22,7 @@ SIZE = (100, 30)
 
 
 async def drain(app, pilot):
-    """Let @work workers (seeding, prompts) finish, then settle the UI."""
+    """Let @work workers (prompt flows) finish, then settle the UI."""
     await app.workers.wait_for_complete()
     await pilot.pause()
 

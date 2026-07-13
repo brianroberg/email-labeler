@@ -129,7 +129,6 @@ class TestHarvestNewsletters:
         g = goldens[0]
         assert g.stories == []
         assert g.reviewed is False
-        assert g.seeded_from == ""
 
     async def test_body_matches_format_thread_transcript(self):
         proxy = _OneNewsletterProxy()

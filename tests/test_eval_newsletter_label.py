@@ -40,10 +40,6 @@ from evals.newsletter_label import (
     restore_snapshot,
     row_for_body_line,
     save_golden_set,
-    seed_confirmation_message,
-    seed_from_extractor,
-    seed_outcome_message,
-    seed_stories,
     select_label_newsletters,
     span_cursor_moved,
     span_mark,
@@ -59,6 +55,19 @@ from evals.newsletter_label import (
 )
 from evals.newsletter_schemas import GoldenNewsletter, GoldenStory
 from newsletter import NewsletterTier, compute_tier
+
+
+def populate_stories(newsletter, story_texts):
+    """Test fixture: replace the story list with stories built from *story_texts*.
+
+    Mirrors what manual curation produces (stable ids); resets ``reviewed``
+    since a replaced list must be re-confirmed."""
+    newsletter.stories = [
+        GoldenStory(story_id=f"{newsletter.thread_id}:{i}", text=t)
+        for i, t in enumerate(story_texts)
+    ]
+    newsletter.reviewed = False
+    return newsletter.stories
 
 
 def _newsletter(thread_id="t1", **kw):
@@ -95,39 +104,6 @@ class TestScorePrompt:
             for tok, num in sorted(_SCORE_TOKENS.items(), key=lambda kv: kv[1])
         )
         assert _SCORE_OPTIONS == expected
-
-
-class TestSeedStories:
-    def test_seeds_candidates_with_stable_ids_and_provenance(self):
-        nl = _newsletter("tS")
-        texts = ["text a", "text b"]
-
-        seed_stories(nl, texts)
-
-        assert [s.story_id for s in nl.stories] == ["tS:0", "tS:1"]
-        assert [s.text for s in nl.stories] == texts
-        assert nl.seeded_from == "parse_stories"
-        assert nl.reviewed is False  # seeding is not confirmation
-        assert all(not s.reviewed for s in nl.stories)
-
-    def test_seeding_a_reviewed_newsletter_clears_reviewed(self):
-        # Re-seeding replaces the confirmed story list with an uncurated machine
-        # seed — it must NOT stay authoritative extraction truth for
-        # reviewed-only runs. Undo still restores via the snapshot.
-        nl = _newsletter("tS", reviewed=True)
-
-        seed_stories(nl, ["text a"])
-
-        assert nl.reviewed is False
-
-    def test_seeding_replaces_prior_candidates(self):
-        nl = _newsletter("tS")
-        nl.stories = [_story("tS:0", text="old")]
-
-        seed_stories(nl, ["new text"])
-
-        assert [s.text for s in nl.stories] == ["new text"]
-        assert nl.stories[0].story_id == "tS:0"
 
 
 class TestAssignScoresAndThemes:
@@ -228,7 +204,7 @@ class TestToggleNewsletterExcluded:
 class TestUndo:
     def test_undo_restores_prior_story_list_and_reviewed(self):
         nl = _newsletter("tU")
-        seed_stories(nl, ["a", "b"])
+        populate_stories(nl, ["a", "b"])
         snap = capture_snapshot(nl)
 
         delete_story(nl, 1)
@@ -244,7 +220,7 @@ class TestUndo:
 
     def test_undo_restores_per_story_labels(self):
         nl = _newsletter("tU")
-        seed_stories(nl, ["a"])
+        populate_stories(nl, ["a"])
         snap = capture_snapshot(nl)
 
         assign_scores_and_themes(
@@ -262,7 +238,7 @@ class TestUndo:
 
     def test_snapshot_is_independent_of_later_mutations(self):
         nl = _newsletter("tU")
-        seed_stories(nl, ["a"])
+        populate_stories(nl, ["a"])
         snap = capture_snapshot(nl)
         nl.stories[0].text = "changed"
 
@@ -281,7 +257,7 @@ class TestExcludeStory:
 class TestDeleteStory:
     def test_delete_removes_candidate(self):
         nl = _newsletter("tD")
-        seed_stories(nl, ["a", "b"])
+        populate_stories(nl, ["a", "b"])
 
         delete_story(nl, 0)
 
@@ -291,7 +267,7 @@ class TestDeleteStory:
 class TestClearStories:
     def test_clear_empties_the_list(self):
         nl = _newsletter("tC")
-        seed_stories(nl, ["a", "b", "c"])
+        populate_stories(nl, ["a", "b", "c"])
 
         clear_stories(nl)
 
@@ -301,7 +277,7 @@ class TestClearStories:
 class TestEditStory:
     def test_edit_updates_text(self):
         nl = _newsletter("tE")
-        seed_stories(nl, ["a"])
+        populate_stories(nl, ["a"])
 
         edit_story(nl, 0, text="a2")
 
@@ -309,7 +285,7 @@ class TestEditStory:
 
     def test_edit_leaves_unspecified_field_untouched(self):
         nl = _newsletter("tE")
-        seed_stories(nl, ["a"])
+        populate_stories(nl, ["a"])
 
         edit_story(nl, 0)
 
@@ -571,7 +547,7 @@ class TestCommitSpanEdit:
 class TestAcceptConfirmationMessage:
     def test_none_when_all_labeled(self):
         nl = _newsletter("t")
-        seed_stories(nl, ["a"])
+        populate_stories(nl, ["a"])
         assign_scores_and_themes(
             nl.stories[0], {"simple": 3, "concrete": 3, "personal": 3, "dynamic": 3}, []
         )
@@ -579,7 +555,7 @@ class TestAcceptConfirmationMessage:
 
     def test_warns_with_unlabeled_count(self):
         nl = _newsletter("t")
-        seed_stories(nl, ["a", "b"])
+        populate_stories(nl, ["a", "b"])
         msg = accept_confirmation_message(nl)
         assert "2" in msg
         assert "y/N" in msg
@@ -591,11 +567,11 @@ class TestModeBars:
         assert "BROWSE" in joined
         assert "[a]dd" in joined
         assert "[c]" in joined  # accept + next
-        assert "[r]eseed" in joined
+        assert "eseed" not in joined  # LLM seeding removed (issue #59)
 
     def test_browse_bar_shows_selected_story(self):
         nl = _newsletter("t")
-        seed_stories(nl, ["a", "b"])
+        populate_stories(nl, ["a", "b"])
         joined = " ".join(browse_mode_bar(nl, 1, 200))
         assert "story 2" in joined
 
@@ -661,7 +637,7 @@ class TestBuildDetailRows:
 class TestConfirmStoryList:
     def test_confirm_marks_newsletter_reviewed(self):
         nl = _newsletter("tC")
-        seed_stories(nl, ["a", "b"])
+        populate_stories(nl, ["a", "b"])
         assert nl.reviewed is False
 
         confirm_story_list(nl)
@@ -670,7 +646,7 @@ class TestConfirmStoryList:
 
     def test_confirm_preserves_existing_ids_after_delete(self):
         nl = _newsletter("tC")
-        seed_stories(nl, ["a", "b", "c"])
+        populate_stories(nl, ["a", "b", "c"])
         delete_story(nl, 1)
 
         confirm_story_list(nl)
@@ -697,7 +673,7 @@ class TestConfirmStoryList:
 class TestAddStory:
     def test_add_after_delete_never_duplicates_an_existing_id(self):
         nl = _newsletter("t1")
-        seed_stories(nl, ["a", "b", "c"])
+        populate_stories(nl, ["a", "b", "c"])
         delete_story(nl, 0)
 
         added = add_story(nl, "d")
@@ -708,7 +684,7 @@ class TestAddStory:
 
     def test_create_from_body_after_delete_never_duplicates_an_existing_id(self):
         nl = _newsletter("t1", body="l0\nl1")
-        seed_stories(nl, ["a", "b", "c"])
+        populate_stories(nl, ["a", "b", "c"])
         delete_story(nl, 0)
 
         story = create_story_from_body(nl, 0, 0)
@@ -735,7 +711,7 @@ class TestLoadSaveRoundTrip:
     def test_save_then_load_preserves_nested_stories(self, tmp_path):
         path = tmp_path / "golden.jsonl"
         nl = _newsletter("t1")
-        seed_stories(nl, ["a", "b"])
+        populate_stories(nl, ["a", "b"])
         assign_scores_and_themes(
             nl.stories[0],
             {"simple": 3, "concrete": 3, "personal": 3, "dynamic": 3},
@@ -763,63 +739,10 @@ class TestLoadSaveRoundTrip:
         assert len(loaded) == 1
 
 
-class TestSeedFromExtractor:
-    def test_runs_extractor_output_through_parse_stories(self):
-        nl = _newsletter("tX")
-        raw = "STORY: first story\n\nSTORY: second story"
-
-        captured = {}
-
-        def fake_extract(body):
-            captured["body"] = body
-            return raw
-
-        seed_from_extractor(nl, fake_extract)
-
-        assert captured["body"] == "raw body"
-        assert [s.text for s in nl.stories] == ["first story", "second story"]
-        assert nl.seeded_from == "parse_stories"
-        assert nl.reviewed is False
-
-    def test_no_stories_seeds_empty_list(self):
-        nl = _newsletter("tX")
-        seed_from_extractor(nl, lambda body: "NO_STORIES")
-        assert nl.stories == []
-        assert nl.seeded_from == "parse_stories"
-
-
-class TestSeedConfirmationMessage:
-    def test_no_confirmation_needed_for_empty_story_list(self):
-        assert seed_confirmation_message(_newsletter("t")) is None
-
-    def test_warns_with_story_count_when_stories_exist(self):
-        nl = _newsletter("t")
-        seed_stories(nl, ["a", "b"])
-        msg = seed_confirmation_message(nl)
-        assert msg is not None
-        assert "2" in msg
-        assert "y/N" in msg
-
-    def test_mentions_labeled_stories_at_risk(self):
-        nl = _newsletter("t")
-        seed_stories(nl, ["a", "b"])
-        assign_scores_and_themes(
-            nl.stories[0], {"simple": 3, "concrete": 3, "personal": 3, "dynamic": 3}, []
-        )
-        assert "1 labeled" in seed_confirmation_message(nl)
-
-    def test_singular_story_in_warning(self):
-        nl = _newsletter("t")
-        seed_stories(nl, ["a"])
-        msg = seed_confirmation_message(nl)
-        assert "Replace 1 story " in msg
-        assert "stories" not in msg
-
-
 class TestConfirmStatusMessage:
     def test_all_labeled_confirms_plainly(self):
         nl = _newsletter("t")
-        seed_stories(nl, ["a"])
+        populate_stories(nl, ["a"])
         assign_scores_and_themes(
             nl.stories[0], {"simple": 3, "concrete": 3, "personal": 3, "dynamic": 3}, []
         )
@@ -827,31 +750,15 @@ class TestConfirmStatusMessage:
 
     def test_singular_unlabeled(self):
         nl = _newsletter("t")
-        seed_stories(nl, ["a"])
+        populate_stories(nl, ["a"])
         msg = confirm_status_message(nl)
         assert "1 story still unlabeled" in msg
         assert "stories" not in msg
 
     def test_plural_unlabeled(self):
         nl = _newsletter("t")
-        seed_stories(nl, ["a", "b"])
+        populate_stories(nl, ["a", "b"])
         assert "2 stories still unlabeled" in confirm_status_message(nl)
-
-
-class TestSeedOutcomeMessage:
-    def test_reports_story_count_on_success(self):
-        assert "2" in seed_outcome_message("STORY: a\n\nSTORY: b", 2)
-
-    def test_singular_story_count(self):
-        assert seed_outcome_message("STORY: a", 1) == "Seeded 1 story."
-
-    def test_distinguishes_no_stories_verdict(self):
-        assert "NO_STORIES" in seed_outcome_message("NO_STORIES", 0)
-
-    def test_distinguishes_unparseable_output(self):
-        msg = seed_outcome_message("prose with no story blocks", 0)
-        assert "NO_STORIES" not in msg
-        assert "no parseable" in msg.lower()
 
 
 class TestRowForBodyLine:
@@ -876,7 +783,7 @@ class TestRowForBodyLine:
 class TestLabelProgress:
     def test_counts_labeled_over_total_excluding_excluded(self):
         nl = _newsletter("t")
-        seed_stories(nl, ["a", "b", "c"])
+        populate_stories(nl, ["a", "b", "c"])
         assign_scores_and_themes(
             nl.stories[0], {"simple": 3, "concrete": 3, "personal": 3, "dynamic": 3}, []
         )
@@ -885,7 +792,7 @@ class TestLabelProgress:
 
     def test_unlabeled_story_count_ignores_excluded(self):
         nl = _newsletter("t")
-        seed_stories(nl, ["a", "b"])
+        populate_stories(nl, ["a", "b"])
         nl.stories[1].excluded = True
         assert unlabeled_story_count(nl) == 1
 
@@ -893,7 +800,7 @@ class TestLabelProgress:
 class TestFormatListRow:
     def test_shows_labeled_over_total_and_sender(self):
         nl = _newsletter("t", sender="paul@dm.org", subject="Fall update")
-        seed_stories(nl, ["a", "b", "c"])
+        populate_stories(nl, ["a", "b", "c"])
         assign_scores_and_themes(
             nl.stories[0], {"simple": 3, "concrete": 3, "personal": 3, "dynamic": 3}, []
         )
@@ -971,63 +878,6 @@ class TestBuildDetailRowsDivider:
         assert len(dividers[0]) <= 30
 
 
-class TestSeedFromExtractorRaw:
-    def test_returns_stories_and_raw_output_for_status_reporting(self):
-        nl = _newsletter("tX")
-        raw = "STORY: first story"
-        stories, returned_raw = seed_from_extractor(nl, lambda body: raw)
-        assert returned_raw == raw
-        assert [s.text for s in stories] == ["first story"]
-
-
-class TestBuildExtractorClientConfig:
-    def test_passes_config_timeout_and_1024_max_tokens_default(self, monkeypatch):
-        import llm_client as llm_client_module
-        from evals.newsletter_label import build_extractor
-
-        captured = {}
-        real_client = llm_client_module.LLMClient
-
-        def spy(*args, **kwargs):
-            captured.update(kwargs)
-            return real_client(*args, **kwargs)
-
-        monkeypatch.setattr(llm_client_module, "LLMClient", spy)
-        monkeypatch.setenv("NEWSLETTER_LLM_URL", "http://llm.example")
-        monkeypatch.setenv("NEWSLETTER_LLM_API_KEY", "k")
-        prompt = {"system": "s", "user_template": "{body}"}
-        quality = {"system": "s", "user_template": "{text}"}
-        config = {
-            "newsletter": {
-                "llm": {"model": "m", "timeout": 123},
-                "prompts": {
-                    "story_extraction": prompt,
-                    "quality_assessment": quality,
-                    "theme_classification": quality,
-                },
-            }
-        }
-
-        build_extractor(config)
-
-        assert captured["timeout"] == 123
-        assert captured["max_tokens"] == 1024
-
-
-class TestBuildExtractorPreflight:
-    def test_missing_endpoint_fails_fast_naming_env_vars(self, monkeypatch):
-        from evals.newsletter_label import build_extractor
-
-        monkeypatch.delenv("NEWSLETTER_LLM_URL", raising=False)
-        monkeypatch.delenv("CLOUD_LLM_URL", raising=False)
-        with pytest.raises(SystemExit) as exc_info:
-            build_extractor({"newsletter": {"llm": {"model": "m"}}})
-        msg = str(exc_info.value)
-        assert "NEWSLETTER_LLM_URL" in msg
-        assert "CLOUD_LLM_URL" in msg
-        assert "--edit" in msg
-
-
 # ---------------------------------------------------------------------------
 # Pilot UI tests — drive the real Textual app: key presses in, widget state,
 # rendered content, and on-disk golden-set effects out.
@@ -1040,12 +890,10 @@ def _scores(n=3):
     return {"simple": n, "concrete": n, "personal": n, "dynamic": n}
 
 
-def _label_app(newsletters, tmp_path, extract_fn=None):
+def _label_app(newsletters, tmp_path):
     from evals.newsletter_label import LabelApp
 
-    return LabelApp(
-        newsletters, newsletters, tmp_path / "golden.jsonl", extract_fn=extract_fn
-    )
+    return LabelApp(newsletters, newsletters, tmp_path / "golden.jsonl")
 
 
 def _detail(app):
@@ -1095,130 +943,10 @@ async def _goto_body(pilot, app, body_idx):
         await pilot.press("down" if delta > 0 else "up")
 
 
-class TestDetailAutoSeed:
-    async def test_opening_unreviewed_story_less_newsletter_auto_seeds(self, tmp_path):
-        nl = _newsletter("tg", body="b0")
-        app = _label_app([nl], tmp_path, extract_fn=lambda body: "STORY: b0")
-        async with app.run_test(size=SIZE) as pilot:
-            await pilot.press("enter")
-            await _drain(app, pilot)
-            assert [s.text for s in nl.stories] == ["b0"]
-
-    async def test_no_auto_seed_when_stories_present(self, tmp_path):
-        nl = _newsletter("tg", body="b0")
-        seed_stories(nl, ["existing"])
-        calls = []
-        app = _label_app([nl], tmp_path, extract_fn=lambda body: calls.append(1) or "STORY: x")
-        async with app.run_test(size=SIZE) as pilot:
-            await pilot.press("enter")
-            await _drain(app, pilot)
-            assert calls == []  # never extracted
-            assert [s.text for s in nl.stories] == ["existing"]
-
-    async def test_no_auto_seed_when_reviewed(self, tmp_path):
-        nl = _newsletter("tg", body="b0", reviewed=True)
-        calls = []
-        app = _label_app([nl], tmp_path, extract_fn=lambda body: calls.append(1) or "STORY: x")
-        async with app.run_test(size=SIZE) as pilot:
-            await pilot.press("enter")
-            await _drain(app, pilot)
-            assert calls == []
-
-    async def test_no_auto_seed_in_edit_mode(self, tmp_path):
-        nl = _newsletter("tg", body="b0")
-        app = _label_app([nl], tmp_path, extract_fn=None)
-        async with app.run_test(size=SIZE) as pilot:
-            await pilot.press("enter")
-            await _drain(app, pilot)
-            assert nl.stories == []
-
-
-class TestDetailReseed:
-    async def test_reseed_over_existing_stories_requires_confirmation(self, tmp_path):
-        nl = _newsletter("tg", body="b0\nb1")
-        seed_stories(nl, ["b0"])
-        assign_scores_and_themes(nl.stories[0], _scores(), {"scripture": "emphasized"})
-        app = _label_app([nl], tmp_path, extract_fn=lambda body: "STORY: b1")
-        async with app.run_test(size=SIZE) as pilot:
-            await pilot.press("enter", "r")
-            await pilot.press("n")  # y/N: keep the curated story
-            await _drain(app, pilot)
-            assert [s.text for s in nl.stories] == ["b0"]
-            assert nl.stories[0].expected_scores == _scores()
-            assert "Seed cancelled" in _status(app)
-
-    async def test_confirmed_reseed_replaces_and_reports_count(self, tmp_path):
-        nl = _newsletter("tg", body="b0\nb1")
-        seed_stories(nl, ["b0"])
-        app = _label_app([nl], tmp_path, extract_fn=lambda body: "STORY: b1")
-        async with app.run_test(size=SIZE) as pilot:
-            await pilot.press("enter", "r")
-            await pilot.press("y")
-            await _drain(app, pilot)
-            assert [s.text for s in nl.stories] == ["b1"]
-            assert "Seeded 1" in _status(app)
-
-    async def test_no_stories_verdict_is_reported_distinctly(self, tmp_path):
-        nl = _newsletter("tg", body="admin only")
-        app = _label_app([nl], tmp_path, extract_fn=lambda body: "NO_STORIES")
-        async with app.run_test(size=SIZE) as pilot:
-            await pilot.press("enter")  # auto-seed returns NO_STORIES
-            await _drain(app, pilot)
-            assert "NO_STORIES" in _status(app)
-
-    async def test_edit_mode_reseed_key_reports_seeding_disabled(self, tmp_path):
-        nl = _newsletter("tg", body="b0")
-        seed_stories(nl, ["b0"])
-        app = _label_app([nl], tmp_path, extract_fn=None)
-        async with app.run_test(size=SIZE) as pilot:
-            await pilot.press("enter", "r")
-            await _drain(app, pilot)
-            assert [s.text for s in nl.stories] == ["b0"]
-            assert "edit mode" in _status(app).lower()
-
-    async def test_seed_failure_keeps_stories_and_undo_clean(self, tmp_path):
-        def boom(body):
-            raise RuntimeError("connection dropped")
-
-        nl = _newsletter("tg", body="b0")
-        app = _label_app([nl], tmp_path, extract_fn=boom)
-        async with app.run_test(size=SIZE) as pilot:
-            await pilot.press("enter")  # auto-seed fails
-            await _drain(app, pilot)
-            assert "Seed failed" in _screen_text(app)
-            await pilot.press("x")  # any key dismisses the hint
-            await _drain(app, pilot)
-            assert nl.stories == []
-            await pilot.press("z")
-            assert "Nothing to undo" in _status(app)
-
-    async def test_second_reseed_while_seeding_is_ignored(self, tmp_path):
-        import threading
-
-        release = threading.Event()
-        calls = []
-
-        def slow_extract(body):
-            calls.append(1)
-            release.wait(timeout=5)
-            return "STORY: b0"
-
-        nl = _newsletter("tg", body="b0")
-        app = _label_app([nl], tmp_path, extract_fn=slow_extract)
-        async with app.run_test(size=SIZE) as pilot:
-            await pilot.press("enter")  # auto-seed starts (in flight)
-            await pilot.pause()
-            await pilot.press("r")  # while the first seed is in flight
-            release.set()
-            await _drain(app, pilot)
-            assert len(calls) == 1
-            assert [s.text for s in nl.stories] == ["b0"]
-
-
 class TestDetailUndo:
     async def test_undo_stack_restores_multiple_edits(self, tmp_path):
         nl = _newsletter("tU", body="b0")
-        seed_stories(nl, ["a", "b", "c"])
+        populate_stories(nl, ["a", "b", "c"])
         app = _label_app([nl], tmp_path)
         async with app.run_test(size=SIZE) as pilot:
             await pilot.press("enter")
@@ -1230,7 +958,7 @@ class TestDetailUndo:
 
     async def test_cancelled_prompt_does_not_clobber_undo(self, tmp_path):
         nl = _newsletter("tU", body="b0")
-        seed_stories(nl, ["a", "b"])
+        populate_stories(nl, ["a", "b"])
         assign_scores_and_themes(nl.stories[1], _scores(), {})
         app = _label_app([nl], tmp_path)
         async with app.run_test(size=SIZE) as pilot:
@@ -1251,7 +979,7 @@ class TestDetailUndo:
 class TestDetailDelete:
     async def test_deleting_labeled_story_requires_confirmation(self, tmp_path):
         nl = _newsletter("tD", body="b0")
-        seed_stories(nl, ["a"])
+        populate_stories(nl, ["a"])
         assign_scores_and_themes(nl.stories[0], _scores(), {})
         app = _label_app([nl], tmp_path)
         async with app.run_test(size=SIZE) as pilot:
@@ -1261,7 +989,7 @@ class TestDetailDelete:
 
     async def test_confirmed_delete_of_labeled_story_reports_what_was_deleted(self, tmp_path):
         nl = _newsletter("tD", body="b0")
-        seed_stories(nl, ["a"])
+        populate_stories(nl, ["a"])
         assign_scores_and_themes(nl.stories[0], _scores(), {})
         app = _label_app([nl], tmp_path)
         async with app.run_test(size=SIZE) as pilot:
@@ -1272,7 +1000,7 @@ class TestDetailDelete:
 
     async def test_delete_without_selection_reports_hint(self, tmp_path):
         nl = _newsletter("tD", body="b0")
-        seed_stories(nl, ["a"])
+        populate_stories(nl, ["a"])
         app = _label_app([nl], tmp_path)
         async with app.run_test(size=SIZE) as pilot:
             await pilot.press("enter")
@@ -1282,7 +1010,7 @@ class TestDetailDelete:
 
     async def test_autosave_persists_mutation_to_disk_before_quit(self, tmp_path):
         nl = _newsletter("tD", body="b0")
-        seed_stories(nl, ["a", "b"])
+        populate_stories(nl, ["a", "b"])
         path = tmp_path / "golden.jsonl"
         save_golden_set([nl], path)
         app = _label_app([nl], tmp_path)
@@ -1313,7 +1041,7 @@ class TestDetailSpanNew:
         # two-press flow can commit, instead of stranding it on the header where
         # Enter can never mark a boundary.
         nl = _newsletter("tA", body="b0\nb1")
-        app = _label_app([nl], tmp_path)  # no extract_fn -> no auto-seed
+        app = _label_app([nl], tmp_path)
         async with app.run_test(size=SIZE) as pilot:
             await pilot.press("enter")           # open detail; cursor on header
             await pilot.press("a")               # add-story from the header row
@@ -1353,7 +1081,7 @@ class TestDetailSpanNew:
 class TestDetailSpanEdit:
     async def test_edit_extends_selected_story_end_preserving_labels(self, tmp_path):
         nl = _newsletter("tE", body="l0\nl1\nl2\nl3")
-        seed_stories(nl, ["l1"])  # story spans body line 1 only
+        populate_stories(nl, ["l1"])  # story spans body line 1 only
         assign_scores_and_themes(nl.stories[0], _scores(), {"church": "emphasized"})
         app = _label_app([nl], tmp_path)
         async with app.run_test(size=SIZE) as pilot:
@@ -1370,7 +1098,7 @@ class TestDetailSpanEdit:
         # Distinguishes span_set_end from span_set_start at the keystroke level:
         # in adjust mode, `e` at the cursor sets the END, keeping the start.
         nl = _newsletter("tE", body="l0\nl1\nl2\nl3")
-        seed_stories(nl, ["l1"])  # story spans body line 1
+        populate_stories(nl, ["l1"])  # story spans body line 1
         app = _label_app([nl], tmp_path)
         async with app.run_test(size=SIZE) as pilot:
             await pilot.press("enter")
@@ -1383,7 +1111,7 @@ class TestDetailSpanEdit:
 
     async def test_edit_unlocatable_story_falls_back_to_text_prompt(self, tmp_path):
         nl = _newsletter("tE", body="l0\nl1")
-        seed_stories(nl, ["text that is not in the body"])
+        populate_stories(nl, ["text that is not in the body"])
         app = _label_app([nl], tmp_path)
         async with app.run_test(size=SIZE) as pilot:
             await pilot.press("enter")
@@ -1401,7 +1129,7 @@ class TestDetailSpanEdit:
         # prefill unchanged must keep the original multi-line text rather than
         # silently flattening the newlines into spaces.
         nl = _newsletter("tE", body="l0\nl1")
-        seed_stories(nl, ["multi\nline story not in body"])
+        populate_stories(nl, ["multi\nline story not in body"])
         app = _label_app([nl], tmp_path)
         async with app.run_test(size=SIZE) as pilot:
             await pilot.press("enter")
@@ -1414,7 +1142,7 @@ class TestDetailSpanEdit:
         # Escaping the fallback text prompt must not mutate the story or push an
         # undo level.
         nl = _newsletter("tE", body="l0\nl1")
-        seed_stories(nl, ["text that is not in the body"])
+        populate_stories(nl, ["text that is not in the body"])
         app = _label_app([nl], tmp_path)
         async with app.run_test(size=SIZE) as pilot:
             await pilot.press("enter")
@@ -1428,7 +1156,7 @@ class TestDetailSpanEdit:
     async def test_unlocatable_fallback_unchanged_text_is_a_noop(self, tmp_path):
         # Submitting the prefilled (unchanged) text is a no-op: no undo, no save.
         nl = _newsletter("tE", body="l0\nl1")
-        seed_stories(nl, ["text that is not in the body"])
+        populate_stories(nl, ["text that is not in the body"])
         app = _label_app([nl], tmp_path)
         async with app.run_test(size=SIZE) as pilot:
             await pilot.press("enter")
@@ -1441,7 +1169,7 @@ class TestDetailSpanEdit:
 
     async def test_edit_without_selection_reports_hint(self, tmp_path):
         nl = _newsletter("tE", body="l0")
-        seed_stories(nl, ["l0"])
+        populate_stories(nl, ["l0"])
         app = _label_app([nl], tmp_path)
         async with app.run_test(size=SIZE) as pilot:
             await pilot.press("enter", "e")
@@ -1451,7 +1179,7 @@ class TestDetailSpanEdit:
 class TestDetailClearAll:
     async def test_clear_all_after_confirm_empties_stories(self, tmp_path):
         nl = _newsletter("tX", body="l0\nl1")
-        seed_stories(nl, ["l0", "l1"])
+        populate_stories(nl, ["l0", "l1"])
         app = _label_app([nl], tmp_path)
         async with app.run_test(size=SIZE) as pilot:
             await pilot.press("enter")
@@ -1463,7 +1191,7 @@ class TestDetailClearAll:
 
     async def test_clear_all_cancel_keeps_stories(self, tmp_path):
         nl = _newsletter("tX", body="l0")
-        seed_stories(nl, ["l0"])
+        populate_stories(nl, ["l0"])
         app = _label_app([nl], tmp_path)
         async with app.run_test(size=SIZE) as pilot:
             await pilot.press("enter")
@@ -1475,7 +1203,7 @@ class TestDetailClearAll:
 class TestDetailSelection:
     async def test_number_and_np_keys_select_stories(self, tmp_path):
         nl = _newsletter("tS", body="l0\nl1\nl2")
-        seed_stories(nl, ["l0", "l1", "l2"])
+        populate_stories(nl, ["l0", "l1", "l2"])
         app = _label_app([nl], tmp_path)
         async with app.run_test(size=SIZE) as pilot:
             await pilot.press("enter")
@@ -1488,7 +1216,7 @@ class TestDetailSelection:
 
     async def test_strip_marks_selected_story(self, tmp_path):
         nl = _newsletter("tS", body="l0\nl1")
-        seed_stories(nl, ["l0", "l1"])
+        populate_stories(nl, ["l0", "l1"])
         app = _label_app([nl], tmp_path)
         async with app.run_test(size=SIZE) as pilot:
             await pilot.press("enter", "2")
@@ -1499,7 +1227,7 @@ class TestDetailSelection:
 
     async def test_enter_on_a_story_body_row_selects_it(self, tmp_path):
         nl = _newsletter("tS", body="l0\nl1\nl2")
-        seed_stories(nl, ["l1"])  # story on body line 1
+        populate_stories(nl, ["l1"])  # story on body line 1
         app = _label_app([nl], tmp_path)
         async with app.run_test(size=SIZE) as pilot:
             await pilot.press("enter")
@@ -1554,7 +1282,7 @@ class TestDetailRowCache:
     async def test_mutation_rebuilds_rows(self, tmp_path, monkeypatch):
         calls = self._counting(monkeypatch)
         nl = _newsletter("tP", body="b0\nb1")
-        seed_stories(nl, ["b0"])
+        populate_stories(nl, ["b0"])
         app = _label_app([nl], tmp_path)
         async with app.run_test(size=SIZE) as pilot:
             await pilot.press("enter")
@@ -1593,7 +1321,7 @@ class TestDetailNotes:
 class TestDetailLabeling:
     async def test_label_flow_assigns_scores_and_saves(self, tmp_path):
         nl = _newsletter("tL", body="b0")
-        seed_stories(nl, ["a"])
+        populate_stories(nl, ["a"])
         app = _label_app([nl], tmp_path)
         async with app.run_test(size=SIZE) as pilot:
             await pilot.press("enter")
@@ -1607,7 +1335,7 @@ class TestDetailLabeling:
 
     async def test_label_without_selection_reports_hint(self, tmp_path):
         nl = _newsletter("tL", body="b0")
-        seed_stories(nl, ["a"])
+        populate_stories(nl, ["a"])
         app = _label_app([nl], tmp_path)
         async with app.run_test(size=SIZE) as pilot:
             await pilot.press("enter", "l")
@@ -1615,7 +1343,7 @@ class TestDetailLabeling:
 
     async def test_relabeling_shows_current_scores(self, tmp_path):
         nl = _newsletter("tL", body="b0")
-        seed_stories(nl, ["a"])
+        populate_stories(nl, ["a"])
         assign_scores_and_themes(
             nl.stories[0],
             {"simple": 2, "concrete": 3, "personal": 3, "dynamic": 1},
@@ -1630,7 +1358,7 @@ class TestDetailLabeling:
 
     async def test_cancelled_score_entry_reports_it(self, tmp_path):
         nl = _newsletter("tL", body="b0")
-        seed_stories(nl, ["a"])
+        populate_stories(nl, ["a"])
         app = _label_app([nl], tmp_path)
         async with app.run_test(size=SIZE) as pilot:
             await pilot.press("enter")
@@ -1643,7 +1371,7 @@ class TestDetailLabeling:
         # The score scale narrowed from 1-5 to 1-3 (issue #53): '4' is no longer
         # a valid score key and cancels entry like any other key.
         nl = _newsletter("tL", body="b0")
-        seed_stories(nl, ["a"])
+        populate_stories(nl, ["a"])
         app = _label_app([nl], tmp_path)
         async with app.run_test(size=SIZE) as pilot:
             await pilot.press("enter")
@@ -1654,7 +1382,7 @@ class TestDetailLabeling:
 
     async def test_theme_cycle_absent_present_emphasized(self, tmp_path):
         nl = _newsletter("tL", body="b0")
-        seed_stories(nl, ["a"])
+        populate_stories(nl, ["a"])
         app = _label_app([nl], tmp_path)
         async with app.run_test(size=SIZE) as pilot:
             await pilot.press("enter")
@@ -1673,7 +1401,7 @@ class TestDetailLabeling:
 class TestDetailAccept:
     async def test_accept_marks_reviewed_and_advances(self, tmp_path):
         nls = [_newsletter("t0", body="b0"), _newsletter("t1", body="b1")]
-        seed_stories(nls[0], ["b0"])
+        populate_stories(nls[0], ["b0"])
         assign_scores_and_themes(nls[0].stories[0], _scores(), {})
         app = _label_app(nls, tmp_path)
         async with app.run_test(size=SIZE) as pilot:
@@ -1685,7 +1413,7 @@ class TestDetailAccept:
 
     async def test_accept_warns_about_unlabeled_stories(self, tmp_path):
         nl = _newsletter("tL", body="b0")
-        seed_stories(nl, ["a", "b"])
+        populate_stories(nl, ["a", "b"])
         app = _label_app([nl], tmp_path)
         async with app.run_test(size=SIZE) as pilot:
             await pilot.press("enter")
@@ -1696,7 +1424,7 @@ class TestDetailAccept:
 
     async def test_accept_warning_declined_keeps_editing(self, tmp_path):
         nl = _newsletter("tL", body="b0")
-        seed_stories(nl, ["a"])
+        populate_stories(nl, ["a"])
         app = _label_app([nl], tmp_path)
         async with app.run_test(size=SIZE) as pilot:
             await pilot.press("enter")
@@ -1709,7 +1437,7 @@ class TestDetailAccept:
         from evals.newsletter_label import DetailScreen
 
         nl = _newsletter("t0", body="b0")
-        seed_stories(nl, ["b0"])
+        populate_stories(nl, ["b0"])
         assign_scores_and_themes(nl.stories[0], _scores(), {})
         app = _label_app([nl], tmp_path)
         async with app.run_test(size=SIZE) as pilot:
@@ -1726,7 +1454,7 @@ class TestDetailAccept:
 
         nls = [_newsletter(f"t{i}", body=f"b{i}") for i in range(3)]
         for nl in nls:
-            seed_stories(nl, [f"b{nls.index(nl)}"])
+            populate_stories(nl, [f"b{nls.index(nl)}"])
             assign_scores_and_themes(nl.stories[0], _scores(), {})
         app = _label_app(nls, tmp_path)
         async with app.run_test(size=SIZE) as pilot:
@@ -1755,7 +1483,7 @@ class TestDetailAccept:
 
         nls = [_newsletter(f"t{i}", body=f"b{i}") for i in range(3)]
         for i, nl in enumerate(nls):
-            seed_stories(nl, [f"b{i}"])
+            populate_stories(nl, [f"b{i}"])
             assign_scores_and_themes(nl.stories[0], _scores(), {})
         app = _label_app(nls, tmp_path)
         async with app.run_test(size=SIZE) as pilot:
@@ -1774,7 +1502,7 @@ class TestDetailAccept:
 class TestDetailStoryExclusion:
     async def test_u_toggles_selected_story_exclusion(self, tmp_path):
         nl = _newsletter("tX", body="b0")
-        seed_stories(nl, ["a"])
+        populate_stories(nl, ["a"])
         app = _label_app([nl], tmp_path)
         async with app.run_test(size=SIZE) as pilot:
             await pilot.press("enter")
@@ -1819,7 +1547,7 @@ class TestDetailModeGating:
         # While marking a span, the browse action keys (delete / accept / clear /
         # label / select) must not fire — only span controls act.
         nl = _newsletter("tG", body="l0\nl1\nl2")
-        seed_stories(nl, ["l0"])
+        populate_stories(nl, ["l0"])
         app = _label_app([nl], tmp_path)
         async with app.run_test(size=SIZE) as pilot:
             await pilot.press("enter")
@@ -1836,13 +1564,13 @@ class TestDetailModeGating:
             assert isinstance(app.screen, DetailScreen)  # no modal stacked
 
     async def test_state_changing_browse_keys_are_inert_in_span_mode(self, tmp_path):
-        # The remaining span-guarded browse keys (r reseed, n/p select, N notes,
+        # The remaining span-guarded browse keys (n/p select, N notes,
         # u exclude, z undo, X exclude-nl) must not mutate state while a span is
-        # being marked — a stray undo/reseed there would desync span_edit's
+        # being marked — a stray undo there would desync span_edit's
         # story_index from a rebuilt story list.
         nl = _newsletter("tG", body="l0\nl1\nl2", notes="keep")
-        seed_stories(nl, ["l0", "l2"])
-        app = _label_app([nl], tmp_path, extract_fn=lambda body: "STORY: l1")
+        populate_stories(nl, ["l0", "l2"])
+        app = _label_app([nl], tmp_path)
         async with app.run_test(size=SIZE) as pilot:
             await pilot.press("enter")
             await pilot.press("1")               # select story 1 (build undo isn't needed)
@@ -1850,12 +1578,12 @@ class TestDetailModeGating:
             assert _detail(app).mode == "span"
             span_before = _detail(app).span_edit
             sel_before = _detail(app).selected_story
-            await pilot.press("r", "n", "p", "N", "u", "z", "X")
+            await pilot.press("n", "p", "N", "u", "z", "X")
             await pilot.pause()
             assert _detail(app).mode == "span"        # still marking
             assert _detail(app).span_edit == span_before   # boundary untouched
             assert _detail(app).selected_story == sel_before
-            assert [s.text for s in nl.stories] == ["l0", "l2"]  # r/z didn't fire
+            assert [s.text for s in nl.stories] == ["l0", "l2"]  # z didn't fire
             assert nl.notes == "keep"                 # N didn't fire
             assert nl.excluded is False               # X didn't fire
             assert nl.stories[0].excluded is False    # u didn't fire
@@ -1968,7 +1696,7 @@ class TestCli:
 
         monkeypatch.setattr(label, "label_loop", fake_loop)
         monkeypatch.setattr(
-            sys, "argv", ["newsletter_label", "--golden-set", str(path), "--edit"]
+            sys, "argv", ["newsletter_label", "--golden-set", str(path)]
         )
         label.cli()
 
@@ -1985,7 +1713,7 @@ class TestCli:
 
         monkeypatch.setattr(
             sys, "argv",
-            ["newsletter_label", "--golden-set", str(tmp_path / "nope.jsonl"), "--edit"],
+            ["newsletter_label", "--golden-set", str(tmp_path / "nope.jsonl")],
         )
         with pytest.raises(SystemExit):
             label.cli()
@@ -2014,7 +1742,7 @@ class TestCli:
         monkeypatch.setattr(label, "label_loop", fake_loop)
         monkeypatch.setattr(
             sys, "argv",
-            ["newsletter_label", "--golden-set", str(path), "--unreviewed-only", "--edit"],
+            ["newsletter_label", "--golden-set", str(path), "--unreviewed-only"],
         )
         label.cli()
 
@@ -2026,7 +1754,7 @@ class TestModalRobustness:
         from textual import events
 
         nl = _newsletter("tR", body="b0")
-        seed_stories(nl, ["a"])
+        populate_stories(nl, ["a"])
         app = _label_app([nl], tmp_path)
         async with app.run_test(size=SIZE) as pilot:
             await pilot.press("enter")
@@ -2060,10 +1788,10 @@ class TestModalRobustness:
         from textual import events
 
         nl = _newsletter("tR", body="b0")
-        seed_stories(nl, ["b0"])
-        app = _label_app([nl], tmp_path, extract_fn=lambda body: "STORY: x")
+        populate_stories(nl, ["b0"])
+        app = _label_app([nl], tmp_path)
         async with app.run_test(size=SIZE) as pilot:
-            await pilot.press("enter", "r")
+            await pilot.press("enter", "C")  # clear-all shows a ConfirmScreen
             app.post_message(events.Key("n", "n"))
             app.post_message(events.Key("n", "n"))
             await _drain(app, pilot)
@@ -2077,7 +1805,7 @@ class TestModalRobustness:
         from textual import events
 
         nl = _newsletter("tR", body="b0")
-        seed_stories(nl, ["a", "b"])
+        populate_stories(nl, ["a", "b"])
         assign_scores_and_themes(nl.stories[0], _scores(), {})
         app = _label_app([nl], tmp_path)
         async with app.run_test(size=SIZE) as pilot:
@@ -2105,30 +1833,6 @@ class TestModalRobustness:
             assert "\x1b" not in nl.notes
             assert "\x07" not in nl.notes
             assert "good" in nl.notes and "note" in nl.notes
-
-
-class TestSeedAbort:
-    async def test_escape_during_seed_discards_the_seed_result(self, tmp_path):
-        import threading
-
-        release = threading.Event()
-
-        def slow_extract(body):
-            release.wait(timeout=5)
-            return "STORY: Machine seed"
-
-        nl = _newsletter("tA", body="b0")
-        seed_stories(nl, ["Hand curated"])
-        nl.reviewed = True
-        app = _label_app([nl], tmp_path, extract_fn=slow_extract)
-        async with app.run_test(size=SIZE) as pilot:
-            await pilot.press("enter", "r", "y")  # confirm reseed, in flight
-            await pilot.pause()
-            await pilot.press("escape")            # abandon mid-seed
-            release.set()
-            await _drain(app, pilot)
-            assert [s.text for s in nl.stories] == ["Hand curated"]
-            assert nl.reviewed is True
 
 
 class TestStatusLifecycle:
@@ -2173,3 +1877,40 @@ class TestLabelAppReviewFindings:
             assert len(app.screen_stack) == 2  # base + ONE detail
             await pilot.press("escape")
             assert not isinstance(app.screen, DetailScreen)
+
+
+class TestSeedingRemoved:
+    """Issue #59: LLM seeding removed — curation is manual-only, always."""
+
+    def test_cli_has_no_edit_flag(self, monkeypatch):
+        """With seeding gone there is no LLM mode to disable, so --edit is gone."""
+        import argparse
+
+        from evals import newsletter_label
+
+        captured = {}
+
+        def capture(parser_self, *args, **kwargs):
+            captured["parser"] = parser_self
+            raise SystemExit(0)
+
+        monkeypatch.setattr(argparse.ArgumentParser, "parse_args", capture)
+        with pytest.raises(SystemExit):
+            newsletter_label.cli()
+        flags = {
+            opt
+            for action in captured["parser"]._actions
+            for opt in action.option_strings
+        }
+        assert "--edit" not in flags
+
+    async def test_r_key_is_inert_in_browse_mode(self, tmp_path):
+        """`r` is no longer bound: no reseed, no status chatter about seeding."""
+        nl = _newsletter("tg", body="b0")
+        nl.stories = [GoldenStory(story_id="tg:0", text="b0")]
+        app = _label_app([nl], tmp_path)
+        async with app.run_test(size=SIZE) as pilot:
+            await pilot.press("enter", "r")
+            await _drain(app, pilot)
+            assert [s.text for s in nl.stories] == ["b0"]
+            assert "seed" not in _status(app).lower()

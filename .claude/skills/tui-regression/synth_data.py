@@ -68,7 +68,7 @@ def newsletters() -> list[GoldenNewsletter]:
         subject="(empty body newsletter)", body="",
     ))
 
-    # 2. Single-line body, unreviewed, no stories -> auto-seed fires on open.
+    # 2. Single-line body, unreviewed, no stories (populated by scenarios as needed).
     nls.append(GoldenNewsletter(
         thread_id="nl-single", message_id="m-single", sender="updates@dm.org",
         subject="One story", body="Sarah joined campus ministry as a freshman and found faith.",
@@ -109,7 +109,7 @@ def newsletters() -> list[GoldenNewsletter]:
     reviewed = GoldenNewsletter(
         thread_id="nl-reviewed", message_id="m-rev", sender="done@dm.org",
         subject="Already reviewed", body="Dana mentored three interns over the summer.",
-        reviewed=True, seeded_from="parse_stories",
+        reviewed=True,
     )
     s = GoldenStory(story_id="nl-reviewed:0", text="Dana mentored three interns over the summer.",
                     expected_scores=_scores(3, 3, 3, 3), expected_tier="excellent",
@@ -125,11 +125,10 @@ def newsletters() -> list[GoldenNewsletter]:
     )
     nls.append(excl)
 
-    # 8. Pre-seeded story whose text is NOT in the body -> text-edit fallback.
+    # 8. Pre-populated story whose text is NOT in the body -> text-edit fallback.
     unloc = GoldenNewsletter(
         thread_id="nl-unlocatable", message_id="m-unloc", sender="edit@dm.org",
         subject="Unlocatable story", body="Body line one.\nBody line two.",
-        seeded_from="parse_stories",
     )
     unloc.stories = [GoldenStory(
         story_id="nl-unlocatable:0",
@@ -141,7 +140,7 @@ def newsletters() -> list[GoldenNewsletter]:
     many_body = "\n\n".join(f"Story number {i} about ministry work in region {i}." for i in range(12))
     many = GoldenNewsletter(
         thread_id="nl-many", message_id="m-many", sender="lots@dm.org",
-        subject="Twelve stories", body=many_body, seeded_from="parse_stories",
+        subject="Twelve stories", body=many_body,
     )
     many.stories = [
         GoldenStory(story_id=f"nl-many:{i}", text=f"Story number {i} about ministry work in region {i}.")
@@ -160,7 +159,6 @@ def newsletters() -> list[GoldenNewsletter]:
             "\n"
             "A separate short story about a baptism."
         ),
-        seeded_from="parse_stories",
     )
     mixed.stories = [
         GoldenStory(

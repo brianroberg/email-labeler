@@ -186,6 +186,23 @@ To classify only newsletters (skipping all other emails):
 NEWSLETTER_ONLY=1 docker compose up email-labeler
 ```
 
+**⚠️ Newsletter assessments need a volume mount.** The daemon appends newsletter
+grading records to `data/newsletter_assessments.jsonl` — a path relative to the
+container's working directory (`/app`). Without a bind mount the records land in
+the container's writable layer and are **destroyed the next time the container is
+recreated** (`docker compose up -d` with a new image). Mount the host directory
+you browse with `python -m newsletter_review`:
+
+```yaml
+services:
+  email-labeler:
+    volumes:
+      - ./data:/app/data   # or an absolute host path
+```
+
+The daemon logs the resolved absolute path at startup
+(`Newsletter assessments append to: ...`) — check it points at the mount.
+
 ## Resilience
 
 The daemon is designed to run unattended and recover from transient failures:

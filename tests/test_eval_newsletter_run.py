@@ -557,7 +557,7 @@ def _full_config():
 class TestBuildMeta:
     def test_records_prompt_hash_model_and_system_prompts(self):
         cfg = _full_config()
-        golden = [_newsletter("nl1", reviewed=True, seeded_from="parse_stories",
+        golden = [_newsletter("nl1", reviewed=True,
                               stories=[_story("nl1:0"), _story("nl1:1")])]
         meta = build_meta(
             config=cfg, config_path="config.toml", golden_path="g.jsonl",
@@ -575,8 +575,6 @@ class TestBuildMeta:
         assert meta.theme_system_prompt == "theme sys"
         assert meta.temperature == 0.0
         assert meta.max_tokens == 1024
-        # seeded_from pulled from the golden set
-        assert meta.seeded_from == "parse_stories"
 
     def test_story_count_counts_only_labeled_stories(self):
         """story_count must match what a story-mode run actually evaluates,

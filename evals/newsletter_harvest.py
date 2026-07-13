@@ -163,7 +163,6 @@ async def harvest_newsletters(
                 stories=[],
                 source="harvested",
                 harvested_at=now,
-                seeded_from="",
                 reviewed=False,
             )
             results.append(golden)

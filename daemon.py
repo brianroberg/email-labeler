@@ -788,6 +788,17 @@ async def run_daemon() -> None:
         newsletter_recipient = nl_config["recipient"]
         newsletter_output_file = nl_config.get("output_file", "")
         log.info("Newsletter classification enabled for: %s", newsletter_recipient)
+        if newsletter_output_file:
+            # Log the RESOLVED path: output_file is relative to the process
+            # working directory, so in Docker (WORKDIR /app) a missing bind
+            # mount for this directory silently strands assessments in the
+            # container layer — lost on the next recreate. Making the absolute
+            # destination visible up front is the deployment sanity check.
+            log.info(
+                "Newsletter assessments append to: %s (persist this path via a "
+                "volume mount when running in Docker)",
+                Path(newsletter_output_file).resolve(),
+            )
 
     newsletter_only = os.environ.get("NEWSLETTER_ONLY", "").strip().lower() in ("1", "true", "yes")
     if newsletter_only:
