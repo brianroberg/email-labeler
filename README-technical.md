@@ -223,6 +223,21 @@ Check container health with:
 docker inspect --format='{{.State.Health.Status}}' agent-stack-email-labeler-1
 ```
 
+### Out-of-funds halt (healthy but halted)
+
+When an LLM provider reports the account is out of funds (HTTP 402, or a body
+carrying a balance/quota signature such as Novita's `NOT_ENOUGH_BALANCE` —
+raised as `LLMBalanceError`), the daemon stops polling entirely: the fault is
+account-wide, so per-thread retries would only burn the backlog into
+`agent/attempted`. The triggering thread is left unprocessed. The halt is
+in-memory only; **restarting the daemon is the only reset**. While halted the
+daemon logs this line at ERROR once per poll interval and keeps the healthcheck
+timestamp fresh (deliberately halted, not hung — the container stays healthy):
+
+```
+Daemon halted — <reason>. Add funds to the provider account, then restart the daemon to resume processing.
+```
+
 ## TUI Conventions (Textual)
 
 All interactive terminal UIs use [Textual](https://textual.textualize.io/) (a runtime
@@ -252,10 +267,10 @@ Conventions shared by every TUI:
 
 | Test file | Module | What's covered |
 |---|---|---|
-| `test_llm_client.py` | `llm_client.py` | Request format, auth headers, `<think>` tag stripping, error handling, availability checks |
+| `test_llm_client.py` | `llm_client.py` | Request format, auth headers, `<think>` tag stripping, error handling, out-of-funds (`LLMBalanceError`) detection, availability checks |
 | `test_classifier.py` | `classifier.py` | `parse_sender` formats, `parse_sender_type` edge cases and defaults, `parse_email_label` edge cases and defaults, cloud/local routing, full pipeline |
 | `test_labeler.py` | `labeler.py` | Label verification (all present, partial, none), label ID mapping, inbox/archive actions, single API call per email |
-| `test_daemon.py` | `daemon.py` | Service email path, person email path, MLX-unavailable skip, error isolation, config loading |
+| `test_daemon.py` | `daemon.py` | Service email path, person email path, MLX-unavailable skip, error isolation, out-of-funds halt, config loading |
 | `test_config_utils.py` | `config_utils.py` | Config loading, `{env.VAR}` substitution |
 | `test_newsletter.py` | `newsletter.py` | Newsletter story extraction, quality scoring, theme classification |
 | `test_eval_schemas.py` | `evals/schemas.py` | GoldenThread/PredictionResult/RunMeta serialization round-trips |
