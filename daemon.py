@@ -22,7 +22,7 @@ from classifier import EmailClassifier, EmailLabel, SenderType, ThreadMetadata
 from config_utils import substitute_env_vars
 from gmail_utils import decode_body, get_header
 from labeler import LabelManager, _get_priority
-from llm_client import LLMClient, LLMUnavailableError
+from llm_client import LLMBalanceError, LLMClient, LLMUnavailableError
 from newsletter import (
     NewsletterClassifier,
     NewsletterTier,
@@ -188,6 +188,29 @@ class FailureTracker:
         return out
 
 
+class DaemonHalt:
+    """Daemon-wide halt state for account-level faults (provider out of funds).
+
+    Unlike a poison thread (FailureTracker's territory), an out-of-funds provider
+    fails EVERY request: retrying per-thread just burns the backlog into
+    agent/attempted. Tripping this halts the poll loop entirely until the admin
+    adds funds and restarts. In-memory and session-scoped by design — a restart
+    is the only way to clear it. First tripper wins: threads in one
+    asyncio.gather cycle may race to trip, and the reason must stay stable.
+    """
+
+    def __init__(self):
+        self.reason: str | None = None
+
+    def trip(self, reason: str) -> None:
+        if self.reason is None:
+            self.reason = reason
+
+    @property
+    def tripped(self) -> bool:
+        return self.reason is not None
+
+
 async def _give_up_if_stuck(
     thread_id: str,
     msg_ids: list[str],
@@ -303,6 +326,7 @@ async def process_single_thread(
     fetch_sem: asyncio.Semaphore | None = None,
     write_sem: asyncio.Semaphore | None = None,
     local_deferrals: list[str] | None = None,
+    halt: "DaemonHalt | None" = None,
 ) -> bool:
     """Process a single thread through the classification pipeline.
 
@@ -340,6 +364,13 @@ async def process_single_thread(
     # give-up exists to break never converges).
     ids_to_mark = msg_ids
     try:
+        # A sibling thread in this cycle may already have tripped the halt (the
+        # provider is out of funds account-wide): don't fetch or classify —
+        # every further request is a known failure. Checked again after the
+        # fetch, before the expensive LLM stage.
+        if halt is not None and halt.tripped:
+            return False
+
         # Fetch full thread (all messages in one API call). Bounded by fetch_sem so
         # a large max_emails_per_cycle can't burst one concurrent proxy read per
         # thread (the cloud/local semaphores gate only the classify calls).
@@ -360,6 +391,12 @@ async def process_single_thread(
         # Every post-fetch branch shares this single computation.
         all_msg_ids = [msg["id"] for msg in messages]
         ids_to_mark = all_msg_ids
+
+        # Re-check after the fetch: a sibling may have tripped the halt while this
+        # thread was fetching. Everything past here issues LLM requests (including
+        # any retry backoff), which are guaranteed to fail out-of-funds too.
+        if halt is not None and halt.tripped:
+            return False
 
         # Newsletter detection — route to newsletter pipeline if applicable
         if newsletter_classifier and newsletter_recipient:
@@ -557,6 +594,14 @@ async def process_single_thread(
         # forever. (Connect/pool timeouts are LLMUnavailableError, handled above.)
         log.error("Timeout processing thread %s: %s", thread_id, exc)
         return await _give_up_if_stuck(thread_id, ids_to_mark, failure_tracker, label_manager, write_sem)
+    except LLMBalanceError as exc:
+        # Account-wide, not a thread fault (and must precede the RuntimeError arm,
+        # which it subclasses): don't count toward give-up, don't mark anything —
+        # the thread is re-processed after the admin adds funds and restarts.
+        log.error("Thread %s deferred — %s", thread_id, exc)
+        if halt is not None:
+            halt.trip(str(exc))
+        return False
     except RuntimeError as exc:
         log.error("Thread %s: %s", thread_id, exc)
         return await _give_up_if_stuck(thread_id, ids_to_mark, failure_tracker, label_manager, write_sem)
@@ -770,6 +815,10 @@ async def run_daemon() -> None:
     # a few attempts. Session-scoped — counts reset on restart.
     failure_tracker = FailureTracker()
 
+    # Account-level fault switch (provider out of funds): once tripped the poll
+    # loop stands down until the admin adds funds and restarts. Session-scoped.
+    halt = DaemonHalt()
+
     # Wait for a transiently-unreachable api-proxy to come up, then verify labels.
     missing = await verify_labels_with_retry(label_manager)
     if missing:
@@ -792,6 +841,26 @@ async def run_daemon() -> None:
     proxy_lost = False  # set by the lost-connection arm, cleared on the next good poll
 
     while True:
+        if halt.tripped:
+            # An out-of-funds provider fails EVERY request — polling on would
+            # only burn the backlog into agent/attempted. Stand down but stay
+            # alive: the heartbeat stays fresh (deliberately halted, not hung),
+            # and the instruction repeats at ERROR every cycle so it can't
+            # scroll out of the logs. Restarting the daemon is the only reset.
+            log.error(
+                "Daemon halted — %s. Add funds to the provider account, "
+                "then restart the daemon to resume processing.",
+                halt.reason,
+            )
+            try:
+                healthcheck_file.write_text(str(asyncio.get_event_loop().time()))
+            except OSError as exc:
+                # This branch sits outside the loop's try/except; a transient
+                # filesystem fault must not kill the daemon — the recurring
+                # instruction above is the whole point of the halt state.
+                log.warning("Failed to update healthcheck while halted: %s", exc)
+            await asyncio.sleep(poll_interval)
+            continue
         try:
             response = await proxy_client.list_messages(q=gmail_query, max_results=max_emails)
             messages = response.get("messages", [])
@@ -836,6 +905,7 @@ async def run_daemon() -> None:
                         fetch_sem=fetch_sem,
                         write_sem=write_sem,
                         local_deferrals=local_deferrals,
+                        halt=halt,
                     )
                     for tid, msg_ids in thread_items
                 ),

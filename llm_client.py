@@ -84,6 +84,41 @@ class LLMContentError(RuntimeError):
     """
 
 
+# Bodies that mean "the account is out of funds/credit", across providers:
+# Novita (NOT_ENOUGH_BALANCE), OpenAI-style (insufficient_quota), Anthropic
+# ("credit balance is too low", sent as HTTP 400). Deliberately narrow —
+# distinctive tokens only, no prose like "insufficient balance" that an error
+# body could echo from the email being classified (a bank alert must never
+# read as the provider being broke). DeepSeek-style "Insufficient Balance"
+# arrives with HTTP 402, which is treated as a balance error on status alone.
+_BALANCE_SIGNATURE = re.compile(
+    r"not_enough_balance|insufficient_balance|insufficient_quota"
+    r"|credit balance is too low",
+    re.IGNORECASE,
+)
+
+# Only non-retryable statuses may signal funds exhaustion (402 unconditionally;
+# 400/403 when the body matches). 429 is excluded even though some providers
+# phrase hard quota exhaustion identically to a per-minute rate limit
+# ("exceeded your current quota"): wrongly converting a transient rate limit
+# into a restart-only daemon halt is worse than letting a rare 429-signaled
+# out-of-funds fall back to per-thread give-up.
+_BALANCE_SIGNATURE_STATUSES = frozenset({400, 403})
+
+
+class LLMBalanceError(RuntimeError):
+    """The provider account is out of funds/credit (e.g. Novita's 403 NOT_ENOUGH_BALANCE).
+
+    Account-wide, not request-specific: if one request fails for lack of balance,
+    every subsequent request to the same provider will too. The daemon therefore
+    treats this as a halt condition (stop processing, tell the admin to add funds
+    and restart) rather than a per-thread give-up — the failing thread is left
+    unprocessed so it's retried after restart. Subclasses ``RuntimeError`` so
+    callers unaware of it (evals) still see a generic LLM failure; the daemon must
+    catch it *before* its ``except RuntimeError`` arm.
+    """
+
+
 class LLMClient:
     """Client for OpenAI-compatible chat completion endpoints."""
 
@@ -108,6 +143,11 @@ class LLMClient:
         # "cloud" / "local" — carried on LLMUnavailableError so callers can tell
         # a routine local outage from a surprising cloud one (issue #24).
         self.tier = tier
+
+    def _provider(self) -> str:
+        """Identify this client in error messages: which of the (up to 3) LLMClient
+        instances — cloud, local MLX, newsletter — a failure came from."""
+        return f"tier={self.tier or '-'} model={self.model} url={self.base_url}"
 
     def _is_glm_model(self) -> bool:
         """Check if model uses GLM-style reasoning_content instead of inline think tags."""
@@ -146,7 +186,11 @@ class LLMClient:
             LLMUnavailableError: If the endpoint is unreachable (connection refused
                 or connect/pool timeout) or the connection drops mid-request —
                 transient unavailability.
-            RuntimeError: If the LLM returns a non-200 response.
+            LLMBalanceError: If the non-200 response says the provider account is
+                out of funds (402, or a 400/403 whose body carries a balance
+                signature) — account-wide; the daemon halts rather than giving
+                up per-thread.
+            RuntimeError: If the LLM returns any other non-200 response.
         """
         headers = {"Content-Type": "application/json"}
         if self.api_key:
@@ -208,8 +252,17 @@ class LLMClient:
         if response.status_code != 200:
             prompt_chars = len(system_prompt) + len(user_content)
             resp_body = response.text[:500]
+            if response.status_code == 402 or (
+                response.status_code in _BALANCE_SIGNATURE_STATUSES
+                and _BALANCE_SIGNATURE.search(response.text)
+            ):
+                raise LLMBalanceError(
+                    f"LLM provider out of funds — status {response.status_code} "
+                    f"[{self._provider()}]: {resp_body}"
+                )
             raise RuntimeError(
                 f"LLM request failed with status {response.status_code} "
+                f"[{self._provider()}] "
                 f"(prompt ~{prompt_chars // 4} tokens, {prompt_chars} chars): {resp_body}"
             )
 

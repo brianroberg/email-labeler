@@ -8,6 +8,7 @@ import pytest
 from llm_client import (
     DEFAULT_AVAILABILITY_TIMEOUT,
     AvailabilityResult,
+    LLMBalanceError,
     LLMClient,
     LLMContentError,
     LLMUnavailableError,
@@ -206,6 +207,15 @@ class TestComplete:
             with pytest.raises(RuntimeError, match="LLM request failed"):
                 await cloud_client.complete("sys", "user")
 
+    async def test_http_error_message_identifies_provider(self, cloud_client):
+        """Any non-200 error message names the model and endpoint (3 clients exist)."""
+        with pytest.raises(RuntimeError) as exc_info:
+            await _post_canned(cloud_client, _mock_response(400, {"error": "bad request"}))
+
+        msg = str(exc_info.value)
+        assert "test-cloud-model" in msg
+        assert "api.cloud.example.com" in msg
+
     async def test_connect_error_surfaces_as_unavailable(self, cloud_client):
         """A refused connection (server down) surfaces as LLMUnavailableError (transient)."""
         with patch("llm_client.httpx.AsyncClient") as mock_client_cls:
@@ -354,6 +364,104 @@ class TestTier:
             with pytest.raises(LLMUnavailableError) as exc_info:
                 await cloud_client.complete("sys", "user")
         assert exc_info.value.tier is None
+
+
+async def _post_canned(client, response):
+    """Drive complete() against a canned httpx response."""
+    with patch("llm_client.httpx.AsyncClient") as mock_client_cls:
+        mock_client = AsyncMock()
+        mock_client.post.return_value = response
+        mock_client_cls.return_value.__aenter__ = AsyncMock(return_value=mock_client)
+        mock_client_cls.return_value.__aexit__ = AsyncMock(return_value=False)
+        return await client.complete("sys", "user")
+
+
+# Verbatim shape of the Novita out-of-funds response observed in production.
+NOVITA_BALANCE_BODY = {
+    "code": 403,
+    "reason": "NOT_ENOUGH_BALANCE",
+    "message": "not enough balance",
+    "metadata": {},
+}
+
+
+class TestBalanceError:
+    """Out-of-funds responses raise LLMBalanceError (account-wide: halts the daemon).
+
+    Detection must be conservative enough that an ordinary 403 (bad key, forbidden
+    route) stays a bare RuntimeError — only a payment-required status or a body
+    carrying a known balance/quota signature may trip the daemon-wide halt.
+    """
+
+    async def test_403_with_balance_body_raises_balance_error(self, cloud_client):
+        """The exact Novita NOT_ENOUGH_BALANCE response surfaces as LLMBalanceError."""
+        with pytest.raises(LLMBalanceError):
+            await _post_canned(cloud_client, _mock_response(403, NOVITA_BALANCE_BODY))
+
+    async def test_402_raises_balance_error_regardless_of_body(self, cloud_client):
+        """402 Payment Required is a balance error whatever the body says."""
+        with pytest.raises(LLMBalanceError):
+            await _post_canned(cloud_client, _mock_response(402, {"error": "payment required"}))
+
+    async def test_plain_403_stays_bare_runtime_error(self, cloud_client):
+        """A 403 without a balance signature (bad key etc.) must NOT halt the daemon."""
+        with pytest.raises(RuntimeError) as exc_info:
+            await _post_canned(cloud_client, _mock_response(403, {"error": "forbidden"}))
+        assert not isinstance(exc_info.value, LLMBalanceError)
+
+    @pytest.mark.parametrize(
+        ("status", "message"),
+        [
+            (403, "Insufficient_Quota: request rejected"),
+            (400, "Your credit balance is too low to access the Anthropic API."),
+            (400, "NOT_ENOUGH_BALANCE"),
+        ],
+    )
+    async def test_balance_signatures_matched_case_insensitively(
+        self, cloud_client, status, message
+    ):
+        """Known provider phrasings (OpenAI-style, Anthropic) count on 400/403 too."""
+        body = {"error": {"message": message, "code": "billing"}}
+        with pytest.raises(LLMBalanceError):
+            await _post_canned(cloud_client, _mock_response(status, body))
+
+    async def test_429_quota_phrasing_stays_runtime_error(self, cloud_client):
+        """A 429 must NEVER halt, even with quota phrasing: Gemini-style per-minute
+        rate limits use the same wording as hard quota exhaustion, and wrongly
+        converting a transient rate limit into a restart-only halt is worse than
+        letting a rare 429-signaled out-of-funds fall back to per-thread give-up."""
+        body = {"error": {"message": "You exceeded your current quota, please check your plan."}}
+        with patch("retry.asyncio.sleep", new=AsyncMock()):  # skip real retry backoff
+            with pytest.raises(RuntimeError) as exc_info:
+                await _post_canned(cloud_client, _mock_response(429, body))
+        assert not isinstance(exc_info.value, LLMBalanceError)
+
+    async def test_echoed_email_balance_phrase_does_not_trip(self, cloud_client):
+        """An error body that quotes the email being classified (e.g. a bank
+        'insufficient balance' alert echoed by a moderation/validation error)
+        must not read as the PROVIDER being out of funds."""
+        body = {
+            "error": "invalid request",
+            "input": "ALERT: your checking account has an insufficient balance for autopay.",
+        }
+        with pytest.raises(RuntimeError) as exc_info:
+            await _post_canned(cloud_client, _mock_response(403, body))
+        assert not isinstance(exc_info.value, LLMBalanceError)
+
+    async def test_message_identifies_provider(self):
+        """The error message names tier, model, and endpoint so logs show WHO is broke."""
+        client = LLMClient(
+            base_url="https://api.cloud.example.com/v1/chat/completions",
+            api_key="sk-test-key",
+            model="test-cloud-model",
+            tier="cloud",
+        )
+        with pytest.raises(LLMBalanceError) as exc_info:
+            await _post_canned(client, _mock_response(403, NOVITA_BALANCE_BODY))
+        msg = str(exc_info.value)
+        assert "test-cloud-model" in msg
+        assert "api.cloud.example.com" in msg
+        assert "cloud" in msg
 
 
 class TestContentlessResponse:
