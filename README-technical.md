@@ -225,11 +225,14 @@ docker inspect --format='{{.State.Health.Status}}' agent-stack-email-labeler-1
 
 ### Out-of-funds halt (healthy but halted)
 
-When an LLM provider reports the account is out of funds (HTTP 402, or a body
-carrying a balance/quota signature such as Novita's `NOT_ENOUGH_BALANCE` —
-raised as `LLMBalanceError`), the daemon stops polling entirely: the fault is
+When an LLM provider reports the account is out of funds (HTTP 402, or a
+400/403 whose body carries a balance signature such as Novita's
+`NOT_ENOUGH_BALANCE` or Anthropic's "credit balance is too low" — raised as
+`LLMBalanceError`), the daemon stops polling entirely: the fault is
 account-wide, so per-thread retries would only burn the backlog into
-`agent/attempted`. The triggering thread is left unprocessed. The halt is
+`agent/attempted`. HTTP 429 never halts, even with quota phrasing — a
+per-minute rate limit is worded identically to hard quota exhaustion, and a
+wrong restart-only halt is worse than falling back to per-thread give-up. The triggering thread is left unprocessed. The halt is
 in-memory only; **restarting the daemon is the only reset**. While halted the
 daemon logs this line at ERROR once per poll interval and keeps the healthcheck
 timestamp fresh (deliberately halted, not hung — the container stays healthy):

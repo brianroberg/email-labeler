@@ -209,16 +209,8 @@ class TestComplete:
 
     async def test_http_error_message_identifies_provider(self, cloud_client):
         """Any non-200 error message names the model and endpoint (3 clients exist)."""
-        mock_response = _mock_response(status_code=400, json_data={"error": "bad request"})
-
-        with patch("llm_client.httpx.AsyncClient") as mock_client_cls:
-            mock_client = AsyncMock()
-            mock_client.post.return_value = mock_response
-            mock_client_cls.return_value.__aenter__ = AsyncMock(return_value=mock_client)
-            mock_client_cls.return_value.__aexit__ = AsyncMock(return_value=False)
-
-            with pytest.raises(RuntimeError) as exc_info:
-                await cloud_client.complete("sys", "user")
+        with pytest.raises(RuntimeError) as exc_info:
+            await _post_canned(cloud_client, _mock_response(400, {"error": "bad request"}))
 
         msg = str(exc_info.value)
         assert "test-cloud-model" in msg
@@ -418,18 +410,43 @@ class TestBalanceError:
         assert not isinstance(exc_info.value, LLMBalanceError)
 
     @pytest.mark.parametrize(
-        "message",
+        ("status", "message"),
         [
-            "Insufficient Balance",
-            "insufficient_quota",
-            "You exceeded your current quota, please check your plan and billing details.",
+            (403, "Insufficient_Quota: request rejected"),
+            (400, "Your credit balance is too low to access the Anthropic API."),
+            (400, "NOT_ENOUGH_BALANCE"),
         ],
     )
-    async def test_balance_signatures_matched_case_insensitively(self, cloud_client, message):
-        """Known provider phrasings (DeepSeek, OpenAI-style) also count as balance errors."""
+    async def test_balance_signatures_matched_case_insensitively(
+        self, cloud_client, status, message
+    ):
+        """Known provider phrasings (OpenAI-style, Anthropic) count on 400/403 too."""
         body = {"error": {"message": message, "code": "billing"}}
         with pytest.raises(LLMBalanceError):
+            await _post_canned(cloud_client, _mock_response(status, body))
+
+    async def test_429_quota_phrasing_stays_runtime_error(self, cloud_client):
+        """A 429 must NEVER halt, even with quota phrasing: Gemini-style per-minute
+        rate limits use the same wording as hard quota exhaustion, and wrongly
+        converting a transient rate limit into a restart-only halt is worse than
+        letting a rare 429-signaled out-of-funds fall back to per-thread give-up."""
+        body = {"error": {"message": "You exceeded your current quota, please check your plan."}}
+        with patch("retry.asyncio.sleep", new=AsyncMock()):  # skip real retry backoff
+            with pytest.raises(RuntimeError) as exc_info:
+                await _post_canned(cloud_client, _mock_response(429, body))
+        assert not isinstance(exc_info.value, LLMBalanceError)
+
+    async def test_echoed_email_balance_phrase_does_not_trip(self, cloud_client):
+        """An error body that quotes the email being classified (e.g. a bank
+        'insufficient balance' alert echoed by a moderation/validation error)
+        must not read as the PROVIDER being out of funds."""
+        body = {
+            "error": "invalid request",
+            "input": "ALERT: your checking account has an insufficient balance for autopay.",
+        }
+        with pytest.raises(RuntimeError) as exc_info:
             await _post_canned(cloud_client, _mock_response(403, body))
+        assert not isinstance(exc_info.value, LLMBalanceError)
 
     async def test_message_identifies_provider(self):
         """The error message names tier, model, and endpoint so logs show WHO is broke."""

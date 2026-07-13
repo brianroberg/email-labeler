@@ -85,14 +85,25 @@ class LLMContentError(RuntimeError):
 
 
 # Bodies that mean "the account is out of funds/credit", across providers:
-# Novita (NOT_ENOUGH_BALANCE), DeepSeek-style ("Insufficient Balance"),
-# OpenAI-style (insufficient_quota / "You exceeded your current quota").
-# Matched against any non-200 body; a match is account-wide → LLMBalanceError.
+# Novita (NOT_ENOUGH_BALANCE), OpenAI-style (insufficient_quota), Anthropic
+# ("credit balance is too low", sent as HTTP 400). Deliberately narrow —
+# distinctive tokens only, no prose like "insufficient balance" that an error
+# body could echo from the email being classified (a bank alert must never
+# read as the provider being broke). DeepSeek-style "Insufficient Balance"
+# arrives with HTTP 402, which is treated as a balance error on status alone.
 _BALANCE_SIGNATURE = re.compile(
-    r"not_enough_balance|insufficient[ _]balance|insufficient[ _]quota"
-    r"|exceeded your current quota",
+    r"not_enough_balance|insufficient_balance|insufficient_quota"
+    r"|credit balance is too low",
     re.IGNORECASE,
 )
+
+# Only non-retryable statuses may signal funds exhaustion (402 unconditionally;
+# 400/403 when the body matches). 429 is excluded even though some providers
+# phrase hard quota exhaustion identically to a per-minute rate limit
+# ("exceeded your current quota"): wrongly converting a transient rate limit
+# into a restart-only daemon halt is worse than letting a rare 429-signaled
+# out-of-funds fall back to per-thread give-up.
+_BALANCE_SIGNATURE_STATUSES = frozenset({400, 403})
 
 
 class LLMBalanceError(RuntimeError):
@@ -176,8 +187,9 @@ class LLMClient:
                 or connect/pool timeout) or the connection drops mid-request —
                 transient unavailability.
             LLMBalanceError: If the non-200 response says the provider account is
-                out of funds (402, or a balance/quota signature in the body) —
-                account-wide; the daemon halts rather than giving up per-thread.
+                out of funds (402, or a 400/403 whose body carries a balance
+                signature) — account-wide; the daemon halts rather than giving
+                up per-thread.
             RuntimeError: If the LLM returns any other non-200 response.
         """
         headers = {"Content-Type": "application/json"}
@@ -240,7 +252,10 @@ class LLMClient:
         if response.status_code != 200:
             prompt_chars = len(system_prompt) + len(user_content)
             resp_body = response.text[:500]
-            if response.status_code == 402 or _BALANCE_SIGNATURE.search(response.text):
+            if response.status_code == 402 or (
+                response.status_code in _BALANCE_SIGNATURE_STATUSES
+                and _BALANCE_SIGNATURE.search(response.text)
+            ):
                 raise LLMBalanceError(
                     f"LLM provider out of funds — status {response.status_code} "
                     f"[{self._provider()}]: {resp_body}"

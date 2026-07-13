@@ -19,6 +19,12 @@ from llm_client import LLMBalanceError, LLMClient, LLMContentError, LLMUnavailab
 
 log = logging.getLogger(__name__)
 
+# Errors that affect every story, not just the one being graded: propagate out
+# of the per-story isolation handlers (to daemon give-up or the daemon halt)
+# instead of committing a permanently mis-graded newsletter. Single-sourced so
+# the quality and theme arms can't drift apart.
+_PIPELINE_WIDE_ERRORS = (LLMUnavailableError, LLMContentError, LLMBalanceError)
+
 
 class NewsletterTier(Enum):
     EXCELLENT = "excellent"
@@ -377,7 +383,7 @@ class NewsletterClassifier:
                     result.scores = scores
                     result.average_score = sum(scores.values()) / len(scores)
                     result.tier = compute_tier(scores)
-            except (LLMUnavailableError, LLMContentError, LLMBalanceError):
+            except _PIPELINE_WIDE_ERRORS:
                 # transient outage, a content-less response (issue #30), or an
                 # out-of-funds provider: all affect every story, so propagate
                 # (to give-up or the daemon halt) rather than commit a
@@ -390,7 +396,7 @@ class NewsletterClassifier:
                 themes, theme_cot = await self.classify_themes(text)
                 result.themes = themes
                 result.theme_cot = theme_cot
-            except (LLMUnavailableError, LLMContentError, LLMBalanceError):
+            except _PIPELINE_WIDE_ERRORS:
                 raise
             except Exception:
                 log.warning("Theme classification failed for story: %s", text[:60])

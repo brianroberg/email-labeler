@@ -456,6 +456,45 @@ class TestProcessSingleThread:
         assert halt.tripped is True
         assert "out of funds" in halt.reason
 
+    async def test_tripped_halt_short_circuits_before_any_work(
+        self, mock_proxy, mock_classifier, mock_label_manager, cloud_sem, local_sem,
+    ):
+        """Once the halt is tripped, sibling threads in the same cycle must not keep
+        fetching and hammering the known-dead provider."""
+        halt = DaemonHalt()
+        halt.trip("out of funds")
+
+        result = await process_single_thread(
+            "thread_next", ["msg_1"], mock_proxy, mock_classifier, mock_label_manager,
+            cloud_sem, local_sem, max_thread_chars=16000, halt=halt,
+        )
+
+        assert result is False
+        mock_proxy.get_thread.assert_not_called()
+        mock_classifier.classify_sender.assert_not_called()
+
+    async def test_halt_tripped_mid_fetch_skips_classification(
+        self, mock_proxy, mock_classifier, mock_label_manager, cloud_sem, local_sem,
+        mock_thread_response,
+    ):
+        """A thread already past the entry check when a sibling trips the halt must
+        still skip its LLM calls (the expensive step, including any retry ladder)."""
+        halt = DaemonHalt()
+
+        async def fetch_then_sibling_trips(*args, **kwargs):
+            halt.trip("out of funds")
+            return mock_thread_response
+
+        mock_proxy.get_thread.side_effect = fetch_then_sibling_trips
+
+        result = await process_single_thread(
+            "thread_next", ["msg_1"], mock_proxy, mock_classifier, mock_label_manager,
+            cloud_sem, local_sem, max_thread_chars=16000, halt=halt,
+        )
+
+        assert result is False
+        mock_classifier.classify_sender.assert_not_called()
+
     async def test_local_tier_outage_defers_quietly_and_is_counted(
         self, mock_proxy, mock_classifier, mock_label_manager, cloud_sem, local_sem,
         mock_thread_response, caplog,
@@ -1165,6 +1204,31 @@ class TestOutOfFundsHalt:
         # One write per cycle, halted or not: a stale heartbeat would misreport
         # a deliberately-halted daemon as hung.
         assert heartbeat.write_text.call_count == 3
+
+    async def test_heartbeat_write_failure_while_halted_does_not_crash(
+        self, monkeypatch, tmp_path, caplog
+    ):
+        """The halted branch sits outside the poll loop's try/except; a transient
+        filesystem fault (disk full, read-only remount) must not kill the daemon —
+        the recurring admin instruction is the whole point of the halt state."""
+        heartbeat = MagicMock()
+        heartbeat.write_text.side_effect = OSError("read-only file system")
+        real_path = daemon.Path
+
+        def spy_path(arg):
+            return heartbeat if "healthcheck" in str(arg) else real_path(arg)
+
+        monkeypatch.setattr(daemon, "Path", spy_path)
+        with caplog.at_level(logging.ERROR, logger="email-labeler"):
+            await run_poll_cycles(
+                monkeypatch, tmp_path,
+                [{"messages": [{"id": "m1", "threadId": "t1"}]}],
+                process_mock=_out_of_funds_process,
+                cycles=3,
+            )
+        # Both halted cycles survived the failed write and still logged the line.
+        halted = [r for r in caplog.records if "restart the daemon" in r.getMessage()]
+        assert len(halted) == 2
 
 
 class TestLoadConfig:

@@ -364,6 +364,13 @@ async def process_single_thread(
     # give-up exists to break never converges).
     ids_to_mark = msg_ids
     try:
+        # A sibling thread in this cycle may already have tripped the halt (the
+        # provider is out of funds account-wide): don't fetch or classify —
+        # every further request is a known failure. Checked again after the
+        # fetch, before the expensive LLM stage.
+        if halt is not None and halt.tripped:
+            return False
+
         # Fetch full thread (all messages in one API call). Bounded by fetch_sem so
         # a large max_emails_per_cycle can't burst one concurrent proxy read per
         # thread (the cloud/local semaphores gate only the classify calls).
@@ -384,6 +391,12 @@ async def process_single_thread(
         # Every post-fetch branch shares this single computation.
         all_msg_ids = [msg["id"] for msg in messages]
         ids_to_mark = all_msg_ids
+
+        # Re-check after the fetch: a sibling may have tripped the halt while this
+        # thread was fetching. Everything past here issues LLM requests (including
+        # any retry backoff), which are guaranteed to fail out-of-funds too.
+        if halt is not None and halt.tripped:
+            return False
 
         # Newsletter detection — route to newsletter pipeline if applicable
         if newsletter_classifier and newsletter_recipient:
@@ -839,7 +852,13 @@ async def run_daemon() -> None:
                 "then restart the daemon to resume processing.",
                 halt.reason,
             )
-            healthcheck_file.write_text(str(asyncio.get_event_loop().time()))
+            try:
+                healthcheck_file.write_text(str(asyncio.get_event_loop().time()))
+            except OSError as exc:
+                # This branch sits outside the loop's try/except; a transient
+                # filesystem fault must not kill the daemon — the recurring
+                # instruction above is the whole point of the halt state.
+                log.warning("Failed to update healthcheck while halted: %s", exc)
             await asyncio.sleep(poll_interval)
             continue
         try:
