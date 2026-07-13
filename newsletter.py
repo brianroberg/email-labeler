@@ -15,7 +15,7 @@ from enum import Enum
 from pathlib import Path
 
 from gmail_utils import get_header
-from llm_client import LLMClient, LLMContentError, LLMUnavailableError
+from llm_client import LLMBalanceError, LLMClient, LLMContentError, LLMUnavailableError
 
 log = logging.getLogger(__name__)
 
@@ -358,7 +358,9 @@ class NewsletterClassifier:
         propagates so the daemon retries the whole newsletter thread next cycle,
         rather than committing a permanently mis-graded newsletter (empty
         tier/themes) and marking it processed. Mirrors the email pipeline's
-        transient-outage guarantee.
+        transient-outage guarantee. An out-of-funds provider (LLMBalanceError)
+        propagates likewise: the thread stays unprocessed and the daemon halts
+        until the admin adds funds and restarts.
         """
         stories = await self.extract_stories(body)
         if not stories:
@@ -375,10 +377,11 @@ class NewsletterClassifier:
                     result.scores = scores
                     result.average_score = sum(scores.values()) / len(scores)
                     result.tier = compute_tier(scores)
-            except (LLMUnavailableError, LLMContentError):
-                # transient outage OR a content-less response (issue #30): both
-                # affect every story, so propagate to give-up rather than commit
-                # a permanently mis-graded (empty) newsletter.
+            except (LLMUnavailableError, LLMContentError, LLMBalanceError):
+                # transient outage, a content-less response (issue #30), or an
+                # out-of-funds provider: all affect every story, so propagate
+                # (to give-up or the daemon halt) rather than commit a
+                # permanently mis-graded (empty) newsletter.
                 raise
             except Exception:
                 log.warning("Quality assessment failed for story: %s", text[:60])
@@ -387,7 +390,7 @@ class NewsletterClassifier:
                 themes, theme_cot = await self.classify_themes(text)
                 result.themes = themes
                 result.theme_cot = theme_cot
-            except (LLMUnavailableError, LLMContentError):
+            except (LLMUnavailableError, LLMContentError, LLMBalanceError):
                 raise
             except Exception:
                 log.warning("Theme classification failed for story: %s", text[:60])

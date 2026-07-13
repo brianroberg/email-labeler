@@ -5,7 +5,7 @@ from unittest.mock import AsyncMock
 
 import pytest
 
-from llm_client import LLMContentError, LLMUnavailableError
+from llm_client import LLMBalanceError, LLMContentError, LLMUnavailableError
 from newsletter import (
     NewsletterClassifier,
     NewsletterTier,
@@ -553,6 +553,25 @@ class TestClassifyNewsletterTransientOutage:
             LLMContentError("model returned no content"),                  # classify_themes
         ]
         with pytest.raises(LLMContentError):
+            await nl_classifier.classify_newsletter("body")
+
+    async def test_balance_error_during_quality_propagates(self, nl_classifier, mock_cloud_llm):
+        """An out-of-funds LLMBalanceError affects every story (account-wide), so it
+        must propagate to the daemon's halt handling — not be swallowed per-story."""
+        mock_cloud_llm.complete.side_effect = [
+            ("STORY: Content", ""),                    # extract_stories
+            LLMBalanceError("provider out of funds"),  # assess_quality
+        ]
+        with pytest.raises(LLMBalanceError):
+            await nl_classifier.classify_newsletter("body")
+
+    async def test_balance_error_during_themes_propagates(self, nl_classifier, mock_cloud_llm):
+        mock_cloud_llm.complete.side_effect = [
+            ("STORY: Content", ""),                                        # extract_stories
+            ("SIMPLE: OK\nCONCRETE: OK\nPERSONAL: OK\nDYNAMIC: OK", ""),    # assess_quality
+            LLMBalanceError("provider out of funds"),                      # classify_themes
+        ]
+        with pytest.raises(LLMBalanceError):
             await nl_classifier.classify_newsletter("body")
 
     async def test_non_transient_quality_error_stays_isolated(self, nl_classifier, mock_cloud_llm):
