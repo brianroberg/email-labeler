@@ -20,6 +20,7 @@ from classifier import (
     SenderType,
 )
 from daemon import (
+    DaemonHalt,
     FailureTracker,
     IdleState,
     format_thread_transcript,
@@ -31,7 +32,7 @@ from daemon import (
     summarize_cycle,
 )
 from labeler import _get_priority
-from llm_client import LLMClient, LLMUnavailableError
+from llm_client import LLMBalanceError, LLMClient, LLMUnavailableError
 from newsletter import NewsletterTier, StoryResult
 from proxy_client import ProxyAuthError, ProxyError, ProxyUnavailableError
 
@@ -416,6 +417,45 @@ class TestProcessSingleThread:
 
         mock_label_manager.mark_processed.assert_not_called()
 
+    async def test_balance_error_never_counts_toward_give_up_or_marks(
+        self, mock_proxy, mock_classifier, mock_label_manager, cloud_sem, local_sem,
+        mock_thread_response,
+    ):
+        """An out-of-funds provider is account-wide, not a poison thread: the thread
+        must be left fully unprocessed (no agent/attempted, no agent/processed) so
+        it is retried after the admin adds funds and restarts."""
+        mock_proxy.get_thread.return_value = mock_thread_response
+        mock_classifier.classify_sender.side_effect = LLMBalanceError("out of funds")
+        tracker = FailureTracker(max_failures=2)
+
+        for _ in range(5):
+            result = await process_single_thread(
+                "thread_broke", ["msg_1"], mock_proxy, mock_classifier, mock_label_manager,
+                cloud_sem, local_sem, max_thread_chars=16000, failure_tracker=tracker,
+            )
+            assert result is False
+
+        mock_label_manager.mark_attempted.assert_not_called()
+        mock_label_manager.mark_processed.assert_not_called()
+
+    async def test_balance_error_trips_daemon_halt(
+        self, mock_proxy, mock_classifier, mock_label_manager, cloud_sem, local_sem,
+        mock_thread_response,
+    ):
+        """A balance error signals the poll loop (via DaemonHalt) to stop processing."""
+        mock_proxy.get_thread.return_value = mock_thread_response
+        mock_classifier.classify_sender.side_effect = LLMBalanceError("out of funds")
+        halt = DaemonHalt()
+
+        result = await process_single_thread(
+            "thread_broke", ["msg_1"], mock_proxy, mock_classifier, mock_label_manager,
+            cloud_sem, local_sem, max_thread_chars=16000, halt=halt,
+        )
+
+        assert result is False
+        assert halt.tripped is True
+        assert "out of funds" in halt.reason
+
     async def test_local_tier_outage_defers_quietly_and_is_counted(
         self, mock_proxy, mock_classifier, mock_label_manager, cloud_sem, local_sem,
         mock_thread_response, caplog,
@@ -783,6 +823,29 @@ class TestFailureTracker:
         t.record_failure("active")
         t.prune({"active"})
         assert t.should_give_up("active") is True  # still counted toward give-up
+
+
+class TestDaemonHalt:
+    """In-memory daemon-wide halt state (out-of-funds). Restart is the only reset."""
+
+    def test_starts_untripped(self):
+        halt = DaemonHalt()
+        assert halt.tripped is False
+        assert halt.reason is None
+
+    def test_trip_sets_reason_and_tripped(self):
+        halt = DaemonHalt()
+        halt.trip("cloud provider out of funds")
+        assert halt.tripped is True
+        assert halt.reason == "cloud provider out of funds"
+
+    def test_first_trip_wins(self):
+        # Threads in one asyncio.gather cycle may race to trip; the reason must
+        # stay stable (first wins) rather than churn with each late tripper.
+        halt = DaemonHalt()
+        halt.trip("first")
+        halt.trip("second")
+        assert halt.reason == "first"
 
 
 class TestSummarizeCycle:

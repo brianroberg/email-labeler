@@ -22,7 +22,7 @@ from classifier import EmailClassifier, EmailLabel, SenderType, ThreadMetadata
 from config_utils import substitute_env_vars
 from gmail_utils import decode_body, get_header
 from labeler import LabelManager, _get_priority
-from llm_client import LLMClient, LLMUnavailableError
+from llm_client import LLMBalanceError, LLMClient, LLMUnavailableError
 from newsletter import (
     NewsletterClassifier,
     NewsletterTier,
@@ -188,6 +188,29 @@ class FailureTracker:
         return out
 
 
+class DaemonHalt:
+    """Daemon-wide halt state for account-level faults (provider out of funds).
+
+    Unlike a poison thread (FailureTracker's territory), an out-of-funds provider
+    fails EVERY request: retrying per-thread just burns the backlog into
+    agent/attempted. Tripping this halts the poll loop entirely until the admin
+    adds funds and restarts. In-memory and session-scoped by design — a restart
+    is the only way to clear it. First tripper wins: threads in one
+    asyncio.gather cycle may race to trip, and the reason must stay stable.
+    """
+
+    def __init__(self):
+        self.reason: str | None = None
+
+    def trip(self, reason: str) -> None:
+        if self.reason is None:
+            self.reason = reason
+
+    @property
+    def tripped(self) -> bool:
+        return self.reason is not None
+
+
 async def _give_up_if_stuck(
     thread_id: str,
     msg_ids: list[str],
@@ -303,6 +326,7 @@ async def process_single_thread(
     fetch_sem: asyncio.Semaphore | None = None,
     write_sem: asyncio.Semaphore | None = None,
     local_deferrals: list[str] | None = None,
+    halt: "DaemonHalt | None" = None,
 ) -> bool:
     """Process a single thread through the classification pipeline.
 
@@ -557,6 +581,14 @@ async def process_single_thread(
         # forever. (Connect/pool timeouts are LLMUnavailableError, handled above.)
         log.error("Timeout processing thread %s: %s", thread_id, exc)
         return await _give_up_if_stuck(thread_id, ids_to_mark, failure_tracker, label_manager, write_sem)
+    except LLMBalanceError as exc:
+        # Account-wide, not a thread fault (and must precede the RuntimeError arm,
+        # which it subclasses): don't count toward give-up, don't mark anything —
+        # the thread is re-processed after the admin adds funds and restarts.
+        log.error("Thread %s deferred — %s", thread_id, exc)
+        if halt is not None:
+            halt.trip(str(exc))
+        return False
     except RuntimeError as exc:
         log.error("Thread %s: %s", thread_id, exc)
         return await _give_up_if_stuck(thread_id, ids_to_mark, failure_tracker, label_manager, write_sem)
