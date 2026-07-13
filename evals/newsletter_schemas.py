@@ -136,7 +136,6 @@ class GoldenNewsletter:
     stories: list[GoldenStory] = field(default_factory=list)
     source: str = "harvested"
     harvested_at: str = ""  # ISO 8601
-    seeded_from: str = ""  # provenance of Phase-A story seeding, e.g. "parse_stories"
     reviewed: bool = False  # story list confirmed = authoritative extraction truth
     notes: str = ""
     excluded: bool = False
@@ -152,7 +151,6 @@ class GoldenNewsletter:
             "stories": [s.to_dict() for s in self.stories],
             "source": self.source,
             "harvested_at": self.harvested_at,
-            "seeded_from": self.seeded_from,
             "reviewed": self.reviewed,
             "notes": self.notes,
             "excluded": self.excluded,
@@ -169,7 +167,6 @@ class GoldenNewsletter:
             stories=[GoldenStory.from_dict(s) for s in d.get("stories", [])],
             source=d.get("source", "harvested"),
             harvested_at=d.get("harvested_at", ""),
-            seeded_from=d.get("seeded_from", ""),
             reviewed=d.get("reviewed", False),
             notes=d.get("notes", ""),
             excluded=d.get("excluded", False),
@@ -326,7 +323,6 @@ class NewsletterRunMeta:
     extra_body: dict | None = None
     parallelism: int = 1
     tag: str = ""
-    seeded_from: str = ""
     # System prompts (constant across a run, deterministic from config)
     extraction_system_prompt: str = ""
     quality_system_prompt: str = ""
@@ -350,7 +346,6 @@ class NewsletterRunMeta:
             "extra_body": self.extra_body,
             "parallelism": self.parallelism,
             "tag": self.tag,
-            "seeded_from": self.seeded_from,
             "extraction_system_prompt": self.extraction_system_prompt,
             "quality_system_prompt": self.quality_system_prompt,
             "theme_system_prompt": self.theme_system_prompt,
@@ -374,7 +369,6 @@ class NewsletterRunMeta:
             extra_body=d.get("extra_body"),
             parallelism=d.get("parallelism", 1),
             tag=d.get("tag", ""),
-            seeded_from=d.get("seeded_from", ""),
             extraction_system_prompt=d.get("extraction_system_prompt", ""),
             quality_system_prompt=d.get("quality_system_prompt", ""),
             theme_system_prompt=d.get("theme_system_prompt", ""),

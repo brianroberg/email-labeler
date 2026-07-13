@@ -2,7 +2,6 @@
 
 Usage:
     python -m evals.newsletter_label                     # curate + label
-    python -m evals.newsletter_label --edit              # manual-only (no LLM seeding)
     python -m evals.newsletter_label --unreviewed-only
 
 The detail screen is **body-centric**: it shows the newsletter body with each
@@ -11,10 +10,8 @@ are visible together. A compact story strip above the body lists each story with
 its located line range. Two explicit modes drive story refinement, and the mode
 bar always names the active mode and its keys:
 
-Phase A — curate stories / extraction truth.
-  * **Auto-seed**: opening an unreviewed, story-less newsletter runs a fresh LLM
-    extraction (``newsletter.parse_stories`` over the production extraction
-    prompt) so the model's stories are already visible. Press ``r`` to re-seed.
+Phase A — curate stories / extraction truth (all manual; issue #59 removed the
+LLM auto-seeding — it never sped curation up).
   * **Browse mode** (default): ``n``/``p`` or a number key selects a story;
     ``a`` starts a new story, ``e`` edits the selected story's boundaries,
     ``d`` deletes it, ``C`` clears all stories, ``u`` excludes it. ``c`` accepts
@@ -35,7 +32,6 @@ Textual's Pilot driver.
 """
 
 import argparse
-import asyncio
 import copy
 import json
 import sys
@@ -52,7 +48,7 @@ from textual.widgets import Label, ListItem, ListView, Static
 
 from evals import atomic_write_jsonl, plural
 from evals.newsletter_schemas import GoldenNewsletter, GoldenStory
-from newsletter import _SCORE_TOKENS, compute_tier, parse_stories
+from newsletter import _SCORE_TOKENS, compute_tier
 from tui_common import BottomModal, HintScreen, PageListView, PromptLineScreen
 
 _DIMENSIONS = ("simple", "concrete", "personal", "dynamic")
@@ -102,37 +98,6 @@ def save_golden_set(newsletters: list[GoldenNewsletter], path: Path) -> None:
 # ---------------------------------------------------------------------------
 # Pure state transitions (Phase A — curate stories)
 # ---------------------------------------------------------------------------
-
-def seed_from_extractor(newsletter, extract_fn):
-    """Seed candidates by running *extract_fn* over the body, then parse_stories.
-
-    *extract_fn* takes the raw body and returns the raw LLM extraction string
-    (kept injectable so tests never touch a network). The production
-    ``parse_stories`` turns that into a list of story texts. Returns
-    ``(stories, raw)`` so the caller can report the outcome (e.g. distinguish
-    a NO_STORIES verdict from unparseable output — see ``seed_outcome_message``).
-    """
-    raw = extract_fn(newsletter.body)
-    return seed_stories(newsletter, parse_stories(raw)), raw
-
-
-def seed_stories(newsletter, story_texts):
-    """Populate candidate stories from ``parse_stories`` story texts.
-
-    Replaces any existing story list, assigns stable ids, and records the seed
-    provenance. Replacing the list invalidates any prior confirmation, so
-    ``newsletter.reviewed`` is reset to False — the uncurated machine seed must
-    be re-confirmed before it counts as extraction truth (undo still restores
-    the prior state, ``reviewed`` included, via the snapshot).
-    """
-    newsletter.stories = [
-        GoldenStory(story_id=f"{newsletter.thread_id}:{i}", text=text)
-        for i, text in enumerate(story_texts)
-    ]
-    newsletter.seeded_from = "parse_stories"
-    newsletter.reviewed = False
-    return newsletter.stories
-
 
 def _next_story_id(newsletter) -> str:
     """Next unique story id: ``max(existing numeric suffixes) + 1``.
@@ -472,7 +437,7 @@ def _pack_bar(items, width: int) -> list[str]:
 
 _BROWSE_KEYS = (
     "n/p:pick-story", "1-9:pick", "[a]dd", "[e]dit-bounds", "[d]el", "[l]abel",
-    "[u]excl-story", "[C]lear-all", "[r]eseed", "[c]:accept+next", "[k]skip",
+    "[u]excl-story", "[C]lear-all", "[c]:accept+next", "[k]skip",
     "[z]undo", "[N]otes", "[X]excl-nl", "Esc:back", "q:quit",
 )
 
@@ -501,30 +466,6 @@ def span_mode_bar(edit, width: int) -> list[str]:
          "Esc:cancel"],
         width,
     )
-
-
-def seed_confirmation_message(newsletter) -> str | None:
-    """Confirmation to show before ``r`` re-seeds over existing stories.
-
-    Returns None when seeding is safe (empty story list); otherwise a y/N
-    question stating how many stories — and how many carrying Phase-B labels —
-    would be discarded.
-    """
-    n = len(newsletter.stories)
-    if n == 0:
-        return None
-    labeled = sum(1 for s in newsletter.stories if s.expected_scores is not None)
-    detail = f" ({labeled} labeled)" if labeled else ""
-    return f"Replace {plural(n, 'story', 'stories')}{detail} with a fresh seed? y/N"
-
-
-def seed_outcome_message(raw: str, story_count: int) -> str:
-    """Status line after a seed: distinguishes NO_STORIES from a parse washout."""
-    if story_count:
-        return f"Seeded {plural(story_count, 'story', 'stories')}."
-    if raw.strip().upper() == "NO_STORIES":
-        return "Extractor returned NO_STORIES."
-    return "Extractor output had no parseable story blocks."
 
 
 def confirm_status_message(newsletter) -> str:
@@ -615,7 +556,7 @@ def format_story_strip(newsletter, spans, selected, width: int) -> list[str]:
     With no stories, a single hint line is returned so the strip is never blank.
     """
     if not newsletter.stories:
-        return ["Stories: none — [a]dd a story or [r]eseed from the model"]
+        return ["Stories: none — [a]dd a story"]
     lines = []
     for i, s in enumerate(newsletter.stories):
         marker = "▶" if i == selected else " "
@@ -656,7 +597,7 @@ def format_theme_legend(selected, width: int) -> str:
 # ---------------------------------------------------------------------------
 
 # Mutable newsletter-level fields captured for undo (stories handled separately)
-_NL_SNAPSHOT_FIELDS = ("seeded_from", "reviewed", "notes", "excluded")
+_NL_SNAPSHOT_FIELDS = ("reviewed", "notes", "excluded")
 
 
 def capture_snapshot(newsletter):
@@ -696,58 +637,6 @@ def select_label_newsletters(newsletters, *, unreviewed_only=False, include_excl
     if unreviewed_only:
         result = [n for n in result if not n.reviewed]
     return result
-
-
-# ---------------------------------------------------------------------------
-# Phase-A seed extractor (real LLM; injected for tests)
-# ---------------------------------------------------------------------------
-
-def build_extractor(config: dict):
-    """Build a synchronous ``extract_fn(body) -> raw_str`` for Phase-A seeding.
-
-    Wraps the production newsletter story-extraction LLM call, returning the
-    *raw* extraction string (not parsed) so ``seed_from_extractor`` can run it
-    through ``parse_stories`` exactly like production. Kept separate from the
-    pure functions so tests inject a fake extractor and never hit the network.
-    """
-    from daemon import resolve_newsletter_llm_endpoint
-    from llm_client import LLMClient
-    from newsletter import NewsletterClassifier
-
-    base_url, api_key = resolve_newsletter_llm_endpoint()
-    if not base_url:
-        # Fail fast, before the app starts — otherwise the missing endpoint only
-        # surfaces as a truncated error when a seed is triggered deep in the TUI.
-        raise SystemExit(
-            "No LLM endpoint configured for Phase-A seeding: set NEWSLETTER_LLM_URL "
-            "or CLOUD_LLM_URL, or run with --edit to curate without seeding."
-        )
-    nl_llm = config["newsletter"]["llm"]
-    # Mirror daemon.run_daemon / newsletter_run.build_classifier defaults.
-    client = LLMClient(
-        base_url=base_url,
-        api_key=api_key,
-        model=nl_llm["model"],
-        temperature=nl_llm.get("temperature", 0.0),
-        max_tokens=nl_llm.get("max_tokens", 1024),
-        timeout=nl_llm.get("timeout", 60),
-        extra_body=nl_llm.get("extra_body"),
-    )
-    classifier = NewsletterClassifier(client, config)
-    extraction_config = classifier.extraction_config
-
-    def extract_fn(body: str) -> str:
-        user_content = extraction_config["user_template"].format(body=body)
-
-        async def _run():
-            raw, _ = await client.complete(
-                extraction_config["system"], user_content, include_thinking=True
-            )
-            return raw
-
-        return asyncio.run(_run())
-
-    return extract_fn
 
 
 # ---------------------------------------------------------------------------
@@ -976,7 +865,6 @@ class DetailScreen(Screen):
     BINDINGS = [
         Binding("escape", "esc", "Back", show=False),
         Binding("q", "quit_app", "Quit", show=False),
-        Binding("r", "seed", "Reseed", show=False),
         Binding("a", "add_story", "Add story", show=False),
         Binding("e", "e_key", "Edit bounds / set end", show=False),
         Binding("s", "s_key", "Set start", show=False),
@@ -1032,14 +920,13 @@ class DetailScreen(Screen):
     }
     """
 
-    def __init__(self, newsletters, index, all_newsletters, path, *, extract_fn=None):
+    def __init__(self, newsletters, index, all_newsletters, path):
         super().__init__()
         self.newsletters = newsletters
         self.nl_index = index
         self.newsletter = newsletters[index]
         self.all_newsletters = all_newsletters
         self.path = path
-        self.extract_fn = extract_fn
         self.mode = "browse"  # "browse" | "span"
         self.selected_story: int | None = None
         self.span_edit: SpanEdit | None = None
@@ -1048,7 +935,7 @@ class DetailScreen(Screen):
         self._rows: list[DetailRow] | None = None
         self._spans: list = []
         self._status_msg = ""
-        self._busy = False  # a seed/flow is in flight; mutating keys are ignored
+        self._busy = False  # a mutation flow is in flight; mutating keys are ignored
         self._dismiss_guard = False  # guards a second dismiss on an already-popped screen
         self._last_size: tuple[int, int] | None = None
 
@@ -1062,10 +949,6 @@ class DetailScreen(Screen):
         self._refresh(rebuild=True)
         self.query_one("#rows", ListView).focus()
         self._set_status("")
-        # Auto-seed: opening an unreviewed, story-less newsletter runs a fresh
-        # extraction so the model's stories are visible without a keypress.
-        if self.extract_fn and not self.newsletter.stories and not self.newsletter.reviewed:
-            self._seed(auto=True)
 
     def on_resize(self, event) -> None:
         size = (event.size.width, event.size.height)
@@ -1280,7 +1163,7 @@ class DetailScreen(Screen):
 
     def _select_story(self, si: int) -> None:
         if not self.newsletter.stories:
-            self._set_status("No stories — press a to add or r to seed.")
+            self._set_status("No stories — press a to add one.")
             return
         si %= len(self.newsletter.stories)
         self.selected_story = si
@@ -1449,53 +1332,6 @@ class DetailScreen(Screen):
             self._set_status(f"Story [{si + 1}] text updated.")
         finally:
             self._end_flow()
-
-    # -- seeding ---------------------------------------------------------------
-
-    def action_seed(self) -> None:
-        if self.mode == "span":
-            return
-        self._seed(auto=False)
-
-    @work
-    async def _seed(self, auto: bool = False) -> None:
-        if not self._begin_flow():
-            return
-        try:
-            await self._run_seed(auto=auto)
-        finally:
-            self._end_flow()
-
-    async def _run_seed(self, auto: bool = False) -> None:
-        if self.extract_fn is None:
-            if not auto:
-                self._set_status("Seeding disabled in edit mode (run without --edit to seed).")
-            return
-        if not auto:
-            confirm_msg = seed_confirmation_message(self.newsletter)
-            if confirm_msg is not None and not await self.app.push_screen_wait(
-                ConfirmScreen(confirm_msg)
-            ):
-                self._set_status("Seed cancelled — stories kept.")
-                return
-        self._set_status("Extracting stories…")
-        try:
-            # Only the network call runs in the thread; the newsletter is mutated
-            # on the UI task AFTER the await, so dismissing the screen mid-seed
-            # cancels this worker and the late extractor result is discarded
-            # instead of clobbering curated stories.
-            raw = await asyncio.to_thread(self.extract_fn, self.newsletter.body)
-            texts = parse_stories(raw)
-        except Exception as exc:
-            # No undo snapshot was pushed, so the stack stays clean.
-            self._set_status("")
-            self.app.push_screen(HintScreen(f"Seed failed: {exc}"))
-        else:
-            self._push_undo()
-            self.selected_story = None
-            stories = seed_stories(self.newsletter, texts)
-            self._save()
-            self._set_status(seed_outcome_message(raw, len(stories)))
 
     # -- story curation --------------------------------------------------------
 
@@ -1696,12 +1532,11 @@ class LabelApp(App):
     }
     """
 
-    def __init__(self, newsletters, all_newsletters, path, *, extract_fn=None):
+    def __init__(self, newsletters, all_newsletters, path):
         super().__init__()
         self.newsletters = newsletters
         self.all_newsletters = all_newsletters
         self.path = Path(path)
-        self.extract_fn = extract_fn
 
     def compose(self) -> ComposeResult:
         yield Static(
@@ -1750,10 +1585,7 @@ class LabelApp(App):
             self._refresh_list()
 
         self.push_screen(
-            DetailScreen(
-                self.newsletters, index, self.all_newsletters, self.path,
-                extract_fn=self.extract_fn,
-            ),
+            DetailScreen(self.newsletters, index, self.all_newsletters, self.path),
             on_dismiss,
         )
 
@@ -1761,12 +1593,12 @@ class LabelApp(App):
         self.exit("quit")
 
 
-def label_loop(newsletters, all_newsletters, path, *, extract_fn=None):
+def label_loop(newsletters, all_newsletters, path):
     """Launch the labeling TUI. Saving is atomic + auto on each edit."""
     if not newsletters:
         print("No newsletters to label.")
         return
-    LabelApp(newsletters, all_newsletters, Path(path), extract_fn=extract_fn).run()
+    LabelApp(newsletters, all_newsletters, Path(path)).run()
 
 
 # ---------------------------------------------------------------------------
@@ -1779,16 +1611,11 @@ def cli():
         "--golden-set", default="evals/newsletter_golden_set.jsonl",
         help="Path to newsletter golden set JSONL",
     )
-    parser.add_argument("--edit", action="store_true",
-                        help="Edit mode: no LLM seeding (curate/label existing stories)")
     parser.add_argument("--unreviewed-only", action="store_true",
                         help="Queue only unreviewed newsletters")
     parser.add_argument("--include-excluded", action="store_true",
                         help="Also queue excluded newsletters (to inspect or restore "
                              "them with the X hotkey; default: excluded are skipped)")
-    parser.add_argument("--config",
-                        help="Path to config.toml (default: the repo-root config.toml, "
-                             "regardless of CWD)")
     args = parser.parse_args()
 
     path = Path(args.golden_set)
@@ -1815,14 +1642,7 @@ def cli():
         print("No newsletters match the filters.", file=sys.stderr)
         sys.exit(0)
 
-    # Build the Phase-A seed extractor unless --edit (edit mode never hits an LLM).
-    extract_fn = None
-    if not args.edit:
-        from evals.newsletter_harvest import load_eval_config
-
-        extract_fn = build_extractor(load_eval_config(args.config))
-
-    label_loop(newsletters, all_newsletters, path, extract_fn=extract_fn)
+    label_loop(newsletters, all_newsletters, path)
 
     # The TUI auto-saves on each edit; save once more so a monkeypatched loop
     # (and any final in-memory state) is persisted. Saving all_newsletters keeps

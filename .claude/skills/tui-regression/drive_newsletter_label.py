@@ -1,9 +1,10 @@
-"""E2E driver for evals.newsletter_label (LabelApp) with a mocked extractor.
+"""E2E driver for evals.newsletter_label (LabelApp).
 
 Drives the full curate+label workflow over diverse synthetic newsletters:
-auto-seed, browse/select, span add/edit/delete, clear-all, reseed (+confirm),
-unlocatable text-edit fallback, Phase-B scoring+themes, story/newsletter
-exclusion, notes, undo, accept, skip, and every seed-outcome branch.
+browse/select, span add/edit/delete, clear-all, unlocatable text-edit fallback,
+Phase-B scoring+themes, story/newsletter exclusion, notes, undo, accept, skip.
+The TUI is manual-only (issue #59 removed LLM auto-seeding), so scenarios
+pre-populate stories directly where a story-ful newsletter is needed.
 """
 
 import asyncio
@@ -11,7 +12,6 @@ import tempfile
 from pathlib import Path
 
 import _e2e
-import mocks
 import synth_data
 from _e2e import SIZE, drain, report, run_scenarios
 
@@ -20,6 +20,7 @@ from evals.newsletter_label import (
     LabelApp,
     row_for_body_line,
 )
+from evals.newsletter_schemas import GoldenStory
 
 NLS = {n.thread_id: n for n in synth_data.newsletters()}
 
@@ -29,9 +30,24 @@ def _fresh():
     return {n.thread_id: n for n in synth_data.newsletters()}
 
 
-def _app(queue, extract_fn=None):
+def _app(queue):
     tmp = Path(tempfile.mkdtemp()) / "golden.jsonl"
-    return LabelApp(queue, queue, tmp, extract_fn=extract_fn)
+    return LabelApp(queue, queue, tmp)
+
+
+def _populate_from_paragraphs(nl):
+    """Pre-populate one story per blank-line paragraph of the body.
+
+    Stands in for the removed LLM auto-seed (issue #59) wherever a scenario
+    needs a story-ful newsletter — the stories are exact body slices, so they
+    all locate."""
+    normalized = nl.body.replace("\r\n", "\n").replace("\r", "\n").strip()
+    paragraphs = [p.strip() for p in normalized.split("\n\n") if p.strip()]
+    nl.stories = [
+        GoldenStory(story_id=f"{nl.thread_id}:{i}", text=p)
+        for i, p in enumerate(paragraphs)
+    ]
+    return nl
 
 
 def _detail(app) -> DetailScreen:
@@ -51,15 +67,15 @@ async def _goto_body(pilot, app, body_idx):
 
 # ---------------------------------------------------------------------------
 
-async def s_auto_seed_and_label(chk):
+async def s_label_single_story(chk):
     nls = _fresh()
-    nl = nls["nl-single"]
-    app = _app([nl], extract_fn=mocks.RecordingExtractor())
+    nl = _populate_from_paragraphs(nls["nl-single"])
+    app = _app([nl])
     async with app.run_test(size=SIZE) as pilot:
-        await pilot.press("enter")          # open -> auto-seed on mount
+        await pilot.press("enter")
         await drain(app, pilot)
-        chk.eq(len(nl.stories), 1, "auto-seed produced one story")
-        chk.that(nl.stories and "Sarah" in nl.stories[0].text, "seeded text is the body")
+        chk.eq(len(nl.stories), 1, "single-paragraph body -> one story")
+        chk.that(nl.stories and "Sarah" in nl.stories[0].text, "story text is the body")
         # Phase B: score all-Good (1/2/3 = Poor/OK/Good) + scripture theme emphasized.
         await pilot.press("1", "l")
         await pilot.press("3", "3", "3", "3")
@@ -77,12 +93,12 @@ async def s_auto_seed_and_label(chk):
 
 async def s_span_add_edit_delete_clear(chk):
     nls = _fresh()
-    nl = nls["nl-multi"]
-    app = _app([nl], extract_fn=mocks.fake_extract_fn)
+    nl = _populate_from_paragraphs(nls["nl-multi"])
+    app = _app([nl])
     async with app.run_test(size=SIZE) as pilot:
         await pilot.press("enter")
         await drain(app, pilot)
-        chk.eq(len(nl.stories), 3, "auto-seed produced three stories")
+        chk.eq(len(nl.stories), 3, "three-paragraph body -> three stories")
         start_n = len(nl.stories)
         # Add a new story via span: go to a body line, mark start, extend, commit.
         await _goto_body(pilot, app, 0)
@@ -108,7 +124,7 @@ async def s_unlocatable_text_fallback(chk):
     nls = _fresh()
     nl = nls["nl-unlocatable"]
     original = nl.stories[0].text
-    app = _app([nl])  # edit mode (no extractor) so the pre-seeded story stays
+    app = _app([nl])  # nl-unlocatable ships with its story pre-populated
     async with app.run_test(size=SIZE) as pilot:
         await pilot.press("enter")
         await drain(app, pilot)
@@ -129,55 +145,24 @@ async def s_unlocatable_text_fallback(chk):
         chk.eq(nl.stories[0].text, "corrected single line", "text updated on real edit")
 
 
-async def s_reseed_with_confirm(chk):
-    nls = _fresh()
-    nl = nls["nl-multi"]
-    app = _app([nl], extract_fn=mocks.fake_extract_fn)
-    async with app.run_test(size=SIZE) as pilot:
-        await pilot.press("enter")
-        await drain(app, pilot)
-        chk.eq(len(nl.stories), 3, "seeded three")
-        # Reseed over existing stories -> confirmation, answer y.
-        await pilot.press("r", "y")
-        await drain(app, pilot)
-        chk.eq(len(nl.stories), 3, "reseed replaced stories")
-        chk.that(not nl.reviewed, "reseed resets reviewed=False")
-
-
-async def s_seed_outcome_branches(chk):
-    # NO_STORIES (empty body auto-seed).
+async def s_story_less_open_stays_empty(chk):
+    # An unreviewed, story-less newsletter opens with an empty strip and the
+    # add-a-story hint — nothing auto-populates it (issue #59 removed seeding).
     nls = _fresh()
     empty = nls["nl-empty"]
-    app = _app([empty], extract_fn=mocks.fake_extract_fn)
+    app = _app([empty])
     async with app.run_test(size=SIZE) as pilot:
         await pilot.press("enter")
         await drain(app, pilot)
-        chk.eq(len(empty.stories), 0, "empty body -> no stories")
-        chk.that("NO_STORIES" in _e2e.static_text(app, "#status"), "NO_STORIES status shown")
-    # Unparseable washout (reseed with garbage extractor, no confirm since no stories).
-    nls = _fresh()
-    single = nls["nl-single"]
-    app = _app([single], extract_fn=mocks.unparseable_extract_fn)
-    async with app.run_test(size=SIZE) as pilot:
-        await pilot.press("enter")
-        await drain(app, pilot)
-        chk.eq(len(single.stories), 0, "unparseable -> no stories")
-        chk.that("parseable" in _e2e.static_text(app, "#status").lower(), "washout status shown")
-    # Hard extractor failure -> HintScreen, no crash.
-    nls = _fresh()
-    single = nls["nl-single"]
-    app = _app([single], extract_fn=mocks.failing_extract_fn)
-    async with app.run_test(size=SIZE) as pilot:
-        await pilot.press("enter")
-        await drain(app, pilot)
-        chk.that(app.is_running, "app survives extractor failure")
-        chk.eq(len(single.stories), 0, "failed seed left stories empty")
+        chk.eq(len(empty.stories), 0, "story-less newsletter stays empty on open")
+        chk.that("[a]dd a story" in _e2e.screen_text(app), "manual add hint shown")
+        chk.that(app.is_running, "empty newsletter opens without crashing")
 
 
 async def s_many_stories_navigation(chk):
     nls = _fresh()
     nl = nls["nl-many"]
-    app = _app([nl])  # 12 pre-seeded stories, edit mode
+    app = _app([nl])  # nl-many ships with 12 pre-populated stories
     async with app.run_test(size=SIZE) as pilot:
         await pilot.press("enter")
         await drain(app, pilot)
@@ -214,9 +199,9 @@ async def s_exclude_and_undo(chk):
 
 async def s_notes_and_skip(chk):
     nls = _fresh()
-    nl = nls["nl-single"]
+    nl = _populate_from_paragraphs(nls["nl-single"])
     other = nls["nl-multi"]
-    app = _app([nl, other], extract_fn=mocks.fake_extract_fn)
+    app = _app([nl, other])
     async with app.run_test(size=SIZE) as pilot:
         await pilot.press("enter")
         await drain(app, pilot)
@@ -256,8 +241,8 @@ async def s_accept_confirm_when_unlabeled(chk):
 
 async def s_span_commits_exact_text(chk):
     nls = _fresh()
-    nl = nls["nl-multi"]
-    app = _app([nl], extract_fn=mocks.fake_extract_fn)
+    nl = _populate_from_paragraphs(nls["nl-multi"])
+    app = _app([nl])
     async with app.run_test(size=SIZE) as pilot:
         await pilot.press("enter")
         await drain(app, pilot)
@@ -284,8 +269,8 @@ async def s_span_commits_exact_text(chk):
 
 async def s_esc_cancels_span_and_backs_out(chk):
     nls = _fresh()
-    nl = nls["nl-multi"]
-    app = _app([nl], extract_fn=mocks.fake_extract_fn)
+    nl = _populate_from_paragraphs(nls["nl-multi"])
+    app = _app([nl])
     async with app.run_test(size=SIZE) as pilot:
         await pilot.press("enter")
         await drain(app, pilot)
@@ -324,25 +309,26 @@ async def s_relabel_and_score_cancel(chk):
 
 
 async def s_diverse_data_render(chk):
-    # Actually OPEN the wide-char / emoji / CRLF newsletters and confirm they seed,
-    # locate, and render without crashing (display-width wrapping + CRLF splitlines).
+    # Actually OPEN the wide-char / emoji / CRLF newsletters and confirm their
+    # stories locate and render without crashing (display-width wrapping + CRLF
+    # splitlines).
     for tid in ("nl-emoji", "nl-crlf"):
         nls = _fresh()
-        nl = nls[tid]
-        app = _app([nl], extract_fn=mocks.fake_extract_fn)
+        nl = _populate_from_paragraphs(nls[tid])
+        app = _app([nl])
         async with app.run_test(size=SIZE) as pilot:
             await pilot.press("enter")
             await drain(app, pilot)
             chk.that(app.is_running, f"{tid} opens without crashing")
-            chk.that(len(nl.stories) >= 2, f"{tid} seeded its stories")
+            chk.that(len(nl.stories) >= 2, f"{tid} has its stories")
             located = [s for s in _detail(app)._spans if s is not None]
             chk.eq(len(located), len(nl.stories), f"{tid} every story located in the body for rendering")
 
 
 async def s_guard_and_decline_paths(chk):
     nls = _fresh()
-    nl = nls["nl-multi"]
-    app = _app([nl], extract_fn=mocks.fake_extract_fn)
+    nl = _populate_from_paragraphs(nls["nl-multi"])
+    app = _app([nl])
     async with app.run_test(size=SIZE) as pilot:
         await pilot.press("enter")
         await drain(app, pilot)
@@ -353,11 +339,7 @@ async def s_guard_and_decline_paths(chk):
         # Out-of-range number.
         await pilot.press("8")
         chk.that("No story 8" in _e2e.static_text(app, "#status"), "out-of-range number rejected")
-        # Decline reseed -> stories kept.
         n0 = len(nl.stories)
-        await pilot.press("r", "n")
-        await drain(app, pilot)
-        chk.eq(len(nl.stories), n0, "declining reseed keeps stories")
         # Decline clear-all -> stories kept.
         await pilot.press("C", "n")
         await drain(app, pilot)
@@ -374,7 +356,7 @@ async def s_list_nav_and_quit(chk):
     from textual.widgets import ListView
     nls = _fresh()
     queue = [nls["nl-single"], nls["nl-multi"], nls["nl-long"]]
-    app = _app(queue)                       # edit mode -> no auto-seed on the list
+    app = _app(queue)
     async with app.run_test(size=SIZE) as pilot:
         lv = app.query_one("#newsletters", ListView)
         chk.eq(len(lv), 3, "all queued newsletters listed")
@@ -400,11 +382,10 @@ async def s_quit_from_detail(chk):
 
 def scenarios():
     return [
-        ("auto_seed_and_label", s_auto_seed_and_label),
+        ("label_single_story", s_label_single_story),
         ("span_add_edit_delete_clear", s_span_add_edit_delete_clear),
         ("unlocatable_text_fallback", s_unlocatable_text_fallback),
-        ("reseed_with_confirm", s_reseed_with_confirm),
-        ("seed_outcome_branches", s_seed_outcome_branches),
+        ("story_less_open_stays_empty", s_story_less_open_stays_empty),
         ("many_stories_navigation", s_many_stories_navigation),
         ("exclude_and_undo", s_exclude_and_undo),
         ("notes_and_skip", s_notes_and_skip),

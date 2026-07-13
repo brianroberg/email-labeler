@@ -126,13 +126,14 @@ the daemon (see the `.env` symlink note in [README.md](README.md)):
 
 | Variable | Used by | Purpose |
 |---|---|---|
-| `NEWSLETTER_LLM_URL` / `NEWSLETTER_LLM_API_KEY` | `newsletter_label` (Phase-A seeding), `newsletter_run` | The `[newsletter.llm]` endpoint. The override is atomic: once the URL is set, the key comes only from `NEWSLETTER_LLM_API_KEY` |
+| `NEWSLETTER_LLM_URL` / `NEWSLETTER_LLM_API_KEY` | `newsletter_run` | The `[newsletter.llm]` endpoint. The override is atomic: once the URL is set, the key comes only from `NEWSLETTER_LLM_API_KEY` |
 | `CLOUD_LLM_URL` / `CLOUD_LLM_API_KEY` | same | Fallback endpoint when `NEWSLETTER_LLM_URL` is unset |
 | `PROXY_URL` / `PROXY_API_KEY` | `newsletter_harvest` | Gmail api-proxy address + auth. `PROXY_API_KEY` must be non-empty; harvest exits with a one-line error when it is missing |
 
-`newsletter_label` (without `--edit`) and `newsletter_run` fail fast before doing
-any work when no LLM endpoint is configured, and their error messages name the
-resolved URL and which env var supplied it.
+`newsletter_run` fails fast before doing any work when no LLM endpoint is
+configured, and its error messages name the resolved URL and which env var
+supplied it. (`newsletter_label` needs no LLM at all — curation is fully manual
+since issue #59 removed auto-seeding.)
 
 ### newsletter_harvest
 
@@ -165,16 +166,12 @@ of a traceback.
 | Flag | Description |
 |---|---|
 | `--golden-set` | Path to newsletter golden set JSONL (default: `evals/newsletter_golden_set.jsonl`) |
-| `--edit` | Disable LLM seeding — manual curation only. Same Textual TUI, but auto-seed and `r` (reseed) are inert and no LLM endpoint is needed |
 | `--unreviewed-only` | Show only newsletters not yet reviewed |
 | `--include-excluded` | Also queue excluded newsletters, so they can be inspected or restored with the `X` hotkey (default: excluded newsletters are skipped) |
-| `--config` | Path to config.toml (default: the repo-root `config.toml`, regardless of CWD) |
 
-Both modes open the same Textual TUI; `--edit` only removes the Phase-A LLM
-seeding (it does **not** filter to reviewed newsletters — combine with
-`--unreviewed-only` or not as needed). Without `--edit`, a missing
-`NEWSLETTER_LLM_URL`/`CLOUD_LLM_URL` exits immediately at startup with an
-actionable message instead of failing later inside the TUI.
+Curation is fully manual and needs no LLM endpoint (issue #59 removed the
+Phase-A auto-seeding and its `--edit`/`--config` flags — the seed never sped
+curation up, so manual-only became the only mode).
 
 The detail screen is **body-centric**: the newsletter body fills the screen with
 each story's span highlighted **in place** (a colored gutter bar + tint, and a
@@ -188,16 +185,6 @@ text, never line numbers.
 Two phases per newsletter. **Phase A** curates the story list (extraction truth)
 in two explicit modes:
 
-- **Auto-seed**: opening an *unreviewed, story-less* newsletter automatically
-  runs the production `parse_stories` extractor over a fresh, uncached LLM
-  extraction of the body (status shows `Extracting stories…`), so the model's
-  stories are visible without a keypress. `r` re-seeds manually; re-seeding over
-  a non-empty list asks `Replace N stories (M labeled) with a fresh seed? y/N`
-  and the outcome is reported on the status line (`Seeded N stories.` /
-  `Extractor returned NO_STORIES.` / `Extractor output had no parseable story
-  blocks.`). Re-seeding resets `newsletter.reviewed=False`. Under `--edit`,
-  auto-seed and `r` are inert. Leaving the screen mid-seed discards the late
-  result (the newsletter is mutated only after the network await).
 - **Browse mode** (default): `n`/`p` or a number key (`1`–`9`) selects a story
   (emphasized in the body and the strip); `Enter` on a story's body row selects
   it. `a` starts a new story, `e` edits the selected story's boundaries, `d`
@@ -256,10 +243,6 @@ TUI details:
 > identified everywhere by a first-words text excerpt. This changed the
 > extraction/quality/theme `prompt_hash`, so runs recorded before the change are
 > no longer prompt-comparable.
-
-`seed_from_extractor()` returns `(stories, raw)` — the raw extractor output is
-kept so the caller can distinguish a `NO_STORIES` verdict from unparseable
-output.
 
 ### newsletter_run
 

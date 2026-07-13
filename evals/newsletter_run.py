@@ -396,9 +396,7 @@ def build_meta(
 
     Records prompt_hash (content-hash of the merged prompt block) + the three
     system prompts verbatim + model/temperature/max_tokens/extra_body/counts/tag/
-    mode so prompt A/Bs are self-identifying and comparable. seeded_from is pulled
-    from the golden set (first newsletter that carries it) so the report can flag
-    extraction-recall bias from Phase-A seeding.
+    mode so prompt A/Bs are self-identifying and comparable.
 
     story_count reflects what the run actually evaluated: story modes count only
     Phase-B-labeled, non-excluded stories (the metric denominators), while an
@@ -413,7 +411,6 @@ def build_meta(
         story_count = sum(len(nl.stories) for nl in golden_set)
     else:
         story_count = len(select_stories(golden_set)[0])
-    seeded_from = next((nl.seeded_from for nl in golden_set if nl.seeded_from), "")
     return NewsletterRunMeta(
         run_id=uuid.uuid4().hex,
         timestamp=datetime.now(timezone.utc).isoformat(),
@@ -430,7 +427,6 @@ def build_meta(
         extra_body=llm_cfg.get("extra_body"),
         parallelism=parallelism,
         tag=tag,
-        seeded_from=seeded_from,
         extraction_system_prompt=prompts["story_extraction"]["system"],
         quality_system_prompt=prompts["quality_assessment"]["system"],
         theme_system_prompt=prompts["theme_classification"]["system"],

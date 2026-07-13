@@ -76,8 +76,9 @@ def test_config_flag_help_states_repo_root_default(subtests):
     """The --config default is resolved against the repo root
     (Path(__file__).parent.parent / "config.toml"), not the CWD — the help
     text must not claim './config.toml'."""
-    for module_name in ("evals.newsletter_harvest", "evals.newsletter_label",
-                        "evals.newsletter_run"):
+    # newsletter_label dropped --config with its LLM seeding (issue #59) —
+    # it no longer loads config.toml at all.
+    for module_name in ("evals.newsletter_harvest", "evals.newsletter_run"):
         parser = _capture_parser(module_name)
         config_actions = [
             a for a in parser._actions if "--config" in a.option_strings
