@@ -174,3 +174,4 @@ All tests use mocks — no external services needed. Test files mirror source fi
 - `test_eval_newsletter_report.py` — `match_stories`, tier/dimension/theme metrics, comparison deltas
 - `test_eval_newsletter_cli_docs.py` — Every newsletter eval `--flag` documented in `README-technical.md`
 - `test_newsletter_eval_docs.py` — Newsletter eval modules/tests listed in `README-technical.md` structure + coverage
+- `test_tui_docs.py` — Every Textual TUI (discovered from disk) documented in its nearest `README.md`: launch command in a code block, or named for flag-reached TUIs

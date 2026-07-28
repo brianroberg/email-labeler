@@ -203,6 +203,35 @@ services:
 The daemon logs the resolved absolute path at startup
 (`Newsletter assessments append to: ...`) — check it points at the mount.
 
+### Newsletter review TUI
+
+Newsletter grading writes one assessment record per newsletter to
+`data/newsletter_assessments.jsonl`. To read them, browse the file in a terminal
+UI instead of by hand:
+
+```bash
+uv run python -m newsletter_review
+```
+
+The listing shows one row per newsletter, newest send-date first. Press `Enter`
+to open a newsletter and see its stories with their dimension scores and themes,
+`Esc` to go back, `f` to open the filter menu, and `q` to quit.
+
+Filters are also available up front, so you can open straight into a slice:
+
+```bash
+uv run python -m newsletter_review --tier poor       # excellent | good | fair | poor
+uv run python -m newsletter_review --theme scripture # scripture, christlikeness, church,
+                                                     # vocation-family, disciple-making
+uv run python -m newsletter_review --sender dm.org   # substring match on the sender
+uv run python -m newsletter_review --since 2026-01-01  # sends on/after a local date
+uv run python -m newsletter_review --file path/to/file.jsonl  # a JSONL somewhere else
+```
+
+If you ran the daemon in Docker, point `--file` at the host path you mounted (or
+run the command from the directory holding `data/`) — the default path is
+relative to the current directory.
+
 ## Resilience
 
 The daemon is designed to run unattended and recover from transient failures:
