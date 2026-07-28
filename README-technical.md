@@ -297,6 +297,16 @@ Conventions shared by every TUI:
 - **Async**: Textual apps are asyncio-native. Long-running work inside a UI
   (e.g. LLM calls) must be awaited or run in a Textual worker — never
   `asyncio.run()` inside an app, which raises `RuntimeError` in a running loop.
+- **Every TUI must be documented in a README**, enforced by
+  `tests/test_tui_docs.py`. That test discovers TUIs from disk (any non-test
+  module defining a Textual `App` subclass) and checks the *nearest* `README.md`
+  walking up from the module — `evals/README.md` for eval tools, the root
+  `README.md` for everything else. A TUI launchable as `python -m <target>`
+  (package with a `__main__.py`, or module with an `if __name__ == "__main__":`
+  guard) needs that command shown in a fenced code block; a TUI reached only
+  through another tool's flag (e.g. `evals/edit_tui.py` via
+  `evals.review --edit`) needs the README to name the module. A new TUI fails
+  those tests until documented, with no test edit required.
 
 ## Test Coverage by Module
 
