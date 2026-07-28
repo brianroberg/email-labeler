@@ -210,7 +210,7 @@ Newsletter grading writes one assessment record per newsletter to
 UI instead of by hand:
 
 ```bash
-python -m newsletter_review
+uv run python -m newsletter_review
 ```
 
 The listing shows one row per newsletter, newest send-date first. Press `Enter`
@@ -220,12 +220,12 @@ to open a newsletter and see its stories with their dimension scores and themes,
 Filters are also available up front, so you can open straight into a slice:
 
 ```bash
-python -m newsletter_review --tier poor              # excellent | good | fair | poor
-python -m newsletter_review --theme scripture        # scripture, christlikeness, church,
+uv run python -m newsletter_review --tier poor       # excellent | good | fair | poor
+uv run python -m newsletter_review --theme scripture # scripture, christlikeness, church,
                                                      # vocation-family, disciple-making
-python -m newsletter_review --sender dm.org          # substring match on the sender
-python -m newsletter_review --since 2026-01-01       # sends on/after a local date
-python -m newsletter_review --file path/to/file.jsonl  # a JSONL somewhere else
+uv run python -m newsletter_review --sender dm.org   # substring match on the sender
+uv run python -m newsletter_review --since 2026-01-01  # sends on/after a local date
+uv run python -m newsletter_review --file path/to/file.jsonl  # a JSONL somewhere else
 ```
 
 If you ran the daemon in Docker, point `--file` at the host path you mounted (or
