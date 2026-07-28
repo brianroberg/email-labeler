@@ -200,8 +200,23 @@ services:
       - ./data:/app/data   # or an absolute host path
 ```
 
-The daemon logs the resolved absolute path at startup
-(`Newsletter assessments append to: ...`) — check it points at the mount.
+The daemon checks this for you at startup. It logs the resolved absolute path
+along with how many records that file already holds
+(`Newsletter assessments append to: /app/data/newsletter_assessments.jsonl (412
+existing record(s))`) — a long-running daemon reporting `0 existing record(s)` is
+writing somewhere other than the file you browse. If nothing is mounted over the
+path, it says so as an ERROR on the next line.
+
+If you have already been running without the mount, the records so far are still
+inside the *running* container and will be destroyed the moment it is recreated.
+Rescue them before your next `docker compose up -d`:
+
+```bash
+docker compose cp email-labeler:/app/data/newsletter_assessments.jsonl ./recovered.jsonl
+```
+
+Then append `recovered.jsonl` to your host file (the review TUI keeps the newest
+record per newsletter, so overlapping entries are harmless).
 
 ### Newsletter review TUI
 

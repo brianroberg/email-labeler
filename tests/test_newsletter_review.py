@@ -121,6 +121,32 @@ class TestLoadAssessments:
         records = load_assessments(f)
         assert records == []
 
+    def test_keeps_only_the_newest_record_per_thread(self, tmp_path):
+        """A newsletter can be written twice: the assessment is persisted before
+        the labels commit, so a label failure leaves the thread unprocessed and
+        the retry re-grades and re-writes it. The reader shows one row per
+        newsletter — the newest grading, i.e. the last one appended."""
+        f = tmp_path / "assessments.jsonl"
+        first = _make_record(thread_id="t1", overall_tier="fair")
+        retry = _make_record(thread_id="t1", overall_tier="good")
+        other = _make_record(thread_id="t2")
+        f.write_text("\n".join(json.dumps(r) for r in (first, other, retry)) + "\n")
+
+        records = load_assessments(f)
+        assert [r["thread_id"] for r in records] == ["t1", "t2"]
+        assert records[0]["overall_tier"] == "good"
+
+    def test_records_without_a_thread_id_are_all_kept(self, tmp_path):
+        """No thread_id, no identity — deduping them would silently merge
+        unrelated newsletters."""
+        f = tmp_path / "assessments.jsonl"
+        a, b = _make_record(), _make_record()
+        a.pop("thread_id")
+        b.pop("thread_id")
+        f.write_text(json.dumps(a) + "\n" + json.dumps(b) + "\n")
+
+        assert len(load_assessments(f)) == 2
+
     def test_rejects_old_scheme_list_themes(self, tmp_path):
         # A pre-#53 record stores story themes as a LIST; build_detail_lines
         # later does themes.items() and would crash mid-render. Fail fast at

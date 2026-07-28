@@ -185,11 +185,50 @@ services:
       - ./data:/app/data
 ```
 
-The daemon logs the resolved absolute destination at startup —
-`Newsletter assessments append to: /app/data/newsletter_assessments.jsonl (persist
-this path via a volume mount when running in Docker)` — so a missing mount is
-diagnosable from the first log lines: verify the logged path is covered by a
-mount in `docker inspect <container> --format '{{json .Mounts}}'`.
+#### Sink preflight (startup)
+
+Every way this sink fails is silent in normal operation — an unmounted path
+accepts writes right up until the container is recreated — so the daemon
+preflights it before grading anything and reports what it found:
+
+```
+INFO  Newsletter assessments append to: /app/data/newsletter_assessments.jsonl (412 existing record(s))
+ERROR Newsletter assessments resolve to /app/data/newsletter_assessments.jsonl, which no
+      volume covers — it is inside the container's writable layer. Writes will appear to
+      succeed, but the records are invisible on the host and are DESTROYED when the
+      container is recreated. Mount the directory you review, e.g. '- ./data:/app/data'
+      under the service's volumes.
+ERROR Newsletter assessments sink is not writable: /app/data. Newsletters will be left
+      unprocessed (and eventually marked agent/attempted) rather than graded into a
+      record that cannot be saved.
+```
+
+* **The record count** is the tell for a *misdirected* sink: a daemon that has
+  been grading for weeks against a path holding `0 existing record(s)` is not
+  appending to the file you review.
+* **The persistence check** compares the resolved path against
+  `/proc/self/mountinfo`: it fires only inside a container (`/.dockerenv` or
+  `/run/.containerenv`) and only when the nearest mount enclosing the path is
+  the container root itself. A bind mount over the directory *or* over the file
+  silences it; an unreadable `mountinfo` (non-Linux) means no evidence, so no
+  warning.
+* **The writability check** uses the nearest existing ancestor when the file
+  doesn't exist yet (`write_assessment` creates missing parents).
+
+#### Write-before-label ordering
+
+The assessment record is written **before** `apply_newsletter_classification`
+commits the Gmail labels. The JSONL is the only durable copy of a grading —
+Gmail keeps just the coarse tier/theme labels — and those labels include
+`agent/processed`, which drops the thread out of `gmail_query` permanently.
+Labeling first and writing after (with the write error swallowed) turned any
+sink fault into silent, unrecoverable loss: labels applied, grading gone, thread
+never re-graded. Writing first inverts the failure mode:
+
+| Fault | Outcome |
+|---|---|
+| Sink write fails | `OSError` logged at ERROR naming the resolved path, thread left unprocessed → retried next cycle → persistent fault ends at the give-up path's findable `agent/attempted` |
+| Labels fail after a successful write | Thread unprocessed → re-graded next cycle → a second record for that `thread_id`; `load_assessments` keeps the newest per thread, so the review TUI still shows one row |
 
 ### Prompt templates
 
@@ -315,9 +354,9 @@ Conventions shared by every TUI:
 | `test_llm_client.py` | `llm_client.py` | Request format, auth headers, `<think>` tag stripping, error handling, out-of-funds (`LLMBalanceError`) detection, availability checks |
 | `test_classifier.py` | `classifier.py` | `parse_sender` formats, `parse_sender_type` edge cases and defaults, `parse_email_label` edge cases and defaults, cloud/local routing, full pipeline |
 | `test_labeler.py` | `labeler.py` | Label verification (all present, partial, none), label ID mapping, inbox/archive actions, single API call per email |
-| `test_daemon.py` | `daemon.py` | Service email path, person email path, MLX-unavailable skip, error isolation, out-of-funds halt, config loading |
+| `test_daemon.py` | `daemon.py` | Service email path, person email path, MLX-unavailable skip, error isolation, out-of-funds halt, config loading, assessment-sink preflight + write-before-label durability |
 | `test_config_utils.py` | `config_utils.py` | Config loading, `{env.VAR}` substitution |
-| `test_newsletter.py` | `newsletter.py` | Newsletter story extraction, quality scoring, theme classification |
+| `test_newsletter.py` | `newsletter.py` | Newsletter story extraction, quality scoring, theme classification, assessment record writing, sink persistence/writability diagnostics |
 | `test_eval_schemas.py` | `evals/schemas.py` | GoldenThread/PredictionResult/RunMeta serialization round-trips |
 | `test_eval_harvest.py` | `evals/harvest.py` | Ground truth inference from labels, deduplication |
 | `test_eval_report.py` | `evals/report.py` | Confusion matrix, precision/recall/F1, accuracy, privacy violation metrics |
@@ -326,4 +365,4 @@ Conventions shared by every TUI:
 | `test_eval_newsletter_label.py` | `evals/newsletter_label.py` | Story curation + per-story scoring/theme pure functions, tier derivation, undo + Pilot UI tests (seed guard, undo stack, delete/label flows, selection, skip-through, autosave) |
 | `test_eval_newsletter_run.py` | `evals/newsletter_run.py` | `prompt_hash`, cache reuse, extraction vs quality/theme modes |
 | `test_eval_newsletter_report.py` | `evals/newsletter_report.py` | `match_stories`, tier/dimension/theme metrics, comparison deltas |
-| `test_newsletter_review.py` | `newsletter_review/tui.py` | Pure helpers (loading, filtering, formatting) + Pilot UI tests (navigation, drill-down, tier/theme/sender filters, quit) |
+| `test_newsletter_review.py` | `newsletter_review/tui.py` | Pure helpers (loading, per-thread dedup, filtering, formatting) + Pilot UI tests (navigation, drill-down, tier/theme/sender filters, quit) |

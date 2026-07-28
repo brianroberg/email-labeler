@@ -45,6 +45,13 @@ _COL_GAP = 2
 def load_assessments(path: Path) -> list[dict]:
     """Load newsletter assessment records from a JSONL file.
 
+    One row per newsletter: a thread graded more than once keeps only its last
+    (newest) record. The daemon persists the assessment *before* committing the
+    Gmail labels, so a newsletter whose labels fail to apply stays unprocessed
+    and is re-graded — and re-appended — next cycle. Deduping on read keeps that
+    durability guarantee from showing up as duplicate rows here. Records with no
+    ``thread_id`` have no identity to dedupe on and are all kept.
+
     Fails fast on pre-#53 old-scheme records whose story ``themes`` are stored
     as a LIST instead of a theme->grade dict: they would otherwise crash the
     detail view mid-render (``build_detail_lines`` calls ``themes.items()``).
@@ -52,6 +59,7 @@ def load_assessments(path: Path) -> list[dict]:
     clear, located error naming the file + line so the reader knows to
     re-migrate rather than seeing an opaque ``AttributeError`` (Finding 4)."""
     records = []
+    by_thread: dict[str, int] = {}  # thread_id -> index of its latest record
     with open(path) as f:
         for lineno, line in enumerate(f, 1):
             if not line.strip():
@@ -65,6 +73,12 @@ def load_assessments(path: Path) -> list[dict]:
                         "file predates the #53 theme-dict migration and must be "
                         "re-migrated before it can be browsed."
                     )
+            thread_id = record.get("thread_id")
+            if thread_id and thread_id in by_thread:
+                records[by_thread[thread_id]] = record  # supersede in place
+                continue
+            if thread_id:
+                by_thread[thread_id] = len(records)
             records.append(record)
     return records
 

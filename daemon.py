@@ -27,8 +27,13 @@ from newsletter import (
     NewsletterClassifier,
     NewsletterTier,
     aggregate_theme_grades,
+    count_records,
     is_newsletter,
     parse_send_date,
+    read_mountinfo,
+    running_in_container,
+    sink_persistence_warning,
+    sink_writability_warning,
     write_assessment,
 )
 from proxy_client import (
@@ -421,14 +426,16 @@ async def process_single_thread(
                 # Merge graded themes across stories (strongest grade per theme)
                 all_themes = aggregate_theme_grades(story_results)
 
-                async with (write_sem or nullcontext()):
-                    await label_manager.apply_newsletter_classification(
-                        message_ids=all_msg_ids,
-                        tier=best_tier,
-                        themes=all_themes,
-                    )
-
-                # Write structured results
+                # Persist the assessment BEFORE the labels commit. The JSONL record
+                # is the only durable copy of the grading — Gmail keeps just the
+                # coarse tier/theme labels, and apply_newsletter_classification also
+                # adds agent/processed, which drops the thread out of gmail_query for
+                # good. Writing afterwards (and swallowing the error) turned any sink
+                # fault — a bind mount gone read-only, a full disk, bad permissions —
+                # into permanent silent data loss: labels applied, grading gone,
+                # thread never re-graded. Writing first means a sink fault leaves the
+                # thread unprocessed, so the next cycle retries it (and a persistent
+                # fault ends at the give-up path's findable agent/attempted).
                 if newsletter_output_file:
                     try:
                         write_assessment(
@@ -442,8 +449,25 @@ async def process_single_thread(
                             send_date=send_date,
                             model=newsletter_classifier.cloud_llm.model,
                         )
-                    except Exception:
-                        log.exception("Failed to write newsletter assessment for thread %s", thread_id)
+                    except OSError as exc:
+                        # Named at ERROR with the resolved path so a sink fault is
+                        # distinguishable from a grading fault at a glance.
+                        log.error(
+                            "Cannot write newsletter assessment to %s: %s — thread %s "
+                            "left unprocessed for retry (check the path exists, is "
+                            "writable, and is volume-mounted)",
+                            Path(newsletter_output_file).resolve(),
+                            exc,
+                            thread_id,
+                        )
+                        raise
+
+                async with (write_sem or nullcontext()):
+                    await label_manager.apply_newsletter_classification(
+                        message_ids=all_msg_ids,
+                        tier=best_tier,
+                        themes=all_themes,
+                    )
 
                 story_count = len(story_results)
                 log.info(
@@ -729,6 +753,40 @@ async def verify_labels_with_retry(
             backoff = min(backoff * 2, max_backoff)
 
 
+def preflight_assessment_sink(output_file: str) -> None:
+    """Report — loudly, at startup — where newsletter assessments will land and
+    whether that destination can actually keep them.
+
+    Every way this sink fails is silent in normal operation, so each one gets a
+    line the operator can act on before a single newsletter is graded:
+
+      * the RESOLVED absolute path, since ``output_file`` is relative to the
+        working directory (``/app`` in the image), plus how many records it
+        already holds — a long-running daemon reporting 0 is appending
+        somewhere other than the file being reviewed;
+      * an ERROR when the path is not writable (a read-only mount), which now
+        blocks labeling rather than being swallowed; and
+      * an ERROR when nothing persists the path — in a container with no volume
+        over it, writes succeed and every record dies with the container.
+    """
+    path = Path(output_file).resolve()
+    existing = count_records(path)
+    tally = (
+        f"{existing} existing record(s)" if existing is not None
+        else "existing record count unreadable"
+    )
+    log.info("Newsletter assessments append to: %s (%s)", path, tally)
+
+    writability = sink_writability_warning(path)
+    if writability:
+        log.error("%s", writability)
+
+    if running_in_container():
+        persistence = sink_persistence_warning(path, read_mountinfo())
+        if persistence:
+            log.error("%s", persistence)
+
+
 async def run_daemon() -> None:
     """Main polling loop."""
     config = load_config()
@@ -789,16 +847,7 @@ async def run_daemon() -> None:
         newsletter_output_file = nl_config.get("output_file", "")
         log.info("Newsletter classification enabled for: %s", newsletter_recipient)
         if newsletter_output_file:
-            # Log the RESOLVED path: output_file is relative to the process
-            # working directory, so in Docker (WORKDIR /app) a missing bind
-            # mount for this directory silently strands assessments in the
-            # container layer — lost on the next recreate. Making the absolute
-            # destination visible up front is the deployment sanity check.
-            log.info(
-                "Newsletter assessments append to: %s (persist this path via a "
-                "volume mount when running in Docker)",
-                Path(newsletter_output_file).resolve(),
-            )
+            preflight_assessment_sink(newsletter_output_file)
 
     newsletter_only = os.environ.get("NEWSLETTER_ONLY", "").strip().lower() in ("1", "true", "yes")
     if newsletter_only:

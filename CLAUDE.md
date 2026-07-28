@@ -55,8 +55,8 @@ Poll loop → find unprocessed newsletters (To/Cc matches config recipient)
   → Score each story on 4 quality dimensions (simple, concrete, personal, dynamic) as Poor/OK/Good (Cloud LLM)
   → Grade each story against Ends Statement themes as Absent/Present/Emphasized (Cloud LLM)
   → Compute overall tier (excellent/good/fair/poor) from the averaged dimension scores (Poor/OK/Good → 1/2/3; excellent ≥ 2.75, good ≥ 2.25, fair ≥ 1.75, else poor)
+  → Append assessment record to JSONL file  ← before labeling, see Design Decision 6
   → Apply tier + theme labels via api-proxy → Gmail
-  → Append assessment record to JSONL file
 ```
 
 Newsletter uses its own `[newsletter.llm]` config (currently Sonnet 4.6) independent of the email classification LLM settings.
@@ -104,7 +104,8 @@ cheap and self-identifying. See `evals/README.md` (workflows) and
 3. **MLX degradation**: If local MLX is down, person emails are skipped (retried next cycle). Privacy invariant preserved.
 4. **No web server**: Pure asyncio daemon. Health check via file timestamp + Docker HEALTHCHECK.
 5. **Out-of-funds halt**: A provider balance error (HTTP 402, or a 400/403 whose body carries a balance signature like `NOT_ENOUGH_BALANCE` or Anthropic's "credit balance is too low" → `LLMBalanceError`) is account-wide, not a poison thread: the daemon halts polling entirely (in-memory `DaemonHalt`; restart is the only reset), leaves the thread unprocessed (no `agent/attempted`), logs "add funds … restart the daemon" at ERROR each cycle, and keeps the healthcheck heartbeat fresh (halted by design, not hung). 429s never halt — quota phrasing on a rate limit is indistinguishable from transient throttling.
-6. **Bounded-concurrency processing**: Threads in a poll cycle are processed concurrently, bounded by the `cloud_parallel`/`local_parallel` semaphores. `local_parallel` defaults to **1** (env override: `LOCAL_PARALLEL`): each concurrent local request needs its own KV cache, and long transcripts make those multi-GB, so concurrent requests can exceed the GPU's Metal working set and OOM-crash the local server. Raise it only after confirming the model + N KV caches fit; keep ≤ 8. See README-technical "Local Model Serving & Memory".
+6. **Assessment record before labels**: the newsletter JSONL is the only durable copy of a grading (Gmail keeps just the coarse tier/theme labels), and `apply_newsletter_classification` also applies `agent/processed`, which drops the thread out of `gmail_query` for good. So the record is written first: a sink fault (unwritable path, full disk) leaves the thread unprocessed and retried rather than labeled-but-lost, and is logged at ERROR with the resolved path instead of swallowed. The sink is preflighted at startup — resolved path + existing record count, plus an ERROR when it isn't writable or (in a container) isn't covered by a volume. Cost: a label failure after a successful write re-grades and re-appends next cycle, so `load_assessments` keeps only the newest record per `thread_id`.
+7. **Bounded-concurrency processing**: Threads in a poll cycle are processed concurrently, bounded by the `cloud_parallel`/`local_parallel` semaphores. `local_parallel` defaults to **1** (env override: `LOCAL_PARALLEL`): each concurrent local request needs its own KV cache, and long transcripts make those multi-GB, so concurrent requests can exceed the GPU's Metal working set and OOM-crash the local server. Raise it only after confirming the model + N KV caches fit; keep ≤ 8. See README-technical "Local Model Serving & Memory".
 
 ## Labels (must be pre-created in Gmail)
 
