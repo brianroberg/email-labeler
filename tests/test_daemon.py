@@ -1321,6 +1321,23 @@ class TestNewsletterOutputPathLogging:
 
         assert not [r for r in caplog.records if r.levelno >= logging.ERROR]
 
+    async def test_startup_errors_when_no_sink_is_configured(
+        self, monkeypatch, tmp_path, caplog
+    ):
+        """The third silent way assessments go missing: [newsletter] with no
+        output_file at all. Grading runs, labels apply, the per-thread INFO
+        summary prints — and nothing is ever recorded. Startup must say so."""
+        with caplog.at_level(logging.INFO, logger="email-labeler"):
+            await run_poll_cycles(
+                monkeypatch, tmp_path, [{"messages": []}],
+                keep_newsletter=True, newsletter_output_file="",
+            )
+
+        errors = [r.getMessage() for r in caplog.records if r.levelno >= logging.ERROR]
+        assert any("output_file" in m for m in errors), (
+            f"startup did not flag the missing assessments sink; errors={errors}"
+        )
+
     async def test_startup_errors_when_the_sink_is_not_writable(
         self, monkeypatch, tmp_path, caplog
     ):

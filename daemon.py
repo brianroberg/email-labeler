@@ -848,6 +848,14 @@ async def run_daemon() -> None:
         log.info("Newsletter classification enabled for: %s", newsletter_recipient)
         if newsletter_output_file:
             preflight_assessment_sink(newsletter_output_file)
+        else:
+            # Grading with no sink is silent by construction: labels apply, the
+            # per-thread summary logs, and nothing is ever recorded to review.
+            log.error(
+                "Newsletter classification is enabled but [newsletter] output_file is "
+                "not set in config.toml — newsletters will be graded and labeled, but "
+                "no assessment records will be written"
+            )
 
     newsletter_only = os.environ.get("NEWSLETTER_ONLY", "").strip().lower() in ("1", "true", "yes")
     if newsletter_only:
