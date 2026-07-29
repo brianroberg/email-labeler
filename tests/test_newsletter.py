@@ -16,8 +16,9 @@ from newsletter import (
     classify_theme_line,
     compute_tier,
     count_records,
+    covering_mount,
     is_newsletter,
-    mount_points,
+    parse_mounts,
     parse_quality_scores,
     parse_send_date,
     parse_stories,
@@ -808,16 +809,38 @@ _MOUNTINFO_WITH_BIND = _MOUNTINFO_NO_BIND + (
 )
 
 
-class TestMountPoints:
-    def test_parses_mount_points_from_mountinfo(self):
-        assert mount_points(_MOUNTINFO_WITH_BIND) == {"/", "/proc", "/etc/hosts", "/app/data"}
+class TestParseMounts:
+    def test_maps_mount_point_to_its_source(self):
+        assert parse_mounts(_MOUNTINFO_WITH_BIND)["/app/data"] == (
+            "/Users/brian/email-labeler/data"
+        )
+
+    def test_parses_every_mount_point(self):
+        assert set(parse_mounts(_MOUNTINFO_WITH_BIND)) == {
+            "/", "/proc", "/etc/hosts", "/app/data",
+        }
 
     def test_octal_escaped_space_is_decoded(self):
         line = "1470 1450 259:2 /src /app/my\\040data rw,relatime - ext4 /dev/sda1 rw\n"
-        assert "/app/my data" in mount_points(line)
+        assert "/app/my data" in parse_mounts(line)
 
     def test_ignores_malformed_lines(self):
-        assert mount_points("garbage\n\n1 2 3\n") == set()
+        assert parse_mounts("garbage\n\n1 2 3\n") == {}
+
+
+class TestCoveringMount:
+    """Which mount actually holds the sink — the nearest one enclosing it."""
+
+    def test_returns_the_nearest_enclosing_mount(self):
+        mount = covering_mount(Path("/app/data/a.jsonl"), _MOUNTINFO_WITH_BIND)
+        assert mount == ("/app/data", "/Users/brian/email-labeler/data")
+
+    def test_falls_back_to_the_root_mount(self):
+        mount = covering_mount(Path("/app/data/a.jsonl"), _MOUNTINFO_NO_BIND)
+        assert mount[0] == "/"
+
+    def test_none_when_mountinfo_is_unreadable(self):
+        assert covering_mount(Path("/app/data/a.jsonl"), None) is None
 
 
 class TestSinkPersistenceWarning:

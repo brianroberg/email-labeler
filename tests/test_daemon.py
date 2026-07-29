@@ -1301,6 +1301,36 @@ class TestNewsletterOutputPathLogging:
             f"no startup ERROR warned that {sink} is not persisted; errors={errors}"
         )
 
+    async def test_startup_names_the_host_directory_behind_the_mount(
+        self, monkeypatch, tmp_path, caplog
+    ):
+        """A mount pointing at a host directory other than the one being reviewed
+        fails exactly like no mount at all — records accumulate somewhere nobody
+        looks — but no check can know which directory the operator *meant*. So
+        name the source: the one line that makes it verifiable at a glance."""
+        sink = tmp_path / "data" / "assessments.jsonl"
+        monkeypatch.setattr(daemon, "running_in_container", lambda: True)
+        monkeypatch.setattr(
+            daemon, "read_mountinfo",
+            lambda: (
+                "1450 1449 0:118 / / rw,relatime - overlay overlay rw,lowerdir=/l/A\n"
+                f"1470 1450 259:2 /srv/elsewhere/data {tmp_path / 'data'} rw,relatime "
+                "- ext4 /dev/sda1 rw\n"
+            ),
+        )
+
+        with caplog.at_level(logging.INFO, logger="email-labeler"):
+            await run_poll_cycles(
+                monkeypatch, tmp_path, [{"messages": []}],
+                keep_newsletter=True, newsletter_output_file=sink,
+            )
+
+        assert any(
+            "/srv/elsewhere/data" in r.getMessage() for r in caplog.records
+        ), "startup did not name the host source of the mount holding the sink"
+        # A real mount covers it, so the container-layer ERROR must stay quiet.
+        assert not [r for r in caplog.records if r.levelno >= logging.ERROR]
+
     async def test_no_persistence_error_outside_a_container(
         self, monkeypatch, tmp_path, caplog
     ):

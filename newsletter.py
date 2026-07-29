@@ -328,21 +328,47 @@ def read_mountinfo(path: Path = _MOUNTINFO) -> str | None:
         return None
 
 
-def mount_points(mountinfo: str) -> set[str]:
-    """Extract the mount points (field 5) from ``/proc/self/mountinfo`` text.
+def parse_mounts(mountinfo: str) -> dict[str, str]:
+    """Map mount point -> source from ``/proc/self/mountinfo`` text.
+
+    Fields 5 and 4 respectively: the mount point, and the source path *within
+    its own filesystem* — for a Docker bind mount that is the host directory
+    (``/var/lib/docker/volumes/<name>/_data`` for a named volume), which is what
+    makes "am I appending to the directory I actually review?" answerable from
+    inside the container.
 
     Paths containing spaces, tabs, newlines, or backslashes are octal-escaped in
     mountinfo; ``\\040`` (space) is the one worth decoding for a bind-mounted
     host directory. Malformed lines are skipped rather than raising — this is a
     diagnostic, and it must never be the thing that breaks startup.
     """
-    points = set()
+    mounts = {}
     for line in mountinfo.splitlines():
         fields = line.split(" ")
         if len(fields) < 10:  # a real mountinfo line has at least 10 fields
             continue
-        points.add(fields[4].replace("\\040", " "))
-    return points
+        mounts[fields[4].replace("\\040", " ")] = fields[3].replace("\\040", " ")
+    return mounts
+
+
+def covering_mount(path: Path, mountinfo: str | None) -> tuple[str, str] | None:
+    """The mount actually holding *path*, as ``(mount_point, source)``.
+
+    The nearest enclosing mount: the longest mount point that is *path* itself or
+    one of its ancestors. Compared as paths, not strings, so ``/app/dataset`` is
+    never mistaken for a mount covering ``/app/data``. Returns None when
+    mountinfo is unreadable (non-Linux) — no evidence, no claim.
+    """
+    if mountinfo is None:
+        return None
+
+    nearest: tuple[str, str] | None = None
+    for point, source in parse_mounts(mountinfo).items():
+        candidate = Path(point)
+        if path == candidate or path.is_relative_to(candidate):
+            if nearest is None or len(point) > len(nearest[0]):
+                nearest = (point, source)
+    return nearest
 
 
 def sink_persistence_warning(path: Path, mountinfo: str | None) -> str | None:
@@ -352,26 +378,14 @@ def sink_persistence_warning(path: Path, mountinfo: str | None) -> str | None:
     in the image), so without a volume mount the assessments land in the
     container layer: every write succeeds, the review TUI on the host sees
     nothing new, and the records are destroyed on the next ``docker compose up``.
-    Detection is "which mount covers this path" — the nearest enclosing mount
-    point. If that is the container root itself, nothing is persisting it.
+    If the mount covering the path is the container root itself, nothing is
+    persisting it.
 
     Returns None when there's no evidence to act on (mountinfo unreadable), so
     the check never cries wolf on a platform it can't inspect.
     """
-    if mountinfo is None:
-        return None
-
-    # Nearest enclosing mount = the longest mount point that is the path itself
-    # or one of its ancestors. Compared as paths, not strings, so /app/dataset
-    # is never mistaken for a mount covering /app/data.
-    nearest = ""
-    for point in mount_points(mountinfo):
-        candidate = Path(point)
-        if path == candidate or path.is_relative_to(candidate):
-            if len(str(candidate)) > len(nearest):
-                nearest = str(candidate)
-
-    if nearest != "/":
+    mount = covering_mount(path, mountinfo)
+    if mount is None or mount[0] != "/":
         return None
 
     return (

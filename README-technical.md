@@ -193,6 +193,11 @@ preflights it before grading anything and reports what it found:
 
 ```
 INFO  Newsletter assessments append to: /app/data/newsletter_assessments.jsonl (412 existing record(s))
+INFO  Assessments are persisted by the mount at /app/data (source /home/you/stack/data on the
+      host) — confirm that is the directory you review
+ERROR Newsletter classification is enabled but [newsletter] output_file is not set in
+      config.toml — newsletters will be graded and labeled, but no assessment records
+      will be written
 ERROR Newsletter assessments resolve to /app/data/newsletter_assessments.jsonl, which no
       volume covers — it is inside the container's writable layer. Writes will appear to
       succeed, but the records are invisible on the host and are DESTROYED when the
@@ -212,6 +217,13 @@ ERROR Newsletter assessments sink is not writable: /app/data. Newsletters will b
   the container root itself. A bind mount over the directory *or* over the file
   silences it; an unreadable `mountinfo` (non-Linux) means no evidence, so no
   warning.
+* **The mount source** is logged when a real mount *does* hold the sink, because
+  no check can know which host directory you meant: a volume aimed at the wrong
+  one fails as silently as no volume at all. The source is `mountinfo` field 4 —
+  the path within the mount's own filesystem, which for a Docker bind mount is
+  the host directory (`/var/lib/docker/volumes/<name>/_data` for a named volume).
+* **A missing `output_file`** — `[newsletter]` configured with no sink at all —
+  is its own ERROR: grading and labeling proceed, nothing is ever recorded.
 * **The writability check** uses the nearest existing ancestor when the file
   doesn't exist yet (`write_assessment` creates missing parents).
 

@@ -28,6 +28,7 @@ from newsletter import (
     NewsletterTier,
     aggregate_theme_grades,
     count_records,
+    covering_mount,
     is_newsletter,
     parse_send_date,
     read_mountinfo,
@@ -782,9 +783,23 @@ def preflight_assessment_sink(output_file: str) -> None:
         log.error("%s", writability)
 
     if running_in_container():
-        persistence = sink_persistence_warning(path, read_mountinfo())
+        mountinfo = read_mountinfo()
+        persistence = sink_persistence_warning(path, mountinfo)
         if persistence:
             log.error("%s", persistence)
+        else:
+            # A mount holds the sink, but only the operator knows whether it is
+            # the directory they review: a volume pointed somewhere else fails
+            # just as silently as no volume at all. Name the source so the
+            # answer is one log line away instead of a docker inspect away.
+            mount = covering_mount(path, mountinfo)
+            if mount:
+                log.info(
+                    "Assessments are persisted by the mount at %s (source %s on the "
+                    "host) — confirm that is the directory you review",
+                    mount[0],
+                    mount[1],
+                )
 
 
 async def run_daemon() -> None:
