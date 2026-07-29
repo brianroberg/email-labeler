@@ -254,6 +254,29 @@ If you ran the daemon in Docker, point `--file` at the host path you mounted (or
 run the command from the directory holding `data/`) — the default path is
 relative to the current directory.
 
+#### "old-scheme record" on startup
+
+```
+Error loading …/newsletter_assessments.jsonl: …:1: old-scheme record — story themes
+are a list (['vocation_family']), not a theme->grade dict.
+```
+
+Records written before the scoring-scheme change (July 2026) store story themes
+as a plain list and dimension scores on a 1-5 scale. The reader rejects those
+outright, so one old record at the top of the file blocks the whole file. Convert
+it — with the daemon stopped, since it appends there:
+
+```bash
+python -m scripts.migrate_assessments path/to/newsletter_assessments.jsonl             # counts only
+python -m scripts.migrate_assessments path/to/newsletter_assessments.jsonl --in-place  # apply
+```
+
+A `.bak` copy is kept. Old themes become `present`, old scores are bucketed into
+Poor/OK/Good, and each record's tier is left exactly as graded — so it still
+matches the label on the email. Migrated records say so in their detail view.
+See [README-technical.md](README-technical.md#migrating-pre-53-records) for what
+the conversion can and cannot preserve.
+
 ## Resilience
 
 The daemon is designed to run unattended and recover from transient failures:

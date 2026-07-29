@@ -600,6 +600,21 @@ def _title(app) -> str:
     return str(app.query_one("#title", Static).render())
 
 
+class TestMigratedProvenanceInDetail:
+    """A migrated pre-#53 record's Poor/OK/Good values are re-bucketed 5-point
+    judgments. The detail view must say so, or it presents a precision the
+    grader never expressed."""
+
+    def test_detail_notes_a_migrated_record(self):
+        r = _make_record()
+        r["migrated_from"] = "pre-#53"
+        assert any("pre-#53" in line for line in build_detail_lines(r, width=80))
+
+    def test_detail_says_nothing_for_an_unmigrated_record(self):
+        lines = build_detail_lines(_make_record(), width=80)
+        assert not any("pre-#53" in line for line in lines)
+
+
 class TestFormatSourceLine:
     """The reader must say what it read. The whole July-11 incident was a stale
     copy of the assessments file: the daemon was recording newsletters through

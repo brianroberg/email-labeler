@@ -33,6 +33,7 @@ uv run --extra dev ruff check .  # Lint
 - `gmail_utils.py` — Header/body parsing (copied from email-agent)
 - `config.toml` — Label definitions, prompts, operational params
 - `newsletter_review/` — Textual TUI for browsing newsletter assessment results (`python -m newsletter_review`)
+- `scripts/migrate_assessments.py` — Convert pre-#53 records in an assessments JSONL (list themes → graded dicts, 1-5 scores → Poor/OK/Good) so the review TUI can open a file with old history; tiers are preserved verbatim. Dry-run by default, `--in-place` applies (keeps `.bak`)
 - `tui_common.py` — Shared Textual widgets/screens for all TUIs (see README-technical "TUI Conventions")
 
 ## Architecture

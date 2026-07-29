@@ -270,8 +270,17 @@ def build_detail_lines(record: dict, width: int = 80) -> list[str]:
         f"Model: {model}",
         f"Overall: {overall_tier}",
         f"Stories: {len(stories)}",
-        "",
     ]
+
+    # A migrated record's dimension labels are 5-point scores re-bucketed into
+    # Poor/OK/Good (scripts/migrate_assessments.py); its tier is the one the
+    # grader actually concluded. Say so rather than presenting a precision the
+    # grader never expressed.
+    migrated = record.get("migrated_from")
+    if migrated:
+        lines.append(f"Scores: re-bucketed from the {migrated} 5-point rubric")
+
+    lines.append("")
 
     if not stories:
         lines.append("No stories extracted from this newsletter.")

@@ -34,6 +34,10 @@ email-labeler/
 ├── newsletter_review/  Textual TUI for browsing newsletter assessments
 │   ├── __main__.py     CLI entry point (python -m newsletter_review)
 │   └── tui.py          Pure data helpers + Textual app
+├── scripts/
+│   ├── eval_model.py           One-command-per-model eval wrapper
+│   ├── migrate_assessments.py  Convert pre-#53 records in an assessments JSONL
+│   └── smoke_concurrency.py    Local-serving concurrency smoke test
 └── tests/
     ├── conftest.py          Shared fixtures and sample Gmail data
     ├── test_llm_client.py   LLM client tests
@@ -227,6 +231,35 @@ ERROR Newsletter assessments sink is not writable: /app/data. Newsletters will b
 * **The writability check** uses the nearest existing ancestor when the file
   doesn't exist yet (`write_assessment` creates missing parents).
 
+#### Migrating pre-#53 records
+
+Issue #53 replaced the 1-5 dimension scores with the 3-value Poor/OK/Good rubric
+and list-shaped story themes with theme->grade dicts, and the readers were then
+made to **reject** the old shapes (`70c1a02`) on the premise that affected data
+would be regenerated. That premise held for the eval golden set. It does not hold
+for this file: it is append-only and is the only copy of every grading ever made,
+so a single pre-#53 record at the top makes the whole file unopenable in the
+review TUI. Convert it in place:
+
+```bash
+python -m scripts.migrate_assessments data/newsletter_assessments.jsonl             # dry run: counts
+python -m scripts.migrate_assessments data/newsletter_assessments.jsonl --in-place  # apply (keeps .bak)
+```
+
+Stop the daemon first — it appends to this file. Every line is parsed and
+converted before anything is written, so a malformed file aborts with the
+original untouched, and the rewrite goes through a temp file + `os.replace`.
+
+What the conversion can and cannot preserve:
+
+| Field | Treatment |
+|---|---|
+| `stories[].themes` | List -> `{theme: "present"}`. Exact in meaning: the old list asserted presence with no emphasis judgment. Nothing becomes `emphasized`, so no migrated record implies a theme label — matching the labels those emails carry. |
+| `stories[].scores` | Bucketed 1-2 -> Poor(1), 3 -> OK(2), 4-5 -> Good(3). Lossy by construction — 5 values onto 3. |
+| `stories[].average_score` | Recomputed from the bucketed scores so it agrees with the labels the detail view renders. |
+| `overall_tier`, `stories[].tier` | **Preserved verbatim, never recomputed.** The tier is what the grader concluded under the old rubric and what was applied to the email as a Gmail label; deriving a new one from re-bucketed dimensions would leave the record disagreeing with the message. |
+| `migrated_from` | Added (`"pre-#53"`). The review TUI's detail view surfaces it, so re-bucketed scores are never mistaken for what the grader emitted. |
+
 #### Write-before-label ordering
 
 The assessment record is written **before** `apply_newsletter_classification`
@@ -377,4 +410,5 @@ Conventions shared by every TUI:
 | `test_eval_newsletter_label.py` | `evals/newsletter_label.py` | Story curation + per-story scoring/theme pure functions, tier derivation, undo + Pilot UI tests (seed guard, undo stack, delete/label flows, selection, skip-through, autosave) |
 | `test_eval_newsletter_run.py` | `evals/newsletter_run.py` | `prompt_hash`, cache reuse, extraction vs quality/theme modes |
 | `test_eval_newsletter_report.py` | `evals/newsletter_report.py` | `match_stories`, tier/dimension/theme metrics, comparison deltas |
-| `test_newsletter_review.py` | `newsletter_review/tui.py` | Pure helpers (loading, per-thread dedup, filtering, formatting, source line) + Pilot UI tests (navigation, drill-down, tier/theme/sender filters, source header, quit) |
+| `test_newsletter_review.py` | `newsletter_review/tui.py` | Pure helpers (loading, per-thread dedup, filtering, formatting, source line, migrated-record note) + Pilot UI tests (navigation, drill-down, tier/theme/sender filters, source header, quit) |
+| `test_migrate_assessments.py` | `scripts/migrate_assessments.py` | Old-scheme detection, theme/score conversion, tier preservation, atomic in-place rewrite + abort-on-malformed, round-trip through `load_assessments` |
