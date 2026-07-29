@@ -1368,6 +1368,28 @@ class TestNewsletterOutputPathLogging:
             f"startup did not flag the missing assessments sink; errors={errors}"
         )
 
+    async def test_startup_errors_when_the_sink_cannot_be_read(
+        self, monkeypatch, tmp_path, caplog
+    ):
+        """An unreadable sink is reported, not shrugged at. The realistic cause is
+        an ``output_file`` naming a directory: ``os.access`` calls a directory
+        writable, so without this the one guaranteed-fatal misconfiguration
+        produces nothing louder than an INFO — and then every newsletter is graded
+        and abandoned to agent/attempted."""
+        sink = tmp_path / "data" / "assessments.jsonl"
+        sink.mkdir(parents=True)
+
+        with caplog.at_level(logging.INFO, logger="email-labeler"):
+            await run_poll_cycles(
+                monkeypatch, tmp_path, [{"messages": []}],
+                keep_newsletter=True, newsletter_output_file=sink,
+            )
+
+        errors = [r.getMessage() for r in caplog.records if r.levelno >= logging.ERROR]
+        assert any(str(sink) in m for m in errors), (
+            f"an unreadable/misshapen sink produced no startup ERROR; errors={errors}"
+        )
+
     async def test_startup_errors_when_the_sink_is_not_writable(
         self, monkeypatch, tmp_path, caplog
     ):

@@ -197,8 +197,8 @@ preflights it before grading anything and reports what it found:
 
 ```
 INFO  Newsletter assessments append to: /app/data/newsletter_assessments.jsonl (412 existing record(s))
-INFO  Assessments are persisted by the mount at /app/data (source /home/you/stack/data on the
-      host) — confirm that is the directory you review
+INFO  Assessments are persisted by the ext4 mount at /app/data (source /home/you/stack/data,
+      relative to that filesystem's root) — confirm that is the directory you review
 ERROR Newsletter classification is enabled but [newsletter] output_file is not set in
       config.toml — newsletters will be graded and labeled, but no assessment records
       will be written
@@ -217,19 +217,30 @@ ERROR Newsletter assessments sink is not writable: /app/data. Newsletters will b
   appending to the file you review.
 * **The persistence check** compares the resolved path against
   `/proc/self/mountinfo`: it fires only inside a container (`/.dockerenv` or
-  `/run/.containerenv`) and only when the nearest mount enclosing the path is
-  the container root itself. A bind mount over the directory *or* over the file
-  silences it; an unreadable `mountinfo` (non-Linux) means no evidence, so no
-  warning.
-* **The mount source** is logged when a real mount *does* hold the sink, because
-  no check can know which host directory you meant: a volume aimed at the wrong
-  one fails as silently as no volume at all. The source is `mountinfo` field 4 —
-  the path within the mount's own filesystem, which for a Docker bind mount is
-  the host directory (`/var/lib/docker/volumes/<name>/_data` for a named volume).
+  `/run/.containerenv`), and only when the nearest mount enclosing the path is
+  the container root itself *or* is an ephemeral filesystem (`tmpfs`, `ramfs`,
+  another `overlay`) — a tmpfs over the directory looks like a volume to a
+  mount-point check but dies with the container just the same. A durable bind
+  mount over the directory *or* over the file silences it; an unreadable
+  `mountinfo` (non-Linux) means no evidence, so no warning. Note this only
+  detects containers that drop one of those two marker files — Docker and Podman
+  do, containerd under Kubernetes does not.
+* **The mount source and fstype** are logged when a real mount *does* hold the
+  sink, because no check can know which host directory you meant: a volume aimed
+  at the wrong one fails as silently as no volume at all. The source is
+  `mountinfo` field 4 — the path within the mount's own filesystem
+  (`/var/lib/docker/volumes/<name>/_data` for a named volume). It is *relative to
+  that filesystem's root*, not to the host's `/`: if the host keeps `/srv` on its
+  own filesystem, a bind of `/srv/stack/data` is reported as `/stack/data`, so
+  compare the tail rather than expecting a path that resolves on the host.
 * **A missing `output_file`** — `[newsletter]` configured with no sink at all —
   is its own ERROR: grading and labeling proceed, nothing is ever recorded.
 * **The writability check** uses the nearest existing ancestor when the file
-  doesn't exist yet (`write_assessment` creates missing parents).
+  doesn't exist yet (`write_assessment` creates missing parents), and rejects an
+  `output_file` that names a directory — fatal for every grading, yet `os.access`
+  calls a directory writable.
+* **An unreadable sink** (the count comes back unknown) is an ERROR too, not a
+  footnote on the INFO line: nothing below it can vouch for the path.
 
 #### Migrating pre-#53 records
 
@@ -246,9 +257,18 @@ python -m scripts.migrate_assessments data/newsletter_assessments.jsonl         
 python -m scripts.migrate_assessments data/newsletter_assessments.jsonl --in-place  # apply (keeps .bak)
 ```
 
+Run this **on the host**, against the host copy of the file: the image is built
+with `COPY *.py ./`, so `scripts/` is not in it and `python -m
+scripts.migrate_assessments` has nothing to import inside the container. If the
+records are still stranded in the container layer, `docker compose cp` them out
+first (see [README.md](README.md)).
+
 Stop the daemon first — it appends to this file. Every line is parsed and
-converted before anything is written, so a malformed file aborts with the
-original untouched, and the rewrite goes through a temp file + `os.replace`.
+converted before anything is written, so a malformed file (or a dimension score
+outside the old 1-5 rubric) aborts with the original untouched, and the rewrite
+goes through a temp file + `os.replace`. An `--in-place` run with nothing left to
+migrate is a no-op — it does not rewrite the file, and does not overwrite the
+`.bak` the first run left.
 
 What the conversion can and cannot preserve:
 
@@ -273,7 +293,7 @@ never re-graded. Writing first inverts the failure mode:
 | Fault | Outcome |
 |---|---|
 | Sink write fails | `OSError` logged at ERROR naming the resolved path, thread left unprocessed → retried next cycle → persistent fault ends at the give-up path's findable `agent/attempted` |
-| Labels fail after a successful write | Thread unprocessed → re-graded next cycle → a second record for that `thread_id`; `load_assessments` keeps the newest per thread, so the review TUI still shows one row |
+| Labels fail after a successful write | Thread unprocessed → re-graded next cycle → a second record for that `thread_id`; `load_assessments` keeps the newest per thread — by the record's own `timestamp`, not by file position, so merging a rescued copy of the file cannot resurrect an older grading — and the review TUI still shows one row |
 
 ### Prompt templates
 

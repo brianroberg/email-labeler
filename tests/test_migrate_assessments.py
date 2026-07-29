@@ -150,6 +150,22 @@ class TestMigrateRecord:
         out, _ = migrate_record(_old_record())
         assert out["migrated_from"] == "pre-#53"
 
+    def test_a_score_outside_the_old_rubric_is_rejected_not_passed_through(self):
+        """Silently keeping an unmappable value is the worst option: the record
+        stays flagged old-scheme forever (its value is still outside 1-3), so a
+        second run re-buckets its already-converted siblings — Good(3) -> OK(2) ->
+        Poor(1) — and a non-numeric one blows up in the average instead."""
+        r = _old_record()
+        r["stories"][0]["scores"] = {"simple": 7, "concrete": 3, "personal": 3, "dynamic": 3}
+        with pytest.raises(ValueError, match="7"):
+            migrate_record(r)
+
+    def test_a_non_numeric_score_is_rejected(self):
+        r = _old_record()
+        r["stories"][0]["scores"] = {"simple": "4", "concrete": 3, "personal": 3, "dynamic": 3}
+        with pytest.raises(ValueError):
+            migrate_record(r)
+
     def test_other_fields_are_untouched(self):
         out, _ = migrate_record(_old_record())
         for key in ("timestamp", "message_id", "thread_id", "from", "subject"):
@@ -193,6 +209,45 @@ class TestMigrateFile:
             "vocation_family": "present", "scripture": "present",
         }
         assert (tmp_path / "a.jsonl.bak").read_text() == before
+
+    def test_a_second_run_does_not_destroy_the_original_backup(self, tmp_path):
+        """The .bak is the only pre-migration copy of an append-only, irreplaceable
+        file. Re-running --in-place (out of doubt, or in a script) must not replace
+        it with the already-migrated content."""
+        f = tmp_path / "a.jsonl"
+        self._write(f, [_old_record()])
+        original = f.read_text()
+
+        migrate_file(f, in_place=True)
+        migrated = f.read_text()
+        migrate_file(f, in_place=True)
+
+        assert (tmp_path / "a.jsonl.bak").read_text() == original
+        assert f.read_text() == migrated  # and the file itself is unchanged
+
+    def test_nothing_to_migrate_leaves_the_file_and_backup_alone(self, tmp_path):
+        f = tmp_path / "a.jsonl"
+        self._write(f, [_new_record()])
+        before = f.read_text()
+
+        stats = migrate_file(f, in_place=True)
+
+        assert (stats.total, stats.migrated) == (1, 0)
+        assert f.read_text() == before
+        assert not (tmp_path / "a.jsonl.bak").exists()
+
+    def test_a_bad_score_aborts_before_anything_is_written(self, tmp_path):
+        f = tmp_path / "a.jsonl"
+        bad = _old_record()
+        bad["stories"][0]["scores"] = {"simple": 9}
+        f.write_text(json.dumps(_old_record()) + "\n" + json.dumps(bad) + "\n")
+        before = f.read_text()
+
+        with pytest.raises(ValueError, match="line 2"):
+            migrate_file(f, in_place=True)
+
+        assert f.read_text() == before
+        assert not (tmp_path / "a.jsonl.bak").exists()
 
     def test_record_order_is_preserved(self, tmp_path):
         f = tmp_path / "a.jsonl"

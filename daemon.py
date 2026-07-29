@@ -30,10 +30,10 @@ from newsletter import (
     count_records,
     covering_mount,
     is_newsletter,
+    mount_persistence_warning,
     parse_send_date,
     read_mountinfo,
     running_in_container,
-    sink_persistence_warning,
     sink_writability_warning,
     write_assessment,
 )
@@ -765,41 +765,52 @@ def preflight_assessment_sink(output_file: str) -> None:
         working directory (``/app`` in the image), plus how many records it
         already holds — a long-running daemon reporting 0 is appending
         somewhere other than the file being reviewed;
-      * an ERROR when the path is not writable (a read-only mount), which now
-        blocks labeling rather than being swallowed; and
+      * an ERROR when the path is not writable (a read-only mount) or is not a
+        file at all, which now blocks labeling rather than being swallowed; and
       * an ERROR when nothing persists the path — in a container with no volume
-        over it, writes succeed and every record dies with the container.
+        over it (or only a tmpfs), writes succeed and every record dies with the
+        container.
     """
     path = Path(output_file).resolve()
     existing = count_records(path)
-    tally = (
-        f"{existing} existing record(s)" if existing is not None
-        else "existing record count unreadable"
-    )
-    log.info("Newsletter assessments append to: %s (%s)", path, tally)
+    if existing is None:
+        # Not merely uninformative: the sink cannot be read, so nothing below can
+        # vouch for it and write_assessment is very likely to fail the same way.
+        log.error(
+            "Newsletter assessments append to: %s — but that path cannot be read, so "
+            "its existing records cannot be counted and writes are likely to fail too",
+            path,
+        )
+    else:
+        log.info("Newsletter assessments append to: %s (%d existing record(s))", path, existing)
 
     writability = sink_writability_warning(path)
     if writability:
         log.error("%s", writability)
 
     if running_in_container():
-        mountinfo = read_mountinfo()
-        persistence = sink_persistence_warning(path, mountinfo)
+        # One mountinfo read AND one parse serve both the warning and the source
+        # line below — they answer the same question about the same mount.
+        mount = covering_mount(path, read_mountinfo())
+        persistence = mount_persistence_warning(path, mount)
         if persistence:
             log.error("%s", persistence)
-        else:
+        elif mount:
             # A mount holds the sink, but only the operator knows whether it is
             # the directory they review: a volume pointed somewhere else fails
-            # just as silently as no volume at all. Name the source so the
-            # answer is one log line away instead of a docker inspect away.
-            mount = covering_mount(path, mountinfo)
-            if mount:
-                log.info(
-                    "Assessments are persisted by the mount at %s (source %s on the "
-                    "host) — confirm that is the directory you review",
-                    mount[0],
-                    mount[1],
-                )
+            # just as silently as no volume at all. Name the source so the answer
+            # is one log line away instead of a docker inspect away. It is the
+            # path within the source FILESYSTEM, so it lacks that filesystem's
+            # own host mount point (a bind of /srv/stack/data reports
+            # /stack/data when /srv is a separate filesystem) — say so rather
+            # than claiming a host path that may not exist.
+            log.info(
+                "Assessments are persisted by the %s mount at %s (source %s, relative "
+                "to that filesystem's root) — confirm that is the directory you review",
+                mount[2],
+                mount[0],
+                mount[1],
+            )
 
 
 async def run_daemon() -> None:

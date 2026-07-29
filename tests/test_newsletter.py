@@ -810,10 +810,19 @@ _MOUNTINFO_WITH_BIND = _MOUNTINFO_NO_BIND + (
 
 
 class TestParseMounts:
-    def test_maps_mount_point_to_its_source(self):
+    def test_maps_mount_point_to_its_source_and_fstype(self):
         assert parse_mounts(_MOUNTINFO_WITH_BIND)["/app/data"] == (
-            "/Users/brian/email-labeler/data"
+            "/Users/brian/email-labeler/data", "ext4",
         )
+
+    def test_fstype_is_found_past_the_optional_fields(self):
+        """``master:N`` / ``propagate_from:N`` sit between field 7 and the ``-``,
+        so the fstype's index varies — it must be located by the separator."""
+        line = (
+            "1470 1450 259:2 /src /app/data rw,relatime shared:12 master:7 "
+            "- xfs /dev/sda1 rw\n"
+        )
+        assert parse_mounts(line)["/app/data"] == ("/src", "xfs")
 
     def test_parses_every_mount_point(self):
         assert set(parse_mounts(_MOUNTINFO_WITH_BIND)) == {
@@ -833,7 +842,7 @@ class TestCoveringMount:
 
     def test_returns_the_nearest_enclosing_mount(self):
         mount = covering_mount(Path("/app/data/a.jsonl"), _MOUNTINFO_WITH_BIND)
-        assert mount == ("/app/data", "/Users/brian/email-labeler/data")
+        assert mount == ("/app/data", "/Users/brian/email-labeler/data", "ext4")
 
     def test_falls_back_to_the_root_mount(self):
         mount = covering_mount(Path("/app/data/a.jsonl"), _MOUNTINFO_NO_BIND)
@@ -881,6 +890,23 @@ class TestSinkPersistenceWarning:
         # No evidence either way — never cry wolf.
         assert sink_persistence_warning(Path("/app/data/a.jsonl"), None) is None
 
+    def test_warns_when_the_covering_mount_is_a_tmpfs(self):
+        """A mount over the directory is not automatically persistence: a tmpfs
+        lives in RAM and dies with the container just like the writable layer,
+        while looking to a mount-point check exactly like a bind mount."""
+        mountinfo = _MOUNTINFO_NO_BIND + (
+            "1470 1450 0:99 / /app/data rw,relatime - tmpfs tmpfs rw,size=65536k\n"
+        )
+        warning = sink_persistence_warning(Path("/app/data/a.jsonl"), mountinfo)
+        assert warning is not None
+        assert "tmpfs" in warning
+
+    def test_warns_when_the_covering_mount_is_another_overlay(self):
+        mountinfo = _MOUNTINFO_NO_BIND + (
+            "1470 1450 0:200 / /app/data rw,relatime - overlay overlay rw,lowerdir=/l/B\n"
+        )
+        assert sink_persistence_warning(Path("/app/data/a.jsonl"), mountinfo) is not None
+
 
 class TestSinkWritabilityWarning:
     """A sink that cannot be appended to now blocks labeling (the record is
@@ -911,6 +937,17 @@ class TestSinkWritabilityWarning:
         warning = sink_writability_warning(path)
         assert warning is not None
         assert str(path) in warning
+
+    def test_warns_when_the_configured_sink_is_a_directory(self, tmp_path):
+        """``output_file`` pointing at a directory is fatal for every grading
+        (``open(dir, "a")`` raises ``IsADirectoryError``), but ``os.access`` says
+        the directory is perfectly writable — so the shape has to be checked too,
+        or the one guaranteed-fatal misconfiguration passes preflight silently."""
+        sink = tmp_path / "assessments.jsonl"
+        sink.mkdir()
+        warning = sink_writability_warning(sink)
+        assert warning is not None
+        assert str(sink) in warning
 
     def test_warns_when_the_nearest_existing_directory_is_not_writable(self, tmp_path, monkeypatch):
         # The file (and an intermediate dir) don't exist yet: the check falls back

@@ -83,8 +83,10 @@ python -m newsletter_review --file path/to/file.jsonl  # Custom JSONL path
 The listing shows a send-date column and is sorted by send-date descending (newest
 first; records with no send-date sort last). The header names the resolved file
 path, the newsletter count, and the newest send date, so a stale copy of the
-assessments file is recognizable rather than indistinguishable from a live one.
-Records are deduped per `thread_id` on read (newest wins) — see Design Decision 6.
+assessments file is recognizable rather than indistinguishable from a live one
+(printed too when the file holds no records, which is when it matters most).
+Records are deduped per `thread_id` on read (newest `timestamp` wins) — see
+Design Decision 6.
 
 Hotkeys: `f` opens the filter menu (`t` tier → `e/g/f/p/c`, `h` theme → `s/c/h/v/d/x`, `s` sender text input, `d` date → `3`=past 30d / `9`=past 90d / `y`=past 365d / `s`=since YYYY-MM-DD / `x`=clear), `Enter` opens detail, `Esc` back, `q` quit.
 
@@ -108,7 +110,7 @@ cheap and self-identifying. See `evals/README.md` (workflows) and
 3. **MLX degradation**: If local MLX is down, person emails are skipped (retried next cycle). Privacy invariant preserved.
 4. **No web server**: Pure asyncio daemon. Health check via file timestamp + Docker HEALTHCHECK.
 5. **Out-of-funds halt**: A provider balance error (HTTP 402, or a 400/403 whose body carries a balance signature like `NOT_ENOUGH_BALANCE` or Anthropic's "credit balance is too low" → `LLMBalanceError`) is account-wide, not a poison thread: the daemon halts polling entirely (in-memory `DaemonHalt`; restart is the only reset), leaves the thread unprocessed (no `agent/attempted`), logs "add funds … restart the daemon" at ERROR each cycle, and keeps the healthcheck heartbeat fresh (halted by design, not hung). 429s never halt — quota phrasing on a rate limit is indistinguishable from transient throttling.
-6. **Assessment record before labels**: the newsletter JSONL is the only durable copy of a grading (Gmail keeps just the coarse tier/theme labels), and `apply_newsletter_classification` also applies `agent/processed`, which drops the thread out of `gmail_query` for good. So the record is written first: a sink fault (unwritable path, full disk) leaves the thread unprocessed and retried rather than labeled-but-lost, and is logged at ERROR with the resolved path instead of swallowed. The sink is preflighted at startup — resolved path + existing record count, plus an ERROR when it isn't writable or (in a container) isn't covered by a volume. Cost: a label failure after a successful write re-grades and re-appends next cycle, so `load_assessments` keeps only the newest record per `thread_id`.
+6. **Assessment record before labels**: the newsletter JSONL is the only durable copy of a grading (Gmail keeps just the coarse tier/theme labels), and `apply_newsletter_classification` also applies `agent/processed`, which drops the thread out of `gmail_query` for good. So the record is written first: a sink fault (unwritable path, full disk) leaves the thread unprocessed and retried rather than labeled-but-lost, and is logged at ERROR with the resolved path instead of swallowed. The sink is preflighted at startup — resolved path + existing record count, plus an ERROR when it isn't a readable/writable file or (in a container) isn't covered by a durable volume (a tmpfs over it counts as no volume). Cost: a label failure after a successful write re-grades and re-appends next cycle, so `load_assessments` keeps only the newest record per `thread_id`, chosen by the record's own `timestamp` (file position is only the tie-break — files get merged, not just appended).
 7. **Bounded-concurrency processing**: Threads in a poll cycle are processed concurrently, bounded by the `cloud_parallel`/`local_parallel` semaphores. `local_parallel` defaults to **1** (env override: `LOCAL_PARALLEL`): each concurrent local request needs its own KV cache, and long transcripts make those multi-GB, so concurrent requests can exceed the GPU's Metal working set and OOM-crash the local server. Raise it only after confirming the model + N KV caches fit; keep ≤ 8. See README-technical "Local Model Serving & Memory".
 
 ## Labels (must be pre-created in Gmail)

@@ -328,14 +328,25 @@ def read_mountinfo(path: Path = _MOUNTINFO) -> str | None:
         return None
 
 
-def parse_mounts(mountinfo: str) -> dict[str, str]:
-    """Map mount point -> source from ``/proc/self/mountinfo`` text.
+# Filesystem types that do not outlive the container, whatever they are mounted
+# over: RAM-backed, or another copy-on-write layer discarded with it. A mount of
+# one of these is not persistence, so a mount-point-only check would clear a
+# tmpfs over the sink directory that loses every record on restart.
+_EPHEMERAL_FSTYPES = frozenset({"tmpfs", "ramfs", "overlay", "overlayfs", "aufs", "devtmpfs"})
 
-    Fields 5 and 4 respectively: the mount point, and the source path *within
-    its own filesystem* — for a Docker bind mount that is the host directory
+
+def parse_mounts(mountinfo: str) -> dict[str, tuple[str, str]]:
+    """Map mount point -> ``(source, fstype)`` from ``/proc/self/mountinfo`` text.
+
+    The mount point is field 5. The source is field 4: the path *within its own
+    filesystem* — for a Docker bind mount that is the host directory
     (``/var/lib/docker/volumes/<name>/_data`` for a named volume), which is what
     makes "am I appending to the directory I actually review?" answerable from
-    inside the container.
+    inside the container. Note it is relative to the ROOT OF THAT FILESYSTEM, not
+    to the host's ``/``: if the host keeps ``/srv`` on its own filesystem, a bind
+    of ``/srv/stack/data`` reports ``/stack/data``. The fstype is the first field
+    after the ``-`` separator, and is what distinguishes a durable bind mount from
+    a tmpfs.
 
     Paths containing spaces, tabs, newlines, or backslashes are octal-escaped in
     mountinfo; ``\\040`` (space) is the one worth decoding for a bind-mounted
@@ -347,12 +358,18 @@ def parse_mounts(mountinfo: str) -> dict[str, str]:
         fields = line.split(" ")
         if len(fields) < 10:  # a real mountinfo line has at least 10 fields
             continue
-        mounts[fields[4].replace("\\040", " ")] = fields[3].replace("\\040", " ")
+        # Optional fields sit between field 7 and the "-", so the fstype's index
+        # varies: find the separator rather than assuming a position.
+        try:
+            fstype = fields[fields.index("-", 6) + 1]
+        except (ValueError, IndexError):
+            continue
+        mounts[fields[4].replace("\\040", " ")] = (fields[3].replace("\\040", " "), fstype)
     return mounts
 
 
-def covering_mount(path: Path, mountinfo: str | None) -> tuple[str, str] | None:
-    """The mount actually holding *path*, as ``(mount_point, source)``.
+def covering_mount(path: Path, mountinfo: str | None) -> tuple[str, str, str] | None:
+    """The mount actually holding *path*, as ``(mount_point, source, fstype)``.
 
     The nearest enclosing mount: the longest mount point that is *path* itself or
     one of its ancestors. Compared as paths, not strings, so ``/app/dataset`` is
@@ -362,38 +379,57 @@ def covering_mount(path: Path, mountinfo: str | None) -> tuple[str, str] | None:
     if mountinfo is None:
         return None
 
-    nearest: tuple[str, str] | None = None
-    for point, source in parse_mounts(mountinfo).items():
-        candidate = Path(point)
-        if path == candidate or path.is_relative_to(candidate):
+    nearest: tuple[str, str, str] | None = None
+    for point, (source, fstype) in parse_mounts(mountinfo).items():
+        # is_relative_to is already true for an equal path, so this covers a bind
+        # mount of the sink file itself as well as one of a parent directory.
+        if path.is_relative_to(Path(point)):
             if nearest is None or len(point) > len(nearest[0]):
-                nearest = (point, source)
+                nearest = (point, source, fstype)
     return nearest
 
 
 def sink_persistence_warning(path: Path, mountinfo: str | None) -> str | None:
-    """Warn when *path* resolves into a container's throwaway writable layer.
+    """:func:`mount_persistence_warning` against raw ``mountinfo`` text."""
+    return mount_persistence_warning(path, covering_mount(path, mountinfo))
+
+
+def mount_persistence_warning(path: Path, mount: tuple[str, str, str] | None) -> str | None:
+    """Warn when *mount* — the mount covering *path* — is not keeping it.
 
     The daemon's ``output_file`` is relative to the working directory (``/app``
     in the image), so without a volume mount the assessments land in the
     container layer: every write succeeds, the review TUI on the host sees
     nothing new, and the records are destroyed on the next ``docker compose up``.
-    If the mount covering the path is the container root itself, nothing is
-    persisting it.
+    Two shapes mean exactly that, and both look fine to a mount-point-only check:
 
+      * the mount covering the path IS the container root — nothing was mounted
+        over it; and
+      * something *was* mounted over it, but with an ephemeral filesystem: a
+        tmpfs is RAM, another overlay is another throwaway layer.
+
+    Takes the already-resolved mount so a caller that also wants to *report* the
+    mount (the startup preflight does) reads and parses ``mountinfo`` once.
     Returns None when there's no evidence to act on (mountinfo unreadable), so
     the check never cries wolf on a platform it can't inspect.
     """
-    mount = covering_mount(path, mountinfo)
-    if mount is None or mount[0] != "/":
+    if mount is None:
+        return None
+    point, _source, fstype = mount
+    if point != "/" and fstype not in _EPHEMERAL_FSTYPES:
         return None
 
+    covers = (
+        "which no volume covers — it is inside the container's writable layer"
+        if point == "/"
+        else f"which is covered only by a {fstype} mount at {point} — that filesystem "
+        "does not outlive the container"
+    )
     return (
-        f"Newsletter assessments resolve to {path}, which no volume covers — it is "
-        "inside the container's writable layer. Writes will appear to succeed, but "
-        "the records are invisible on the host and are DESTROYED when the container "
-        "is recreated. Mount the directory you review, e.g. '- ./data:/app/data' "
-        "under the service's volumes."
+        f"Newsletter assessments resolve to {path}, {covers}. Writes will appear to "
+        "succeed, but the records are invisible on the host and are DESTROYED when the "
+        "container is recreated. Mount the directory you review, e.g. "
+        "'- ./data:/app/data' under the service's volumes."
     )
 
 
@@ -403,7 +439,18 @@ def sink_writability_warning(path: Path) -> str | None:
     ``write_assessment`` creates missing parents, so a not-yet-existing file is
     fine as long as the nearest existing ancestor is writable — that ancestor is
     what gets checked, and named, when the file itself isn't there yet.
+
+    An ``output_file`` naming an existing DIRECTORY is caught here too: it is
+    fatal for every grading (``open(dir, "a")`` raises ``IsADirectoryError``) yet
+    ``os.access`` reports a directory as perfectly writable, so the permission
+    check alone would wave the one guaranteed-fatal misconfiguration through.
     """
+    if path.is_dir():
+        return (
+            f"Newsletter assessments sink is a directory, not a file: {path}. Every "
+            "grading will fail to save. Point [newsletter] output_file at a file "
+            "inside it (e.g. data/newsletter_assessments.jsonl)."
+        )
     if path.exists():
         if os.access(path, os.W_OK):
             return None

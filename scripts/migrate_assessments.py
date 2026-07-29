@@ -82,7 +82,21 @@ def _migrate_story(story: dict) -> dict:
 
     scores = story.get("scores")
     if scores:
-        bucketed = {dim: _SCORE_BUCKETS.get(value, value) for dim, value in scores.items()}
+        bucketed = {}
+        for dim, value in scores.items():
+            try:
+                bucketed[dim] = _SCORE_BUCKETS[value]
+            except (KeyError, TypeError):
+                # Refuse rather than pass it through. A value the old rubric never
+                # produced leaves the record permanently flagged old-scheme (still
+                # outside 1-3), so the next run would re-bucket its already-correct
+                # siblings, walking Good(3) -> OK(2) -> Poor(1); a non-numeric one
+                # would instead raise TypeError from the average, which the CLI does
+                # not catch. Abort with the value named, original untouched.
+                raise ValueError(
+                    f"story dimension {dim!r} has score {value!r}, which is not a "
+                    f"1-5 value the pre-#53 rubric could produce — refusing to guess"
+                ) from None
         migrated["scores"] = bucketed
         migrated["average_score"] = sum(bucketed.values()) / len(bucketed)
 
@@ -116,6 +130,11 @@ def migrate_file(
     converted before anything is written, so a malformed file aborts with the
     original untouched — half-migrating the only copy of the grading history is
     not a recoverable state.
+
+    An ``in_place`` run with nothing to migrate is a no-op: it neither rewrites
+    the file nor touches the backup. Otherwise a second run (out of doubt, or
+    from a script) would replace the only pre-migration copy of an append-only,
+    irreplaceable file with the already-migrated content.
     """
     stats = MigrationStats()
     lines = []
@@ -128,12 +147,15 @@ def migrate_file(
             except json.JSONDecodeError as exc:
                 raise ValueError(f"{path}: line {lineno} is not valid JSON: {exc}") from None
             stats.total += 1
-            migrated, changed = migrate_record(record)
+            try:
+                migrated, changed = migrate_record(record)
+            except ValueError as exc:
+                raise ValueError(f"{path}: line {lineno}: {exc}") from None
             stats.migrated += changed
             lines.append(json.dumps(migrated) + "\n")
 
     destination = out if out is not None else (path if in_place else None)
-    if destination is None:
+    if destination is None or (in_place and out is None and not stats.migrated):
         return stats
 
     if in_place and out is None:
@@ -175,6 +197,11 @@ def cli(argv: list[str] | None = None) -> int:
     print(f"{stats.total} records, {stats.migrated} pre-#53 record(s) to migrate")
     if where is None:
         print("Dry run — nothing written. Re-run with --in-place (or --out PATH) to apply.")
+    elif args.in_place and not stats.migrated:
+        # Say what actually happened: claiming a write (and a backup) that was
+        # deliberately skipped would send the reader looking for a .bak that the
+        # first, real run left — or that never existed.
+        print("Already migrated — file and backup left untouched.")
     else:
         print(f"Wrote {where}")
         if args.in_place:

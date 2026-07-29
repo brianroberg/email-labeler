@@ -137,6 +137,32 @@ class TestLoadAssessments:
         assert [r["thread_id"] for r in records] == ["t1", "t2"]
         assert records[0]["overall_tier"] == "good"
 
+    def test_newest_wins_by_timestamp_not_by_file_position(self, tmp_path):
+        """Dedup must pick the newest GRADING, not the last line. README.md tells
+        operators to concatenate a rescued copy of the assessments file onto their
+        host file and calls overlapping entries harmless — which only holds if the
+        record's own ``timestamp`` decides, not the order the files were joined."""
+        f = tmp_path / "assessments.jsonl"
+        newer = _make_record(thread_id="t1", overall_tier="good",
+                             timestamp="2026-07-29T12:00:00+00:00")
+        older = _make_record(thread_id="t1", overall_tier="fair",
+                             timestamp="2026-07-01T12:00:00+00:00")
+        f.write_text(json.dumps(newer) + "\n" + json.dumps(older) + "\n")
+
+        records = load_assessments(f)
+        assert len(records) == 1
+        assert records[0]["overall_tier"] == "good"
+
+    def test_falls_back_to_last_wins_without_usable_timestamps(self, tmp_path):
+        """No comparable timestamp on either side → the appended-later record is
+        the best available guess at "newest"."""
+        f = tmp_path / "assessments.jsonl"
+        first = _make_record(thread_id="t1", overall_tier="fair", timestamp="")
+        second = _make_record(thread_id="t1", overall_tier="good", timestamp="")
+        f.write_text(json.dumps(first) + "\n" + json.dumps(second) + "\n")
+
+        assert load_assessments(f)[0]["overall_tier"] == "good"
+
     def test_records_without_a_thread_id_are_all_kept(self, tmp_path):
         """No thread_id, no identity — deduping them would silently merge
         unrelated newsletters."""
@@ -851,6 +877,14 @@ class TestRunReviewTui:
     def test_empty_records_prints_and_returns(self, capsys):
         run_review_tui([])
         assert "No assessment records" in capsys.readouterr().out
+
+    def test_empty_records_still_name_the_file_that_was_read(self, capsys, tmp_path):
+        """An empty listing is the case the source line matters MOST for — a wrong
+        or stale path looks identical to a genuinely idle daemon. Bailing out
+        before the header renders withholds the one fact that distinguishes them."""
+        f = tmp_path / "data" / "newsletter_assessments.jsonl"
+        run_review_tui([], source=f)
+        assert str(f.resolve()) in capsys.readouterr().out
 
 
 class TestCli:

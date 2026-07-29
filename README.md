@@ -216,7 +216,9 @@ docker compose cp email-labeler:/app/data/newsletter_assessments.jsonl ./recover
 ```
 
 Then append `recovered.jsonl` to your host file (the review TUI keeps the newest
-record per newsletter, so overlapping entries are harmless).
+record per newsletter, decided by each record's own timestamp rather than by
+where it landed in the file, so overlapping entries are harmless in either
+order).
 
 ### Newsletter review TUI
 
@@ -271,7 +273,8 @@ python -m scripts.migrate_assessments path/to/newsletter_assessments.jsonl      
 python -m scripts.migrate_assessments path/to/newsletter_assessments.jsonl --in-place  # apply
 ```
 
-A `.bak` copy is kept. Old themes become `present`, old scores are bucketed into
+Run it from a checkout on the host — `scripts/` is not inside the Docker image.
+A `.bak` copy is kept (a second run changes nothing and leaves that copy alone). Old themes become `present`, old scores are bucketed into
 Poor/OK/Good, and each record's tier is left exactly as graded — so it still
 matches the label on the email. Migrated records say so in their detail view.
 See [README-technical.md](README-technical.md#migrating-pre-53-records) for what

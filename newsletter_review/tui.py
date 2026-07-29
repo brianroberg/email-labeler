@@ -42,15 +42,34 @@ _COL_GAP = 2
 # Pure data functions (no UI, fully testable)
 # ---------------------------------------------------------------------------
 
+def _processed_at(record: dict) -> datetime | None:
+    """A record's processed time as a comparable datetime, or None if unusable.
+
+    Naive timestamps are read as UTC — ``write_assessment`` has always written an
+    aware UTC value, but a hand-edited or hand-merged record may not, and mixing
+    aware and naive datetimes raises on comparison."""
+    try:
+        stamp = datetime.fromisoformat(record.get("timestamp") or "")
+    except (TypeError, ValueError):
+        return None
+    return stamp if stamp.tzinfo else stamp.replace(tzinfo=timezone.utc)
+
+
 def load_assessments(path: Path) -> list[dict]:
     """Load newsletter assessment records from a JSONL file.
 
-    One row per newsletter: a thread graded more than once keeps only its last
-    (newest) record. The daemon persists the assessment *before* committing the
-    Gmail labels, so a newsletter whose labels fail to apply stays unprocessed
-    and is re-graded — and re-appended — next cycle. Deduping on read keeps that
-    durability guarantee from showing up as duplicate rows here. Records with no
-    ``thread_id`` have no identity to dedupe on and are all kept.
+    One row per newsletter: a thread graded more than once keeps only its NEWEST
+    record, decided by the record's own ``timestamp`` rather than by its position
+    in the file. The daemon persists the assessment *before* committing the Gmail
+    labels, so a newsletter whose labels fail to apply stays unprocessed and is
+    re-graded — and re-appended — next cycle. Deduping on read keeps that
+    durability guarantee from showing up as duplicate rows here.
+
+    Position is only the tie-break (later line wins) when neither record carries a
+    comparable timestamp: files get *merged*, not just appended — README.md has
+    operators concatenate a rescued copy of the assessments file onto their host
+    file — so "last line" is not a reliable stand-in for "latest grading".
+    Records with no ``thread_id`` have no identity to dedupe on and are all kept.
 
     Fails fast on pre-#53 old-scheme records whose story ``themes`` are stored
     as a LIST instead of a theme->grade dict: they would otherwise crash the
@@ -75,7 +94,10 @@ def load_assessments(path: Path) -> list[dict]:
                     )
             thread_id = record.get("thread_id")
             if thread_id and thread_id in by_thread:
-                records[by_thread[thread_id]] = record  # supersede in place
+                kept = records[by_thread[thread_id]]
+                new_at, kept_at = _processed_at(record), _processed_at(kept)
+                if new_at is None or kept_at is None or new_at >= kept_at:
+                    records[by_thread[thread_id]] = record  # supersede in place
                 continue
             if thread_id:
                 by_thread[thread_id] = len(records)
@@ -633,7 +655,12 @@ def run_review_tui(
     values from CLI args are passed via init_tier/init_theme/init_sender/init_since.
     """
     if not records:
+        # Name the file even here — especially here. An empty listing is exactly
+        # when a wrong or stale path is indistinguishable from an idle daemon, and
+        # the TUI (which carries the source line) never opens on this path.
         print("No assessment records to display.")
+        if source is not None:
+            print(format_source_line(source, records))
         return
     ReviewApp(
         records,
