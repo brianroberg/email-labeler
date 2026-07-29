@@ -68,6 +68,7 @@ def cli() -> None:
 
     run_review_tui(
         records,
+        source=args.file,
         init_tier=args.tier,
         init_theme=args.theme,
         init_sender=args.sender,

@@ -18,6 +18,7 @@ from newsletter_review.tui import (
     build_detail_lines,
     format_filter_summary,
     format_list_row,
+    format_source_line,
     load_assessments,
     run_review_tui,
     sort_by_send_date,
@@ -597,6 +598,57 @@ def _ui_records():
 
 def _title(app) -> str:
     return str(app.query_one("#title", Static).render())
+
+
+class TestFormatSourceLine:
+    """The reader must say what it read. The whole July-11 incident was a stale
+    copy of the assessments file: the daemon was recording newsletters through
+    today into its mounted path while the TUI was browsing an older file
+    somewhere else, and nothing on screen distinguished the two."""
+
+    def test_names_the_resolved_path_and_newest_send_date(self, tmp_path):
+        f = tmp_path / "data" / "newsletter_assessments.jsonl"
+        line = format_source_line(f, [
+            _make_record(thread_id="a", send_date="2026-07-11T09:00:00+00:00"),
+            _make_record(thread_id="b", send_date="2026-07-29T09:00:00+00:00"),
+        ])
+        assert str(f.resolve()) in line
+        assert "2 newsletters" in line
+        assert "2026-07-29" in line
+
+    def test_reports_an_empty_file(self, tmp_path):
+        line = format_source_line(tmp_path / "a.jsonl", [])
+        assert "0 newsletters" in line
+
+    def test_dash_when_no_record_carries_a_send_date(self, tmp_path):
+        r = _make_record(send_date=None)
+        line = format_source_line(tmp_path / "a.jsonl", [r])
+        assert "1 newsletter" in line
+        assert "—" in line
+
+    def test_newest_send_date_is_the_local_calendar_date(self, tmp_path):
+        # Same off-by-one care as the list column: a UTC-stored evening send must
+        # display as the local date, not the UTC one.
+        with _use_tz("America/New_York"):
+            line = format_source_line(
+                tmp_path / "a.jsonl",
+                [_make_record(send_date="2026-07-30T01:30:00+00:00")],
+            )
+        assert "2026-07-29" in line
+
+
+class TestReviewAppSourceLine:
+    async def test_source_line_is_displayed_when_a_path_is_known(self, tmp_path):
+        f = tmp_path / "newsletter_assessments.jsonl"
+        app = ReviewApp(_ui_records(), source=f)
+        async with app.run_test(size=SIZE):
+            shown = str(app.query_one("#source", Static).render())
+        assert str(f.resolve()) in shown
+
+    async def test_no_source_line_without_a_path(self):
+        app = ReviewApp(_ui_records())
+        async with app.run_test(size=SIZE):
+            assert not app.query("#source")
 
 
 class TestReviewAppList:

@@ -201,6 +201,21 @@ def format_filter_summary(
     return "  ".join(parts)
 
 
+def format_source_line(path: Path, records: list[dict]) -> str:
+    """Identify the file being browsed: resolved path, record count, newest send.
+
+    The reader is one half of a pair — the daemon logs where it *writes*, this
+    says what was *read*. Without it, a stale copy of the assessments file is
+    indistinguishable from a live one, which is exactly how a daemon recording
+    newsletters daily can look like it stopped weeks ago. The newest send date is
+    the tell, and it's shown as a local calendar date to match the list column.
+    """
+    dates = [d for d in (_local_date(r.get("send_date")) for r in records) if d]
+    newest = max(dates) if dates else "—"
+    noun = "newsletter" if len(records) == 1 else "newsletters"
+    return f"{path.resolve()} — {len(records)} {noun}, newest sent {newest}"
+
+
 def _list_date(record: dict) -> str:
     """The send-date's LOCAL calendar date for the list column, or ``—`` if
     absent/unparseable (#36)."""
@@ -429,12 +444,16 @@ class ReviewApp(App):
     ReviewApp #header {
         text-style: underline;
     }
+    ReviewApp #source {
+        color: $text-muted;
+    }
     """
 
     def __init__(
         self,
         records: list[dict],
         *,
+        source: Path | None = None,
         init_tier: str | None = None,
         init_theme: str | None = None,
         init_sender: str | None = None,
@@ -443,6 +462,7 @@ class ReviewApp(App):
         super().__init__()
         # Default ordering is send-date descending, newest first (issue #36).
         self.all_records = sort_by_send_date(records)
+        self.source = source
         self.filtered = self.all_records
         self.f_tier = init_tier
         self.f_theme = init_theme
@@ -451,6 +471,13 @@ class ReviewApp(App):
 
     def compose(self) -> ComposeResult:
         yield Static(id="title", markup=False)
+        if self.source is not None:
+            # Which file this listing came from — omitted only when the caller
+            # supplied records with no path behind them (tests, embedding).
+            yield Static(
+                format_source_line(self.source, self.all_records),
+                id="source", markup=False,
+            )
         hdr = (
             f"{'Date':<{_COL_DATE}}"
             f"  {'Tier':<{_COL_TIER}}"
@@ -584,6 +611,7 @@ class ReviewApp(App):
 def run_review_tui(
     records: list[dict],
     *,
+    source: Path | None = None,
     init_tier: str | None = None,
     init_theme: str | None = None,
     init_sender: str | None = None,
@@ -591,14 +619,16 @@ def run_review_tui(
 ) -> None:
     """Launch the newsletter review TUI.
 
-    *records* is the full (unfiltered) set. Initial filter values from CLI
-    args are passed via init_tier/init_theme/init_sender/init_since.
+    *records* is the full (unfiltered) set, and *source* the file they were read
+    from (shown in the header so a stale file is recognizable). Initial filter
+    values from CLI args are passed via init_tier/init_theme/init_sender/init_since.
     """
     if not records:
         print("No assessment records to display.")
         return
     ReviewApp(
         records,
+        source=source,
         init_tier=init_tier, init_theme=init_theme, init_sender=init_sender,
         init_since=init_since,
     ).run()

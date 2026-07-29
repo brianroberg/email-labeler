@@ -80,7 +80,10 @@ python -m newsletter_review --file path/to/file.jsonl  # Custom JSONL path
 ```
 
 The listing shows a send-date column and is sorted by send-date descending (newest
-first; records with no send-date sort last).
+first; records with no send-date sort last). The header names the resolved file
+path, the newsletter count, and the newest send date, so a stale copy of the
+assessments file is recognizable rather than indistinguishable from a live one.
+Records are deduped per `thread_id` on read (newest wins) — see Design Decision 6.
 
 Hotkeys: `f` opens the filter menu (`t` tier → `e/g/f/p/c`, `h` theme → `s/c/h/v/d/x`, `s` sender text input, `d` date → `3`=past 30d / `9`=past 90d / `y`=past 365d / `s`=since YYYY-MM-DD / `x`=clear), `Enter` opens detail, `Esc` back, `q` quit.
 

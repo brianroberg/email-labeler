@@ -232,6 +232,13 @@ The listing shows one row per newsletter, newest send-date first. Press `Enter`
 to open a newsletter and see its stories with their dimension scores and themes,
 `Esc` to go back, `f` to open the filter menu, and `q` to quit.
 
+The header names the file it read, how many newsletters are in it, and the newest
+send date — e.g. `/srv/stack/data/newsletter_assessments.jsonl — 253 newsletters,
+newest sent 2026-07-29`. That is deliberate: a stale copy of the file, or a copy
+from a path the daemon no longer writes to, looks exactly like a working one until
+you notice its newest newsletter is weeks old. Cross-check it against the path the
+daemon logs at startup.
+
 Filters are also available up front, so you can open straight into a slice:
 
 ```bash
