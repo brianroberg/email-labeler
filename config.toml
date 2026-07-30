@@ -53,10 +53,12 @@ model = "zai-org/glm-5"
 # entirely on the native reasoning channel — and issue #64's probes showed
 # disabling it changes labels. Disable only behind an eval gate (issue #13).
 # Unlike the local tier, the budget is not squeezed: the same fixtures that
-# exhausted qwen's 1024 finished in 204-486 completion tokens here. 2048 is
-# cheap insurance on top of that headroom (measured on 5 probe fixtures, not
-# proof under service-heavy traffic).
-max_tokens = 2048
+# exhausted qwen's 1024 finished in 204-486 completion tokens here (2-5x
+# headroom — measured on 5 probe fixtures, so monitoring-grade evidence, not
+# proof under service-heavy traffic). If a squeeze ever develops, it now fails
+# loudly: llm_client raises on finish_reason "length" with the real
+# diagnostics, so watch the logs for LLMContentError naming this model.
+max_tokens = 1024
 temperature = 0
 timeout = 60
 
