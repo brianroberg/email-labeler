@@ -675,6 +675,69 @@ class TestFinishReasonLength:
         assert "no reasoning field" in msg
         assert "finish_reason=None" in msg
 
+    async def test_length_with_inline_think_content_names_inline_channel(self, local_client):
+        """When the reasoning that ate the budget sits inline in content as an
+        (unclosed) <think> block — the mlx_lm.server / LM Studio think-on
+        truncation shape, the original #10/#30 failure — the diagnostics must
+        say so instead of claiming "no reasoning field": an operator triaging
+        logs would otherwise conclude the model emitted no reasoning at all."""
+        resp = _mock_response(json_data={
+            "choices": [{
+                "finish_reason": "length",
+                "message": {
+                    "role": "assistant",
+                    "content": "<think>step 1: the sender appears to be... step 2:",
+                },
+            }]
+        })
+        with pytest.raises(LLMContentError) as exc_info:
+            await _post_canned(local_client, resp)
+        msg = str(exc_info.value)
+        assert "inline <think>" in msg
+        assert "no reasoning field" not in msg
+
+
+class TestThinkOnlyResponse:
+    """Non-empty content that strips to NOTHING — a fully-closed think-only
+    response (finish_reason "stop") — is as unusable as no content: returning
+    "" would let parse_email_label default to LOW_PRIORITY and silently archive
+    the email, the exact silent-default shape issue #64 eliminates. Reachable
+    whenever a backend leaves thinking effectively on (e.g. mlx_lm.server
+    ignoring reasoning_effort) and the model closes its think block without an
+    answer."""
+
+    async def test_closed_think_only_content_raises(self, local_client):
+        resp = _mock_response(json_data={
+            "choices": [{
+                "finish_reason": "stop",
+                "message": {
+                    "role": "assistant",
+                    "content": "<think>the sender is a colleague... FYI probably</think>",
+                },
+            }]
+        })
+        with pytest.raises(LLMContentError, match="only reasoning"):
+            await _post_canned(local_client, resp)
+
+    async def test_closed_think_only_raises_in_include_thinking_mode(self, local_client):
+        """The guard must also cover the include_thinking path (evals)."""
+        resp = _mock_response(json_data={
+            "choices": [{
+                "finish_reason": "stop",
+                "message": {
+                    "role": "assistant",
+                    "content": "<think>reasoning without an answer</think>",
+                },
+            }]
+        })
+        with patch("llm_client.httpx.AsyncClient") as mock_client_cls:
+            mock_client = AsyncMock()
+            mock_client.post.return_value = resp
+            mock_client_cls.return_value.__aenter__ = AsyncMock(return_value=mock_client)
+            mock_client_cls.return_value.__aexit__ = AsyncMock(return_value=False)
+            with pytest.raises(LLMContentError, match="only reasoning"):
+                await local_client.complete("sys", "user", include_thinking=True)
+
 
 class TestProbe:
     """probe() carries status detail so preflight can distinguish a 404
@@ -1039,10 +1102,12 @@ class TestGLMReasoningContent:
             assert response == "SERVICE"
             assert "some reasoning" in thinking
 
-    async def test_separate_reasoning_field_wins_over_inline_tags_for_non_glm(self):
-        """A populated separate reasoning field is preferred over inline tags for
-        ANY model, not just GLM (issue #64: capture used to be GLM-gated, so
-        Ollama-served local models silently yielded thinking="")."""
+    async def test_separate_and_inline_channels_both_captured_for_non_glm(self):
+        """A populated separate reasoning field is read for ANY model, not just
+        GLM (issue #64: capture used to be GLM-gated, so Ollama-served local
+        models silently yielded thinking=""). Nothing "wins": the inline
+        channel is captured alongside it — the inline block is stripped from
+        the returned content, so dropping it here would lose it entirely."""
         client = LLMClient(
             base_url="https://api.example.com/v1/chat/completions",
             api_key="sk-test",
@@ -1064,6 +1129,7 @@ class TestGLMReasoningContent:
             response, thinking = await client.complete("sys", "user", include_thinking=True)
             assert response == "SERVICE"  # inline tags still stripped from content
             assert "separate-channel reasoning" in thinking
+            assert "inline reasoning" in thinking
 
     async def test_glm_empty_reasoning_content_falls_back(self, glm_client):
         """GLM with empty reasoning_content falls back to inline tags."""
@@ -1236,3 +1302,98 @@ class TestSeparateReasoningFieldCapture:
             extra_body={"reasoning_effort": "low"},
         )
         assert client._extra_body_disables_thinking() is False
+
+    async def test_reasoning_effort_none_recognized_case_insensitively(self):
+        """A hand-edited config or --extra-body JSON may spell it "None"/"NONE";
+        case must not silently flip a think-off A/B arm back to thinking-on."""
+        client = LLMClient(
+            base_url="https://api.example.com/v1/chat/completions",
+            api_key="sk-test",
+            model="zai-org/glm-5",
+            extra_body={"reasoning_effort": "None"},
+        )
+        mock_response = _mock_response(json_data={
+            "choices": [{"message": {"content": "SERVICE"}}]
+        })
+
+        with patch("llm_client.httpx.AsyncClient") as mock_client_cls:
+            mock_client = AsyncMock()
+            mock_client.post.return_value = mock_response
+            mock_client_cls.return_value.__aenter__ = AsyncMock(return_value=mock_client)
+            mock_client_cls.return_value.__aexit__ = AsyncMock(return_value=False)
+
+            await client.complete("sys", "user", include_thinking=True)
+
+            body = mock_client.post.call_args.kwargs["json"]
+            assert body["thinking"] == {"type": "disabled"}
+
+    async def test_non_string_reasoning_field_is_ignored(self):
+        """A backend/proxy may surface the reasoning channel as structured data
+        (e.g. an OpenRouter-style list of reasoning blocks). Non-string values
+        must not crash the thinking join — fall back to the inline channel, as
+        the old GLM-gated code did for fields it didn't read."""
+        mock_response = _mock_response(json_data={
+            "choices": [{"message": {
+                "content": "<think>inline fallback</think>\nFYI",
+                "reasoning": [{"type": "reasoning.text", "text": "structured"}],
+            }}]
+        })
+
+        with patch("llm_client.httpx.AsyncClient") as mock_client_cls:
+            mock_client = AsyncMock()
+            mock_client.post.return_value = mock_response
+            mock_client_cls.return_value.__aenter__ = AsyncMock(return_value=mock_client)
+            mock_client_cls.return_value.__aexit__ = AsyncMock(return_value=False)
+
+            response, thinking = await self._qwen_ollama_client().complete(
+                "sys", "user", include_thinking=True,
+            )
+            assert response == "FYI"
+            assert thinking == "inline fallback"
+
+    async def test_both_separate_fields_captured_when_populated(self):
+        """Some proxies populate BOTH reasoning_content and reasoning — the
+        error-path diagnostics already treat them as simultaneously reportable.
+        Neither channel may be silently dropped from the sidecar."""
+        mock_response = _mock_response(json_data={
+            "choices": [{"message": {
+                "content": "FYI",
+                "reasoning_content": "CHANNEL_A",
+                "reasoning": "CHANNEL_B",
+            }}]
+        })
+
+        with patch("llm_client.httpx.AsyncClient") as mock_client_cls:
+            mock_client = AsyncMock()
+            mock_client.post.return_value = mock_response
+            mock_client_cls.return_value.__aenter__ = AsyncMock(return_value=mock_client)
+            mock_client_cls.return_value.__aexit__ = AsyncMock(return_value=False)
+
+            response, thinking = await self._qwen_ollama_client().complete(
+                "sys", "user", include_thinking=True,
+            )
+            assert response == "FYI"
+            assert "CHANNEL_A" in thinking
+            assert "CHANNEL_B" in thinking
+
+    async def test_mirrored_separate_fields_not_duplicated(self):
+        """A proxy that mirrors the same text into both separate fields must
+        not double it in the captured thinking."""
+        mock_response = _mock_response(json_data={
+            "choices": [{"message": {
+                "content": "FYI",
+                "reasoning_content": "SAME TEXT",
+                "reasoning": "SAME TEXT",
+            }}]
+        })
+
+        with patch("llm_client.httpx.AsyncClient") as mock_client_cls:
+            mock_client = AsyncMock()
+            mock_client.post.return_value = mock_response
+            mock_client_cls.return_value.__aenter__ = AsyncMock(return_value=mock_client)
+            mock_client_cls.return_value.__aexit__ = AsyncMock(return_value=False)
+
+            _, thinking = await self._qwen_ollama_client().complete(
+                "sys", "user", include_thinking=True,
+            )
+            assert thinking == "SAME TEXT"

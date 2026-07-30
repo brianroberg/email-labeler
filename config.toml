@@ -73,6 +73,11 @@ model = "{env.MLX_MODEL}"
 # that backstop turns every over-budget thread into an eventual give-up
 # (agent/attempted) — the budget must fit the honest demand. This raise is
 # therefore coupled to the thinking disable below, not independent tuning.
+# NOTE: this also quadruples the per-request decode budget each concurrent
+# local request's KV cache can grow into. The documented LOCAL_PARALLEL
+# ceiling ("keep ≤ 8", README-technical "Local Model Serving & Memory") was
+# calibrated under the old 1024-token decode — re-confirm the model + N KV
+# caches fit the GPU's Metal budget before raising LOCAL_PARALLEL above 1.
 max_tokens = 4096
 temperature = 0
 timeout = 180
@@ -161,9 +166,19 @@ model = "claude-sonnet-4-6"
 # story list, so an undersized budget here would abandon long newsletters to
 # agent/attempted rather than mis-grade them. Sized by that reasoning (issue
 # #64's Fix 4); this tier has not been live-probed.
+# NOTE: max_tokens is part of the eval cache key (evals/llm_cache.py), so
+# changing it invalidates every cached newsletter response and the next
+# newsletter_run re-bills the whole golden set — while prompt_hash (prompts
+# only) stays identical, so pre/post-change runs are NOT distinguishable by
+# hash. Budget changes deserve a note alongside the A/B comparison.
 max_tokens = 4096
 temperature = 0
-timeout = 60
+# 180, not 60: a full-budget 4096-token Sonnet decode at typical non-streaming
+# throughput (~50-80 tok/s) runs 50-80+ seconds — the old 60s bound only fit
+# responses capped at 1024 tokens. A timeout here is give-up-eligible
+# (agent/attempted after repeated strikes), so the timeout must contain the
+# decode the max_tokens budget above allows.
+timeout = 180
 
 
 [newsletter.labels]

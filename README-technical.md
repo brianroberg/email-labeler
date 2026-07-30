@@ -34,6 +34,10 @@ email-labeler/
 ├── newsletter_review/  Textual TUI for browsing newsletter assessments
 │   ├── __main__.py     CLI entry point (python -m newsletter_review)
 │   └── tui.py          Pure data helpers + Textual app
+├── docs/
+│   └── runbook-agent-attempted-recovery.md  Owner-run manual sweep of threads
+│                       dropped to agent/attempted by issue #64 (time-sensitive:
+│                       cleanest before the first post-#65 image is deployed)
 ├── scripts/
 │   ├── eval_model.py           One-command-per-model eval wrapper
 │   ├── migrate_assessments.py  Convert pre-#53 records in an assessments JSONL
@@ -342,7 +346,7 @@ Apple Silicon caps the GPU's Metal working set at roughly **75% of unified memor
   (kIOGPUCommandBufferCallbackErrorOutOfMemory)  ... SIGABRT
 ```
 
-A 27B model at 8-bit is ~34 GB, leaving only ~14 GB of headroom. Long transcripts have multi-GB KV caches, so a few concurrent long-transcript requests (or a large retained prompt cache) blow the ceiling. Mitigations, in order of preference:
+A 27B model at 8-bit is ~34 GB, leaving only ~14 GB of headroom. Long transcripts have multi-GB KV caches, so a few concurrent long-transcript requests (or a large retained prompt cache) blow the ceiling. Note that `[llm.local] max_tokens` was raised 1024 → 4096 (issue #64), so each in-flight request's KV cache can now grow up to 3,072 tokens further during decode than when the `local_parallel` ≤ 8 guidance was calibrated — re-confirm the model + N KV caches fit under the ceiling before raising `LOCAL_PARALLEL`. Mitigations, in order of preference:
 
 1. **Free system RAM** — leaked/idle processes shrink what the GPU can wire.
 2. **`local_parallel = 1`** (the default) — one live KV cache at a time.

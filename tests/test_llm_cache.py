@@ -8,7 +8,7 @@ from unittest.mock import AsyncMock
 import pytest
 
 from evals.llm_cache import CachedLLMClient
-from llm_client import LLMClient
+from llm_client import LLMClient, LLMContentError
 
 
 def _make_inner(**overrides) -> LLMClient:
@@ -291,6 +291,81 @@ class TestCorruptCacheFile:
         assert thinking == "reasoning about sender type"
         assert cached2.hits == 1
         inner2.complete.assert_not_awaited()
+
+    async def test_pre_capture_fix_empty_thinking_entry_is_backfilled(self, tmp_path: Path):
+        """A disk entry with thinking="" but NO thinking_complete marker predates
+        the any-model capture fix (issue #64): its "" may hide reasoning that sat
+        unread in a non-GLM separate field (e.g. Ollama's `reasoning`), so it is
+        backfillable — not authoritative emptiness."""
+        cache_path = tmp_path / "cache.jsonl"
+        inner = _make_inner()
+        valid_key = CachedLLMClient(inner, cache_path)._cache_key("sys", "usr")
+        cache_path.write_text(
+            json.dumps({
+                "key": valid_key, "model": "test-model",
+                "response": "SERVICE", "thinking": "",
+            }) + "\n"
+        )
+
+        _set_return(inner, "SERVICE", "reasoning captured post-fix")
+        cached = CachedLLMClient(inner, cache_path)
+        response, thinking = await cached.complete("sys", "usr", include_thinking=True)
+
+        assert response == "SERVICE"  # cached response preserved
+        assert thinking == "reasoning captured post-fix"
+        inner.complete.assert_awaited_once()
+
+    async def test_backfilled_empty_thinking_is_frozen_with_marker(self, tmp_path: Path):
+        """When the backfill of a pre-fix "" entry again captures nothing, the
+        re-written entry must be authoritative — one re-fetch total, not one
+        per run forever."""
+        cache_path = tmp_path / "cache.jsonl"
+        inner = _make_inner()
+        valid_key = CachedLLMClient(inner, cache_path)._cache_key("sys", "usr")
+        cache_path.write_text(
+            json.dumps({
+                "key": valid_key, "model": "test-model",
+                "response": "SERVICE", "thinking": "",
+            }) + "\n"
+        )
+
+        _set_return(inner, "SERVICE", "")  # still nothing capturable post-fix
+        cached = CachedLLMClient(inner, cache_path)
+        await cached.complete("sys", "usr", include_thinking=True)
+        cached.flush()
+
+        inner2 = _make_inner()
+        cached2 = CachedLLMClient(inner2, cache_path)
+        response, thinking = await cached2.complete("sys", "usr", include_thinking=True)
+
+        assert response == "SERVICE"
+        assert thinking == ""
+        assert cached2.hits == 1
+        inner2.complete.assert_not_awaited()
+
+    async def test_backfill_content_error_falls_back_to_cached_response(self, tmp_path: Path):
+        """A backfill re-fetch that raises LLMContentError (e.g. the re-decode
+        truncates at the max_tokens budget under the post-#64 guard) must not
+        discard the perfectly usable cached response: return it with thinking
+        "", and remember the failure instead of re-firing a doomed request."""
+        cache_path = tmp_path / "cache.jsonl"
+        inner = _make_inner()
+        valid_key = CachedLLMClient(inner, cache_path)._cache_key("sys", "usr")
+        cache_path.write_text(
+            json.dumps({"key": valid_key, "model": "test-model", "response": "SERVICE"}) + "\n"
+        )
+
+        inner.complete.side_effect = LLMContentError(
+            "LLM test-model answer truncated at the max_tokens budget"
+        )
+        cached = CachedLLMClient(inner, cache_path)
+        response, thinking = await cached.complete("sys", "usr", include_thinking=True)
+
+        assert response == "SERVICE"
+        assert thinking == ""
+        # Same session: the failure is remembered, no second doomed re-fetch
+        await cached.complete("sys", "usr", include_thinking=True)
+        assert inner.complete.await_count == 1
 
 
     async def test_current_entry_with_empty_thinking_is_a_hit(self, tmp_path: Path):

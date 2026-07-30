@@ -98,7 +98,12 @@ dialects: `chat_template_kwargs.enable_thinking = false` (mlx_lm.server /
 LM Studio) and top-level `reasoning_effort = "none"` (Ollama, verified on
 0.32.5 — `"low"` is a silent no-op and `think: false` is ignored on its
 OpenAI-compat endpoint). If your server expects something else, pass it
-explicitly via `--local-extra-body`.
+explicitly via `--local-extra-body`. Caveat: a strictly-validating provider
+(e.g. OpenAI for non-reasoning models, or one that enforces the
+low/medium/high enum) may reject the top-level `reasoning_effort = "none"`
+with a 400 rather than ignoring it — every row then errors instead of
+producing a think-off arm. Against such a backend, skip the flag and pass only
+the dialect it accepts via `--extra-body`/`--local-extra-body`.
 
 ### report
 
@@ -426,24 +431,32 @@ The eval suite includes a disk-backed LLM response cache that avoids redundant L
 [model, temperature, max_tokens, extra_body, system_prompt, user_content]
 ```
 
-Changing any of these — the model name, temperature, inference parameters, `extra_body` config, or the prompt content — produces a different cache key, ensuring stale hits don't occur across configurations.
+Changing any of these — the model name, temperature, inference parameters, `extra_body` config, or the prompt content — produces a different cache key, ensuring stale hits don't occur across configurations. The flip side: a config-only change (e.g. raising a tier's `max_tokens`) invalidates every cached entry for that tier and re-bills the next run, **without changing `prompt_hash`** — the hash covers prompts only, so two runs that differ only in inference parameters are not distinguishable by hash. Note such changes alongside any A/B comparison they straddle.
 
 **Behavior:**
 
 - On startup, the entire cache file is loaded into memory.
 - Cache hits return instantly without contacting the LLM. An entry whose stored
-  `thinking` is `""` means the response carried no separately-capturable
-  reasoning — no separate reasoning field (`reasoning_content` / `reasoning`)
-  and no inline `<think>` block. It is a normal hit, not re-fetched.
+  `thinking` is `""` **and** which carries the `thinking_complete` marker was
+  written by post-#64 any-model capture: the response carried no
+  separately-capturable reasoning — no separate reasoning field
+  (`reasoning_content` / `reasoning`) and no inline `<think>` block. It is a
+  normal hit, not re-fetched.
   **`""` is NOT proof the model didn't reason** (issue #64): with native
   thinking disabled, the model reasons as untagged prose in the content
   channel, which is preserved in the result's `label_raw`, not in `thinking`.
-  (Entries written before issue #64 have a second blind spot: capture was
-  GLM-only, so reasoning a backend routed to a separate non-GLM field — e.g.
-  Ollama's `reasoning` — was dropped as `""` even though the model reasoned.)
-- Legacy entries written before thinking capture (no `thinking` key at all) are
-  backfilled with one LLM call the first time chain-of-thought is requested for
-  them, then cached permanently.
+- Entries with unknown thinking are backfilled with one LLM call the first time
+  chain-of-thought is requested for them, then re-written with the
+  `thinking_complete` marker and cached permanently. "Unknown" covers both
+  legacy entries (no `thinking` key at all) and entries whose `""` predates the
+  any-model capture fix (no `thinking_complete` marker): those were written
+  when capture was GLM-only, so reasoning a backend routed to a separate
+  non-GLM field — e.g. Ollama's `reasoning` — was dropped as `""` even though
+  the model reasoned. If the backfill call itself returns no usable answer
+  (`LLMContentError`, e.g. the re-decode truncates at the `max_tokens` budget),
+  the cached response is still served — never discarded over a thinking
+  backfill — and `""` is frozen with the marker so the doomed re-fetch isn't
+  re-billed every run.
 - Cache misses call the real LLM, then store the response in memory.
 - New entries are appended to disk when `flush()` is called (at the end of each run).
 - Hit/miss statistics are printed at the end of every evaluation run.
