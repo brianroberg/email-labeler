@@ -1465,17 +1465,19 @@ class TestLoadConfig:
     def test_config_disables_native_thinking_on_local_classifier(self):
         # Issue #10: the eval showed native thinking on the local person-email
         # classifier is strictly worse (budget-split failures where reasoning
-        # overruns max_tokens and no label is emitted). The classification prompt
-        # already drives reasoning into the content channel, so native thinking is
-        # disabled via request-level chat_template_kwargs (the form mlx_lm.server
-        # honors). The cloud classifier is unaffected.
+        # overruns max_tokens and no label is emitted). The disable dialect is
+        # backend-specific: this test guards the chat_template_kwargs form
+        # (honored by mlx_lm.server / LM Studio, ignored by Ollama); the Ollama
+        # form is reasoning_effort = "none", guarded by
+        # test_config_local_extra_body_disables_thinking_on_ollama (issue #64).
+        # The cloud classifier is unaffected.
         config = load_config()
         local = config["llm"]["local"]
         # Layout guard: the flag must be in the nested chat_template_kwargs form.
-        # mlx_lm.server (the real local server) honors this form and ignores a
-        # top-level enable_thinking, so this specific nesting is load-bearing — a
-        # refactor to the top-level form would silently re-enable thinking on the
-        # local server even though llm_client treats both as no-think.
+        # mlx_lm.server honors this form and ignores a top-level enable_thinking,
+        # so this specific nesting is load-bearing — a refactor to the top-level
+        # form would silently stop disabling thinking on mlx_lm.server even
+        # though llm_client treats both as no-think.
         ctk = local["extra_body"]["chat_template_kwargs"]
         assert ctk["enable_thinking"] is False
         # Behavior guard: the LLMClient the daemon builds from this config must
@@ -1485,6 +1487,44 @@ class TestLoadConfig:
             extra_body=local.get("extra_body"),
         )
         assert client._extra_body_disables_thinking() is True
+
+    def test_config_local_extra_body_disables_thinking_on_ollama(self):
+        # Issue #64: Ollama's OpenAI-compat endpoint ignores the
+        # chat_template_kwargs.enable_thinking form entirely (measured on
+        # 0.32.5), so native thinking was silently re-enabled and reasoning
+        # consumed the whole max_tokens budget before any content was emitted.
+        # The one field that Ollama honors is a top-level
+        # reasoning_effort = "none" ("low" is a silent no-op — only "none"
+        # disables). llm_client merges extra_body at the top level of the
+        # request body, so this is pure config data.
+        config = load_config()
+        extra_body = config["llm"]["local"]["extra_body"]
+        assert extra_body["reasoning_effort"] == "none"
+
+    def test_config_local_max_tokens_covers_thinking_off_decode(self):
+        # Issue #64: with thinking off, the prompts still elicit the full
+        # step-by-step scaffold as untagged content, and observed demand ran up
+        # to 1,293 completion tokens — beyond the old 1024 budget. An
+        # over-budget decode truncates content before any label; llm_client now
+        # raises LLMContentError on finish_reason "length" (it used to parse to
+        # a silent LOW_PRIORITY default), so an undersized budget means loud
+        # give-ups rather than mislabels — still lost mail. The budget raise is
+        # therefore coupled to the thinking disable, not optional insurance.
+        # 2048 is the measured floor; shipped value 4096.
+        config = load_config()
+        assert config["llm"]["local"]["max_tokens"] >= 2048
+
+    def test_config_newsletter_max_tokens_covers_multi_story_extraction(self):
+        # Issue #64 collateral: story_extraction re-emits the FULL text of every
+        # story in one response, so its output scales with newsletter size — the
+        # one call whose demand 1024 demonstrably cannot bound. With llm_client
+        # now raising on finish_reason "length" (instead of silently truncating
+        # mid-story), an undersized budget would turn every long newsletter into
+        # a deterministic give-up (agent/attempted). Sized by that reasoning
+        # (issue #64's Fix 4), not by live measurement — the newsletter tier was
+        # never probed.
+        config = load_config()
+        assert config["newsletter"]["llm"]["max_tokens"] >= 2048
 
     def test_config_has_newsletter_section(self):
         config = load_config()

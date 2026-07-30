@@ -10,7 +10,7 @@ import json
 import time
 from pathlib import Path
 
-from llm_client import LLMClient
+from llm_client import LLMClient, LLMContentError
 
 
 class CachedLLMClient:
@@ -23,9 +23,15 @@ class CachedLLMClient:
     def __init__(self, inner: LLMClient, cache_path: Path):
         self.inner = inner
         self.cache_path = cache_path
-        # key -> (response, thinking). thinking is None for legacy entries
-        # written before thinking capture (unknown, backfillable); "" means the
-        # model was called and legitimately emitted no thinking (do NOT re-fetch).
+        # key -> (response, thinking). thinking is None when unknown and
+        # backfillable: legacy entries written before thinking capture, AND
+        # entries whose stored "" predates the any-model capture fix (issue
+        # #64 — their reasoning may have sat unread in a non-GLM separate
+        # field). A trusted "" — written by post-fix code, marked
+        # thinking_complete on disk — means the model was called and no
+        # separately-capturable reasoning arrived: no separate reasoning
+        # field, no <think> block (do NOT re-fetch; with thinking off the CoT
+        # is the untagged response itself).
         self._cache: dict[str, tuple[str, str | None]] = {}
         self._pending: list[dict] = []  # new entries to flush to disk
         self.hits = 0
@@ -48,11 +54,20 @@ class CachedLLMClient:
                 try:
                     entry = json.loads(line)
                     response = entry["response"]
-                    # A present "thinking" key (even "") means the entry was
-                    # written by thinking-aware code: "" is a real "no thinking
-                    # emitted", not a gap to backfill. Only entries missing the
-                    # key entirely are legacy (thinking unknown -> None).
-                    thinking = entry["thinking"] if "thinking" in entry else None
+                    # A present "thinking" key alone does NOT make "" trusted:
+                    # entries written before the any-model capture fix (issue
+                    # #64) stored "" while reasoning sat unread in a non-GLM
+                    # separate field (e.g. Ollama's `reasoning`). Only entries
+                    # carrying the thinking_complete marker (written by
+                    # post-fix code) may freeze "" as "nothing separately
+                    # capturable"; an unmarked "" is treated like a legacy
+                    # entry (thinking unknown -> None, backfillable — one
+                    # re-fetch, then re-written with the marker).
+                    raw_thinking = entry.get("thinking")
+                    if raw_thinking or entry.get("thinking_complete"):
+                        thinking = raw_thinking
+                    else:
+                        thinking = None
                     # Normalize old entries that may contain unstripped think tags
                     extra_thinking = LLMClient._extract_thinking(response)
                     response = LLMClient._strip_thinking(response)
@@ -85,15 +100,29 @@ class CachedLLMClient:
 
         if key in self._cache:
             response, thinking = self._cache[key]
-            # Backfill thinking only for legacy entries where it is unknown
-            # (None). An empty string means the model emitted no thinking —
-            # re-fetching those would re-bill every terse response forever.
+            # Backfill thinking only where it is unknown (None): legacy
+            # entries and pre-#64 "" entries (see _load). A trusted "" means
+            # nothing was separately capturable (e.g. thinking-off runs, where
+            # the CoT is the response itself) — re-fetching those would
+            # re-bill every terse response forever.
             if include_thinking and thinking is None:
                 self.misses += 1
                 start = time.monotonic()
-                _, thinking = await self.inner.complete(
-                    system_prompt, user_content, include_thinking=True,
-                )
+                try:
+                    _, thinking = await self.inner.complete(
+                        system_prompt, user_content, include_thinking=True,
+                    )
+                except LLMContentError:
+                    # The metadata-only re-fetch produced no usable answer
+                    # (e.g. the re-decode truncated at the max_tokens budget
+                    # under the post-#64 guard). The cached response is still
+                    # perfectly usable — never discard it over a thinking
+                    # backfill. Freeze "" rather than leaving None: under this
+                    # cache key the model/budget are fixed, so the re-fetch
+                    # would fail identically (and re-bill) on every run, and
+                    # any config change that could succeed also changes the
+                    # key.
+                    thinking = ""
                 self._llm_seconds[tk] = (
                     self._llm_seconds.get(tk, 0.0) + time.monotonic() - start
                 )
@@ -103,6 +132,7 @@ class CachedLLMClient:
                     "model": self.inner.model,
                     "response": response,
                     "thinking": thinking,
+                    "thinking_complete": True,
                 })
             else:
                 self.hits += 1
@@ -123,11 +153,14 @@ class CachedLLMClient:
             self._thinking_buffers.setdefault(tk, []).append(thinking)
 
         self._cache[key] = (response, thinking)
+        # thinking_complete marks the thinking value as written by post-#64
+        # any-model capture, so a "" is trusted emptiness on reload — see _load.
         self._pending.append({
             "key": key,
             "model": self.inner.model,
             "response": response,
             "thinking": thinking,
+            "thinking_complete": True,
         })
         if include_thinking:
             return response, thinking

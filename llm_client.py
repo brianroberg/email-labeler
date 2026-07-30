@@ -72,15 +72,18 @@ class LLMUnavailableError(Exception):
 
 
 class LLMContentError(RuntimeError):
-    """The model returned no usable ``content`` (issue #30).
+    """The model returned no usable ``content`` (issues #30, #64).
 
     A reasoning model that exhausts max_tokens mid-<think>, a GLM reply carrying
     only ``reasoning_content``, or an empty string all yield an unusable response.
-    Retrying as-is won't help, so it is request-specific/permanent and
-    give-up-eligible. It subclasses ``RuntimeError`` so the email pipeline's
-    ``except RuntimeError`` give-up handler catches it unchanged, while giving the
-    newsletter pipeline a dedicated type to re-raise (a *bare* per-story
-    RuntimeError stays isolated; a content-less one propagates to give-up).
+    So does a response whose ``finish_reason`` is ``"length"`` even when content
+    is non-empty: the answer was cut at the max_tokens budget, and parsing a
+    truncated answer silently defaults the label (issue #64). Retrying as-is
+    won't help, so it is request-specific/permanent and give-up-eligible. It
+    subclasses ``RuntimeError`` so the email pipeline's ``except RuntimeError``
+    give-up handler catches it unchanged, while giving the newsletter pipeline a
+    dedicated type to re-raise (a *bare* per-story RuntimeError stays isolated;
+    a content-less one propagates to give-up).
     """
 
 
@@ -156,13 +159,21 @@ class LLMClient:
     def _extra_body_disables_thinking(self) -> bool:
         """True if extra_body asks to turn thinking off.
 
-        Recognizes both the chat_template_kwargs.enable_thinking form (Qwen / LM
-        Studio, what --no-think emits) and a top-level enable_thinking flag. GLM
-        ignores those fields, so complete() uses this to set GLM's native thinking
-        field to disabled rather than contradicting the request with enabled.
+        Recognizes the chat_template_kwargs.enable_thinking form (Qwen / LM
+        Studio), a top-level enable_thinking flag, and reasoning_effort="none"
+        (the Ollama dialect — only "none" disables there; "low" etc. are model
+        defaults, not a disable). Matched case-insensitively: a hand-edited
+        config or --extra-body JSON spelling it "None" still carries disable
+        intent, and missing it would silently flip a think-off A/B arm back to
+        thinking-on. GLM ignores all of those fields, so complete() uses this
+        to set GLM's native thinking field to disabled rather than
+        contradicting the request with enabled.
         """
         ctk = self.extra_body.get("chat_template_kwargs")
         if isinstance(ctk, dict) and ctk.get("enable_thinking") is False:
+            return True
+        effort = self.extra_body.get("reasoning_effort")
+        if isinstance(effort, str) and effort.lower() == "none":
             return True
         return self.extra_body.get("enable_thinking") is False
 
@@ -190,6 +201,9 @@ class LLMClient:
                 out of funds (402, or a 400/403 whose body carries a balance
                 signature) — account-wide; the daemon halts rather than giving
                 up per-thread.
+            LLMContentError: If the response carries no usable answer — empty/
+                missing content, or finish_reason "length" (answer truncated at
+                the max_tokens budget) — request-specific and give-up-eligible.
             RuntimeError: If the LLM returns any other non-200 response.
         """
         headers = {"Content-Type": "application/json"}
@@ -266,33 +280,84 @@ class LLMClient:
                 f"(prompt ~{prompt_chars // 4} tokens, {prompt_chars} chars): {resp_body}"
             )
 
-        msg = response.json()["choices"][0]["message"]
+        choice = response.json()["choices"][0]
+        msg = choice["message"]
+        finish_reason = choice.get("finish_reason")
         content = msg.get("content")
-        if not content:
-            # A reasoning model that exhausts max_tokens mid-<think> (or a GLM reply
-            # that returns only reasoning_content) yields a message with no usable
-            # `content` — whether that arrives as null, a missing key, or an empty
-            # string. Retrying as-is won't help, so this is request-specific/
-            # permanent: surface a clear RuntimeError (give-up-eligible via the daemon),
-            # never LLMUnavailableError (would retry forever) or a raw KeyError.
-            # (An empty string must be caught too: it would otherwise parse to a
-            # default SERVICE / LOW_PRIORITY label and silently mislabel the email.)
-            has_reasoning = bool(msg.get("reasoning_content") or msg.get("reasoning"))
+        stripped = self._strip_thinking(content) if content else ""
+        if not stripped or finish_reason == "length":
+            # Three unusable-response shapes, all request-specific/permanent
+            # (retrying as-is won't help), so all raise LLMContentError —
+            # give-up-eligible via the daemon, never LLMUnavailableError (would
+            # retry forever) or a raw KeyError (issue #64):
+            #   - No `content` (null, missing key, or empty string): a reasoning
+            #     model exhausted max_tokens in its thinking channel, or GLM
+            #     returned only reasoning_content.
+            #   - Content that strips to nothing: a fully-closed think-only
+            #     response — the model spent its whole turn inside <think> and
+            #     never answered. Both empty shapes would otherwise parse to a
+            #     default SERVICE / LOW_PRIORITY label and silently mislabel
+            #     the email.
+            #   - finish_reason "length" with non-empty content: the answer was
+            #     cut at the max_tokens budget, usually mid-reasoning before any
+            #     label. Parsing it would silently default to LOW_PRIORITY and
+            #     archive the email, so a truncated answer is never returned.
+            # The diagnostics report the response's actual finish_reason and
+            # where the reasoning actually sat — a separate field (Ollama uses
+            # `reasoning`, GLM uses `reasoning_content`) or inline <think>
+            # prose in content (the mlx_lm.server / LM Studio think-on shape) —
+            # the old message hardcoded a guess, which masked the real failure
+            # pattern in production logs.
+            populated = [f for f in ("reasoning_content", "reasoning") if msg.get(f)]
+            if content and "<think>" in content:
+                populated.append("inline <think> tags")
+            prompt_chars = len(system_prompt) + len(user_content)
+            diagnostics = (
+                f"finish_reason={finish_reason!r}, max_tokens={self.max_tokens}, "
+                f"prompt ~{prompt_chars // 4} tokens ({prompt_chars} chars); "
+                + (f"reasoning in {' + '.join(populated)}" if populated else "no reasoning field")
+            )
+            if not content:
+                raise LLMContentError(
+                    f"LLM {self.model} returned no content ({diagnostics})"
+                )
+            if finish_reason == "length":
+                raise LLMContentError(
+                    f"LLM {self.model} answer truncated at the max_tokens budget — "
+                    f"{len(content)} chars of content but no trustworthy final answer "
+                    f"({diagnostics})"
+                )
             raise LLMContentError(
-                f"LLM {self.model} returned no content "
-                f"(max_tokens={self.max_tokens} likely exhausted before a final answer; "
-                f"reasoning_content {'present' if has_reasoning else 'absent'})"
+                f"LLM {self.model} returned only reasoning, no final answer — "
+                f"{len(content)} chars of content strip to nothing ({diagnostics})"
             )
 
         if include_thinking:
-            # GLM models return reasoning in a separate field
-            if self._is_glm_model() and msg.get("reasoning_content"):
-                thinking = msg["reasoning_content"]
-            else:
-                # DeepSeek/Qwen models use inline <think> tags
-                thinking = self._extract_thinking(content)
-            return self._strip_thinking(content), thinking
-        return self._strip_thinking(content)
+            # Separate-channel reasoning is read for ANY model — the field name
+            # is backend-specific (GLM: reasoning_content; Ollama: reasoning),
+            # and a proxy may populate both at once, so every string-valued
+            # field is captured (mirrored duplicates collapsed) — the error
+            # diagnostics above already treat the fields as simultaneously
+            # reportable. Non-string values (structured reasoning blocks from
+            # some proxies) are ignored rather than crashing the join. This
+            # used to be GLM-gated, so Ollama-served local models silently
+            # yielded thinking="" (issue #64). Inline <think> tags are captured
+            # TOO, not as a mere fallback: with thinking on and budget to spare
+            # the model emitted both channels at once, and the inline block is
+            # stripped from the returned content — dropping it here would lose
+            # it entirely. With thinking disabled there is no separate field and
+            # no tags: the reasoning is the untagged content itself, so "" here
+            # just means "read the content".
+            separate = [
+                v for v in (msg.get("reasoning_content"), msg.get("reasoning"))
+                if isinstance(v, str) and v
+            ]
+            if len(separate) == 2 and separate[0] == separate[1]:
+                separate = separate[:1]
+            inline = self._extract_thinking(content)
+            thinking = "\n\n".join(part for part in (*separate, inline) if part)
+            return stripped, thinking
+        return stripped
 
     async def probe(self, timeout: float | None = None) -> "AvailabilityResult":
         """Probe the endpoint, returning status detail (issue #41 item 7).

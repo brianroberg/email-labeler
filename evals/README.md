@@ -298,20 +298,23 @@ uv run python -m evals.report --compare evals/results/*baseline*.jsonl evals/res
 
 **Thinking on/off A/B (reasoning models):**
 
-The local model reasons in `<think>` tags by default; that costs tokens and
-latency. To measure what disabling it does to accuracy *before* changing
-`config.toml`, run the same person-thread evaluation both ways and compare:
+The shipped `config.toml` disables the local model's native thinking (issues
+#10, #64), so a plain run is already the thinking-off arm. To measure what
+thinking ON does to accuracy, re-enable it explicitly for one run and compare:
 
 ```bash
-uv run python -m evals.run_eval --stages stage2_only --sender-type person --tag think-on
+uv run python -m evals.run_eval --stages stage2_only --sender-type person --tag think-off
 uv run python -m evals.run_eval --stages stage2_only --sender-type person \
-    --local-no-think --tag think-off
-uv run python -m evals.report --compare evals/results/*think-on*.jsonl evals/results/*think-off*.jsonl
+    --local-extra-body '{"reasoning_effort": "low", "chat_template_kwargs": {"enable_thinking": true}}' \
+    --tag think-on
+uv run python -m evals.report --compare evals/results/*think-off*.jsonl evals/results/*think-on*.jsonl
 ```
 
-`--local-no-think` / `--cloud-no-think` emit the `chat_template_kwargs` disable
-form (Qwen / LM Studio) and also natively disable thinking on GLM-style cloud
-models. If your server expects a different flag, pass it explicitly via
+`--local-no-think` / `--cloud-no-think` emit both known disable dialects —
+`chat_template_kwargs.enable_thinking=false` (mlx_lm.server / LM Studio) and
+`reasoning_effort="none"` (Ollama; the only form its OpenAI-compat endpoint
+honors) — and also natively disable thinking on GLM-style cloud models. If
+your server expects a different flag, pass it explicitly via
 `--local-extra-body` / `--cloud-extra-body`. The extra body is part of the LLM
 cache key, so the two runs cache independently — no `--no-cache` needed.
 

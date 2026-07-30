@@ -123,9 +123,22 @@ class TestApplyConfigOverrides:
         cfg = _override_config()
         apply_config_overrides(cfg, _override_args(local_no_think=True))
         assert cfg["llm"]["local"]["extra_body"] == {
-            "chat_template_kwargs": {"enable_thinking": False}
+            "chat_template_kwargs": {"enable_thinking": False},
+            "reasoning_effort": "none",
         }
         assert "extra_body" not in cfg["llm"]["cloud"]  # cloud untouched
+
+    def test_cloud_no_think_applies_both_dialects_to_cloud(self):
+        # The cloud flag's wiring is separate from the local flag's — a
+        # disconnected --cloud-no-think would be a silently-inert no-op, the
+        # exact failure shape issue #64 is about.
+        cfg = _override_config()
+        apply_config_overrides(cfg, _override_args(cloud_no_think=True))
+        assert cfg["llm"]["cloud"]["extra_body"] == {
+            "chat_template_kwargs": {"enable_thinking": False},
+            "reasoning_effort": "none",
+        }
+        assert "extra_body" not in cfg["llm"]["local"]  # local untouched
 
     def test_extra_body_json_is_merged(self):
         cfg = _override_config()
@@ -177,22 +190,52 @@ class TestResolveExtraBody:
     def test_passes_through_base_when_no_overrides(self):
         assert resolve_extra_body({"top_p": 0.9}, False, None) == {"top_p": 0.9}
 
-    def test_no_think_sets_chat_template_kwargs(self):
+    def test_no_think_sets_both_disable_dialects(self):
+        # Issue #64: --no-think used to emit only the chat_template_kwargs form,
+        # which Ollama silently ignores — so a think-on/think-off A/B against an
+        # Ollama backend compared think-on to think-on. The flag must emit BOTH
+        # known dialects: chat_template_kwargs.enable_thinking=false (mlx_lm /
+        # LM Studio) and top-level reasoning_effort="none" (Ollama; only "none"
+        # disables there).
         assert resolve_extra_body(None, True, None) == {
-            "chat_template_kwargs": {"enable_thinking": False}
+            "chat_template_kwargs": {"enable_thinking": False},
+            "reasoning_effort": "none",
         }
 
     def test_no_think_preserves_existing_chat_template_kwargs(self):
         out = resolve_extra_body({"chat_template_kwargs": {"foo": 1}}, True, None)
-        assert out == {"chat_template_kwargs": {"foo": 1, "enable_thinking": False}}
+        assert out == {
+            "chat_template_kwargs": {"foo": 1, "enable_thinking": False},
+            "reasoning_effort": "none",
+        }
 
     def test_explicit_json_merges_and_wins(self):
         out = resolve_extra_body({"top_p": 0.9}, False, '{"top_p": 0.5, "min_p": 0.1}')
         assert out == {"top_p": 0.5, "min_p": 0.1}
 
     def test_explicit_json_overrides_no_think(self):
+        # JSON overrides the keys it names; --no-think keys it doesn't name stay.
         out = resolve_extra_body(None, True, '{"chat_template_kwargs": {"enable_thinking": true}}')
-        assert out == {"chat_template_kwargs": {"enable_thinking": True}}
+        assert out == {
+            "chat_template_kwargs": {"enable_thinking": True},
+            "reasoning_effort": "none",
+        }
+
+    def test_explicit_json_overrides_no_think_reasoning_effort(self):
+        out = resolve_extra_body(None, True, '{"reasoning_effort": "high"}')
+        assert out == {
+            "chat_template_kwargs": {"enable_thinking": False},
+            "reasoning_effort": "high",
+        }
+
+    def test_no_think_overrides_base_config_reasoning_effort(self):
+        # Precedence: --no-think must OVERRIDE a base config's reasoning_effort,
+        # not merely fill it in when absent. A base carrying "low" is plausible
+        # Ollama tuning — and "low" is a silent no-op there (thinking stays ON),
+        # so preserving it would make --no-think inert against exactly the
+        # backend it was fixed for.
+        out = resolve_extra_body({"reasoning_effort": "low"}, True, None)
+        assert out["reasoning_effort"] == "none"
 
     def test_invalid_json_raises(self):
         with pytest.raises(ValueError):

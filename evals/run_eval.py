@@ -174,7 +174,11 @@ def resolve_extra_body(base: dict | None, no_think: bool, override_json: str | N
 
     Precedence (later wins):
       1. config's existing extra_body (*base*)
-      2. --no-think -> sets chat_template_kwargs.enable_thinking = False
+      2. --no-think -> sets BOTH disable dialects: chat_template_kwargs.
+         enable_thinking = False (mlx_lm.server / LM Studio) and top-level
+         reasoning_effort = "none" (Ollama — the only field its OpenAI-compat
+         endpoint honors; issue #64). A backend ignores the dialect it doesn't
+         know, so emitting both keeps the flag meaningful across backends.
       3. --extra-body JSON object (its keys override the above)
 
     Returns the merged dict, or None when nothing is set (so the LLMClient keeps
@@ -189,6 +193,7 @@ def resolve_extra_body(base: dict | None, no_think: bool, override_json: str | N
         ctk = dict(result.get("chat_template_kwargs") or {})
         ctk["enable_thinking"] = False
         result["chat_template_kwargs"] = ctk
+        result["reasoning_effort"] = "none"
     if override_json:
         try:
             override = json.loads(override_json)
@@ -741,11 +746,13 @@ def cli():
                         help='JSON object merged into every local LLM request body '
                              '(e.g. \'{"chat_template_kwargs": {"enable_thinking": false}}\')')
     parser.add_argument("--cloud-no-think", action="store_true",
-                        help="Disable thinking for the cloud LLM "
-                             "(sets chat_template_kwargs.enable_thinking=false)")
+                        help="Disable thinking for the cloud LLM (sets "
+                             "chat_template_kwargs.enable_thinking=false and "
+                             "reasoning_effort=none)")
     parser.add_argument("--local-no-think", action="store_true",
-                        help="Disable thinking for the local LLM "
-                             "(sets chat_template_kwargs.enable_thinking=false)")
+                        help="Disable thinking for the local LLM (sets "
+                             "chat_template_kwargs.enable_thinking=false and "
+                             "reasoning_effort=none)")
     args = parser.parse_args()
 
     if args.stages not in VALID_STAGES:

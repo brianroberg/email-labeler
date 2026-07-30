@@ -8,6 +8,7 @@ Background daemon that continuously polls Gmail for unclassified emails and appl
 - `README-technical.md` — Agent/reference: project structure, config.toml reference, environment variables, test coverage
 - `evals/README.md` — Human-oriented eval suite guide: pipeline stages, common workflows, key commands
 - `evals/README-technical.md` — Agent/reference: complete CLI flags for all eval tools, LLM cache internals, chain-of-thought capture format
+- `docs/runbook-agent-attempted-recovery.md` — Owner-run manual sweep of threads dropped to `agent/attempted` by the issue-#64 bug; time-sensitive (cleanest before the first post-#65 image is deployed), and not to be executed by an agent with Gmail write access
 
 ## Privacy Invariant
 
