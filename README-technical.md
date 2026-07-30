@@ -137,23 +137,34 @@ timeout = 180       # Local LLM gets more time (runs on consumer hardware)
 
 Each `[llm.*]` section supports an optional `extra_body` table. Any key-value pairs defined here are merged into every API request body sent to that endpoint. This is useful for provider-specific parameters that aren't part of the standard OpenAI chat completion format.
 
-**Disabling thinking for reasoning models** — Models like Qwen3, DeepSeek-R1, and GLM-4.5 generate chain-of-thought reasoning in `<think>` tags before answering. While the daemon already strips these tags from responses, you can disable thinking entirely to save tokens and reduce latency.
+**Disabling thinking for reasoning models** — Models like Qwen3, DeepSeek-R1, and GLM-4.5 generate chain-of-thought reasoning before answering — inline in `<think>` tags or in a separate response field, depending on the backend. While the daemon strips inline tags from responses, you can disable thinking entirely to save tokens and reduce latency.
 
-The shipped `config.toml` **disables native thinking on the local person-email classifier** (`[llm.local.extra_body.chat_template_kwargs]` → `enable_thinking = false`). A paired `stage2_only --sender-type person` eval (n=20) found native thinking strictly worse here: the model spent its `max_tokens` budget reasoning in the `<think>` channel and emitted no label on some threads (a `KeyError: 'content'` failure), while think-off was ≥ think-on on every thread (85% vs 78% accuracy, 0 vs 2 errors). The classification prompt already drives step-by-step reasoning into the *content* channel, so disabling native thinking preserves reasoning quality without the budget-split failure. `mlx_lm.server` honors this request-level `chat_template_kwargs` form; a top-level `enable_thinking` is ignored by that server.
+The shipped `config.toml` **disables native thinking on the local person-email classifier**. A paired `stage2_only --sender-type person` eval (n=20) found native thinking strictly worse here: the model spent its `max_tokens` budget reasoning in its thinking channel and emitted no label on some threads, while think-off was ≥ think-on on every thread (85% vs 78% accuracy, 0 vs 2 errors). Issue #64 later reproduced exactly that failure in production under Ollama. The classification prompt already drives step-by-step reasoning into the *content* channel, so disabling native thinking preserves reasoning quality without the budget-split failure.
 
-For providers that accept a top-level `enable_thinking` flag instead (Novita.ai, many OpenAI-compatible APIs):
+**The disable dialect is backend-specific, and a backend silently ignores dialects it doesn't understand** — a wrong-dialect disable is indistinguishable from a working one until the errors start (that was issue #64). The shipped config sends both known forms:
+
+For **Ollama** (verified on 0.32.5), the only working field on its OpenAI-compatible endpoint is a top-level `reasoning_effort = "none"`. Only `"none"` disables — `"low"` is a silent no-op, and `think = false` / `chat_template_kwargs` are ignored there:
+
+```toml
+[llm.local.extra_body]
+reasoning_effort = "none"
+```
+
+For **LM Studio and `mlx_lm.server`** with models that use `chat_template_kwargs` (e.g. Qwen3) — where a top-level `enable_thinking` is ignored:
+
+```toml
+[llm.local.extra_body.chat_template_kwargs]
+enable_thinking = false
+```
+
+Some providers accept a top-level `enable_thinking` flag instead (Novita.ai, various OpenAI-compatible APIs):
 
 ```toml
 [llm.local.extra_body]
 enable_thinking = false
 ```
 
-For LM Studio and `mlx_lm.server` with models that use `chat_template_kwargs` (e.g. Qwen3) — the shipped default:
-
-```toml
-[llm.local.extra_body.chat_template_kwargs]
-enable_thinking = false
-```
+Do **not** reach for Qwen's `/no_think` prompt switch: under Ollama it emitted a stray closing think-tag into content with no opening tag, which the tag-stripping regex cannot remove (issue #64).
 
 You can put any provider-specific fields in `extra_body` — it is not limited to thinking controls. For example:
 

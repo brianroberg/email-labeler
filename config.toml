@@ -53,17 +53,34 @@ timeout = 60
 
 [llm.local]
 model = "{env.MLX_MODEL}"
-max_tokens = 1024
+# 4096, not 1024: with native thinking disabled, the model still emits the full
+# step-by-step scaffold the prompt asks for — as untagged prose in content,
+# label last — and observed demand ran to ~1,300 completion tokens on hard
+# threads (issue #64). An over-budget decode with thinking off does NOT fail
+# loudly: content arrives truncated before any label and would parse to the
+# default LOW_PRIORITY → archive. This raise is therefore coupled to the
+# thinking disable below, not independent tuning.
+max_tokens = 4096
 temperature = 0
 timeout = 180
-# Extra fields merged into every API request body.
-# Disable native thinking on the local person-email classifier (issue #10): the
-# eval showed native thinking is strictly worse here — reasoning overruns the
-# max_tokens budget in the <think> channel and no label is emitted. The
-# classification prompt already drives step-by-step reasoning into the content
-# channel, so this keeps reasoning quality without the budget-split failure.
-# mlx_lm.server honors this request-level chat_template_kwargs form; a top-level
-# enable_thinking is ignored by that server.
+# Extra fields merged verbatim into the top level of every API request body.
+# Native thinking must be OFF on the local person-email classifier: the #10
+# eval showed it strictly worse (reasoning overruns the max_tokens budget in
+# the separate channel and no label is emitted), and issue #64 reproduced that
+# exact failure in production under Ollama. The disable dialect is
+# backend-specific, so BOTH known forms are sent:
+#   - reasoning_effort = "none" is the form Ollama (verified on 0.32.5) honors
+#     on its OpenAI-compatible endpoint. Only "none" disables — "low" is a
+#     silent no-op there, and think=false / chat_template_kwargs are ignored.
+#   - chat_template_kwargs.enable_thinking = false is the form mlx_lm.server
+#     and LM Studio honor (Ollama ignores it). Kept for portability back to
+#     those backends; issue #64's probes sent both fields together against
+#     Ollama without harm.
+# Never use Qwen's /no_think prompt switch instead: it emitted a stray closing
+# think-tag into content that _strip_thinking cannot remove (issue #64).
+[llm.local.extra_body]
+reasoning_effort = "none"
+
 [llm.local.extra_body.chat_template_kwargs]
 enable_thinking = false
 
