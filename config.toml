@@ -47,7 +47,16 @@ low_priority = "archive"
 
 [llm.cloud]
 model = "zai-org/glm-5"
-max_tokens = 1024
+# Native thinking stays ENABLED here — deliberately asymmetric with
+# [llm.local]. glm-5 emits no in-content chain-of-thought at all (the <think>
+# instruction in the prompts is dead weight for it), so its accuracy rides
+# entirely on the native reasoning channel — and issue #64's probes showed
+# disabling it changes labels. Disable only behind an eval gate (issue #13).
+# Unlike the local tier, the budget is not squeezed: the same fixtures that
+# exhausted qwen's 1024 finished in 204-486 completion tokens here. 2048 is
+# cheap insurance on top of that headroom (measured on 5 probe fixtures, not
+# proof under service-heavy traffic).
+max_tokens = 2048
 temperature = 0
 timeout = 60
 
