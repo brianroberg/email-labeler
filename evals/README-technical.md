@@ -63,31 +63,42 @@ Review hotkeys: `p`/`s` sender (person/service); `r`/`f`/`l` label (needs_respon
 | `--local-timeout` | Override local LLM request timeout in seconds (for slow prefills on long inputs) |
 | `--cloud-extra-body` | JSON object merged into every cloud LLM request body (e.g. `'{"top_p": 0.9}'`) |
 | `--local-extra-body` | JSON object merged into every local LLM request body (e.g. `'{"chat_template_kwargs": {"enable_thinking": false}}'`) |
-| `--cloud-no-think` | Disable thinking for the cloud LLM (shortcut for `--cloud-extra-body '{"chat_template_kwargs": {"enable_thinking": false}}'`) |
-| `--local-no-think` | Disable thinking for the local LLM (shortcut for `--local-extra-body '{"chat_template_kwargs": {"enable_thinking": false}}'`) |
+| `--cloud-no-think` | Disable thinking for the cloud LLM (sets both `chat_template_kwargs.enable_thinking=false` and `reasoning_effort="none"`; see below) |
+| `--local-no-think` | Disable thinking for the local LLM (sets both `chat_template_kwargs.enable_thinking=false` and `reasoning_effort="none"`; see below) |
 
 #### A/B testing thinking on vs. off
 
-The local model (person-body label classification) is a reasoning model by
-default. To measure the accuracy impact of disabling thinking before changing
-`config.toml`, run two evaluations and compare:
+The shipped `config.toml` already disables native thinking on the local tier
+(issues #10, #64), so a plain run **is** the thinking-off arm. To measure the
+accuracy impact of thinking ON (e.g. re-validating the #10 result on a new
+backend), re-enable it explicitly for one run and compare:
 
 ```bash
-# Baseline (thinking on, from config) — person threads only
-uv run python -m evals.run_eval --stages stage2_only --sender-type person --tag think-on
+# Thinking off — the shipped config; person threads only
+uv run python -m evals.run_eval --stages stage2_only --sender-type person --tag think-off
 
-# Thinking off
+# Thinking on: override both disable dialects that config.toml carries.
+# reasoning_effort "low" maps to the model default on Ollama — i.e. thinking
+# back on (only "none" disables there); enable_thinking=true re-enables under
+# mlx_lm.server / LM Studio.
 uv run python -m evals.run_eval --stages stage2_only --sender-type person \
-    --local-no-think --tag think-off
+    --local-extra-body '{"reasoning_effort": "low", "chat_template_kwargs": {"enable_thinking": true}}' \
+    --tag think-on
 
-uv run python -m evals.report --compare evals/results/<think-on>.jsonl evals/results/<think-off>.jsonl
+uv run python -m evals.report --compare evals/results/<think-off>.jsonl evals/results/<think-on>.jsonl
 ```
 
 Because `extra_body` is part of the cache key, the two runs are cached
 independently — no `--no-cache` needed. The exact disable payload is
-server-specific; `--local-no-think` uses the `chat_template_kwargs` form
-(Qwen3 / LM Studio). If your server expects a top-level flag instead, pass it
-explicitly, e.g. `--local-extra-body '{"enable_thinking": false}'`.
+server-specific and **a server silently ignores dialects it doesn't know** —
+which is how an A/B can quietly compare think-on to think-on (issue #64:
+the flags used to emit only the `chat_template_kwargs` form, which Ollama
+ignores). `--local-no-think` / `--cloud-no-think` therefore emit BOTH known
+dialects: `chat_template_kwargs.enable_thinking = false` (mlx_lm.server /
+LM Studio) and top-level `reasoning_effort = "none"` (Ollama, verified on
+0.32.5 — `"low"` is a silent no-op and `think: false` is ignored on its
+OpenAI-compat endpoint). If your server expects something else, pass it
+explicitly via `--local-extra-body`.
 
 ### report
 
@@ -421,8 +432,15 @@ Changing any of these — the model name, temperature, inference parameters, `ex
 
 - On startup, the entire cache file is loaded into memory.
 - Cache hits return instantly without contacting the LLM. An entry whose stored
-  `thinking` is `""` means the model was called and emitted no `<think>` block —
-  it is a normal hit, not re-fetched.
+  `thinking` is `""` means the response carried no separately-capturable
+  reasoning — no separate reasoning field (`reasoning_content` / `reasoning`)
+  and no inline `<think>` block. It is a normal hit, not re-fetched.
+  **`""` is NOT proof the model didn't reason** (issue #64): with native
+  thinking disabled, the model reasons as untagged prose in the content
+  channel, which is preserved in the result's `label_raw`, not in `thinking`.
+  (Entries written before issue #64 have a second blind spot: capture was
+  GLM-only, so reasoning a backend routed to a separate non-GLM field — e.g.
+  Ollama's `reasoning` — was dropped as `""` even though the model reasoned.)
 - Legacy entries written before thinking capture (no `thinking` key at all) are
   backfilled with one LLM call the first time chain-of-thought is requested for
   them, then cached permanently.
@@ -440,7 +458,7 @@ uv run python -m evals.run_eval --no-cache
 
 ## Chain-of-Thought Capture
 
-When running evaluations with the LLM cache enabled (the default), chain-of-thought content from `<think>...</think>` blocks is automatically captured and stored in sidecar files alongside results.
+When running evaluations with the LLM cache enabled (the default), chain-of-thought content is automatically captured and stored in sidecar files alongside results. Capture reads, in order: the response's separate reasoning field for any model (`reasoning_content` — GLM; `reasoning` — Ollama), then inline `<think>...</think>` blocks in content. With native thinking disabled (the shipped local config), neither exists — the model's step-by-step reasoning is the untagged content itself, preserved in `label_raw`; that's where to look when inspecting a thinking-off run's reasoning (e.g. issue #14).
 
 **Sidecar format:** `evals/results/<run>.cot.jsonl` — one JSON line per thread with `stage1_thinking` and `stage2_thinking` fields.
 

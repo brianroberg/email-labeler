@@ -1033,8 +1033,10 @@ class TestGLMReasoningContent:
             assert response == "SERVICE"
             assert "some reasoning" in thinking
 
-    async def test_non_glm_ignores_reasoning_content(self):
-        """Non-GLM models use inline tags even if reasoning_content is present."""
+    async def test_separate_reasoning_field_wins_over_inline_tags_for_non_glm(self):
+        """A populated separate reasoning field is preferred over inline tags for
+        ANY model, not just GLM (issue #64: capture used to be GLM-gated, so
+        Ollama-served local models silently yielded thinking="")."""
         client = LLMClient(
             base_url="https://api.example.com/v1/chat/completions",
             api_key="sk-test",
@@ -1043,7 +1045,7 @@ class TestGLMReasoningContent:
         mock_response = _mock_response(json_data={
             "choices": [{"message": {
                 "content": "<think>inline reasoning</think>\nSERVICE",
-                "reasoning_content": "should be ignored",
+                "reasoning_content": "separate-channel reasoning",
             }}]
         })
 
@@ -1054,9 +1056,8 @@ class TestGLMReasoningContent:
             mock_client_cls.return_value.__aexit__ = AsyncMock(return_value=False)
 
             response, thinking = await client.complete("sys", "user", include_thinking=True)
-            assert response == "SERVICE"
-            assert "inline reasoning" in thinking
-            assert "should be ignored" not in thinking
+            assert response == "SERVICE"  # inline tags still stripped from content
+            assert "separate-channel reasoning" in thinking
 
     async def test_glm_empty_reasoning_content_falls_back(self, glm_client):
         """GLM with empty reasoning_content falls back to inline tags."""
@@ -1076,3 +1077,127 @@ class TestGLMReasoningContent:
             response, thinking = await glm_client.complete("sys", "user", include_thinking=True)
             assert response == "SERVICE"
             assert "inline thought" in thinking
+
+
+class TestSeparateReasoningFieldCapture:
+    """include_thinking must read the separate reasoning field for ANY model
+    (issue #64). It was GLM-gated, so under Ollama — which routes Qwen's
+    reasoning to `msg.reasoning`, not `reasoning_content` — every local call
+    returned thinking="" and the eval .cot.jsonl sidecar was silently empty,
+    documented as if the model had emitted no reasoning.
+    """
+
+    def _qwen_ollama_client(self):
+        return LLMClient(
+            base_url="http://ollama.example.com/v1/chat/completions",
+            api_key="",
+            model="qwen3.6:35b-mlx",
+        )
+
+    async def test_ollama_reasoning_field_yields_thinking(self):
+        """The Ollama response shape (reasoning in `msg.reasoning`, bare-prose
+        content) must yield non-empty thinking for a non-GLM model."""
+        mock_response = _mock_response(json_data={
+            "choices": [{
+                "finish_reason": "stop",
+                "message": {
+                    "role": "assistant",
+                    "content": "1. The sender is a colleague.\n\nFYI",
+                    "reasoning": "Okay, let me work through the three questions...",
+                },
+            }]
+        })
+
+        with patch("llm_client.httpx.AsyncClient") as mock_client_cls:
+            mock_client = AsyncMock()
+            mock_client.post.return_value = mock_response
+            mock_client_cls.return_value.__aenter__ = AsyncMock(return_value=mock_client)
+            mock_client_cls.return_value.__aexit__ = AsyncMock(return_value=False)
+
+            response, thinking = await self._qwen_ollama_client().complete(
+                "sys", "user", include_thinking=True,
+            )
+            assert "FYI" in response
+            assert "three questions" in thinking
+
+    async def test_no_separate_field_falls_back_to_inline_tags(self):
+        """Without a separate field, inline <think> extraction still works
+        (DeepSeek/Qwen served by mlx_lm.server with thinking on)."""
+        mock_response = _mock_response(json_data={
+            "choices": [{"message": {
+                "content": "<think>inline path</think>\nLOW_PRIORITY",
+            }}]
+        })
+
+        with patch("llm_client.httpx.AsyncClient") as mock_client_cls:
+            mock_client = AsyncMock()
+            mock_client.post.return_value = mock_response
+            mock_client_cls.return_value.__aenter__ = AsyncMock(return_value=mock_client)
+            mock_client_cls.return_value.__aexit__ = AsyncMock(return_value=False)
+
+            response, thinking = await self._qwen_ollama_client().complete(
+                "sys", "user", include_thinking=True,
+            )
+            assert response == "LOW_PRIORITY"
+            assert "inline path" in thinking
+
+    async def test_untagged_content_with_no_reasoning_yields_empty_thinking(self):
+        """Thinking-off Ollama shape: no separate field, no tags — the CoT is
+        the untagged content itself (preserved in the response / label_raw), so
+        thinking is legitimately ""."""
+        mock_response = _mock_response(json_data={
+            "choices": [{
+                "finish_reason": "stop",
+                "message": {
+                    "role": "assistant",
+                    "content": "1. A vendor.\n2. No action.\n\nLOW_PRIORITY",
+                },
+            }]
+        })
+
+        with patch("llm_client.httpx.AsyncClient") as mock_client_cls:
+            mock_client = AsyncMock()
+            mock_client.post.return_value = mock_response
+            mock_client_cls.return_value.__aenter__ = AsyncMock(return_value=mock_client)
+            mock_client_cls.return_value.__aexit__ = AsyncMock(return_value=False)
+
+            response, thinking = await self._qwen_ollama_client().complete(
+                "sys", "user", include_thinking=True,
+            )
+            assert thinking == ""
+            assert "LOW_PRIORITY" in response
+
+    async def test_reasoning_effort_none_recognized_as_thinking_disable(self):
+        """reasoning_effort="none" (the Ollama disable dialect, now in the
+        shipped local config) must read as thinking-disabled intent — so a GLM
+        client carrying it injects thinking=disabled instead of contradicting
+        it with enabled."""
+        client = LLMClient(
+            base_url="https://api.example.com/v1/chat/completions",
+            api_key="sk-test",
+            model="zai-org/glm-5",
+            extra_body={"reasoning_effort": "none"},
+        )
+        mock_response = _mock_response(json_data={
+            "choices": [{"message": {"content": "SERVICE"}}]
+        })
+
+        with patch("llm_client.httpx.AsyncClient") as mock_client_cls:
+            mock_client = AsyncMock()
+            mock_client.post.return_value = mock_response
+            mock_client_cls.return_value.__aenter__ = AsyncMock(return_value=mock_client)
+            mock_client_cls.return_value.__aexit__ = AsyncMock(return_value=False)
+
+            await client.complete("sys", "user", include_thinking=True)
+
+            body = mock_client.post.call_args.kwargs["json"]
+            assert body["thinking"] == {"type": "disabled"}
+
+    async def test_reasoning_effort_other_values_do_not_read_as_disable(self):
+        """Only "none" disables (Ollama treats "low" as a silent no-op), so only
+        "none" may read as disable intent."""
+        client = LLMClient(
+            base_url="", api_key="", model="qwen3",
+            extra_body={"reasoning_effort": "low"},
+        )
+        assert client._extra_body_disables_thinking() is False

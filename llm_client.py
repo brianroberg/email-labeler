@@ -159,13 +159,17 @@ class LLMClient:
     def _extra_body_disables_thinking(self) -> bool:
         """True if extra_body asks to turn thinking off.
 
-        Recognizes both the chat_template_kwargs.enable_thinking form (Qwen / LM
-        Studio, what --no-think emits) and a top-level enable_thinking flag. GLM
-        ignores those fields, so complete() uses this to set GLM's native thinking
-        field to disabled rather than contradicting the request with enabled.
+        Recognizes the chat_template_kwargs.enable_thinking form (Qwen / LM
+        Studio), a top-level enable_thinking flag, and reasoning_effort="none"
+        (the Ollama dialect — only "none" disables there; "low" etc. are model
+        defaults, not a disable). GLM ignores all of those fields, so complete()
+        uses this to set GLM's native thinking field to disabled rather than
+        contradicting the request with enabled.
         """
         ctk = self.extra_body.get("chat_template_kwargs")
         if isinstance(ctk, dict) and ctk.get("enable_thinking") is False:
+            return True
+        if self.extra_body.get("reasoning_effort") == "none":
             return True
         return self.extra_body.get("enable_thinking") is False
 
@@ -312,12 +316,18 @@ class LLMClient:
             )
 
         if include_thinking:
-            # GLM models return reasoning in a separate field
-            if self._is_glm_model() and msg.get("reasoning_content"):
-                thinking = msg["reasoning_content"]
-            else:
-                # DeepSeek/Qwen models use inline <think> tags
-                thinking = self._extract_thinking(content)
+            # Separate-channel reasoning is read for ANY model — the field name
+            # is backend-specific (GLM: reasoning_content; Ollama: reasoning).
+            # This used to be GLM-gated, so Ollama-served local models silently
+            # yielded thinking="" (issue #64). Fall back to inline <think> tags
+            # (DeepSeek/Qwen under mlx_lm.server). With thinking disabled there
+            # is no separate field and no tags: the reasoning is the untagged
+            # content itself, so "" here just means "read the content".
+            thinking = (
+                msg.get("reasoning_content")
+                or msg.get("reasoning")
+                or self._extract_thinking(content)
+            )
             return self._strip_thinking(content), thinking
         return self._strip_thinking(content)
 
