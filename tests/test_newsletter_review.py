@@ -18,6 +18,7 @@ from newsletter_review.tui import (
     build_detail_lines,
     format_filter_summary,
     format_list_row,
+    format_source_line,
     load_assessments,
     run_review_tui,
     sort_by_send_date,
@@ -120,6 +121,58 @@ class TestLoadAssessments:
 
         records = load_assessments(f)
         assert records == []
+
+    def test_keeps_only_the_newest_record_per_thread(self, tmp_path):
+        """A newsletter can be written twice: the assessment is persisted before
+        the labels commit, so a label failure leaves the thread unprocessed and
+        the retry re-grades and re-writes it. The reader shows one row per
+        newsletter — the newest grading, i.e. the last one appended."""
+        f = tmp_path / "assessments.jsonl"
+        first = _make_record(thread_id="t1", overall_tier="fair")
+        retry = _make_record(thread_id="t1", overall_tier="good")
+        other = _make_record(thread_id="t2")
+        f.write_text("\n".join(json.dumps(r) for r in (first, other, retry)) + "\n")
+
+        records = load_assessments(f)
+        assert [r["thread_id"] for r in records] == ["t1", "t2"]
+        assert records[0]["overall_tier"] == "good"
+
+    def test_newest_wins_by_timestamp_not_by_file_position(self, tmp_path):
+        """Dedup must pick the newest GRADING, not the last line. README.md tells
+        operators to concatenate a rescued copy of the assessments file onto their
+        host file and calls overlapping entries harmless — which only holds if the
+        record's own ``timestamp`` decides, not the order the files were joined."""
+        f = tmp_path / "assessments.jsonl"
+        newer = _make_record(thread_id="t1", overall_tier="good",
+                             timestamp="2026-07-29T12:00:00+00:00")
+        older = _make_record(thread_id="t1", overall_tier="fair",
+                             timestamp="2026-07-01T12:00:00+00:00")
+        f.write_text(json.dumps(newer) + "\n" + json.dumps(older) + "\n")
+
+        records = load_assessments(f)
+        assert len(records) == 1
+        assert records[0]["overall_tier"] == "good"
+
+    def test_falls_back_to_last_wins_without_usable_timestamps(self, tmp_path):
+        """No comparable timestamp on either side → the appended-later record is
+        the best available guess at "newest"."""
+        f = tmp_path / "assessments.jsonl"
+        first = _make_record(thread_id="t1", overall_tier="fair", timestamp="")
+        second = _make_record(thread_id="t1", overall_tier="good", timestamp="")
+        f.write_text(json.dumps(first) + "\n" + json.dumps(second) + "\n")
+
+        assert load_assessments(f)[0]["overall_tier"] == "good"
+
+    def test_records_without_a_thread_id_are_all_kept(self, tmp_path):
+        """No thread_id, no identity — deduping them would silently merge
+        unrelated newsletters."""
+        f = tmp_path / "assessments.jsonl"
+        a, b = _make_record(), _make_record()
+        a.pop("thread_id")
+        b.pop("thread_id")
+        f.write_text(json.dumps(a) + "\n" + json.dumps(b) + "\n")
+
+        assert len(load_assessments(f)) == 2
 
     def test_rejects_old_scheme_list_themes(self, tmp_path):
         # A pre-#53 record stores story themes as a LIST; build_detail_lines
@@ -573,6 +626,72 @@ def _title(app) -> str:
     return str(app.query_one("#title", Static).render())
 
 
+class TestMigratedProvenanceInDetail:
+    """A migrated pre-#53 record's Poor/OK/Good values are re-bucketed 5-point
+    judgments. The detail view must say so, or it presents a precision the
+    grader never expressed."""
+
+    def test_detail_notes_a_migrated_record(self):
+        r = _make_record()
+        r["migrated_from"] = "pre-#53"
+        assert any("pre-#53" in line for line in build_detail_lines(r, width=80))
+
+    def test_detail_says_nothing_for_an_unmigrated_record(self):
+        lines = build_detail_lines(_make_record(), width=80)
+        assert not any("pre-#53" in line for line in lines)
+
+
+class TestFormatSourceLine:
+    """The reader must say what it read. The whole July-11 incident was a stale
+    copy of the assessments file: the daemon was recording newsletters through
+    today into its mounted path while the TUI was browsing an older file
+    somewhere else, and nothing on screen distinguished the two."""
+
+    def test_names_the_resolved_path_and_newest_send_date(self, tmp_path):
+        f = tmp_path / "data" / "newsletter_assessments.jsonl"
+        line = format_source_line(f, [
+            _make_record(thread_id="a", send_date="2026-07-11T09:00:00+00:00"),
+            _make_record(thread_id="b", send_date="2026-07-29T09:00:00+00:00"),
+        ])
+        assert str(f.resolve()) in line
+        assert "2 newsletters" in line
+        assert "2026-07-29" in line
+
+    def test_reports_an_empty_file(self, tmp_path):
+        line = format_source_line(tmp_path / "a.jsonl", [])
+        assert "0 newsletters" in line
+
+    def test_dash_when_no_record_carries_a_send_date(self, tmp_path):
+        r = _make_record(send_date=None)
+        line = format_source_line(tmp_path / "a.jsonl", [r])
+        assert "1 newsletter" in line
+        assert "—" in line
+
+    def test_newest_send_date_is_the_local_calendar_date(self, tmp_path):
+        # Same off-by-one care as the list column: a UTC-stored evening send must
+        # display as the local date, not the UTC one.
+        with _use_tz("America/New_York"):
+            line = format_source_line(
+                tmp_path / "a.jsonl",
+                [_make_record(send_date="2026-07-30T01:30:00+00:00")],
+            )
+        assert "2026-07-29" in line
+
+
+class TestReviewAppSourceLine:
+    async def test_source_line_is_displayed_when_a_path_is_known(self, tmp_path):
+        f = tmp_path / "newsletter_assessments.jsonl"
+        app = ReviewApp(_ui_records(), source=f)
+        async with app.run_test(size=SIZE):
+            shown = str(app.query_one("#source", Static).render())
+        assert str(f.resolve()) in shown
+
+    async def test_no_source_line_without_a_path(self):
+        app = ReviewApp(_ui_records())
+        async with app.run_test(size=SIZE):
+            assert not app.query("#source")
+
+
 class TestReviewAppList:
     async def test_list_shows_all_records(self):
         app = ReviewApp(_ui_records())
@@ -758,6 +877,14 @@ class TestRunReviewTui:
     def test_empty_records_prints_and_returns(self, capsys):
         run_review_tui([])
         assert "No assessment records" in capsys.readouterr().out
+
+    def test_empty_records_still_name_the_file_that_was_read(self, capsys, tmp_path):
+        """An empty listing is the case the source line matters MOST for — a wrong
+        or stale path looks identical to a genuinely idle daemon. Bailing out
+        before the header renders withholds the one fact that distinguishes them."""
+        f = tmp_path / "data" / "newsletter_assessments.jsonl"
+        run_review_tui([], source=f)
+        assert str(f.resolve()) in capsys.readouterr().out
 
 
 class TestCli:

@@ -7,6 +7,7 @@ and tags them with Ends Statement themes. All LLM calls use the cloud endpoint
 
 import json
 import logging
+import os
 import re
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -296,6 +297,190 @@ def write_assessment(
     path.parent.mkdir(parents=True, exist_ok=True)
     with open(path, "a") as f:
         f.write(json.dumps(record) + "\n")
+
+
+# ---------------------------------------------------------------------------
+# Assessment sink diagnostics
+#
+# The JSONL sink is the only durable copy of a newsletter's grading, and the
+# ways it goes wrong are all silent: writes to an unmounted container path
+# succeed right up until the container is recreated, and a read-only mount only
+# surfaces per-thread, mid-cycle. These preflight the sink at startup so a
+# misconfigured deployment announces itself instead of quietly grading into the
+# void.
+# ---------------------------------------------------------------------------
+
+# Marker files every mainstream container runtime drops in the root filesystem.
+_CONTAINER_MARKERS = (Path("/.dockerenv"), Path("/run/.containerenv"))
+_MOUNTINFO = Path("/proc/self/mountinfo")
+
+
+def running_in_container() -> bool:
+    """True when this process looks like it is running inside a container."""
+    return any(marker.exists() for marker in _CONTAINER_MARKERS)
+
+
+def read_mountinfo(path: Path = _MOUNTINFO) -> str | None:
+    """Read ``/proc/self/mountinfo``, or None where it isn't available (macOS)."""
+    try:
+        return path.read_text()
+    except OSError:
+        return None
+
+
+# Filesystem types that do not outlive the container, whatever they are mounted
+# over: RAM-backed, or another copy-on-write layer discarded with it. A mount of
+# one of these is not persistence, so a mount-point-only check would clear a
+# tmpfs over the sink directory that loses every record on restart.
+_EPHEMERAL_FSTYPES = frozenset({"tmpfs", "ramfs", "overlay", "overlayfs", "aufs", "devtmpfs"})
+
+
+def parse_mounts(mountinfo: str) -> dict[str, tuple[str, str]]:
+    """Map mount point -> ``(source, fstype)`` from ``/proc/self/mountinfo`` text.
+
+    The mount point is field 5. The source is field 4: the path *within its own
+    filesystem* — for a Docker bind mount that is the host directory
+    (``/var/lib/docker/volumes/<name>/_data`` for a named volume), which is what
+    makes "am I appending to the directory I actually review?" answerable from
+    inside the container. Note it is relative to the ROOT OF THAT FILESYSTEM, not
+    to the host's ``/``: if the host keeps ``/srv`` on its own filesystem, a bind
+    of ``/srv/stack/data`` reports ``/stack/data``. The fstype is the first field
+    after the ``-`` separator, and is what distinguishes a durable bind mount from
+    a tmpfs.
+
+    Paths containing spaces, tabs, newlines, or backslashes are octal-escaped in
+    mountinfo; ``\\040`` (space) is the one worth decoding for a bind-mounted
+    host directory. Malformed lines are skipped rather than raising — this is a
+    diagnostic, and it must never be the thing that breaks startup.
+    """
+    mounts = {}
+    for line in mountinfo.splitlines():
+        fields = line.split(" ")
+        if len(fields) < 10:  # a real mountinfo line has at least 10 fields
+            continue
+        # Optional fields sit between field 7 and the "-", so the fstype's index
+        # varies: find the separator rather than assuming a position.
+        try:
+            fstype = fields[fields.index("-", 6) + 1]
+        except (ValueError, IndexError):
+            continue
+        mounts[fields[4].replace("\\040", " ")] = (fields[3].replace("\\040", " "), fstype)
+    return mounts
+
+
+def covering_mount(path: Path, mountinfo: str | None) -> tuple[str, str, str] | None:
+    """The mount actually holding *path*, as ``(mount_point, source, fstype)``.
+
+    The nearest enclosing mount: the longest mount point that is *path* itself or
+    one of its ancestors. Compared as paths, not strings, so ``/app/dataset`` is
+    never mistaken for a mount covering ``/app/data``. Returns None when
+    mountinfo is unreadable (non-Linux) — no evidence, no claim.
+    """
+    if mountinfo is None:
+        return None
+
+    nearest: tuple[str, str, str] | None = None
+    for point, (source, fstype) in parse_mounts(mountinfo).items():
+        # is_relative_to is already true for an equal path, so this covers a bind
+        # mount of the sink file itself as well as one of a parent directory.
+        if path.is_relative_to(Path(point)):
+            if nearest is None or len(point) > len(nearest[0]):
+                nearest = (point, source, fstype)
+    return nearest
+
+
+def sink_persistence_warning(path: Path, mountinfo: str | None) -> str | None:
+    """:func:`mount_persistence_warning` against raw ``mountinfo`` text."""
+    return mount_persistence_warning(path, covering_mount(path, mountinfo))
+
+
+def mount_persistence_warning(path: Path, mount: tuple[str, str, str] | None) -> str | None:
+    """Warn when *mount* — the mount covering *path* — is not keeping it.
+
+    The daemon's ``output_file`` is relative to the working directory (``/app``
+    in the image), so without a volume mount the assessments land in the
+    container layer: every write succeeds, the review TUI on the host sees
+    nothing new, and the records are destroyed on the next ``docker compose up``.
+    Two shapes mean exactly that, and both look fine to a mount-point-only check:
+
+      * the mount covering the path IS the container root — nothing was mounted
+        over it; and
+      * something *was* mounted over it, but with an ephemeral filesystem: a
+        tmpfs is RAM, another overlay is another throwaway layer.
+
+    Takes the already-resolved mount so a caller that also wants to *report* the
+    mount (the startup preflight does) reads and parses ``mountinfo`` once.
+    Returns None when there's no evidence to act on (mountinfo unreadable), so
+    the check never cries wolf on a platform it can't inspect.
+    """
+    if mount is None:
+        return None
+    point, _source, fstype = mount
+    if point != "/" and fstype not in _EPHEMERAL_FSTYPES:
+        return None
+
+    covers = (
+        "which no volume covers — it is inside the container's writable layer"
+        if point == "/"
+        else f"which is covered only by a {fstype} mount at {point} — that filesystem "
+        "does not outlive the container"
+    )
+    return (
+        f"Newsletter assessments resolve to {path}, {covers}. Writes will appear to "
+        "succeed, but the records are invisible on the host and are DESTROYED when the "
+        "container is recreated. Mount the directory you review, e.g. "
+        "'- ./data:/app/data' under the service's volumes."
+    )
+
+
+def sink_writability_warning(path: Path) -> str | None:
+    """Warn when *path* cannot be appended to (read-only mount, permissions).
+
+    ``write_assessment`` creates missing parents, so a not-yet-existing file is
+    fine as long as the nearest existing ancestor is writable — that ancestor is
+    what gets checked, and named, when the file itself isn't there yet.
+
+    An ``output_file`` naming an existing DIRECTORY is caught here too: it is
+    fatal for every grading (``open(dir, "a")`` raises ``IsADirectoryError``) yet
+    ``os.access`` reports a directory as perfectly writable, so the permission
+    check alone would wave the one guaranteed-fatal misconfiguration through.
+    """
+    if path.is_dir():
+        return (
+            f"Newsletter assessments sink is a directory, not a file: {path}. Every "
+            "grading will fail to save. Point [newsletter] output_file at a file "
+            "inside it (e.g. data/newsletter_assessments.jsonl)."
+        )
+    if path.exists():
+        if os.access(path, os.W_OK):
+            return None
+        target = path
+    else:
+        target = next((p for p in path.parents if p.exists()), Path(path.anchor or "."))
+        if os.access(target, os.W_OK | os.X_OK):
+            return None
+
+    return (
+        f"Newsletter assessments sink is not writable: {target}. Newsletters will be "
+        "left unprocessed (and eventually marked agent/attempted) rather than graded "
+        "into a record that cannot be saved."
+    )
+
+
+def count_records(path: Path) -> int | None:
+    """Count non-blank lines in the assessments JSONL, or None if unreadable.
+
+    Reported at startup: a daemon that has been grading for weeks against a sink
+    holding 0 records is writing somewhere other than the file being reviewed —
+    the single number that makes a misdirected sink obvious.
+    """
+    try:
+        with open(path) as f:
+            return sum(1 for line in f if line.strip())
+    except FileNotFoundError:
+        return 0
+    except OSError:
+        return None
 
 
 def is_newsletter(messages: list[dict], recipient: str) -> bool:

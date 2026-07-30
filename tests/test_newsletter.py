@@ -1,10 +1,12 @@
 """Tests for newsletter classifier — parsing functions and data models."""
 
 import json
+from pathlib import Path
 from unittest.mock import AsyncMock
 
 import pytest
 
+import newsletter
 from llm_client import LLMBalanceError, LLMContentError, LLMUnavailableError
 from newsletter import (
     NewsletterClassifier,
@@ -13,11 +15,16 @@ from newsletter import (
     aggregate_theme_grades,
     classify_theme_line,
     compute_tier,
+    count_records,
+    covering_mount,
     is_newsletter,
+    parse_mounts,
     parse_quality_scores,
     parse_send_date,
     parse_stories,
     parse_themes,
+    sink_persistence_warning,
+    sink_writability_warning,
     write_assessment,
 )
 
@@ -785,3 +792,186 @@ class TestIsNewsletter:
 
     def test_empty_messages(self):
         assert is_newsletter([], "newsletters@dm.org") is False
+
+
+# Real /proc/self/mountinfo excerpts (fields: id parent major:minor root
+# mount-point ...). The container-layer case has only the overlay root; the
+# mounted case adds the bind mount the operator configured.
+_MOUNTINFO_NO_BIND = """\
+1450 1449 0:118 / / rw,relatime - overlay overlay rw,lowerdir=/var/lib/docker/overlay2/l/AAA
+1451 1450 0:121 / /proc rw,nosuid,nodev,noexec,relatime - proc proc rw
+1465 1450 259:2 /var/lib/docker/containers/abc/hosts /etc/hosts rw,relatime - ext4 /dev/nvme0n1p2 rw
+"""
+
+_MOUNTINFO_WITH_BIND = _MOUNTINFO_NO_BIND + (
+    "1470 1450 259:2 /Users/brian/email-labeler/data /app/data rw,relatime "
+    "- ext4 /dev/nvme0n1p2 rw\n"
+)
+
+
+class TestParseMounts:
+    def test_maps_mount_point_to_its_source_and_fstype(self):
+        assert parse_mounts(_MOUNTINFO_WITH_BIND)["/app/data"] == (
+            "/Users/brian/email-labeler/data", "ext4",
+        )
+
+    def test_fstype_is_found_past_the_optional_fields(self):
+        """``master:N`` / ``propagate_from:N`` sit between field 7 and the ``-``,
+        so the fstype's index varies — it must be located by the separator."""
+        line = (
+            "1470 1450 259:2 /src /app/data rw,relatime shared:12 master:7 "
+            "- xfs /dev/sda1 rw\n"
+        )
+        assert parse_mounts(line)["/app/data"] == ("/src", "xfs")
+
+    def test_parses_every_mount_point(self):
+        assert set(parse_mounts(_MOUNTINFO_WITH_BIND)) == {
+            "/", "/proc", "/etc/hosts", "/app/data",
+        }
+
+    def test_octal_escaped_space_is_decoded(self):
+        line = "1470 1450 259:2 /src /app/my\\040data rw,relatime - ext4 /dev/sda1 rw\n"
+        assert "/app/my data" in parse_mounts(line)
+
+    def test_ignores_malformed_lines(self):
+        assert parse_mounts("garbage\n\n1 2 3\n") == {}
+
+
+class TestCoveringMount:
+    """Which mount actually holds the sink — the nearest one enclosing it."""
+
+    def test_returns_the_nearest_enclosing_mount(self):
+        mount = covering_mount(Path("/app/data/a.jsonl"), _MOUNTINFO_WITH_BIND)
+        assert mount == ("/app/data", "/Users/brian/email-labeler/data", "ext4")
+
+    def test_falls_back_to_the_root_mount(self):
+        mount = covering_mount(Path("/app/data/a.jsonl"), _MOUNTINFO_NO_BIND)
+        assert mount[0] == "/"
+
+    def test_none_when_mountinfo_is_unreadable(self):
+        assert covering_mount(Path("/app/data/a.jsonl"), None) is None
+
+
+class TestSinkPersistenceWarning:
+    """The failure that silently stopped assessment storage: in Docker the
+    daemon's default output path (``data/...`` relative to WORKDIR ``/app``)
+    lands in the container's writable layer unless a volume covers it. Writes
+    keep succeeding, so nothing fails — the records are just destroyed the next
+    time the container is recreated."""
+
+    def test_warns_when_path_is_only_covered_by_the_container_root(self):
+        warning = sink_persistence_warning(
+            Path("/app/data/newsletter_assessments.jsonl"), _MOUNTINFO_NO_BIND
+        )
+        assert warning is not None
+        # Actionable: names the path and the fix.
+        assert "/app/data/newsletter_assessments.jsonl" in warning
+        assert "volume" in warning.lower() or "mount" in warning.lower()
+
+    def test_silent_when_a_bind_mount_covers_the_directory(self):
+        assert sink_persistence_warning(
+            Path("/app/data/newsletter_assessments.jsonl"), _MOUNTINFO_WITH_BIND
+        ) is None
+
+    def test_silent_when_the_file_itself_is_bind_mounted(self):
+        mountinfo = _MOUNTINFO_NO_BIND + (
+            "1470 1450 259:2 /host/a.jsonl /app/data/a.jsonl rw,relatime - ext4 /dev/sda1 rw\n"
+        )
+        assert sink_persistence_warning(Path("/app/data/a.jsonl"), mountinfo) is None
+
+    def test_a_sibling_mount_does_not_count_as_coverage(self):
+        # /app/dataset must not be read as covering /app/data* by string prefix.
+        mountinfo = _MOUNTINFO_NO_BIND + (
+            "1470 1450 259:2 /host /app/dataset rw,relatime - ext4 /dev/sda1 rw\n"
+        )
+        assert sink_persistence_warning(Path("/app/data/a.jsonl"), mountinfo) is not None
+
+    def test_unreadable_mountinfo_yields_no_warning(self):
+        # No evidence either way — never cry wolf.
+        assert sink_persistence_warning(Path("/app/data/a.jsonl"), None) is None
+
+    def test_warns_when_the_covering_mount_is_a_tmpfs(self):
+        """A mount over the directory is not automatically persistence: a tmpfs
+        lives in RAM and dies with the container just like the writable layer,
+        while looking to a mount-point check exactly like a bind mount."""
+        mountinfo = _MOUNTINFO_NO_BIND + (
+            "1470 1450 0:99 / /app/data rw,relatime - tmpfs tmpfs rw,size=65536k\n"
+        )
+        warning = sink_persistence_warning(Path("/app/data/a.jsonl"), mountinfo)
+        assert warning is not None
+        assert "tmpfs" in warning
+
+    def test_warns_when_the_covering_mount_is_another_overlay(self):
+        mountinfo = _MOUNTINFO_NO_BIND + (
+            "1470 1450 0:200 / /app/data rw,relatime - overlay overlay rw,lowerdir=/l/B\n"
+        )
+        assert sink_persistence_warning(Path("/app/data/a.jsonl"), mountinfo) is not None
+
+
+class TestSinkWritabilityWarning:
+    """A sink that cannot be appended to now blocks labeling (the record is
+    written before the labels commit), so the operator must learn about it at
+    startup rather than through a give-up storm.
+
+    The unwritable cases drive ``os.access`` directly instead of chmod-ing a
+    fixture: the daemon runs as root in its container, and root bypasses
+    permission bits — a chmod-based test would assert behavior the daemon can
+    never actually hit. What must be proven is that an OS "no" (a read-only
+    mount is the realistic one) becomes a warning naming the location.
+    """
+
+    def test_silent_for_a_writable_existing_file(self, tmp_path):
+        path = tmp_path / "assessments.jsonl"
+        path.write_text("")
+        assert sink_writability_warning(path) is None
+
+    def test_silent_when_the_file_does_not_exist_yet_but_a_parent_is_writable(self, tmp_path):
+        # write_assessment creates missing parents, so an absent file/dir is fine
+        # as long as the nearest existing ancestor can be written to.
+        assert sink_writability_warning(tmp_path / "data" / "sub" / "a.jsonl") is None
+
+    def test_warns_when_the_existing_file_is_not_writable(self, tmp_path, monkeypatch):
+        path = tmp_path / "assessments.jsonl"
+        path.write_text("")
+        monkeypatch.setattr(newsletter.os, "access", lambda *_args, **_kw: False)
+        warning = sink_writability_warning(path)
+        assert warning is not None
+        assert str(path) in warning
+
+    def test_warns_when_the_configured_sink_is_a_directory(self, tmp_path):
+        """``output_file`` pointing at a directory is fatal for every grading
+        (``open(dir, "a")`` raises ``IsADirectoryError``), but ``os.access`` says
+        the directory is perfectly writable — so the shape has to be checked too,
+        or the one guaranteed-fatal misconfiguration passes preflight silently."""
+        sink = tmp_path / "assessments.jsonl"
+        sink.mkdir()
+        warning = sink_writability_warning(sink)
+        assert warning is not None
+        assert str(sink) in warning
+
+    def test_warns_when_the_nearest_existing_directory_is_not_writable(self, tmp_path, monkeypatch):
+        # The file (and an intermediate dir) don't exist yet: the check falls back
+        # to the nearest ancestor that does, and must name THAT in the warning.
+        monkeypatch.setattr(newsletter.os, "access", lambda *_args, **_kw: False)
+        warning = sink_writability_warning(tmp_path / "data" / "a.jsonl")
+        assert warning is not None
+        assert str(tmp_path) in warning
+
+
+class TestCountRecords:
+    """The startup line reports how many records the resolved path already holds:
+    a daemon that has been grading for weeks but reports 0 existing records is
+    writing somewhere other than the file the operator reviews."""
+
+    def test_counts_non_blank_lines(self, tmp_path):
+        path = tmp_path / "a.jsonl"
+        path.write_text('{"a": 1}\n\n{"a": 2}\n')
+        assert count_records(path) == 2
+
+    def test_missing_file_counts_zero(self, tmp_path):
+        assert count_records(tmp_path / "missing.jsonl") == 0
+
+    def test_unreadable_file_counts_none(self, tmp_path):
+        # A directory where the file should be: report "unknown", not a crash.
+        (tmp_path / "a.jsonl").mkdir()
+        assert count_records(tmp_path / "a.jsonl") is None

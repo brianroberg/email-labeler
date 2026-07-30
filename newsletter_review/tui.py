@@ -42,8 +42,34 @@ _COL_GAP = 2
 # Pure data functions (no UI, fully testable)
 # ---------------------------------------------------------------------------
 
+def _processed_at(record: dict) -> datetime | None:
+    """A record's processed time as a comparable datetime, or None if unusable.
+
+    Naive timestamps are read as UTC — ``write_assessment`` has always written an
+    aware UTC value, but a hand-edited or hand-merged record may not, and mixing
+    aware and naive datetimes raises on comparison."""
+    try:
+        stamp = datetime.fromisoformat(record.get("timestamp") or "")
+    except (TypeError, ValueError):
+        return None
+    return stamp if stamp.tzinfo else stamp.replace(tzinfo=timezone.utc)
+
+
 def load_assessments(path: Path) -> list[dict]:
     """Load newsletter assessment records from a JSONL file.
+
+    One row per newsletter: a thread graded more than once keeps only its NEWEST
+    record, decided by the record's own ``timestamp`` rather than by its position
+    in the file. The daemon persists the assessment *before* committing the Gmail
+    labels, so a newsletter whose labels fail to apply stays unprocessed and is
+    re-graded — and re-appended — next cycle. Deduping on read keeps that
+    durability guarantee from showing up as duplicate rows here.
+
+    Position is only the tie-break (later line wins) when neither record carries a
+    comparable timestamp: files get *merged*, not just appended — README.md has
+    operators concatenate a rescued copy of the assessments file onto their host
+    file — so "last line" is not a reliable stand-in for "latest grading".
+    Records with no ``thread_id`` have no identity to dedupe on and are all kept.
 
     Fails fast on pre-#53 old-scheme records whose story ``themes`` are stored
     as a LIST instead of a theme->grade dict: they would otherwise crash the
@@ -52,6 +78,7 @@ def load_assessments(path: Path) -> list[dict]:
     clear, located error naming the file + line so the reader knows to
     re-migrate rather than seeing an opaque ``AttributeError`` (Finding 4)."""
     records = []
+    by_thread: dict[str, int] = {}  # thread_id -> index of its latest record
     with open(path) as f:
         for lineno, line in enumerate(f, 1):
             if not line.strip():
@@ -65,6 +92,15 @@ def load_assessments(path: Path) -> list[dict]:
                         "file predates the #53 theme-dict migration and must be "
                         "re-migrated before it can be browsed."
                     )
+            thread_id = record.get("thread_id")
+            if thread_id and thread_id in by_thread:
+                kept = records[by_thread[thread_id]]
+                new_at, kept_at = _processed_at(record), _processed_at(kept)
+                if new_at is None or kept_at is None or new_at >= kept_at:
+                    records[by_thread[thread_id]] = record  # supersede in place
+                continue
+            if thread_id:
+                by_thread[thread_id] = len(records)
             records.append(record)
     return records
 
@@ -187,6 +223,21 @@ def format_filter_summary(
     return "  ".join(parts)
 
 
+def format_source_line(path: Path, records: list[dict]) -> str:
+    """Identify the file being browsed: resolved path, record count, newest send.
+
+    The reader is one half of a pair — the daemon logs where it *writes*, this
+    says what was *read*. Without it, a stale copy of the assessments file is
+    indistinguishable from a live one, which is exactly how a daemon recording
+    newsletters daily can look like it stopped weeks ago. The newest send date is
+    the tell, and it's shown as a local calendar date to match the list column.
+    """
+    dates = [d for d in (_local_date(r.get("send_date")) for r in records) if d]
+    newest = max(dates) if dates else "—"
+    noun = "newsletter" if len(records) == 1 else "newsletters"
+    return f"{path.resolve()} — {len(records)} {noun}, newest sent {newest}"
+
+
 def _list_date(record: dict) -> str:
     """The send-date's LOCAL calendar date for the list column, or ``—`` if
     absent/unparseable (#36)."""
@@ -241,8 +292,17 @@ def build_detail_lines(record: dict, width: int = 80) -> list[str]:
         f"Model: {model}",
         f"Overall: {overall_tier}",
         f"Stories: {len(stories)}",
-        "",
     ]
+
+    # A migrated record's dimension labels are 5-point scores re-bucketed into
+    # Poor/OK/Good (scripts/migrate_assessments.py); its tier is the one the
+    # grader actually concluded. Say so rather than presenting a precision the
+    # grader never expressed.
+    migrated = record.get("migrated_from")
+    if migrated:
+        lines.append(f"Scores: re-bucketed from the {migrated} 5-point rubric")
+
+    lines.append("")
 
     if not stories:
         lines.append("No stories extracted from this newsletter.")
@@ -415,12 +475,16 @@ class ReviewApp(App):
     ReviewApp #header {
         text-style: underline;
     }
+    ReviewApp #source {
+        color: $text-muted;
+    }
     """
 
     def __init__(
         self,
         records: list[dict],
         *,
+        source: Path | None = None,
         init_tier: str | None = None,
         init_theme: str | None = None,
         init_sender: str | None = None,
@@ -429,6 +493,7 @@ class ReviewApp(App):
         super().__init__()
         # Default ordering is send-date descending, newest first (issue #36).
         self.all_records = sort_by_send_date(records)
+        self.source = source
         self.filtered = self.all_records
         self.f_tier = init_tier
         self.f_theme = init_theme
@@ -437,6 +502,13 @@ class ReviewApp(App):
 
     def compose(self) -> ComposeResult:
         yield Static(id="title", markup=False)
+        if self.source is not None:
+            # Which file this listing came from — omitted only when the caller
+            # supplied records with no path behind them (tests, embedding).
+            yield Static(
+                format_source_line(self.source, self.all_records),
+                id="source", markup=False,
+            )
         hdr = (
             f"{'Date':<{_COL_DATE}}"
             f"  {'Tier':<{_COL_TIER}}"
@@ -570,6 +642,7 @@ class ReviewApp(App):
 def run_review_tui(
     records: list[dict],
     *,
+    source: Path | None = None,
     init_tier: str | None = None,
     init_theme: str | None = None,
     init_sender: str | None = None,
@@ -577,14 +650,21 @@ def run_review_tui(
 ) -> None:
     """Launch the newsletter review TUI.
 
-    *records* is the full (unfiltered) set. Initial filter values from CLI
-    args are passed via init_tier/init_theme/init_sender/init_since.
+    *records* is the full (unfiltered) set, and *source* the file they were read
+    from (shown in the header so a stale file is recognizable). Initial filter
+    values from CLI args are passed via init_tier/init_theme/init_sender/init_since.
     """
     if not records:
+        # Name the file even here — especially here. An empty listing is exactly
+        # when a wrong or stale path is indistinguishable from an idle daemon, and
+        # the TUI (which carries the source line) never opens on this path.
         print("No assessment records to display.")
+        if source is not None:
+            print(format_source_line(source, records))
         return
     ReviewApp(
         records,
+        source=source,
         init_tier=init_tier, init_theme=init_theme, init_sender=init_sender,
         init_since=init_since,
     ).run()

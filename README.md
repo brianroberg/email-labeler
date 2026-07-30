@@ -200,8 +200,25 @@ services:
       - ./data:/app/data   # or an absolute host path
 ```
 
-The daemon logs the resolved absolute path at startup
-(`Newsletter assessments append to: ...`) — check it points at the mount.
+The daemon checks this for you at startup. It logs the resolved absolute path
+along with how many records that file already holds
+(`Newsletter assessments append to: /app/data/newsletter_assessments.jsonl (412
+existing record(s))`) — a long-running daemon reporting `0 existing record(s)` is
+writing somewhere other than the file you browse. If nothing is mounted over the
+path, it says so as an ERROR on the next line.
+
+If you have already been running without the mount, the records so far are still
+inside the *running* container and will be destroyed the moment it is recreated.
+Rescue them before your next `docker compose up -d`:
+
+```bash
+docker compose cp email-labeler:/app/data/newsletter_assessments.jsonl ./recovered.jsonl
+```
+
+Then append `recovered.jsonl` to your host file (the review TUI keeps the newest
+record per newsletter, decided by each record's own timestamp rather than by
+where it landed in the file, so overlapping entries are harmless in either
+order).
 
 ### Newsletter review TUI
 
@@ -217,6 +234,13 @@ The listing shows one row per newsletter, newest send-date first. Press `Enter`
 to open a newsletter and see its stories with their dimension scores and themes,
 `Esc` to go back, `f` to open the filter menu, and `q` to quit.
 
+The header names the file it read, how many newsletters are in it, and the newest
+send date — e.g. `/srv/stack/data/newsletter_assessments.jsonl — 253 newsletters,
+newest sent 2026-07-29`. That is deliberate: a stale copy of the file, or a copy
+from a path the daemon no longer writes to, looks exactly like a working one until
+you notice its newest newsletter is weeks old. Cross-check it against the path the
+daemon logs at startup.
+
 Filters are also available up front, so you can open straight into a slice:
 
 ```bash
@@ -231,6 +255,30 @@ uv run python -m newsletter_review --file path/to/file.jsonl  # a JSONL somewher
 If you ran the daemon in Docker, point `--file` at the host path you mounted (or
 run the command from the directory holding `data/`) — the default path is
 relative to the current directory.
+
+#### "old-scheme record" on startup
+
+```
+Error loading …/newsletter_assessments.jsonl: …:1: old-scheme record — story themes
+are a list (['vocation_family']), not a theme->grade dict.
+```
+
+Records written before the scoring-scheme change (July 2026) store story themes
+as a plain list and dimension scores on a 1-5 scale. The reader rejects those
+outright, so one old record at the top of the file blocks the whole file. Convert
+it — with the daemon stopped, since it appends there:
+
+```bash
+python -m scripts.migrate_assessments path/to/newsletter_assessments.jsonl             # counts only
+python -m scripts.migrate_assessments path/to/newsletter_assessments.jsonl --in-place  # apply
+```
+
+Run it from a checkout on the host — `scripts/` is not inside the Docker image.
+A `.bak` copy is kept (a second run changes nothing and leaves that copy alone). Old themes become `present`, old scores are bucketed into
+Poor/OK/Good, and each record's tier is left exactly as graded — so it still
+matches the label on the email. Migrated records say so in their detail view.
+See [README-technical.md](README-technical.md#migrating-pre-53-records) for what
+the conversion can and cannot preserve.
 
 ## Resilience
 

@@ -1035,7 +1035,7 @@ class _StopLoop(Exception):
 
 async def run_poll_cycles(
     monkeypatch, tmp_path, poll_outcomes, process_mock=None, cycles=None,
-    keep_newsletter=False,
+    keep_newsletter=False, newsletter_output_file=None,
 ):
     """Drive run_daemon through poll cycles, then stop; returns the proxy mock.
 
@@ -1047,12 +1047,15 @@ async def run_poll_cycles(
     replaces the default always-succeeds process_single_thread stub — halted
     cycles sleep without polling, so cycles may exceed len(poll_outcomes).
     `keep_newsletter` retains the [newsletter] config so startup wiring (e.g.
-    the assessments-path log line) can be exercised; NEWSLETTER_ONLY stays
-    unset so the loop itself remains on the plain email pipeline.
+    the assessments-path log line and the sink preflight) can be exercised;
+    NEWSLETTER_ONLY stays unset so the loop itself remains on the plain email
+    pipeline. `newsletter_output_file` overrides the configured sink path.
     """
     config = copy.deepcopy(load_config())
     if not keep_newsletter:
         config.pop("newsletter", None)  # keep the loop on the plain email pipeline
+    elif newsletter_output_file is not None:
+        config["newsletter"]["output_file"] = str(newsletter_output_file)
     config["daemon"]["healthcheck_file"] = str(tmp_path / "healthcheck")
     monkeypatch.setattr(daemon, "load_config", lambda: config)
 
@@ -1253,6 +1256,157 @@ class TestNewsletterOutputPathLogging:
             f"no startup log line contains the resolved assessments path {expected}"
         )
 
+    async def test_startup_reports_how_many_records_the_sink_already_holds(
+        self, monkeypatch, tmp_path, caplog
+    ):
+        """The count is the tell for a misdirected sink: a daemon that has been
+        grading for weeks against a path holding 0 records is not appending to
+        the file the operator reviews."""
+        sink = tmp_path / "data" / "assessments.jsonl"
+        sink.parent.mkdir()
+        sink.write_text('{"thread_id": "a"}\n{"thread_id": "b"}\n')
+
+        with caplog.at_level(logging.INFO, logger="email-labeler"):
+            await run_poll_cycles(
+                monkeypatch, tmp_path, [{"messages": []}],
+                keep_newsletter=True, newsletter_output_file=sink,
+            )
+
+        assert any(
+            str(sink) in r.getMessage() and "2 existing" in r.getMessage()
+            for r in caplog.records
+        ), "startup line did not report the sink's existing record count"
+
+    async def test_startup_errors_when_the_sink_is_not_persisted(
+        self, monkeypatch, tmp_path, caplog
+    ):
+        """The silent failure this guards: in a container with no volume over the
+        assessments directory, every write succeeds and every record is lost on
+        the next recreate. It must be an ERROR at startup, not a surprise later."""
+        sink = tmp_path / "data" / "assessments.jsonl"
+        monkeypatch.setattr(daemon, "running_in_container", lambda: True)
+        monkeypatch.setattr(
+            daemon, "read_mountinfo",
+            lambda: "1450 1449 0:118 / / rw,relatime - overlay overlay rw,lowerdir=/l/A\n",
+        )
+
+        with caplog.at_level(logging.INFO, logger="email-labeler"):
+            await run_poll_cycles(
+                monkeypatch, tmp_path, [{"messages": []}],
+                keep_newsletter=True, newsletter_output_file=sink,
+            )
+
+        errors = [r.getMessage() for r in caplog.records if r.levelno >= logging.ERROR]
+        assert any(str(sink) in m and "volume" in m.lower() for m in errors), (
+            f"no startup ERROR warned that {sink} is not persisted; errors={errors}"
+        )
+
+    async def test_startup_names_the_host_directory_behind_the_mount(
+        self, monkeypatch, tmp_path, caplog
+    ):
+        """A mount pointing at a host directory other than the one being reviewed
+        fails exactly like no mount at all — records accumulate somewhere nobody
+        looks — but no check can know which directory the operator *meant*. So
+        name the source: the one line that makes it verifiable at a glance."""
+        sink = tmp_path / "data" / "assessments.jsonl"
+        monkeypatch.setattr(daemon, "running_in_container", lambda: True)
+        monkeypatch.setattr(
+            daemon, "read_mountinfo",
+            lambda: (
+                "1450 1449 0:118 / / rw,relatime - overlay overlay rw,lowerdir=/l/A\n"
+                f"1470 1450 259:2 /srv/elsewhere/data {tmp_path / 'data'} rw,relatime "
+                "- ext4 /dev/sda1 rw\n"
+            ),
+        )
+
+        with caplog.at_level(logging.INFO, logger="email-labeler"):
+            await run_poll_cycles(
+                monkeypatch, tmp_path, [{"messages": []}],
+                keep_newsletter=True, newsletter_output_file=sink,
+            )
+
+        assert any(
+            "/srv/elsewhere/data" in r.getMessage() for r in caplog.records
+        ), "startup did not name the host source of the mount holding the sink"
+        # A real mount covers it, so the container-layer ERROR must stay quiet.
+        assert not [r for r in caplog.records if r.levelno >= logging.ERROR]
+
+    async def test_no_persistence_error_outside_a_container(
+        self, monkeypatch, tmp_path, caplog
+    ):
+        """On a host, a path on the root filesystem is perfectly durable — the
+        check must not fire there."""
+        monkeypatch.setattr(daemon, "running_in_container", lambda: False)
+        monkeypatch.setattr(
+            daemon, "read_mountinfo",
+            lambda: "1450 1449 0:118 / / rw,relatime - overlay overlay rw,lowerdir=/l/A\n",
+        )
+
+        with caplog.at_level(logging.INFO, logger="email-labeler"):
+            await run_poll_cycles(
+                monkeypatch, tmp_path, [{"messages": []}],
+                keep_newsletter=True,
+                newsletter_output_file=tmp_path / "data" / "assessments.jsonl",
+            )
+
+        assert not [r for r in caplog.records if r.levelno >= logging.ERROR]
+
+    async def test_startup_errors_when_no_sink_is_configured(
+        self, monkeypatch, tmp_path, caplog
+    ):
+        """The third silent way assessments go missing: [newsletter] with no
+        output_file at all. Grading runs, labels apply, the per-thread INFO
+        summary prints — and nothing is ever recorded. Startup must say so."""
+        with caplog.at_level(logging.INFO, logger="email-labeler"):
+            await run_poll_cycles(
+                monkeypatch, tmp_path, [{"messages": []}],
+                keep_newsletter=True, newsletter_output_file="",
+            )
+
+        errors = [r.getMessage() for r in caplog.records if r.levelno >= logging.ERROR]
+        assert any("output_file" in m for m in errors), (
+            f"startup did not flag the missing assessments sink; errors={errors}"
+        )
+
+    async def test_startup_errors_when_the_sink_cannot_be_read(
+        self, monkeypatch, tmp_path, caplog
+    ):
+        """An unreadable sink is reported, not shrugged at. The realistic cause is
+        an ``output_file`` naming a directory: ``os.access`` calls a directory
+        writable, so without this the one guaranteed-fatal misconfiguration
+        produces nothing louder than an INFO — and then every newsletter is graded
+        and abandoned to agent/attempted."""
+        sink = tmp_path / "data" / "assessments.jsonl"
+        sink.mkdir(parents=True)
+
+        with caplog.at_level(logging.INFO, logger="email-labeler"):
+            await run_poll_cycles(
+                monkeypatch, tmp_path, [{"messages": []}],
+                keep_newsletter=True, newsletter_output_file=sink,
+            )
+
+        errors = [r.getMessage() for r in caplog.records if r.levelno >= logging.ERROR]
+        assert any(str(sink) in m for m in errors), (
+            f"an unreadable/misshapen sink produced no startup ERROR; errors={errors}"
+        )
+
+    async def test_startup_errors_when_the_sink_is_not_writable(
+        self, monkeypatch, tmp_path, caplog
+    ):
+        sink = tmp_path / "data" / "assessments.jsonl"
+        monkeypatch.setattr(daemon, "sink_writability_warning", lambda _p: "sink is read-only")
+
+        with caplog.at_level(logging.INFO, logger="email-labeler"):
+            await run_poll_cycles(
+                monkeypatch, tmp_path, [{"messages": []}],
+                keep_newsletter=True, newsletter_output_file=sink,
+            )
+
+        assert any(
+            "sink is read-only" in r.getMessage()
+            for r in caplog.records if r.levelno >= logging.ERROR
+        )
+
 
 class TestLoadConfig:
     def test_loads_config_toml(self):
@@ -1407,7 +1561,12 @@ class TestResolveIntEnv:
 
 @pytest.fixture
 def mock_newsletter_classifier():
-    return AsyncMock()
+    classifier = AsyncMock()
+    # A real model string, not an AsyncMock attribute: the assessment record is
+    # JSON-serialized before the labels commit, so a non-serializable model would
+    # fail the write (and, by design, block labeling) in every newsletter test.
+    classifier.cloud_llm.model = "claude-sonnet-4-6"
+    return classifier
 
 
 @pytest.fixture
@@ -1448,6 +1607,7 @@ class TestNewsletterRouting:
         cloud_sem,
         local_sem,
         newsletter_thread_response,
+        tmp_path,
     ):
         mock_proxy.get_thread.return_value = newsletter_thread_response
         mock_newsletter_classifier.classify_newsletter.return_value = [
@@ -1471,7 +1631,7 @@ class TestNewsletterRouting:
             max_thread_chars=50000,
             newsletter_classifier=mock_newsletter_classifier,
             newsletter_recipient="newsletters@dm.org",
-            newsletter_output_file="/tmp/test.jsonl",
+            newsletter_output_file=str(tmp_path / "assessments.jsonl"),
         )
 
         assert result is True
@@ -1596,6 +1756,7 @@ class TestNewsletterRouting:
         cloud_sem,
         local_sem,
         mock_thread_response,
+        tmp_path,
     ):
         mock_proxy.get_thread.return_value = mock_thread_response
 
@@ -1610,7 +1771,7 @@ class TestNewsletterRouting:
             max_thread_chars=50000,
             newsletter_classifier=mock_newsletter_classifier,
             newsletter_recipient="newsletters@dm.org",
-            newsletter_output_file="/tmp/test.jsonl",
+            newsletter_output_file=str(tmp_path / "assessments.jsonl"),
         )
 
         assert result is True
@@ -1627,6 +1788,7 @@ class TestNewsletterRouting:
         cloud_sem,
         local_sem,
         newsletter_thread_response,
+        tmp_path,
     ):
         mock_proxy.get_thread.return_value = newsletter_thread_response
         mock_newsletter_classifier.classify_newsletter.return_value = []
@@ -1642,7 +1804,7 @@ class TestNewsletterRouting:
             max_thread_chars=50000,
             newsletter_classifier=mock_newsletter_classifier,
             newsletter_recipient="newsletters@dm.org",
-            newsletter_output_file="/tmp/test.jsonl",
+            newsletter_output_file=str(tmp_path / "assessments.jsonl"),
         )
 
         assert result is True
@@ -1659,6 +1821,7 @@ class TestNewsletterRouting:
         cloud_sem,
         local_sem,
         mock_thread_response,
+        tmp_path,
     ):
         mock_proxy.get_thread.return_value = mock_thread_response
 
@@ -1673,7 +1836,7 @@ class TestNewsletterRouting:
             max_thread_chars=50000,
             newsletter_classifier=mock_newsletter_classifier,
             newsletter_recipient="newsletters@dm.org",
-            newsletter_output_file="/tmp/test.jsonl",
+            newsletter_output_file=str(tmp_path / "assessments.jsonl"),
             newsletter_only=True,
         )
 
@@ -1691,6 +1854,7 @@ class TestNewsletterRouting:
         cloud_sem,
         local_sem,
         newsletter_thread_response,
+        tmp_path,
     ):
         mock_proxy.get_thread.return_value = newsletter_thread_response
         mock_newsletter_classifier.classify_newsletter.return_value = [
@@ -1714,7 +1878,7 @@ class TestNewsletterRouting:
             max_thread_chars=50000,
             newsletter_classifier=mock_newsletter_classifier,
             newsletter_recipient="newsletters@dm.org",
-            newsletter_output_file="/tmp/test.jsonl",
+            newsletter_output_file=str(tmp_path / "assessments.jsonl"),
             newsletter_only=True,
         )
 
@@ -1746,6 +1910,155 @@ class TestNewsletterRouting:
 
         assert result is True
         mock_classifier.classify_sender.assert_called_once()
+
+
+class TestNewsletterAssessmentDurability:
+    """The assessment JSONL is the only place a newsletter's grading survives —
+    Gmail keeps just the coarse tier/theme labels, and the labels include
+    ``agent/processed``, which drops the thread out of ``gmail_query`` forever.
+
+    So the record must be persisted BEFORE the labels commit. Committing first
+    and writing after makes any sink failure (missing bind mount made
+    read-only, full disk, bad permissions) permanently lose that newsletter's
+    grade: the thread is already marked processed, so it is never re-graded.
+    """
+
+    @staticmethod
+    def _story():
+        return StoryResult(
+            text="Content",
+            scores={"simple": 3, "concrete": 3, "personal": 3, "dynamic": 3},
+            average_score=3.0,
+            tier=NewsletterTier.EXCELLENT,
+            themes={"scripture": "emphasized"},
+        )
+
+    async def test_record_is_on_disk_before_labels_are_applied(
+        self,
+        mock_proxy,
+        mock_classifier,
+        mock_label_manager,
+        mock_newsletter_classifier,
+        cloud_sem,
+        local_sem,
+        newsletter_thread_response,
+        tmp_path,
+    ):
+        mock_proxy.get_thread.return_value = newsletter_thread_response
+        mock_newsletter_classifier.classify_newsletter.return_value = [self._story()]
+        out = tmp_path / "assessments.jsonl"
+
+        seen_at_label_time = {}
+
+        async def _capture(**_kwargs):
+            seen_at_label_time["text"] = out.read_text() if out.exists() else ""
+
+        mock_label_manager.apply_newsletter_classification.side_effect = _capture
+
+        result = await process_single_thread(
+            "thread_nl",
+            ["msg_nl_001"],
+            mock_proxy,
+            mock_classifier,
+            mock_label_manager,
+            cloud_sem,
+            local_sem,
+            max_thread_chars=50000,
+            newsletter_classifier=mock_newsletter_classifier,
+            newsletter_recipient="newsletters@dm.org",
+            newsletter_output_file=str(out),
+        )
+
+        assert result is True
+        assert seen_at_label_time["text"].strip(), (
+            "labels were applied while the assessment file was still empty — a "
+            "sink failure at that point loses the grading permanently"
+        )
+
+    async def test_sink_failure_leaves_thread_unlabeled_for_retry(
+        self,
+        monkeypatch,
+        mock_proxy,
+        mock_classifier,
+        mock_label_manager,
+        mock_newsletter_classifier,
+        cloud_sem,
+        local_sem,
+        newsletter_thread_response,
+    ):
+        """An unwritable sink must NOT be swallowed: no labels, no
+        agent/processed, and a False return so the thread is retried next
+        cycle (and, if the fault persists, given up as agent/attempted)."""
+        mock_proxy.get_thread.return_value = newsletter_thread_response
+        mock_newsletter_classifier.classify_newsletter.return_value = [self._story()]
+
+        def _boom(**_kwargs):
+            raise OSError(30, "Read-only file system")
+
+        monkeypatch.setattr(daemon, "write_assessment", _boom)
+        tracker = FailureTracker(max_failures=3)  # below threshold -> retry, not give up
+
+        result = await process_single_thread(
+            "thread_nl",
+            ["msg_nl_001"],
+            mock_proxy,
+            mock_classifier,
+            mock_label_manager,
+            cloud_sem,
+            local_sem,
+            max_thread_chars=50000,
+            newsletter_classifier=mock_newsletter_classifier,
+            newsletter_recipient="newsletters@dm.org",
+            newsletter_output_file="/nonexistent/assessments.jsonl",
+            failure_tracker=tracker,
+        )
+
+        assert result is False
+        mock_label_manager.apply_newsletter_classification.assert_not_called()
+        mock_label_manager.mark_processed.assert_not_called()
+
+    async def test_sink_failure_names_the_path_at_error_level(
+        self,
+        monkeypatch,
+        mock_proxy,
+        mock_classifier,
+        mock_label_manager,
+        mock_newsletter_classifier,
+        cloud_sem,
+        local_sem,
+        newsletter_thread_response,
+        caplog,
+    ):
+        """The operator has to be able to tell a sink fault from a grading fault,
+        so the failing path is named at ERROR."""
+        mock_proxy.get_thread.return_value = newsletter_thread_response
+        mock_newsletter_classifier.classify_newsletter.return_value = [self._story()]
+
+        def _boom(**_kwargs):
+            raise OSError(30, "Read-only file system")
+
+        monkeypatch.setattr(daemon, "write_assessment", _boom)
+
+        with caplog.at_level(logging.ERROR, logger="email-labeler"):
+            await process_single_thread(
+                "thread_nl",
+                ["msg_nl_001"],
+                mock_proxy,
+                mock_classifier,
+                mock_label_manager,
+                cloud_sem,
+                local_sem,
+                max_thread_chars=50000,
+                newsletter_classifier=mock_newsletter_classifier,
+                newsletter_recipient="newsletters@dm.org",
+                newsletter_output_file="/nonexistent/assessments.jsonl",
+            )
+
+        assert any(
+            "/nonexistent/assessments.jsonl" in r.getMessage()
+            for r in caplog.records
+            if r.levelno >= logging.ERROR
+        ), "no ERROR log line named the assessments path that failed to write"
 
 
 class TestVerifyLabelsWithRetry:
