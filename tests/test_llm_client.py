@@ -571,6 +571,105 @@ class TestContentlessResponse:
                 await glm_client.complete("sys", "user", include_thinking=True)
 
 
+class TestFinishReasonLength:
+    """A finish_reason of "length" must be loud, never silently parsed (issue #64).
+
+    Measured hazard: with thinking off, an over-budget decode returns non-empty
+    but truncated content, cut before any label — parse_email_label would
+    silently default to LOW_PRIORITY (action: ARCHIVE) with only a parse
+    WARNING. And the empty-content variant's old error message hardcoded a
+    guess ("max_tokens likely exhausted; reasoning_content ...") instead of
+    reporting the response's actual finish_reason and which reasoning field was
+    populated (Ollama's is `reasoning`, not `reasoning_content`).
+    """
+
+    async def test_length_with_empty_content_reports_real_diagnostics(self, local_client):
+        """The exact production signature (issue #64): HTTP 200, finish_reason
+        "length", content == "", reasoning in Ollama's `reasoning` field. The
+        error must carry the REAL finish_reason, a prompt-size estimate, and
+        name the actual populated reasoning field."""
+        resp = _mock_response(json_data={
+            "choices": [{
+                "finish_reason": "length",
+                "message": {
+                    "role": "assistant",
+                    "content": "",
+                    "reasoning": "Step 1: the sender appears to be a colleague...",
+                },
+            }]
+        })
+        with pytest.raises(LLMContentError) as exc_info:
+            await _post_canned(local_client, resp)
+        msg = str(exc_info.value)
+        assert "finish_reason='length'" in msg
+        assert "max_tokens" in msg
+        assert "prompt ~" in msg  # prompt token estimate, not a hardcoded guess
+        # Names the field that actually held the reasoning (`reasoning`), not
+        # the hardcoded `reasoning_content` guess.
+        assert "reasoning" in msg
+        assert "reasoning_content" not in msg
+
+    async def test_length_with_truncated_content_raises_not_parses(self, local_client):
+        """finish_reason "length" with NON-empty content is a truncated answer:
+        it must raise (give-up-eligible), never return for parsing — the
+        truncation lands mid-scaffold before any label, and a parsed default
+        would silently archive person mail."""
+        resp = _mock_response(json_data={
+            "choices": [{
+                "finish_reason": "length",
+                "message": {
+                    "role": "assistant",
+                    "content": "1. Who is this from? The sender appears to be",
+                },
+            }]
+        })
+        with pytest.raises(LLMContentError, match="truncated"):
+            await _post_canned(local_client, resp)
+
+    async def test_length_with_truncated_content_raises_in_include_thinking_mode(self, local_client):
+        """The truncation guard must also cover the include_thinking path (evals)."""
+        resp = _mock_response(json_data={
+            "choices": [{
+                "finish_reason": "length",
+                "message": {"role": "assistant", "content": "1. Who is this"},
+            }]
+        })
+        with patch("llm_client.httpx.AsyncClient") as mock_client_cls:
+            mock_client = AsyncMock()
+            mock_client.post.return_value = resp
+            mock_client_cls.return_value.__aenter__ = AsyncMock(return_value=mock_client)
+            mock_client_cls.return_value.__aexit__ = AsyncMock(return_value=False)
+            with pytest.raises(LLMContentError, match="truncated"):
+                await local_client.complete("sys", "user", include_thinking=True)
+
+    async def test_stop_with_content_returns_normally(self, local_client):
+        """A normal completion (finish_reason "stop") is unaffected."""
+        resp = _mock_response(json_data={
+            "choices": [{"finish_reason": "stop", "message": {"content": "FYI"}}]
+        })
+        assert await _post_canned(local_client, resp) == "FYI"
+
+    async def test_missing_finish_reason_with_content_returns_normally(self, local_client):
+        """Responses that omit finish_reason entirely (many mocks, some servers)
+        keep working — absence is not "length"."""
+        resp = _mock_response(json_data={
+            "choices": [{"message": {"content": "NEEDS_RESPONSE"}}]
+        })
+        assert await _post_canned(local_client, resp) == "NEEDS_RESPONSE"
+
+    async def test_empty_content_without_finish_reason_names_absent_reasoning(self, cloud_client):
+        """Empty content stays loud even without finish_reason, and the error
+        says no reasoning field was populated rather than guessing one was."""
+        resp = _mock_response(json_data={
+            "choices": [{"message": {"role": "assistant", "content": ""}}]
+        })
+        with pytest.raises(LLMContentError) as exc_info:
+            await _post_canned(cloud_client, resp)
+        msg = str(exc_info.value)
+        assert "no content" in msg
+        assert "no reasoning field" in msg
+
+
 class TestProbe:
     """probe() carries status detail so preflight can distinguish a 404
     (model-name mismatch) from an unreachable endpoint (issue #41 item 7)."""

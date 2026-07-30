@@ -72,15 +72,18 @@ class LLMUnavailableError(Exception):
 
 
 class LLMContentError(RuntimeError):
-    """The model returned no usable ``content`` (issue #30).
+    """The model returned no usable ``content`` (issues #30, #64).
 
     A reasoning model that exhausts max_tokens mid-<think>, a GLM reply carrying
     only ``reasoning_content``, or an empty string all yield an unusable response.
-    Retrying as-is won't help, so it is request-specific/permanent and
-    give-up-eligible. It subclasses ``RuntimeError`` so the email pipeline's
-    ``except RuntimeError`` give-up handler catches it unchanged, while giving the
-    newsletter pipeline a dedicated type to re-raise (a *bare* per-story
-    RuntimeError stays isolated; a content-less one propagates to give-up).
+    So does a response whose ``finish_reason`` is ``"length"`` even when content
+    is non-empty: the answer was cut at the max_tokens budget, and parsing a
+    truncated answer silently defaults the label (issue #64). Retrying as-is
+    won't help, so it is request-specific/permanent and give-up-eligible. It
+    subclasses ``RuntimeError`` so the email pipeline's ``except RuntimeError``
+    give-up handler catches it unchanged, while giving the newsletter pipeline a
+    dedicated type to re-raise (a *bare* per-story RuntimeError stays isolated;
+    a content-less one propagates to give-up).
     """
 
 
@@ -190,6 +193,9 @@ class LLMClient:
                 out of funds (402, or a 400/403 whose body carries a balance
                 signature) — account-wide; the daemon halts rather than giving
                 up per-thread.
+            LLMContentError: If the response carries no usable answer — empty/
+                missing content, or finish_reason "length" (answer truncated at
+                the max_tokens budget) — request-specific and give-up-eligible.
             RuntimeError: If the LLM returns any other non-200 response.
         """
         headers = {"Content-Type": "application/json"}
@@ -266,22 +272,43 @@ class LLMClient:
                 f"(prompt ~{prompt_chars // 4} tokens, {prompt_chars} chars): {resp_body}"
             )
 
-        msg = response.json()["choices"][0]["message"]
+        choice = response.json()["choices"][0]
+        msg = choice["message"]
+        finish_reason = choice.get("finish_reason")
         content = msg.get("content")
-        if not content:
-            # A reasoning model that exhausts max_tokens mid-<think> (or a GLM reply
-            # that returns only reasoning_content) yields a message with no usable
-            # `content` — whether that arrives as null, a missing key, or an empty
-            # string. Retrying as-is won't help, so this is request-specific/
-            # permanent: surface a clear RuntimeError (give-up-eligible via the daemon),
-            # never LLMUnavailableError (would retry forever) or a raw KeyError.
-            # (An empty string must be caught too: it would otherwise parse to a
-            # default SERVICE / LOW_PRIORITY label and silently mislabel the email.)
-            has_reasoning = bool(msg.get("reasoning_content") or msg.get("reasoning"))
+        if not content or finish_reason == "length":
+            # Two unusable-response shapes, both request-specific/permanent
+            # (retrying as-is won't help), so both raise LLMContentError —
+            # give-up-eligible via the daemon, never LLMUnavailableError (would
+            # retry forever) or a raw KeyError (issue #64):
+            #   - No `content` (null, missing key, or empty string): a reasoning
+            #     model exhausted max_tokens in its thinking channel, or GLM
+            #     returned only reasoning_content. An empty string must be caught
+            #     too — it would otherwise parse to a default SERVICE /
+            #     LOW_PRIORITY label and silently mislabel the email.
+            #   - finish_reason "length" with non-empty content: the answer was
+            #     cut at the max_tokens budget, usually mid-reasoning before any
+            #     label. Parsing it would silently default to LOW_PRIORITY and
+            #     archive the email, so a truncated answer is never returned.
+            # The diagnostics report the response's actual finish_reason and
+            # which reasoning field was populated (Ollama uses `reasoning`, GLM
+            # uses `reasoning_content`) — the old message hardcoded a guess,
+            # which masked the real failure pattern in production logs.
+            populated = [f for f in ("reasoning_content", "reasoning") if msg.get(f)]
+            prompt_chars = len(system_prompt) + len(user_content)
+            diagnostics = (
+                f"finish_reason={finish_reason!r}, max_tokens={self.max_tokens}, "
+                f"prompt ~{prompt_chars // 4} tokens ({prompt_chars} chars); "
+                + (f"reasoning in {' + '.join(populated)}" if populated else "no reasoning field")
+            )
+            if not content:
+                raise LLMContentError(
+                    f"LLM {self.model} returned no content ({diagnostics})"
+                )
             raise LLMContentError(
-                f"LLM {self.model} returned no content "
-                f"(max_tokens={self.max_tokens} likely exhausted before a final answer; "
-                f"reasoning_content {'present' if has_reasoning else 'absent'})"
+                f"LLM {self.model} answer truncated at the max_tokens budget — "
+                f"{len(content)} chars of content but no trustworthy final answer "
+                f"({diagnostics})"
             )
 
         if include_thinking:
