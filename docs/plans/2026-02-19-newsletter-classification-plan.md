@@ -1,6 +1,7 @@
 # Newsletter Story Classification — Implementation Plan
 
-> **For Claude:** REQUIRED SUB-SKILL: Use superpowers:executing-plans to implement this plan task-by-task.
+> **Status: executed Feb 2026; superseded (see the design doc's header).
+> Do not implement.**
 
 **Goal:** Add a parallel classification pipeline that detects newsletter emails (sent to `newsletters@dm.org`), extracts individual stories, scores each story on a 4-dimension quality rubric, and tags each story with Ends Statement themes.
 
@@ -185,9 +186,7 @@ from newsletter import (
     compute_tier,
 )
 
-
 # ── Story extraction parsing ────────────────────────────────────────────
-
 
 class TestParseStories:
     def test_single_story(self):
@@ -238,9 +237,7 @@ class TestParseStories:
         stories = parse_stories("This is not formatted correctly at all")
         assert stories == []
 
-
 # ── Quality score parsing ────────────────────────────────────────────────
-
 
 class TestParseQualityScores:
     def test_valid_scores(self):
@@ -282,9 +279,7 @@ class TestParseQualityScores:
         scores = parse_quality_scores(raw)
         assert scores == {"simple": 4, "concrete": 3, "personal": 5, "dynamic": 2}
 
-
 # ── Theme parsing ────────────────────────────────────────────────────────
-
 
 class TestParseThemes:
     def test_single_theme(self):
@@ -320,9 +315,7 @@ class TestParseThemes:
         themes = parse_themes("  SCRIPTURE \n  CHURCH  ")
         assert themes == ["scripture", "church"]
 
-
 # ── Tier computation ─────────────────────────────────────────────────────
-
 
 class TestComputeTier:
     def test_excellent(self):
@@ -372,13 +365,11 @@ from enum import Enum
 
 log = logging.getLogger(__name__)
 
-
 class NewsletterTier(Enum):
     EXCELLENT = "excellent"
     GOOD = "good"
     FAIR = "fair"
     POOR = "poor"
-
 
 _VALID_THEMES = {
     "SCRIPTURE", "CHRISTLIKENESS", "CHURCH",
@@ -386,7 +377,6 @@ _VALID_THEMES = {
 }
 
 _DIMENSIONS = ("simple", "concrete", "personal", "dynamic")
-
 
 @dataclass
 class StoryResult:
@@ -398,7 +388,6 @@ class StoryResult:
     themes: list[str] = field(default_factory=list)
     quality_cot: str = ""
     theme_cot: str = ""
-
 
 def parse_stories(raw: str) -> list[tuple[str, str]]:
     """Parse LLM story extraction output into (title, text) pairs.
@@ -429,7 +418,6 @@ def parse_stories(raw: str) -> list[tuple[str, str]]:
 
     return stories
 
-
 def parse_quality_scores(raw: str) -> dict[str, int] | None:
     """Parse LLM quality assessment output into dimension scores.
 
@@ -459,7 +447,6 @@ def parse_quality_scores(raw: str) -> dict[str, int] | None:
 
     return scores
 
-
 def parse_themes(raw: str) -> list[str]:
     """Parse LLM theme classification output into theme labels.
 
@@ -477,7 +464,6 @@ def parse_themes(raw: str) -> list[str]:
             themes.append(token.lower())
 
     return themes
-
 
 def compute_tier(scores: dict[str, int]) -> NewsletterTier:
     """Derive quality tier from dimension scores."""
@@ -522,11 +508,9 @@ from unittest.mock import AsyncMock
 
 from newsletter import NewsletterClassifier, NewsletterTier
 
-
 @pytest.fixture
 def mock_cloud_llm():
     return AsyncMock()
-
 
 @pytest.fixture
 def newsletter_config():
@@ -552,11 +536,9 @@ def newsletter_config():
         }
     }
 
-
 @pytest.fixture
 def nl_classifier(mock_cloud_llm, newsletter_config):
     return NewsletterClassifier(cloud_llm=mock_cloud_llm, config=newsletter_config)
-
 
 class TestExtractStories:
     async def test_extracts_stories(self, nl_classifier, mock_cloud_llm):
@@ -579,7 +561,6 @@ class TestExtractStories:
         await nl_classifier.extract_stories("the newsletter body")
         user_content = mock_cloud_llm.complete.call_args.args[1]
         assert "the newsletter body" in user_content
-
 
 class TestAssessQuality:
     async def test_scores_story(self, nl_classifier, mock_cloud_llm):
@@ -605,7 +586,6 @@ class TestAssessQuality:
         assert "My Title" in user_content
         assert "My story text" in user_content
 
-
 class TestClassifyThemes:
     async def test_classifies_themes(self, nl_classifier, mock_cloud_llm):
         mock_cloud_llm.complete.return_value = ("SCRIPTURE\nCHURCH", "theme reasoning")
@@ -617,7 +597,6 @@ class TestClassifyThemes:
         mock_cloud_llm.complete.return_value = ("NONE", "")
         themes, cot = await nl_classifier.classify_themes("Title", "Story text")
         assert themes == []
-
 
 class TestClassifyNewsletter:
     async def test_full_pipeline(self, nl_classifier, mock_cloud_llm):
@@ -705,7 +684,6 @@ Add to `newsletter.py` (after the existing parser functions):
 
 ```python
 from llm_client import LLMClient
-
 
 class NewsletterClassifier:
     """Classifies newsletter stories for quality and themes."""
@@ -825,7 +803,6 @@ from pathlib import Path
 
 from newsletter import write_assessment, StoryResult, NewsletterTier
 
-
 class TestWriteAssessment:
     def test_writes_jsonl_record(self, tmp_path):
         output_file = tmp_path / "assessments.jsonl"
@@ -937,7 +914,6 @@ import json
 from datetime import datetime, timezone
 from pathlib import Path
 
-
 def write_assessment(
     output_file: str,
     message_id: str,
@@ -1007,7 +983,6 @@ Append to `tests/test_labeler.py`:
 ```python
 from newsletter import NewsletterTier
 
-
 @pytest.fixture
 def newsletter_config():
     return {
@@ -1043,7 +1018,6 @@ def newsletter_config():
         },
     }
 
-
 @pytest.fixture
 def all_labels_with_newsletter():
     """Gmail API response with all labels including newsletter labels."""
@@ -1070,11 +1044,9 @@ def all_labels_with_newsletter():
         ]
     }
 
-
 @pytest.fixture
 def newsletter_label_manager(mock_proxy, newsletter_config):
     return LabelManager(proxy_client=mock_proxy, config=newsletter_config)
-
 
 class TestNewsletterVerifyLabels:
     async def test_all_newsletter_labels_present(
@@ -1101,7 +1073,6 @@ class TestNewsletterVerifyLabels:
         assert "agent/newsletter" in missing
         assert "agent/newsletter/excellent" in missing
         assert len(missing) == 12
-
 
 class TestNewsletterApplyLabels:
     async def test_apply_newsletter_excellent(
@@ -1279,7 +1250,6 @@ Append to `tests/test_newsletter.py`:
 ```python
 from newsletter import is_newsletter
 
-
 class TestIsNewsletter:
     def test_detects_to_header(self):
         messages = [
@@ -1354,7 +1324,6 @@ Add to `newsletter.py`:
 ```python
 from gmail_utils import get_header
 
-
 def is_newsletter(messages: list[dict], recipient: str) -> bool:
     """Check if any message in a thread was sent to the newsletter address.
 
@@ -1400,11 +1369,9 @@ Append to `tests/test_daemon.py`:
 from unittest.mock import patch
 from newsletter import NewsletterTier, StoryResult
 
-
 @pytest.fixture
 def mock_newsletter_classifier():
     return AsyncMock()
-
 
 @pytest.fixture
 def newsletter_thread_response():
@@ -1433,7 +1400,6 @@ def newsletter_thread_response():
             },
         ],
     }
-
 
 class TestNewsletterRouting:
     async def test_newsletter_skips_priority_classification(

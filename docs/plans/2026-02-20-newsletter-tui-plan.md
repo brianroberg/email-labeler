@@ -1,6 +1,7 @@
 # Newsletter Assessment TUI Implementation Plan
 
-> **For Claude:** REQUIRED SUB-SKILL: Use superpowers:executing-plans to implement this plan task-by-task.
+> **Status: executed; superseded (see design doc header). Do not
+> implement.**
 
 **Goal:** Build a Textual TUI to browse and filter newsletter assessment JSONL data with tier/theme filtering and CoT inspection.
 
@@ -53,7 +54,6 @@ import pytest
 
 from tui_data import Assessment, Story, load_assessments
 
-
 def _write_jsonl(tmp_path, records):
     """Helper: write a list of dicts as JSONL to a temp file, return path."""
     path = tmp_path / "assessments.jsonl"
@@ -61,7 +61,6 @@ def _write_jsonl(tmp_path, records):
         for r in records:
             f.write(json.dumps(r) + "\n")
     return str(path)
-
 
 def _make_story_dict(**overrides):
     """Create a story dict with sensible defaults."""
@@ -78,7 +77,6 @@ def _make_story_dict(**overrides):
     base.update(overrides)
     return base
 
-
 def _make_record(**overrides):
     """Create an assessment record dict with sensible defaults."""
     base = {
@@ -92,7 +90,6 @@ def _make_record(**overrides):
     }
     base.update(overrides)
     return base
-
 
 class TestLoadAssessments:
     def test_loads_valid_jsonl(self, tmp_path):
@@ -163,7 +160,6 @@ from pathlib import Path
 
 log = logging.getLogger(__name__)
 
-
 @dataclass
 class Story:
     title: str
@@ -175,7 +171,6 @@ class Story:
     quality_cot: str
     theme_cot: str
 
-
 @dataclass
 class Assessment:
     timestamp: str
@@ -185,7 +180,6 @@ class Assessment:
     subject: str
     overall_tier: str | None
     stories: list[Story]
-
 
 def load_assessments(path: str) -> list[Assessment]:
     """Load newsletter assessments from a JSONL file.
@@ -294,7 +288,6 @@ def three_assessments(tmp_path):
     path = _write_jsonl(tmp_path, records)
     return load_assessments(path)
 
-
 class TestFilterByTier:
     def test_filters_excellent(self, three_assessments):
         result = filter_by_tier(three_assessments, "excellent")
@@ -313,7 +306,6 @@ class TestFilterByTier:
         result = filter_by_tier(three_assessments, "excellent")
         assert all(a.overall_tier is not None for a in result)
 
-
 class TestFilterByTheme:
     def test_filters_by_theme(self, three_assessments):
         result = filter_by_theme(three_assessments, "scripture")
@@ -328,7 +320,6 @@ class TestFilterByTheme:
     def test_no_matches_returns_empty(self, three_assessments):
         assert filter_by_theme(three_assessments, "nonexistent") == []
 
-
 class TestAvailableTiers:
     def test_returns_unique_tiers(self, three_assessments):
         assert set(available_tiers(three_assessments)) == {"excellent", "good"}
@@ -338,7 +329,6 @@ class TestAvailableTiers:
 
     def test_empty_list(self):
         assert available_tiers([]) == []
-
 
 class TestAvailableThemes:
     def test_returns_unique_themes(self, three_assessments):
@@ -364,16 +354,13 @@ def filter_by_tier(assessments: list[Assessment], tier: str) -> list[Assessment]
     """Return assessments matching the given overall tier."""
     return [a for a in assessments if a.overall_tier == tier]
 
-
 def filter_by_theme(assessments: list[Assessment], theme: str) -> list[Assessment]:
     """Return assessments where any story has the given theme."""
     return [a for a in assessments if any(theme in s.themes for s in a.stories)]
 
-
 def available_tiers(assessments: list[Assessment]) -> list[str]:
     """Return sorted unique non-None tier values present in assessments."""
     return sorted({a.overall_tier for a in assessments if a.overall_tier is not None})
-
 
 def available_themes(assessments: list[Assessment]) -> list[str]:
     """Return sorted unique theme values across all stories."""
@@ -542,7 +529,6 @@ from textual.widgets import DataTable, Static
 from tui import AssessmentApp
 from tui_data import Assessment, Story
 
-
 def _story(**overrides):
     base = dict(
         title="A Story", text="Content.",
@@ -552,7 +538,6 @@ def _story(**overrides):
     )
     base.update(overrides)
     return Story(**base)
-
 
 @pytest.fixture
 def sample_assessments():
@@ -593,7 +578,6 @@ def sample_assessments():
             ],
         ),
     ]
-
 
 class TestAppLaunch:
     async def test_shows_newsletter_table(self, sample_assessments):
@@ -651,7 +635,6 @@ THEME_CYCLE = [
     None, "scripture", "christlikeness", "church",
     "vocation_family", "disciple_making",
 ]
-
 
 class AssessmentApp(App):
     """TUI for browsing newsletter assessment data."""
@@ -994,7 +977,6 @@ def main():
     assessments = load_assessments(args.file)
     app = AssessmentApp(assessments)
     app.run()
-
 
 if __name__ == "__main__":
     main()

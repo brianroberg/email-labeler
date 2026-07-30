@@ -1,5 +1,10 @@
 # Implementation roadmap — all open issues on `brianroberg/email-labeler`
 
+> **Status: frozen snapshot as of 2026-07-08 — GitHub issues are the living
+> tracker.** Known-shipped since: #53, #52, #30, #35, #36, #41-triage (see
+> the phase decision docs). Priorities and "current status" figures are
+> historical.
+
 ## Context
 
 All 28 open issues were triaged against `HEAD b0b7631` (see each issue's comment for

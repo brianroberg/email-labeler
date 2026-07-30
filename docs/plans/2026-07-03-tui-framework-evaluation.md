@@ -1,5 +1,8 @@
 # TUI framework evaluation: Textual vs urwid (issue #40)
 
+> **Status: executed (decision adopted; migration done via issue #43).
+> Historical record.**
+
 **Recommendation: migrate to Textual.** The spike validates the issue's leaning.
 Both frameworks cleanly eliminate the hand-rolled wrapping/scroll/selection code
 and both proved testable in CI, but Textual's official `Pilot` test driver, its

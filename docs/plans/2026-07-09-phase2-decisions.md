@@ -1,5 +1,8 @@
 # Phase 2 implementation — confirmed decisions
 
+> **Status: partially executed** — #13 tooling/#24/#15 shipped; **#28
+> Option A was never implemented** (now registry D6, scheduled Wave 2).
+
 Companion to `docs/plans/2026-07-08-issue-roadmap.md` (Phase 2 — Measurement &
 decisions) and sibling to `2026-07-08-phase1-decisions.md`. Implemented on branch
 `claude/phase2-measurement`, red/green TDD per `CLAUDE.md`, one commit per task.

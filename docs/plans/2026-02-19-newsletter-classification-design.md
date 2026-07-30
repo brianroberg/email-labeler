@@ -1,5 +1,11 @@
 # Newsletter Story Classification
 
+> **Status: executed Feb 2026; superseded in parts.** The shipped system
+> diverges: JSONL write-before-label (inverse of the error table here; see
+> D18), Poor/OK/Good + Emphasized-only rubric (D14/D15, not 1–5 + union),
+> all-grades-errored is a failure (D20/D5). Historical record — do not
+> implement.
+
 ## Problem
 
 Ministry newsletters are sent to `newsletters@dm.org` and arrive in the same Gmail inbox the email-labeler already monitors. These newsletters contain stories about campus ministry work, and we want to automatically assess story quality and categorize stories by organizational mission themes.

@@ -1,5 +1,8 @@
 # Phase 1 implementation — confirmed decisions
 
+> **Status: executed (see per-item DONE markers). Decisions recorded here
+> are superseded by docs/decisions.md where they overlap.**
+
 Companion to `docs/plans/2026-07-08-issue-roadmap.md`. Phase 1 is being implemented
 **autonomously** (owner authorization, 2026-07-08): work through the whole roadmap
 order, stopping only for genuine product decisions. Red/green TDD is mandatory
