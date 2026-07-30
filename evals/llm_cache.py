@@ -25,7 +25,11 @@ class CachedLLMClient:
         self.cache_path = cache_path
         # key -> (response, thinking). thinking is None for legacy entries
         # written before thinking capture (unknown, backfillable); "" means the
-        # model was called and legitimately emitted no thinking (do NOT re-fetch).
+        # model was called and no separately-capturable reasoning arrived — no
+        # separate reasoning field, no <think> block (do NOT re-fetch). NOT
+        # proof the model didn't reason (issue #64): with thinking off the CoT
+        # is the untagged response itself, and entries cached before #64 could
+        # also have had reasoning sitting unread in a non-GLM separate field.
         self._cache: dict[str, tuple[str, str | None]] = {}
         self._pending: list[dict] = []  # new entries to flush to disk
         self.hits = 0
@@ -49,9 +53,10 @@ class CachedLLMClient:
                     entry = json.loads(line)
                     response = entry["response"]
                     # A present "thinking" key (even "") means the entry was
-                    # written by thinking-aware code: "" is a real "no thinking
-                    # emitted", not a gap to backfill. Only entries missing the
-                    # key entirely are legacy (thinking unknown -> None).
+                    # written by thinking-aware code: "" is a real "nothing was
+                    # separately capturable", not a gap to backfill. Only entries
+                    # missing the key entirely are legacy (thinking unknown ->
+                    # None).
                     thinking = entry["thinking"] if "thinking" in entry else None
                     # Normalize old entries that may contain unstripped think tags
                     extra_thinking = LLMClient._extract_thinking(response)
@@ -86,7 +91,8 @@ class CachedLLMClient:
         if key in self._cache:
             response, thinking = self._cache[key]
             # Backfill thinking only for legacy entries where it is unknown
-            # (None). An empty string means the model emitted no thinking —
+            # (None). An empty string means nothing was separately capturable
+            # (e.g. thinking-off runs, where the CoT is the response itself) —
             # re-fetching those would re-bill every terse response forever.
             if include_thinking and thinking is None:
                 self.misses += 1

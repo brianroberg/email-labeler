@@ -319,15 +319,16 @@ class LLMClient:
             # Separate-channel reasoning is read for ANY model — the field name
             # is backend-specific (GLM: reasoning_content; Ollama: reasoning).
             # This used to be GLM-gated, so Ollama-served local models silently
-            # yielded thinking="" (issue #64). Fall back to inline <think> tags
-            # (DeepSeek/Qwen under mlx_lm.server). With thinking disabled there
-            # is no separate field and no tags: the reasoning is the untagged
-            # content itself, so "" here just means "read the content".
-            thinking = (
-                msg.get("reasoning_content")
-                or msg.get("reasoning")
-                or self._extract_thinking(content)
-            )
+            # yielded thinking="" (issue #64). Inline <think> tags are captured
+            # TOO, not as a mere fallback: with thinking on and budget to spare
+            # the model emitted both channels at once, and the inline block is
+            # stripped from the returned content — dropping it here would lose
+            # it entirely. With thinking disabled there is no separate field and
+            # no tags: the reasoning is the untagged content itself, so "" here
+            # just means "read the content".
+            separate = msg.get("reasoning_content") or msg.get("reasoning") or ""
+            inline = self._extract_thinking(content)
+            thinking = "\n\n".join(part for part in (separate, inline) if part)
             return self._strip_thinking(content), thinking
         return self._strip_thinking(content)
 

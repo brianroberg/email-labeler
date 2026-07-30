@@ -128,6 +128,18 @@ class TestApplyConfigOverrides:
         }
         assert "extra_body" not in cfg["llm"]["cloud"]  # cloud untouched
 
+    def test_cloud_no_think_applies_both_dialects_to_cloud(self):
+        # The cloud flag's wiring is separate from the local flag's — a
+        # disconnected --cloud-no-think would be a silently-inert no-op, the
+        # exact failure shape issue #64 is about.
+        cfg = _override_config()
+        apply_config_overrides(cfg, _override_args(cloud_no_think=True))
+        assert cfg["llm"]["cloud"]["extra_body"] == {
+            "chat_template_kwargs": {"enable_thinking": False},
+            "reasoning_effort": "none",
+        }
+        assert "extra_body" not in cfg["llm"]["local"]  # local untouched
+
     def test_extra_body_json_is_merged(self):
         cfg = _override_config()
         apply_config_overrides(cfg, _override_args(cloud_extra_body='{"top_p": 0.9}'))
@@ -215,6 +227,15 @@ class TestResolveExtraBody:
             "chat_template_kwargs": {"enable_thinking": False},
             "reasoning_effort": "high",
         }
+
+    def test_no_think_overrides_base_config_reasoning_effort(self):
+        # Precedence: --no-think must OVERRIDE a base config's reasoning_effort,
+        # not merely fill it in when absent. A base carrying "low" is plausible
+        # Ollama tuning — and "low" is a silent no-op there (thinking stays ON),
+        # so preserving it would make --no-think inert against exactly the
+        # backend it was fixed for.
+        out = resolve_extra_body({"reasoning_effort": "low"}, True, None)
+        assert out["reasoning_effort"] == "none"
 
     def test_invalid_json_raises(self):
         with pytest.raises(ValueError):

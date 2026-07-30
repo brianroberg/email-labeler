@@ -45,10 +45,13 @@ of *why* a given thread was given up on — only the label.
 2. **Re-queue by removing the label.** The mechanism that has worked before:
    remove the `agent/attempted` label — via the Gmail proxy's modify endpoint
    (`modify_message` with `removeLabelIds`), or simply in the Gmail UI (it is
-   an ordinary label). Once removed, the thread matches `gmail_query` again
-   and re-enters the poll. Removing it from *everything* is safe if in doubt:
-   threads that fail for unrelated permanent reasons will take their 5 strikes
-   and return to `agent/attempted`.
+   an ordinary label). One more condition: `gmail_query` is
+   `in:inbox -label:agent/processed -label:agent/attempted`, so the thread
+   must also still be **in the inbox**. The give-up path never archives, but
+   any thread you archived by hand in the meantime needs moving back to the
+   inbox as well or it will not re-enter the poll. Removing the label from
+   *everything* is safe if in doubt: threads that fail for unrelated permanent
+   reasons will take their 5 strikes and return to `agent/attempted`.
 
 3. **Deploy the fix, then restart the daemon.** `config.toml` is baked into
    the image at build time — the #64 fix is not live until the image is

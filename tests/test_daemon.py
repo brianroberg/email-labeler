@@ -1504,14 +1504,27 @@ class TestLoadConfig:
     def test_config_local_max_tokens_covers_thinking_off_decode(self):
         # Issue #64: with thinking off, the prompts still elicit the full
         # step-by-step scaffold as untagged content, and observed demand ran up
-        # to 1,293 completion tokens — beyond the old 1024 budget. Worse, an
-        # over-budget decode with thinking off does NOT raise LLMContentError:
-        # content arrives truncated before any label and parse_email_label
-        # silently defaults to LOW_PRIORITY (whose action is ARCHIVE). The
-        # budget raise is therefore coupled to the thinking disable, not
-        # optional insurance. 2048 is the measured floor; shipped value 4096.
+        # to 1,293 completion tokens — beyond the old 1024 budget. An
+        # over-budget decode truncates content before any label; llm_client now
+        # raises LLMContentError on finish_reason "length" (it used to parse to
+        # a silent LOW_PRIORITY default), so an undersized budget means loud
+        # give-ups rather than mislabels — still lost mail. The budget raise is
+        # therefore coupled to the thinking disable, not optional insurance.
+        # 2048 is the measured floor; shipped value 4096.
         config = load_config()
         assert config["llm"]["local"]["max_tokens"] >= 2048
+
+    def test_config_newsletter_max_tokens_covers_multi_story_extraction(self):
+        # Issue #64 collateral: story_extraction re-emits the FULL text of every
+        # story in one response, so its output scales with newsletter size — the
+        # one call whose demand 1024 demonstrably cannot bound. With llm_client
+        # now raising on finish_reason "length" (instead of silently truncating
+        # mid-story), an undersized budget would turn every long newsletter into
+        # a deterministic give-up (agent/attempted). Sized by that reasoning
+        # (issue #64's Fix 4), not by live measurement — the newsletter tier was
+        # never probed.
+        config = load_config()
+        assert config["newsletter"]["llm"]["max_tokens"] >= 2048
 
     def test_config_has_newsletter_section(self):
         config = load_config()

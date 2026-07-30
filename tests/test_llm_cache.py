@@ -294,14 +294,16 @@ class TestCorruptCacheFile:
 
 
     async def test_current_entry_with_empty_thinking_is_a_hit(self, tmp_path: Path):
-        """An entry written by current code with thinking='' (model emitted no
-        <think> block) must be a cache hit under include_thinking=True — not a
-        legacy entry to re-fetch. Otherwise every terse response (NO_STORIES,
-        'NONE' themes) is re-billed on every run and re-appended to disk."""
+        """An entry written by current code with thinking='' (nothing separately
+        capturable: no reasoning field, no <think> block — e.g. a thinking-off
+        run, where the CoT is the response itself) must be a cache hit under
+        include_thinking=True — not a legacy entry to re-fetch. Otherwise every
+        terse response (NO_STORIES, 'NONE' themes) is re-billed on every run
+        and re-appended to disk."""
         cache_path = tmp_path / "cache.jsonl"
 
         inner1 = _make_inner()
-        _set_return(inner1, "NO_STORIES", "")  # legitimately no thinking
+        _set_return(inner1, "NO_STORIES", "")  # nothing separately capturable
         cached1 = CachedLLMClient(inner1, cache_path)
         await cached1.complete("sys", "usr", include_thinking=True)
         cached1.flush()

@@ -605,9 +605,11 @@ class TestFinishReasonLength:
         assert "max_tokens" in msg
         assert "prompt ~" in msg  # prompt token estimate, not a hardcoded guess
         # Names the field that actually held the reasoning (`reasoning`), not
-        # the hardcoded `reasoning_content` guess.
-        assert "reasoning" in msg
+        # the hardcoded `reasoning_content` guess — and not the absent-field
+        # text, which is what a diagnostics regression would fall back to.
+        assert "reasoning in reasoning" in msg
         assert "reasoning_content" not in msg
+        assert "no reasoning field" not in msg
 
     async def test_length_with_truncated_content_raises_not_parses(self, local_client):
         """finish_reason "length" with NON-empty content is a truncated answer:
@@ -659,7 +661,10 @@ class TestFinishReasonLength:
 
     async def test_empty_content_without_finish_reason_names_absent_reasoning(self, cloud_client):
         """Empty content stays loud even without finish_reason, and the error
-        says no reasoning field was populated rather than guessing one was."""
+        says no reasoning field was populated rather than guessing one was.
+        The reported finish_reason must be the response's REAL (absent) value —
+        this is the case that distinguishes real reporting from a hardcoded
+        'length'."""
         resp = _mock_response(json_data={
             "choices": [{"message": {"role": "assistant", "content": ""}}]
         })
@@ -668,6 +673,7 @@ class TestFinishReasonLength:
         msg = str(exc_info.value)
         assert "no content" in msg
         assert "no reasoning field" in msg
+        assert "finish_reason=None" in msg
 
 
 class TestProbe:
@@ -1166,6 +1172,35 @@ class TestSeparateReasoningFieldCapture:
             )
             assert thinking == ""
             assert "LOW_PRIORITY" in response
+
+    async def test_both_channels_captured_when_model_emits_both(self):
+        """Issue #64 finding: with thinking ON and budget to spare, the model
+        emitted BOTH native reasoning AND <think>-tagged content CoT. Both must
+        land in thinking — the inline block is stripped from the returned
+        content, so capture that takes only the separate field would lose the
+        inline channel entirely (in neither thinking nor label_raw)."""
+        mock_response = _mock_response(json_data={
+            "choices": [{
+                "finish_reason": "stop",
+                "message": {
+                    "content": "<think>inline channel</think>\nFYI",
+                    "reasoning": "native channel",
+                },
+            }]
+        })
+
+        with patch("llm_client.httpx.AsyncClient") as mock_client_cls:
+            mock_client = AsyncMock()
+            mock_client.post.return_value = mock_response
+            mock_client_cls.return_value.__aenter__ = AsyncMock(return_value=mock_client)
+            mock_client_cls.return_value.__aexit__ = AsyncMock(return_value=False)
+
+            response, thinking = await self._qwen_ollama_client().complete(
+                "sys", "user", include_thinking=True,
+            )
+            assert response == "FYI"
+            assert "native channel" in thinking
+            assert "inline channel" in thinking
 
     async def test_reasoning_effort_none_recognized_as_thinking_disable(self):
         """reasoning_effort="none" (the Ollama disable dialect, now in the

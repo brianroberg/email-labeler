@@ -67,10 +67,12 @@ model = "{env.MLX_MODEL}"
 # 4096, not 1024: with native thinking disabled, the model still emits the full
 # step-by-step scaffold the prompt asks for — as untagged prose in content,
 # label last — and observed demand ran to ~1,300 completion tokens on hard
-# threads (issue #64). An over-budget decode with thinking off does NOT fail
-# loudly: content arrives truncated before any label and would parse to the
-# default LOW_PRIORITY → archive. This raise is therefore coupled to the
-# thinking disable below, not independent tuning.
+# threads (issue #64). An over-budget decode truncates content before the label
+# is emitted; llm_client raises LLMContentError on finish_reason "length" (so
+# it can no longer silently parse to the default LOW_PRIORITY → archive), but
+# that backstop turns every over-budget thread into an eventual give-up
+# (agent/attempted) — the budget must fit the honest demand. This raise is
+# therefore coupled to the thinking disable below, not independent tuning.
 max_tokens = 4096
 temperature = 0
 timeout = 180
@@ -152,7 +154,14 @@ output_file = "data/newsletter_assessments.jsonl"
 
 [newsletter.llm]
 model = "claude-sonnet-4-6"
-max_tokens = 1024
+# 4096, not 1024: story_extraction re-emits the FULL text of every story in a
+# single response, so output scales with newsletter size — 1024 truncated
+# multi-story newsletters mid-story. llm_client now raises LLMContentError on
+# finish_reason "length" (issue #64) instead of silently parsing a truncated
+# story list, so an undersized budget here would abandon long newsletters to
+# agent/attempted rather than mis-grade them. Sized by that reasoning (issue
+# #64's Fix 4); this tier has not been live-probed.
+max_tokens = 4096
 temperature = 0
 timeout = 60
 
