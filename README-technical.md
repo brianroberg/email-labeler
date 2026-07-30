@@ -11,8 +11,10 @@ email-labeler/
 ├── labeler.py          Gmail label verification and application
 ├── newsletter.py       Newsletter story extraction, quality scoring, and theme classification
 ├── llm_client.py       LLM abstraction for cloud and local endpoints
-├── proxy_client.py     Gmail API proxy client (shared with email-agent)
-├── gmail_utils.py      Email header and body parsing (shared with email-agent)
+├── proxy_client.py     Gmail API proxy client (forked from email-agent, Feb 2026;
+│                       independently maintained here — no sync obligation, decision D9)
+├── gmail_utils.py      Email header and body parsing (forked from email-agent, Feb 2026;
+│                       independently maintained here — no sync obligation, decision D9)
 ├── config_utils.py     Config loading and env var substitution
 ├── tui_common.py       Shared Textual widgets/screens for the TUIs
 ├── config.toml         Label definitions, prompts, and operational parameters
@@ -67,11 +69,11 @@ email-labeler/
 | `NEWSLETTER_LLM_API_KEY` | No | `CLOUD_LLM_API_KEY` | API key for the newsletter LLM endpoint. The override is atomic: once `NEWSLETTER_LLM_URL` is set, the key comes only from this var (never the cloud key), so set both together. |
 | `MLX_URL` | No | — | Local MLX LLM chat completion endpoint. If unset or unreachable, person emails are skipped. |
 | `MLX_MODEL` | No | — | Local LLM model name. Shared with email-agent so both services use the same model. Referenced in `config.toml` as `{env.MLX_MODEL}`. |
-| `MLX_API_KEY` | No | — | Local LLM API key. Empty string for real MLX; set for public API stand-ins like Novita.ai. |
+| `MLX_API_KEY` | No | — | Local LLM API key. Empty for real MLX. Setting it for a public API stand-in (e.g. Novita.ai) is **non-production/eval use only** — it sends person email bodies off-network (decision D4). |
 | `USER_NAME` | No | — | User's display name, substituted into classification prompts via `{env.USER_NAME}` in `config.toml`. |
 | `VIP_SENDERS` | No | — | Comma-separated email addresses of VIP senders. VIP threads skip the sender classification LLM call. |
 | `EMAIL_LABELER_API_KEY` | No | — | Fallback API key for the api-proxy server, used when `PROXY_API_KEY` is not set. |
-| `NEWSLETTER_ONLY` | No | — | Set to `1`, `true`, or `yes` to skip non-newsletter threads. Useful for testing newsletter classification in isolation. |
+| `NEWSLETTER_ONLY` | No | — | Set to `1`, `true`, or `yes` to run only the newsletter function: threads not matching the newsletter recipient are skipped. Newsletter grading itself is enabled by `[newsletter]` in config.toml, with or without this flag. |
 | `LOCAL_PARALLEL` | No | `1` (from `config.toml`) | Max concurrent local MLX requests, overriding `local_parallel` in `config.toml`. Modern MLX servers batch these (shared weights), so concurrency mostly costs KV cache. Keep ≤ 8 — mlx-lm has a KV-cache cross-contamination bug at 16+. |
 | `MAX_EMAILS_PER_CYCLE` | No | `10` (from `config.toml`) | Max threads processed per poll cycle, overriding `max_emails_per_cycle` in `config.toml`. Raise temporarily to drain a large backlog faster. |
 | `WRITE_PARALLEL` | No | `4` (from `config.toml`) | Max concurrent label-application writes (`modify_message`), overriding `write_parallel` in `config.toml`. Bounds the proxy-write burst when `max_emails_per_cycle` is large. Sized separately from reads because writes may block on human approval (`WRITE_TIMEOUT`, 300s). |
@@ -84,19 +86,15 @@ All operational parameters are in `config.toml`. The daemon reads this file on s
 
 ### Daemon settings
 
-```toml
-[daemon]
-poll_interval_seconds = 60     # How often to poll Gmail
-status_interval_seconds = 900  # How often to log a "still idle" heartbeat when caught up (default 15m)
-max_emails_per_cycle = 10      # Max threads per poll (override: MAX_EMAILS_PER_CYCLE)
-gmail_query = "in:inbox -label:agent/processed -label:agent/attempted"  # Gmail search query
-max_thread_chars = 16000       # Cap on transcript chars sent to the classifier
-cloud_parallel = 2             # Max concurrent cloud LLM requests
-local_parallel = 1             # Max concurrent local MLX requests (override: LOCAL_PARALLEL)
-fetch_parallel = 4             # Max concurrent Gmail thread fetches (get_thread)
-write_parallel = 4             # Max concurrent label-application writes (override: WRITE_PARALLEL)
-healthcheck_file = "/tmp/healthcheck"            # Healthcheck timestamp path
-```
+`[daemon]` keys (values and rationale live in config.toml — authoritative):
+`poll_interval_seconds` (poll cadence) · `status_interval_seconds` (idle
+heartbeat cadence) · `max_emails_per_cycle` (per-cycle thread cap; env
+override `MAX_EMAILS_PER_CYCLE`) · `gmail_query` (the unprocessed-thread
+search; excludes the `agent/processed` and `agent/attempted` markers) ·
+`max_thread_chars` (transcript cap — see below) · `cloud_parallel` /
+`local_parallel` / `fetch_parallel` / `write_parallel` (concurrency
+semaphores; env overrides `LOCAL_PARALLEL` / `WRITE_PARALLEL`) ·
+`healthcheck_file` (heartbeat path).
 
 Threads found in a poll cycle are processed concurrently, bounded by the
 `cloud_parallel` and `local_parallel` semaphores. **`local_parallel` defaults to 1**:
@@ -119,23 +117,14 @@ the levers that keep a single huge thread from stalling the loop.
 
 ### LLM settings
 
-The cloud LLM model is configured here, not in `.env`. The URL and API key come from
-`.env`, but the model name and inference parameters live in `config.toml` so they stay
-in version control.
-
-```toml
-[llm.cloud]
-model = "deepseek/deepseek-v3.2"   # must match your provider's model ID
-max_tokens = 8096
-temperature = 0.2
-timeout = 60
-
-[llm.local]
-model = "{env.MLX_MODEL}"              # set MLX_MODEL in .env (shared with email-agent)
-max_tokens = 8096
-temperature = 0.2
-timeout = 180       # Local LLM gets more time (runs on consumer hardware)
-```
+`[llm.cloud]` and `[llm.local]` configure model, `max_tokens`, `temperature`,
+and `timeout` per tier. **config.toml is authoritative for the values and —
+via its comments — for their rationale**; they are deliberate calibrations
+(issue #64), not free knobs: the token budgets are coupled to the
+thinking-disable decision (registry D16/D17), and `finish_reason: length`
+raises rather than silently truncating. Change them only with the config
+comments in view. URL and API key come from `.env` (secrets); model names and
+inference parameters stay in version-controlled config.toml.
 
 ### Extra request body fields
 
@@ -180,14 +169,12 @@ frequency_penalty = 0.5
 
 ### Newsletter settings
 
-```toml
-[newsletter]
-recipient = "newsletters@example.org"                # To/Cc match that routes a thread to the newsletter pipeline
-output_file = "data/newsletter_assessments.jsonl"    # Assessment record sink (JSONL, appended)
-
-[newsletter.llm]
-model = "claude-sonnet-4-6"   # endpoint/key via NEWSLETTER_LLM_URL / NEWSLETTER_LLM_API_KEY (defaults to the cloud LLM's)
-```
+`[newsletter]` configures `recipient` (the To/Cc match that routes a thread
+to the newsletter function) and `output_file` (the assessment JSONL sink);
+`[newsletter.llm]` configures the grading model and its `max_tokens` /
+`temperature` / `timeout` — values and sizing rationale in config.toml
+(authoritative; the budget/timeout comments there are deliberate issue-#64
+calibration).
 
 **`output_file` is relative to the process working directory** and the daemon
 `mkdir`s it silently if missing. In Docker (`WORKDIR /app`) that means
