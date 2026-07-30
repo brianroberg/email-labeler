@@ -1,9 +1,10 @@
 # Wave 0 — Clarity foundation (docs only)
 
-> **Status: proposed — awaiting owner review (2026-07-30). Nothing in this plan
-> is implemented yet.** This is the first plan written under the frozen-history
-> convention it introduces (task T6): when executed, this header changes to
-> `executed`; if abandoned, to `abandoned`.
+> **Status: executed 2026-07-30** (owner-approved; commits d766662..HEAD on
+> `claude/wave0-clarity-foundation`; three-agent acceptance pass applied).
+> First plan written under the frozen-history convention it introduces (T5).
+> See "Execution record" at the end for accepted deviations and the Wave 3
+> carry-list.
 
 Companion to the Phase 1 clarity audit (2026-07-30, 110 verified findings) and
 the Phase 2 owner dialogue that adjudicated groups A–E. This plan implements
@@ -661,3 +662,25 @@ Insert after the title:
    absorb into Wave 2, #39 is reframed by D7), Wave 1 (privacy tests,
    CI/D13), Wave 2 (D3 exact-match, D5 corollaries, D6, D10, D11, D12),
    Wave 3 (sweep of the Phase 1 findings catalog).
+
+## Execution record (2026-07-30)
+
+Executed T1–T6 in order, one commit each, suite green after every task
+(constant known-failing baseline: issue #67's timezone test). A three-agent
+acceptance pass (completeness / P2-honesty / coherence) ran before this
+header flipped; its fixes landed in the final commit.
+
+Accepted deviation from the plan text: CLAUDE.md's identity section carries
+the D1 `INBOX_ONLY` sentence (added during plan verification to the registry
+entry only); it is registry-consistent and kept.
+
+Wave 3 carry-list from acceptance (out of this wave's docs-only scope):
+- `classifier.py:6` and `daemon.py:6` module docstrings still state the
+  absolute pre-D2 invariant ("NEVER leave the local network");
+  `daemon.py:577` references "graceful degradation of the privacy invariant".
+- `pyproject.toml:4` description still states the email-only identity D1
+  replaced.
+- README-technical's env table restates config.toml defaults; README.md
+  restates the D15 tier bands and quotes literal counts/log lines — the
+  remaining D7 altitude/duplication sweep (D7's status is scoped
+  accordingly).

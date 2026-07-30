@@ -80,7 +80,8 @@ function continues.
 The registry entry D5 lists the corollaries and their implementation status —
 several are `pending`, and until they land, code deviates from this model
 where D5 says so. Current-behavior descriptions live in README.md
-(Resilience) and stay accurate to the code, not the model.
+(Resilience) and README-technical (Health Checking, write-before-label) and
+stay accurate to the code, not the model.
 
 ## Architecture
 
@@ -94,8 +95,9 @@ Poll loop → find unprocessed emails
 
 Per-cycle processing is bounded by the cloud/local/fetch/write semaphores —
 sizing rationale lives in config.toml `[daemon]` comments (authoritative).
-`local_parallel` defaults to 1; see README-technical "Local Model Serving &
-Memory" before raising it.
+`local_parallel` deliberately defaults to serial; see README-technical
+"Local Model Serving & Memory" and the config.toml `[daemon]` comments
+before raising it.
 
 ## Newsletter Classification
 

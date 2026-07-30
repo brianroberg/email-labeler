@@ -98,7 +98,8 @@ Corollaries, each `implementation pending (Wave 2)` until landed:
   that found zero stories; all-grades-unparseable is a failure (extends the
   issue-#30 principle to the parse-to-None path).
 - Assessment-sink faults are shared-cause: never counted, retried forever
-  (docs already claim this; code currently deviates).
+  (README-technical's write-before-label table currently documents the
+  give-up ending, matching the code; this corollary changes both).
 - `max_failures` (the strike bound, currently 5) becomes env-overridable
   (`MAX_FAILURES`) and documented with the other knobs.
 Forecloses: per-cell relitigating of the failure table; new error paths that
@@ -114,7 +115,9 @@ count nothing, re-offer next cycle. A rejection can never cause
 
 ## D7 — Documentation authority map + altitude rule (2026-07-30)
 
-**Status:** implemented (Wave 0).
+**Status:** implemented for the restated settings blocks (Wave 0); the
+remaining altitude/duplication sweep (env-table defaults, README literals and
+quoted log lines) lands with Wave 3.
 
 Every fact has exactly one home; other docs point rather than restate.
 **CLAUDE.md** = constitution: identity, privacy posture, failure model, review

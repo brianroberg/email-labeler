@@ -50,7 +50,7 @@ Newsletter labels (see [Newsletter Classification](#newsletter-classification)):
 | `agent/newsletter/good` | Best story averaged >= 2.25 |
 | `agent/newsletter/fair` | Best story averaged >= 1.75 |
 | `agent/newsletter/poor` | Best story averaged < 1.75 |
-| `agent/newsletter/no-stories` | No extractable stories found |
+| `agent/newsletter/no-stories` | No gradable stories — today applied when zero stories were extracted *or* when every story's grades were unparseable (restricting it to successful zero-story extraction is pending, registry D5/D20) |
 | `agent/newsletter/theme/*` | Theme tags: `scripture`, `christlikeness`, `church`, `vocation-family`, `disciple-making` — applied only when a story grades the theme Emphasized (merely-Present themes are recorded in the assessment JSONL but not labeled) |
 
 ## Architecture
