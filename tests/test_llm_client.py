@@ -608,10 +608,15 @@ class TestContentlessResponse:
 class TestFinishReasonLength:
     """A finish_reason of "length" must be loud, never silently parsed (issue #64).
 
-    Measured hazard: with thinking off, an over-budget decode returns non-empty
-    but truncated content, cut before any label — parse_email_label would
-    silently default to LOW_PRIORITY (action: ARCHIVE) with only a parse
-    WARNING. And the empty-content variant's old error message hardcoded a
+    Measured hazard (as it stood in #64): with thinking off, an over-budget
+    decode returns non-empty but truncated content, cut before any label, and
+    parse_email_label silently defaulted it to LOW_PRIORITY (action: ARCHIVE)
+    with only a parse WARNING. That default is gone (D5 Rule 1, Wave 2 T10),
+    but the guard here is still the right place to fail: it names the real
+    cause — the budget — with the response diagnostics attached, instead of
+    surfacing as an unexplained unparseable reply a cycle later, and it also
+    covers Stage 1, whose SERVICE default deliberately stays (D2).
+    And the empty-content variant's old error message hardcoded a
     guess ("max_tokens likely exhausted; reasoning_content ...") instead of
     reporting the response's actual finish_reason and which reasoning field was
     populated (Ollama's is `reasoning`, not `reasoning_content`).
@@ -734,8 +739,9 @@ class TestFinishReasonLength:
 class TestThinkOnlyResponse:
     """Non-empty content that strips to NOTHING — a fully-closed think-only
     response (finish_reason "stop") — is as unusable as no content: returning
-    "" would let parse_email_label default to LOW_PRIORITY and silently archive
-    the email, the exact silent-default shape issue #64 eliminates. Reachable
+    "" would carry a non-answer downstream, where Stage 1 still reads it as
+    SERVICE (D2) and Stage 2 raises a cause-less parse failure instead of
+    naming the empty reply. Reachable
     whenever a backend leaves thinking effectively on (e.g. mlx_lm.server
     ignoring reasoning_effort) and the model closes its think block without an
     answer."""

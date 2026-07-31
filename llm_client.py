@@ -82,8 +82,8 @@ class LLMContentError(RuntimeError):
     A reasoning model that exhausts max_tokens mid-<think>, a GLM reply carrying
     only ``reasoning_content``, or an empty string all yield an unusable response.
     So does a response whose ``finish_reason`` is ``"length"`` even when content
-    is non-empty: the answer was cut at the max_tokens budget, and parsing a
-    truncated answer silently defaults the label (issue #64). Retrying as-is
+    is non-empty: the answer was cut at the max_tokens budget, so any label read
+    out of it is an artifact of the truncation (issue #64). Retrying as-is
     won't help, so it is request-specific/permanent — a strike candidate under
     the daemon's cycle-level attribution (decision D5). It subclasses
     ``RuntimeError`` so the email pipeline's ``except RuntimeError`` arm catches
@@ -316,21 +316,25 @@ class LLMClient:
         stripped = self._strip_thinking(content) if content else ""
         if not stripped or finish_reason == "length":
             # Three unusable-response shapes, all request-specific/permanent
-            # (retrying as-is won't help), so all raise LLMContentError —
-            # give-up-eligible via the daemon, never LLMUnavailableError (would
-            # retry forever) or a raw KeyError (issue #64):
+            # (retrying as-is won't help), so all raise LLMContentError — a
+            # strike candidate under the daemon's cycle-level attribution (D5),
+            # never LLMUnavailableError (would retry forever) or a raw KeyError
+            # (issue #64):
             #   - No `content` (null, missing key, or empty string): a reasoning
             #     model exhausted max_tokens in its thinking channel, or GLM
             #     returned only reasoning_content.
             #   - Content that strips to nothing: a fully-closed think-only
             #     response — the model spent its whole turn inside <think> and
-            #     never answered. Both empty shapes would otherwise parse to a
-            #     default SERVICE / LOW_PRIORITY label and silently mislabel
-            #     the email.
+            #     never answered.
             #   - finish_reason "length" with non-empty content: the answer was
             #     cut at the max_tokens budget, usually mid-reasoning before any
-            #     label. Parsing it would silently default to LOW_PRIORITY and
-            #     archive the email, so a truncated answer is never returned.
+            #     label.
+            # Guarding here keeps the failure at its source, with the response
+            # diagnostics attached: a Stage-2 reply carrying no label keyword
+            # now raises downstream too (parse_email_label, D5 Rule 1), but
+            # Stage 1 still reads a content-less reply as SERVICE (D2's
+            # best-effort routing), so an unguarded empty answer would quietly
+            # route a person thread's body to the cloud.
             # The diagnostics report the response's actual finish_reason and
             # where the reasoning actually sat — a separate field (Ollama uses
             # `reasoning`, GLM uses `reasoning_content`) or inline <think>

@@ -12,7 +12,7 @@ import re
 from dataclasses import dataclass
 from enum import Enum
 
-from llm_client import LLMClient
+from llm_client import LLMClient, LLMContentError
 
 log = logging.getLogger(__name__)
 
@@ -80,9 +80,6 @@ def parse_sender(from_header: str) -> tuple[str, str]:
     return ("", from_header.strip())
 
 
-_SENDER_TYPE_VALID = {"PERSON", "SERVICE"}
-
-
 def _match_sender_type(text: str) -> SenderType | None:
     """Return SenderType if text starts with a known keyword, else None."""
     if text.startswith("PERSON"):
@@ -130,9 +127,6 @@ def _scan_lines_for_sender_type(text: str) -> SenderType | None:
     return result
 
 
-_EMAIL_LABEL_VALID = {"NEEDS_RESPONSE", "FYI", "LOW_PRIORITY"}
-
-
 def _match_email_label(text: str) -> EmailLabel | None:
     """Return EmailLabel if text starts with a known keyword, else None."""
     if text.startswith("NEEDS_RESPONSE"):
@@ -147,10 +141,25 @@ def _match_email_label(text: str) -> EmailLabel | None:
 
 
 def parse_email_label(raw_llm_output: str) -> EmailLabel:
-    """Parse LLM output into EmailLabel. Defaults to LOW_PRIORITY (safe).
+    """Parse LLM output into EmailLabel. Raises when no keyword is present.
 
     Checks the full output first, then the last line, then scans all lines
     to handle models that emit verbose reasoning around their final answer.
+
+    A reply that survives all three passes carries no answer at all, so there
+    is nothing to commit: raise ``LLMContentError`` (decision D5 Rule 1 —
+    outcomes only come from successes). The old LOW_PRIORITY fallback was not a
+    safe default: that label archives, so an unusable reply silently archived
+    the email and marked the thread processed. Raising completes the issue-#64
+    fail-loud direction (llm_client already raises on empty/truncated replies;
+    this closes the complete-but-keyword-free gap). The error is
+    request-specific, hence a strike candidate under the daemon's cycle-level
+    attribution: one thread's garbage reply converges to a findable
+    ``agent/attempted``, while a prompt bug failing every thread the same way
+    correlates to shared cause — no strikes, loud, backlog kept.
+
+    (``parse_sender_type``'s SERVICE default is a different decision and
+    deliberately stays — D2's best-effort routing.)
     """
     cleaned = raw_llm_output.strip().upper()
     result = _match_email_label(cleaned)
@@ -161,10 +170,8 @@ def parse_email_label(raw_llm_output: str) -> EmailLabel:
         # Scan all lines for a keyword anywhere (handles verbose reasoning models)
         result = _scan_lines_for_email_label(cleaned)
     if result is None:
-        result = EmailLabel.LOW_PRIORITY
-        log.warning(
-            "Unexpected email label output (interpreting as %s): %.200s",
-            result.name, raw_llm_output.strip(),
+        raise LLMContentError(
+            f"No email label keyword in LLM output: {raw_llm_output.strip()[:200]}"
         )
     return result
 

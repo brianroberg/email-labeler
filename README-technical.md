@@ -488,7 +488,7 @@ Conventions shared by every TUI:
 | Test file | Module | What's covered |
 |---|---|---|
 | `test_llm_client.py` | `llm_client.py` | Request format, auth headers, `<think>` tag stripping, separate reasoning-field capture (`reasoning`/`reasoning_content`), `finish_reason: length` handling, error handling, out-of-funds (`LLMBalanceError`) detection, availability checks |
-| `test_classifier.py` | `classifier.py` | `parse_sender` formats, `parse_sender_type` edge cases and defaults, `parse_email_label` edge cases and defaults, cloud/local routing, full pipeline |
+| `test_classifier.py` | `classifier.py` | `parse_sender` formats, `parse_sender_type` edge cases and its SERVICE default, `parse_email_label` edge cases and its keyword-free raise, cloud/local routing, full pipeline |
 | `test_labeler.py` | `labeler.py` | Label verification (all present, partial, none), label ID mapping, inbox/archive actions, single API call per email, per-write semaphore bound (LabelManager-owned `write_sem`, slot released between messages — issue #33) |
 | `test_daemon.py` | `daemon.py` | Service email path, person email path, MLX-unavailable skip, error isolation, per-function out-of-funds halt (`FunctionHalts`), config loading, assessment-sink preflight + write-before-label durability, classification result reuse across write-retry cycles (`ResultCache`, issue #29) |
 | `test_privacy.py` | `classifier.py`, `daemon.py` | Negative-form privacy tests (registry D2/D3): person-classified bodies reach only the local tier (classifier and daemon level), Stage 1 whole-call payload discipline, unparseable-Stage-1 SERVICE-default pin, VIP short-circuit, newsletter ownership bypass, no cloud fallback on local failure, metadata-shape allowlist |

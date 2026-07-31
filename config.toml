@@ -68,8 +68,9 @@ model = "{env.MLX_MODEL}"
 # step-by-step scaffold the prompt asks for — as untagged prose in content,
 # label last — and observed demand ran to ~1,300 completion tokens on hard
 # threads (issue #64). An over-budget decode truncates content before the label
-# is emitted; llm_client raises LLMContentError on finish_reason "length" (so
-# it can no longer silently parse to the default LOW_PRIORITY → archive), but
+# is emitted; llm_client raises LLMContentError on finish_reason "length" (and
+# a keyword-free reply that reaches the parser raises there — since D5 Rule 1
+# there is no LOW_PRIORITY → archive default left to land in), but
 # that backstop makes an undersized budget loud rather than cheap: a lone
 # over-budget thread strikes out to agent/attempted, and several co-failing
 # over-budget threads share a signature and are held as shared-cause (D5) —

@@ -122,8 +122,15 @@ Corollaries, each `implementation pending (Wave 2)` until landed:
   to:recipient"). A shared client ([newsletter.llm] absent) trips both slots
   within a cycle or two, which is correct: the fault disables both functions.
 - A keyword-free label reply raises instead of silently defaulting to
-  LOW_PRIORITY→archive (Rule 1; completes the issue-#64 fail-loud direction).
-  The unknown-sender→SERVICE default *stays* (D2).
+  LOW_PRIORITY→archive — implemented (Wave 2 T10). `parse_email_label` raises
+  `LLMContentError` (quoting the reply) when no keyword survives its three
+  passes, so an unusable answer commits nothing (Rule 1) and is a strike
+  candidate under the correlation attribution; this completes the issue-#64
+  fail-loud direction, which had closed only the empty/truncated-reply half.
+  The unknown-sender→SERVICE default *stays* (D2). llm_client's content guard
+  stays too — it names the budget as the cause and covers Stage 1, where the
+  SERVICE default still applies. Evals degrade honestly: run_eval turns the
+  raise into an error row instead of a silent LOW_PRIORITY prediction.
 - `agent/newsletter/no-stories` may only result from a successful extraction
   that found zero stories; all-grades-unparseable is a failure (extends the
   issue-#30 principle to the parse-to-None path).

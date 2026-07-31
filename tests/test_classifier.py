@@ -15,6 +15,7 @@ from classifier import (
     parse_sender,
     parse_sender_type,
 )
+from llm_client import LLMContentError
 
 # ── Pure parsing function tests ──────────────────────────────────────────
 
@@ -169,14 +170,22 @@ class TestParseEmailLabel:
     def test_last_line_fallback_needs_response(self):
         assert parse_email_label("Looks important\nNEEDS_RESPONSE") == EmailLabel.NEEDS_RESPONSE
 
-    def test_unknown_defaults_to_low_priority(self):
-        assert parse_email_label("SOMETHING_ELSE") == EmailLabel.LOW_PRIORITY
+    def test_unknown_raises(self):
+        """D5 Rule 1 (Wave 2 T10): a keyword-free reply is an unusable answer,
+        not a LOW_PRIORITY (→ archive) outcome. Reworked from the old
+        default-pinning test, which this decision reverses."""
+        with pytest.raises(LLMContentError):
+            parse_email_label("SOMETHING_ELSE")
 
-    def test_empty_defaults_to_low_priority(self):
-        assert parse_email_label("") == EmailLabel.LOW_PRIORITY
+    def test_empty_raises(self):
+        """D5 Rule 1: no answer at all commits nothing (Wave 2 T10)."""
+        with pytest.raises(LLMContentError):
+            parse_email_label("")
 
-    def test_garbage_last_line_defaults_to_low_priority(self):
-        assert parse_email_label("some preamble\nstill garbage") == EmailLabel.LOW_PRIORITY
+    def test_garbage_last_line_raises(self):
+        """D5 Rule 1: garbage through every fallback raises (Wave 2 T10)."""
+        with pytest.raises(LLMContentError):
+            parse_email_label("some preamble\nstill garbage")
 
     def test_no_warning_on_exact_match(self, caplog):
         with caplog.at_level("WARNING", logger="classifier"):
@@ -193,12 +202,13 @@ class TestParseEmailLabel:
             parse_email_label("This is spam\n\nLOW_PRIORITY")
         assert caplog.records == []
 
-    def test_warns_on_unrecognized_output(self, caplog):
-        with caplog.at_level("WARNING", logger="classifier"):
+    def test_raise_names_the_unrecognized_output(self):
+        """D5 Rule 1 (Wave 2 T10): the old WARNING-and-default pair became a
+        raise; the diagnostic half survives — the offending reply is quoted so
+        the daemon's failure line names what the model actually said."""
+        with pytest.raises(LLMContentError) as excinfo:
             parse_email_label("IMPORTANT")
-        assert len(caplog.records) == 1
-        assert "interpreting as LOW_PRIORITY" in caplog.records[0].message
-        assert "IMPORTANT" in caplog.records[0].message
+        assert "IMPORTANT" in str(excinfo.value)
 
     def test_scan_keyword_in_middle_of_reasoning(self):
         """Qwen 3.5 style: keyword buried in verbose reasoning text."""
@@ -221,8 +231,11 @@ class TestParseEmailLabel:
         assert parse_email_label(output) == EmailLabel.NEEDS_RESPONSE
 
     def test_scan_no_false_match_on_substring(self):
-        """FYI must be a whole word — 'NOTIFY' should not match."""
-        assert parse_email_label("NOTIFY the team about this") == EmailLabel.LOW_PRIORITY
+        """FYI must be a whole word — 'NOTIFY' should not match, so the reply
+        carries no label at all and raises (D5 Rule 1, Wave 2 T10; the outcome
+        asserted here used to be the LOW_PRIORITY default)."""
+        with pytest.raises(LLMContentError):
+            parse_email_label("NOTIFY the team about this")
 
     def test_no_warning_on_scan_match(self, caplog):
         with caplog.at_level("WARNING", logger="classifier"):

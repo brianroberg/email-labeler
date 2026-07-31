@@ -1211,6 +1211,60 @@ class TestFailureAttribution:
             for r in caplog.records
         )
 
+    async def test_keyword_free_reply_commits_nothing_and_strikes_as_candidate(
+        self, mock_proxy, mock_label_manager, cloud_sem, local_sem, mock_thread_response,
+    ):
+        """D5 Rule 1 (Wave 2 T10): a Stage-2 reply carrying no label keyword is
+        an unusable answer, not a LOW_PRIORITY → archive outcome. Driven through
+        a REAL EmailClassifier (the mock classifier fixture would bypass the
+        parser): nothing is committed — no labels, no processed marker — and the
+        failure is a strike candidate, so a thread whose model keeps babbling
+        converges to a findable agent/attempted instead of being archived."""
+        from classifier import EmailClassifier
+
+        mock_proxy.get_thread.return_value = mock_thread_response
+        cloud_llm, local_llm = AsyncMock(), AsyncMock()
+        cloud_llm.complete.return_value = ("PERSON", "")  # Stage 1 → local tier
+        local_llm.complete.return_value = ("Hmm, hard to say either way.", "")
+        classifier = EmailClassifier(
+            cloud_llm=cloud_llm,
+            local_llm=local_llm,
+            config={
+                "prompts": {
+                    "sender_classification": {
+                        "system": "s", "user_template": "{sender}{subject}{snippet}",
+                    },
+                    "email_classification": {
+                        "preamble": "p", "postamble": "q",
+                        "user_template": "{sender}{subject}{body}",
+                        "categories": {"NEEDS_RESPONSE": "a", "FYI": "b", "LOW_PRIORITY": "c"},
+                    },
+                }
+            },
+        )
+        failures: list[daemon.CycleFailure] = []
+
+        result = await process_single_thread(
+            "thread_001", ["msg_001", "msg_002"], mock_proxy, classifier,
+            mock_label_manager, cloud_sem, local_sem, max_thread_chars=50000,
+            cycle_failures=failures,
+        )
+
+        assert result is False
+        mock_label_manager.apply_classification.assert_not_called()
+        mock_label_manager.mark_processed.assert_not_called()
+        assert [f.signature for f in failures] == ["LLMContentError"]
+        assert failures[0].provider_shaped is False
+
+        # Strike candidate under the cycle attribution (D5 Rule 2): a singleton
+        # cycle blames the thread, so this failure counts toward give-up.
+        tracker = FailureTracker(max_failures=1)
+        struck_out = daemon.attribute_cycle_failures(
+            [("thread_001", ["msg_001", "msg_002"])], [result], failures, tracker,
+            daemon.MasqueradeTracker(),
+        )
+        assert [entry.thread_id for entry in struck_out] == ["thread_001"]
+
 
 class TestFailureTracker:
     def test_gives_up_only_at_threshold(self):
