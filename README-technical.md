@@ -422,7 +422,10 @@ Conventions shared by every TUI:
 | `test_classifier.py` | `classifier.py` | `parse_sender` formats, `parse_sender_type` edge cases and defaults, `parse_email_label` edge cases and defaults, cloud/local routing, full pipeline |
 | `test_labeler.py` | `labeler.py` | Label verification (all present, partial, none), label ID mapping, inbox/archive actions, single API call per email |
 | `test_daemon.py` | `daemon.py` | Service email path, person email path, MLX-unavailable skip, error isolation, out-of-funds halt, config loading, assessment-sink preflight + write-before-label durability |
+| `test_privacy.py` | `classifier.py`, `daemon.py` | Negative-form privacy tests (registry D2/D3): person-classified bodies reach only the local tier (classifier and daemon level), Stage 1 whole-call payload discipline, unparseable-Stage-1 SERVICE-default pin, VIP short-circuit, newsletter ownership bypass, no cloud fallback on local failure, metadata-shape allowlist |
 | `test_config_utils.py` | `config_utils.py` | Config loading, `{env.VAR}` substitution |
+| `test_env_var_docs.py` | env-var docs (meta-test) | Every env var referenced by daemon sources or `config.toml` `{env.VAR}` is documented in this file's Environment Variables table |
+| `test_env_example_docs.py` | `.env.example` (meta-test) | Every var the example declares is documented in the env table; every Required var has an active line in the example |
 | `test_newsletter.py` | `newsletter.py` | Newsletter story extraction, quality scoring, theme classification, assessment record writing, sink persistence/writability diagnostics |
 | `test_eval_schemas.py` | `evals/schemas.py` | GoldenThread/PredictionResult/RunMeta serialization round-trips |
 | `test_eval_harvest.py` | `evals/harvest.py` | Ground truth inference from labels, deduplication |
@@ -434,3 +437,9 @@ Conventions shared by every TUI:
 | `test_eval_newsletter_report.py` | `evals/newsletter_report.py` | `match_stories`, tier/dimension/theme metrics, comparison deltas |
 | `test_newsletter_review.py` | `newsletter_review/tui.py` | Pure helpers (loading, per-thread dedup, filtering, formatting, source line, migrated-record note) + Pilot UI tests (navigation, drill-down, tier/theme/sender filters, source header, quit) |
 | `test_migrate_assessments.py` | `scripts/migrate_assessments.py` | Old-scheme detection, theme/score conversion, tier preservation, atomic in-place rewrite + abort-on-malformed, round-trip through `load_assessments` |
+
+## Continuous Integration
+
+GitHub Actions (`.github/workflows/ci.yml`, authoritative) runs dependency
+sync, lint, and the full mocked suite on every PR and push to main; no
+secrets are required (registry D13).

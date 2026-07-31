@@ -31,7 +31,7 @@ fixes that assume one function's values govern the other.
 
 ## D2 — Privacy posture: best-effort routing, stated honestly (2026-07-30)
 
-**Status:** implemented (docs, Wave 0); test enforcement pending (Wave 1).
+**Status:** implemented (docs, Wave 0; test enforcement, Wave 1).
 
 The email-triage privacy guarantee is: **bodies of threads classified as
 person are processed only by the local LLM**. This is best-effort routing, not
@@ -180,7 +180,7 @@ so the next schema evolution is a version bump + migration, not shape-sniffing.
 
 ## D13 — Adopt CI (2026-07-30)
 
-**Status:** implementation pending (Wave 1).
+**Status:** implemented (Wave 1).
 
 A minimal GitHub Actions workflow (uv sync, pytest, ruff) on PRs and pushes to
 main. The suite is fully mocked; no secrets. Its absence was not deliberate.

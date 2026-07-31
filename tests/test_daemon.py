@@ -38,11 +38,6 @@ from proxy_client import ProxyAuthError, ProxyError, ProxyUnavailableError
 
 
 @pytest.fixture
-def mock_proxy():
-    return AsyncMock()
-
-
-@pytest.fixture
 def mock_classifier():
     classifier = AsyncMock()
     classifier.classify.return_value = ClassificationResult(
@@ -53,24 +48,6 @@ def mock_classifier():
     )
     classifier.classify_sender.return_value = (SenderType.PERSON, "PERSON", "")
     return classifier
-
-
-@pytest.fixture
-def mock_label_manager():
-    mgr = AsyncMock()
-    # get_existing_priority is synchronous — use MagicMock so it returns a value, not a coroutine
-    mgr.get_existing_priority = MagicMock(return_value=None)
-    return mgr
-
-
-@pytest.fixture
-def cloud_sem():
-    return asyncio.Semaphore(2)
-
-
-@pytest.fixture
-def local_sem():
-    return asyncio.Semaphore(1)
 
 
 @pytest.fixture

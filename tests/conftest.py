@@ -1,8 +1,33 @@
 """Shared fixtures and sample Gmail data for tests."""
 
+import asyncio
 import base64
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
+
+
+@pytest.fixture
+def mock_proxy():
+    return AsyncMock()
+
+
+@pytest.fixture
+def mock_label_manager():
+    mgr = AsyncMock()
+    # get_existing_priority is synchronous — use MagicMock so it returns a value, not a coroutine
+    mgr.get_existing_priority = MagicMock(return_value=None)
+    return mgr
+
+
+@pytest.fixture
+def cloud_sem():
+    return asyncio.Semaphore(2)
+
+
+@pytest.fixture
+def local_sem():
+    return asyncio.Semaphore(1)
 
 
 @pytest.fixture

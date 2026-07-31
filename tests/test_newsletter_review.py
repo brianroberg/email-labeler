@@ -26,6 +26,13 @@ from newsletter_review.tui import (
 )
 
 
+def _local_midday_utc_iso(y, m, d):
+    """Local midday converted to UTC; rendering converts back in the same
+    process timezone, an identity round-trip, so the record shows the
+    authored local date in every timezone (issue #67)."""
+    return datetime(y, m, d, 12, 0).astimezone(timezone.utc).isoformat()
+
+
 @contextmanager
 def _use_tz(name: str):
     """Run the body under a fixed local timezone (Linux ``tzset``), restoring the
@@ -268,9 +275,9 @@ class TestApplyFilters:
     def test_since_filter_keeps_on_or_after_cutoff(self):
         # Issue #36: date filter on the send-date, inclusive of the boundary.
         records = [
-            _make_record(thread_id="old", send_date="2024-01-01T00:00:00+00:00"),
-            _make_record(thread_id="edge", send_date="2024-06-15T09:00:00+00:00"),
-            _make_record(thread_id="new", send_date="2024-12-31T00:00:00+00:00"),
+            _make_record(thread_id="old", send_date=_local_midday_utc_iso(2024, 1, 1)),
+            _make_record(thread_id="edge", send_date=_local_midday_utc_iso(2024, 6, 15)),
+            _make_record(thread_id="new", send_date=_local_midday_utc_iso(2024, 12, 31)),
         ]
         result = apply_filters(records, since="2024-06-15")
         assert {r["thread_id"] for r in result} == {"edge", "new"}
@@ -371,7 +378,7 @@ class TestFormatListRow:
 
     def test_includes_send_date(self):
         # Issue #36: the list date column shows the email SEND date (date part).
-        row = format_list_row(_make_record(send_date="2026-02-19T09:00:00+00:00"), 120)
+        row = format_list_row(_make_record(send_date=_local_midday_utc_iso(2026, 2, 19)), 120)
         assert "2026-02-19" in row
 
     def test_missing_send_date_shows_placeholder(self):
@@ -650,8 +657,8 @@ class TestFormatSourceLine:
     def test_names_the_resolved_path_and_newest_send_date(self, tmp_path):
         f = tmp_path / "data" / "newsletter_assessments.jsonl"
         line = format_source_line(f, [
-            _make_record(thread_id="a", send_date="2026-07-11T09:00:00+00:00"),
-            _make_record(thread_id="b", send_date="2026-07-29T09:00:00+00:00"),
+            _make_record(thread_id="a", send_date=_local_midday_utc_iso(2026, 7, 11)),
+            _make_record(thread_id="b", send_date=_local_midday_utc_iso(2026, 7, 29)),
         ])
         assert str(f.resolve()) in line
         assert "2 newsletters" in line
@@ -1029,11 +1036,16 @@ class TestReviewAppReviewFindings:
 
 
 def _dated_records():
-    """Records with distinct fixed send-dates (all in 2024) for sort/date tests."""
+    """Records with distinct fixed send-dates (all in 2024) for sort/date tests.
+
+    Local-midday instants (see _local_midday_utc_iso) keep each record's
+    rendered date equal to the authored date in every timezone, and clear of
+    the date filter's mid-month cutoffs.
+    """
     return [
-        _make_record(subject="Jan", send_date="2024-01-10T00:00:00+00:00"),
-        _make_record(subject="Mar", send_date="2024-03-10T00:00:00+00:00"),
-        _make_record(subject="Feb", send_date="2024-02-10T00:00:00+00:00"),
+        _make_record(subject="Jan", send_date=_local_midday_utc_iso(2024, 1, 10)),
+        _make_record(subject="Mar", send_date=_local_midday_utc_iso(2024, 3, 10)),
+        _make_record(subject="Feb", send_date=_local_midday_utc_iso(2024, 2, 10)),
     ]
 
 
