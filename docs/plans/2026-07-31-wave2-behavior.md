@@ -1,8 +1,9 @@
 # Wave 2 — Behavior changes under the new policy
 
-> **Status: proposed (2026-07-31).** Owner review required before execution.
-> Drafted from the Wave 0.5 triage feed on issue #68; adversarially verified
-> (6-lens, 56 findings → corrections applied); supersedes nothing.
+> **Status: proposed (2026-07-31); owner-approved 2026-07-31 — execution
+> pending.** Drafted from the Wave 0.5 triage feed on issue #68; adversarially
+> verified (6-lens, 56 findings → corrections applied); supersedes nothing.
+> Flips to `executed` with the T14 execution record (D8).
 
 Fourth step of the 2026-07-30 clarity effort, after Wave 0 (docs foundation),
 Wave 0.5 (issue triage), and Wave 1 (enforcement) — all executed. Wave 2 is
