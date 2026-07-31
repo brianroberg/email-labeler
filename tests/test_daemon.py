@@ -31,7 +31,7 @@ from daemon import (
     resolve_int_env,
     summarize_cycle,
 )
-from labeler import _get_priority
+from labeler import LabelManager, _get_priority
 from llm_client import LLMBalanceError, LLMClient, LLMUnavailableError
 from newsletter import NewsletterTier, StoryResult
 from proxy_client import ProxyAuthError, ProxyError, ProxyUnavailableError
@@ -726,7 +726,7 @@ class TestProcessSingleThread:
         mock_proxy.get_thread.assert_called_once()
 
     async def test_label_application_is_bounded_by_write_sem(
-        self, mock_proxy, mock_classifier, mock_label_manager, cloud_sem, local_sem,
+        self, mock_proxy, mock_classifier, cloud_sem, local_sem,
         mock_thread_response,
     ):
         """Label-application writes run under write_sem, so they can't fan out unbounded.
@@ -735,20 +735,48 @@ class TestProcessSingleThread:
         the label-application phase (modify_message via apply_classification etc.)
         previously ran with no bound, so a large max_emails_per_cycle could burst many
         concurrent writes at the api-proxy / Gmail.
+
+        Reworked for issue #33 (Wave 2 T5): the semaphore moved from the daemon's
+        per-method acquisition sites into LabelManager itself, which acquires one
+        slot per modify_message write — so this drives a real LabelManager holding
+        an exhausted semaphore. Classification must still complete before the
+        write blocks: the semaphore gates only the writes.
         """
         mock_proxy.get_thread.return_value = mock_thread_response
         exhausted = asyncio.Semaphore(0)  # no write permits available
+        label_manager = LabelManager(
+            proxy_client=mock_proxy,
+            config={"labels": {
+                "needs_response": "agent/needs-response",
+                "fyi": "agent/fyi",
+                "low_priority": "agent/low-priority",
+                "processed": "agent/processed",
+                "attempted": "agent/attempted",
+                "personal": "agent/personal",
+                "non_personal": "agent/non-personal",
+                "actions": {
+                    "needs_response": "inbox", "fyi": "inbox", "low_priority": "archive",
+                },
+            }},
+            write_sem=exhausted,
+        )
+        label_manager.label_ids = {
+            "agent/needs-response": "Label_1",
+            "agent/processed": "Label_4",
+            "agent/personal": "Label_5",
+        }
 
         task = asyncio.create_task(process_single_thread(
-            "thread_001", ["msg_001"], mock_proxy, mock_classifier, mock_label_manager,
+            "thread_001", ["msg_001"], mock_proxy, mock_classifier, label_manager,
             cloud_sem, local_sem, max_thread_chars=16000,
-            fetch_sem=asyncio.Semaphore(2), write_sem=exhausted,
+            fetch_sem=asyncio.Semaphore(2),
         ))
         await asyncio.sleep(0.05)
-        # Fetch + classify ran, but blocked acquiring write_sem — no label write yet.
+        # Fetch + classify ran, but the first label write is blocked acquiring the
+        # LabelManager-owned semaphore — nothing written yet.
         mock_proxy.get_thread.assert_called_once()
-        mock_label_manager.apply_classification.assert_not_called()
-        mock_label_manager.mark_processed.assert_not_called()
+        mock_classifier.classify.assert_called_once()
+        mock_proxy.modify_message.assert_not_called()
         task.cancel()
         with pytest.raises(asyncio.CancelledError):
             await task

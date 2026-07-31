@@ -6,6 +6,8 @@ All labels must be pre-created in Gmail (api-proxy blocks label creation).
 
 from __future__ import annotations
 
+import asyncio
+from contextlib import nullcontext
 from typing import TYPE_CHECKING
 
 from classifier import EmailLabel, SenderType
@@ -36,13 +38,31 @@ def _get_priority(label: EmailLabel) -> int:
 
 
 class LabelManager:
-    """Manages Gmail label verification and application."""
+    """Manages Gmail label verification and application.
 
-    def __init__(self, proxy_client: GmailProxyClient, config: dict):
+    Owns the label-write bound (issue #33): when constructed with ``write_sem``,
+    every ``modify_message`` write acquires one slot, released between a
+    thread's messages — so the semaphore bounds *writes in flight*, not threads
+    writing (sizing rationale: config.toml ``[daemon]`` ``write_parallel``).
+    """
+
+    def __init__(
+        self,
+        proxy_client: GmailProxyClient,
+        config: dict,
+        write_sem: asyncio.Semaphore | None = None,
+    ):
         self.proxy = proxy_client
         self.config = config
         self.labels_config = config["labels"]
         self.label_ids: dict[str, str] = {}
+        # None (the default) leaves writes ungated.
+        self.write_sem = write_sem
+
+    async def _modify(self, **kwargs) -> None:
+        """One proxy write under one write_sem slot (per-write granularity)."""
+        async with (self.write_sem or nullcontext()):
+            await self.proxy.modify_message(**kwargs)
 
     async def verify_labels(self) -> list[str]:
         """Verify all required labels exist in Gmail.
@@ -139,7 +159,7 @@ class LabelManager:
             kwargs = {"message_id": msg_id, "add_label_ids": add_label_ids}
             if remove_label_ids:
                 kwargs["remove_label_ids"] = remove_label_ids
-            await self.proxy.modify_message(**kwargs)
+            await self._modify(**kwargs)
 
     async def _apply_marker(self, message_ids: str | list[str], config_key: str) -> None:
         """Apply a single marker label (no INBOX change) to each message.
@@ -155,7 +175,7 @@ class LabelManager:
         marker_name = self.labels_config[config_key]
         add_label_ids = [self.label_ids[marker_name]]
         for msg_id in ids:
-            await self.proxy.modify_message(message_id=msg_id, add_label_ids=add_label_ids)
+            await self._modify(message_id=msg_id, add_label_ids=add_label_ids)
 
     async def mark_processed(self, message_ids: str | list[str]) -> None:
         """Apply only the agent/processed marker label.
@@ -214,7 +234,7 @@ class LabelManager:
                 add_label_ids.append(self.label_ids[theme_name])
 
         for msg_id in message_ids:
-            await self.proxy.modify_message(
+            await self._modify(
                 message_id=msg_id,
                 add_label_ids=add_label_ids,
                 remove_label_ids=["INBOX"],

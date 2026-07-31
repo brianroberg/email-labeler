@@ -467,7 +467,7 @@ Conventions shared by every TUI:
 |---|---|---|
 | `test_llm_client.py` | `llm_client.py` | Request format, auth headers, `<think>` tag stripping, separate reasoning-field capture (`reasoning`/`reasoning_content`), `finish_reason: length` handling, error handling, out-of-funds (`LLMBalanceError`) detection, availability checks |
 | `test_classifier.py` | `classifier.py` | `parse_sender` formats, `parse_sender_type` edge cases and defaults, `parse_email_label` edge cases and defaults, cloud/local routing, full pipeline |
-| `test_labeler.py` | `labeler.py` | Label verification (all present, partial, none), label ID mapping, inbox/archive actions, single API call per email |
+| `test_labeler.py` | `labeler.py` | Label verification (all present, partial, none), label ID mapping, inbox/archive actions, single API call per email, per-write semaphore bound (LabelManager-owned `write_sem`, slot released between messages — issue #33) |
 | `test_daemon.py` | `daemon.py` | Service email path, person email path, MLX-unavailable skip, error isolation, out-of-funds halt, config loading, assessment-sink preflight + write-before-label durability |
 | `test_privacy.py` | `classifier.py`, `daemon.py` | Negative-form privacy tests (registry D2/D3): person-classified bodies reach only the local tier (classifier and daemon level), Stage 1 whole-call payload discipline, unparseable-Stage-1 SERVICE-default pin, VIP short-circuit, newsletter ownership bypass, no cloud fallback on local failure, metadata-shape allowlist |
 | `test_config_utils.py` | `config_utils.py` | Config loading, `{env.VAR}` substitution |

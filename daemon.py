@@ -222,7 +222,6 @@ async def _give_up_if_stuck(
     msg_ids: list[str],
     failure_tracker: "FailureTracker | None",
     label_manager: LabelManager,
-    write_sem: asyncio.Semaphore | None = None,
 ) -> bool:
     """Record a thread-specific failure; if it has failed too many times, mark it
     agent/attempted so it stops being retried every cycle.
@@ -240,8 +239,7 @@ async def _give_up_if_stuck(
     if not failure_tracker.should_give_up(thread_id):
         return False
     try:
-        async with (write_sem or nullcontext()):
-            await label_manager.mark_attempted(msg_ids)
+        await label_manager.mark_attempted(msg_ids)
     except ProxyUnavailableError as exc:
         # The proxy is transiently down, so the agent/attempted marker can't be written
         # right now — expected during an outage, not a bug. We return without recording
@@ -330,7 +328,6 @@ async def process_single_thread(
     newsletter_only: bool = False,
     failure_tracker: "FailureTracker | None" = None,
     fetch_sem: asyncio.Semaphore | None = None,
-    write_sem: asyncio.Semaphore | None = None,
     local_deferrals: list[str] | None = None,
     halt: "DaemonHalt | None" = None,
 ) -> bool:
@@ -463,12 +460,11 @@ async def process_single_thread(
                         )
                         raise
 
-                async with (write_sem or nullcontext()):
-                    await label_manager.apply_newsletter_classification(
-                        message_ids=all_msg_ids,
-                        tier=best_tier,
-                        themes=all_themes,
-                    )
+                await label_manager.apply_newsletter_classification(
+                    message_ids=all_msg_ids,
+                    tier=best_tier,
+                    themes=all_themes,
+                )
 
                 story_count = len(story_results)
                 log.info(
@@ -496,8 +492,7 @@ async def process_single_thread(
             # as the no-downgrade branch below). ids_to_mark was upgraded to all_msg_ids
             # above the priority check, so a failed write here gives up on the whole
             # thread, not just the query stubs.
-            async with (write_sem or nullcontext()):
-                await label_manager.mark_processed(all_msg_ids)
+            await label_manager.mark_processed(all_msg_ids)
             log.info("Thread %s already at max priority, marking processed", thread_id)
             return True
 
@@ -551,14 +546,14 @@ async def process_single_thread(
                 new_priority,
             )
             # Still mark as processed so the thread isn't retried every cycle
-            async with (write_sem or nullcontext()):
-                await label_manager.mark_processed(all_msg_ids)
+            await label_manager.mark_processed(all_msg_ids)
             return True
 
-        # Apply labels to ALL messages in thread (bounded by write_sem so a large
-        # max_emails_per_cycle can't burst one concurrent write per thread).
-        async with (write_sem or nullcontext()):
-            await label_manager.apply_classification(all_msg_ids, result.label, result.sender_type)
+        # Apply labels to ALL messages in thread. The proxy-write burst is
+        # bounded inside LabelManager (issue #33): its write semaphore gates
+        # each modify_message call, so a large max_emails_per_cycle can't
+        # burst one concurrent write per message.
+        await label_manager.apply_classification(all_msg_ids, result.label, result.sender_type)
         log.info(
             "Classified thread %s (%d msgs): sender=%s label=%s — %s",
             thread_id,
@@ -607,7 +602,7 @@ async def process_single_thread(
         # invisible at the cycle level — the proxy is up — so LLMUnavailableError must
         # never give up, or one MLX outage would abandon every person thread.)
         log.warning("api-proxy unavailable processing thread %s: %s", thread_id, exc)
-        return await _give_up_if_stuck(thread_id, ids_to_mark, failure_tracker, label_manager, write_sem)
+        return await _give_up_if_stuck(thread_id, ids_to_mark, failure_tracker, label_manager)
     except httpx.ConnectError as exc:
         # Defensive: a raw ConnectError shouldn't escape the wrapped clients, but if
         # one does it's still a transient outage — retry next cycle, don't give up.
@@ -618,7 +613,7 @@ async def process_single_thread(
         # the timeout) — eligible for give-up so one huge thread can't be retried
         # forever. (Connect/pool timeouts are LLMUnavailableError, handled above.)
         log.error("Timeout processing thread %s: %s", thread_id, exc)
-        return await _give_up_if_stuck(thread_id, ids_to_mark, failure_tracker, label_manager, write_sem)
+        return await _give_up_if_stuck(thread_id, ids_to_mark, failure_tracker, label_manager)
     except LLMBalanceError as exc:
         # Account-wide, not a thread fault (and must precede the RuntimeError arm,
         # which it subclasses): don't count toward give-up, don't mark anything —
@@ -629,10 +624,10 @@ async def process_single_thread(
         return False
     except RuntimeError as exc:
         log.error("Thread %s: %s", thread_id, exc)
-        return await _give_up_if_stuck(thread_id, ids_to_mark, failure_tracker, label_manager, write_sem)
+        return await _give_up_if_stuck(thread_id, ids_to_mark, failure_tracker, label_manager)
     except Exception:
         log.exception("Error processing thread %s", thread_id)
-        return await _give_up_if_stuck(thread_id, ids_to_mark, failure_tracker, label_manager, write_sem)
+        return await _give_up_if_stuck(thread_id, ids_to_mark, failure_tracker, label_manager)
 
 
 def summarize_cycle(
@@ -849,7 +844,12 @@ async def run_daemon() -> None:
         local_llm=local_llm,
         config=config,
     )
-    label_manager = LabelManager(proxy_client=proxy_client, config=config)
+    # The write semaphore is owned by the LabelManager (issue #33): each
+    # modify_message write acquires one slot, so write_parallel bounds writes
+    # in flight, not threads writing. Sizing rationale: config.toml [daemon].
+    write_parallel = resolve_int_env("WRITE_PARALLEL", daemon_config.get("write_parallel", 4))
+    write_sem = asyncio.Semaphore(write_parallel)
+    label_manager = LabelManager(proxy_client=proxy_client, config=config, write_sem=write_sem)
 
     # Newsletter classifier (if configured)
     nl_config = config.get("newsletter")
@@ -895,8 +895,6 @@ async def run_daemon() -> None:
     local_parallel = resolve_int_env("LOCAL_PARALLEL", daemon_config.get("local_parallel", 1))
     local_sem = asyncio.Semaphore(local_parallel)
     fetch_sem = asyncio.Semaphore(daemon_config.get("fetch_parallel", 4))
-    write_parallel = resolve_int_env("WRITE_PARALLEL", daemon_config.get("write_parallel", 4))
-    write_sem = asyncio.Semaphore(write_parallel)
     log.info(
         "Concurrency limits: cloud=%d, local=%d, fetch=%d, write=%d",
         cloud_sem._value, local_sem._value, fetch_sem._value, write_sem._value,
@@ -1001,7 +999,6 @@ async def run_daemon() -> None:
                         newsletter_only=newsletter_only,
                         failure_tracker=failure_tracker,
                         fetch_sem=fetch_sem,
-                        write_sem=write_sem,
                         local_deferrals=local_deferrals,
                         halt=halt,
                     )

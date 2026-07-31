@@ -1,5 +1,6 @@
 """Tests for label manager."""
 
+import asyncio
 from unittest.mock import AsyncMock
 
 import pytest
@@ -195,6 +196,52 @@ class TestBatchApplyClassification:
             assert "Label_4" in kwargs["add_label_ids"]  # processed
             assert "Label_6" in kwargs["add_label_ids"]  # non-personal
             assert "INBOX" in kwargs["remove_label_ids"]
+
+
+class TestWriteSemaphore:
+    """LabelManager owns the write semaphore (issue #33): each modify_message
+    call acquires one slot, so `write_parallel` bounds writes in flight, not
+    threads writing — the slot is released between a thread's messages."""
+
+    async def test_concurrent_applies_interleave_per_message(
+        self, mock_proxy, config, all_labels_response
+    ):
+        order: list[str] = []
+        in_flight = 0
+        max_in_flight = 0
+
+        async def modify(message_id, **kwargs):
+            nonlocal in_flight, max_in_flight
+            in_flight += 1
+            max_in_flight = max(max_in_flight, in_flight)
+            order.append(message_id)
+            await asyncio.sleep(0)  # hold the slot across a scheduling point
+            in_flight -= 1
+            return {"id": message_id}
+
+        manager = LabelManager(
+            proxy_client=mock_proxy, config=config, write_sem=asyncio.Semaphore(1)
+        )
+        mock_proxy.list_labels.return_value = all_labels_response
+        await manager.verify_labels()
+        mock_proxy.modify_message.side_effect = modify
+
+        await asyncio.gather(
+            manager.apply_classification(
+                ["a1", "a2"], EmailLabel.NEEDS_RESPONSE, SenderType.PERSON
+            ),
+            manager.apply_classification(
+                ["b1", "b2"], EmailLabel.FYI, SenderType.SERVICE
+            ),
+        )
+
+        assert sorted(order) == ["a1", "a2", "b1", "b2"]
+        # The Semaphore(1) bound held per write...
+        assert max_in_flight == 1
+        # ...and the slot was released between messages: the second apply's
+        # first write ran before the first apply's second write. Holding the
+        # semaphore across a whole apply would force all a* before any b*.
+        assert order.index("b1") < order.index("a2")
 
 
 class TestGetExistingPriority:
