@@ -150,14 +150,21 @@ and no re-convergence is intended. Never "sync" them with email-agent.
 
 ## D10 — Remove the eval web app (2026-07-30)
 
-**Status:** implementation pending (Wave 2).
+**Status:** implemented (Wave 2).
 
 `evals/web_app.py`, `web_auth.py`, `web_data.py`, `run_web.py`,
 `evals/templates/`, and evals/README.md §5 are removed; `fastapi`, `jinja2`,
-`uvicorn` leave the runtime dependencies. Coupled removals the implementer
+`uvicorn`, and `python-multipart` leave the runtime dependencies
+(`python-multipart` was web-only in fact — FastAPI form parsing — though
+this entry originally omitted it; the `multipart` strings in gmail_utils.py
+are MIME types, not the package). Coupled removals the implementer
 must include or the suite fails: drop `evals.run_web` from
 `tests/test_eval_cli_docs.py`'s `_CLI_MODULES` (it imports the module), and
-delete the `### run_web` section of evals/README-technical.md. Rationale:
+delete the `### run_web` section of evals/README-technical.md. Implementation
+found two doc edits beyond this list: the "plus a web UI" clause in
+evals/README.md's intro and the web-UI sentence in README-technical's
+Chain-of-Thought section (the tui-regression skill's venv pip line also
+dropped the four packages). Rationale:
 forgotten by the owner, workflows CLI-covered, zero tests, and it contradicted
 the no-web-server posture at the dependency level. CoT capture/sidecars are
 unaffected.

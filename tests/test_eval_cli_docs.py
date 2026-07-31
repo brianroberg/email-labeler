@@ -19,7 +19,6 @@ _CLI_MODULES = {
     "evals.review": "### review",
     "evals.run_eval": "### run_eval",
     "evals.report": "### report",
-    "evals.run_web": "### run_web",
 }
 
 
