@@ -392,11 +392,12 @@ NOVITA_BALANCE_BODY = {
 
 
 class TestBalanceError:
-    """Out-of-funds responses raise LLMBalanceError (account-wide: halts the daemon).
+    """Out-of-funds responses raise LLMBalanceError (account-wide: halts the
+    function that provider serves — decision D5's scope rule, D19).
 
     Detection must be conservative enough that an ordinary 403 (bad key, forbidden
     route) stays a bare RuntimeError — only a payment-required status or a body
-    carrying a known balance/quota signature may trip the daemon-wide halt.
+    carrying a known balance/quota signature may trip a restart-only halt.
     """
 
     async def test_403_with_balance_body_raises_balance_error(self, cloud_client):
@@ -410,7 +411,7 @@ class TestBalanceError:
             await _post_canned(cloud_client, _mock_response(402, {"error": "payment required"}))
 
     async def test_plain_403_stays_bare_runtime_error(self, cloud_client):
-        """A 403 without a balance signature (bad key etc.) must NOT halt the daemon."""
+        """A 403 without a balance signature (bad key etc.) must NOT halt anything."""
         with pytest.raises(RuntimeError) as exc_info:
             await _post_canned(cloud_client, _mock_response(403, {"error": "forbidden"}))
         assert not isinstance(exc_info.value, LLMBalanceError)

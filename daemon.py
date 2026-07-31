@@ -358,14 +358,16 @@ class ResultCache:
 
 
 class DaemonHalt:
-    """Daemon-wide halt state for account-level faults (provider out of funds).
+    """Halt state for ONE function's account-level faults (provider out of funds).
 
     Unlike a poison thread (FailureTracker's territory), an out-of-funds provider
-    fails EVERY request: retrying per-thread just burns the backlog into
-    agent/attempted. Tripping this halts the poll loop entirely until the admin
+    fails EVERY request it serves: retrying per-thread just burns that function's
+    backlog into agent/attempted. Tripping this stops the function until the admin
     adds funds and restarts. In-memory and session-scoped by design — a restart
     is the only way to clear it. First tripper wins: threads in one
     asyncio.gather cycle may race to trip, and the reason must stay stable.
+
+    One slot per function, held together by FunctionHalts.
     """
 
     def __init__(self):
@@ -378,6 +380,70 @@ class DaemonHalt:
     @property
     def tripped(self) -> bool:
         return self.reason is not None
+
+
+class FunctionHalts:
+    """Per-function halt state (decision D5's scope rule; D19).
+
+    The two functions fail independently, so an out-of-funds provider stops only
+    the function whose requests it was serving: a newsletter-tier balance fault
+    halts newsletter grading while email triage keeps classifying, and vice
+    versa. Each function owns a DaemonHalt slot (first-tripper-wins,
+    restart-only reset); the poll loop stands down entirely only when EVERY
+    enabled function is halted.
+
+    "Enabled" is a deployment fact, not a runtime one: newsletter grading iff
+    [newsletter] is configured, email triage iff NEWSLETTER_ONLY is unset. A
+    function that isn't running can't be halted, and must never be counted as
+    halted when deciding whether anything is left to do.
+
+    When the two functions share one LLM client ([newsletter.llm] absent), a
+    shared-provider fault trips both slots within a cycle or two as each
+    function hits its own request — correct, since the fault does disable both.
+    """
+
+    def __init__(self, email_enabled: bool = True, newsletter_enabled: bool = False):
+        self.email = DaemonHalt()
+        self.newsletter = DaemonHalt()
+        self.email_enabled = email_enabled
+        self.newsletter_enabled = newsletter_enabled
+
+    def _enabled_slots(self) -> list[tuple[str, DaemonHalt]]:
+        slots = []
+        if self.email_enabled:
+            slots.append(("email triage", self.email))
+        if self.newsletter_enabled:
+            slots.append(("newsletter grading", self.newsletter))
+        return slots
+
+    @property
+    def all_halted(self) -> bool:
+        """True when every enabled function is halted — nothing is left to poll for."""
+        slots = self._enabled_slots()
+        return bool(slots) and all(h.tripped for _name, h in slots)
+
+    @property
+    def any_halted(self) -> bool:
+        return any(h.tripped for _name, h in self._enabled_slots())
+
+    @property
+    def email_only_halted(self) -> bool:
+        """Email triage is halted while newsletter grading still runs — the one
+        direction the Gmail query can narrow (a `to:recipient` clause keeps the
+        halted function's backlog from crowding the page; the mirror direction
+        can't be expressed as "not to:recipient" reliably)."""
+        return (
+            self.email_enabled
+            and self.email.tripped
+            and self.newsletter_enabled
+            and not self.newsletter.tripped
+        )
+
+    def halted_summary(self) -> str:
+        """`function: reason` for each halted enabled function — the operator line."""
+        return "; ".join(
+            f"{name}: {h.reason}" for name, h in self._enabled_slots() if h.tripped
+        )
 
 
 def attribute_cycle_failures(
@@ -570,7 +636,7 @@ async def process_single_thread(
     cycle_failures: "list[CycleFailure] | None" = None,
     fetch_sem: asyncio.Semaphore | None = None,
     local_deferrals: list[str] | None = None,
-    halt: "DaemonHalt | None" = None,
+    halts: "FunctionHalts | None" = None,
     result_cache: "ResultCache | None" = None,
 ) -> bool:
     """Process a single thread through the classification pipeline.
@@ -596,6 +662,11 @@ async def process_single_thread(
     returns False; the poll loop's post-gather attribution step decides strikes
     and marking (attribute_cycle_failures).
 
+    Halts are per-function (decision D5's scope rule, D19): a balance fault
+    trips only the halted function's slot in ``halts``, and a thread whose own
+    function is halted defers (returns False) without a CycleFailure — a halt
+    is a deferral, not a failure to attribute.
+
     Args:
         thread_id: Gmail thread ID.
         msg_ids: List of message IDs in the thread (from list_messages stubs).
@@ -617,11 +688,12 @@ async def process_single_thread(
     # give-up exists to break never converges).
     ids_to_mark = msg_ids
     try:
-        # A sibling thread in this cycle may already have tripped the halt (the
-        # provider is out of funds account-wide): don't fetch or classify —
-        # every further request is a known failure. Checked again after the
-        # fetch, before the expensive LLM stage.
-        if halt is not None and halt.tripped:
+        # Nothing this daemon still does can succeed: every enabled function is
+        # halted (each one's provider is out of funds account-wide), so don't
+        # even fetch. A PARTIAL halt keeps going — this thread's function isn't
+        # known until it is routed, so the function-aware checks sit below
+        # newsletter detection instead (decision D5's scope rule).
+        if halts is not None and halts.all_halted:
             return False
 
         # Fetch full thread (all messages in one API call). Bounded by fetch_sem so
@@ -650,15 +722,17 @@ async def process_single_thread(
         # only ever reused for exactly the content it was computed from.
         fingerprint = tuple(sorted(all_msg_ids))
 
-        # Re-check after the fetch: a sibling may have tripped the halt while this
-        # thread was fetching. Everything past here issues LLM requests (including
-        # any retry backoff), which are guaranteed to fail out-of-funds too.
-        if halt is not None and halt.tripped:
-            return False
-
         # Newsletter detection — route to newsletter pipeline if applicable
         if newsletter_classifier and newsletter_recipient:
             if is_newsletter(messages, newsletter_recipient):
+                # This thread belongs to the newsletter function, and that
+                # function is halted (its provider is out of funds): defer —
+                # no strike, no marker, nothing committed — and let email
+                # triage carry on. Also catches the sibling that tripped the
+                # halt while this thread was fetching, before any LLM request.
+                if halts is not None and halts.newsletter.tripped:
+                    return False
+
                 first_headers = messages[0]["payload"]["headers"]
                 subject = get_header(first_headers, "Subject")
                 sender = get_header(first_headers, "From")
@@ -682,8 +756,24 @@ async def process_single_thread(
                 else:
                     transcript = format_thread_transcript(messages, max_thread_chars)
 
-                    async with cloud_sem:
-                        story_results = await newsletter_classifier.classify_newsletter(transcript)
+                    try:
+                        async with cloud_sem:
+                            story_results = await newsletter_classifier.classify_newsletter(
+                                transcript
+                            )
+                    except LLMBalanceError as exc:
+                        # The NEWSLETTER function's provider is out of funds. Its
+                        # [newsletter.llm] endpoint is configured independently of
+                        # the email tiers (and LLMBalanceError carries no function
+                        # provenance), so the call site is what tells the two
+                        # functions apart: halt newsletter grading only — email
+                        # triage keeps running (decision D5's scope rule, D19).
+                        # The thread is left unprocessed, no strike, and is
+                        # re-graded after the admin adds funds and restarts.
+                        log.error("Newsletter thread %s deferred — %s", thread_id, exc)
+                        if halts is not None:
+                            halts.newsletter.trip(str(exc))
+                        return False
 
                     # Determine overall tier (best story's tier)
                     best_tier = None
@@ -765,6 +855,15 @@ async def process_single_thread(
         # Newsletter-only mode: skip non-newsletter threads
         if newsletter_only:
             log.debug("Skipping non-newsletter thread %s (newsletter-only mode)", thread_id)
+            return False
+
+        # This thread belongs to the email function, and that function is halted
+        # (its provider is out of funds): defer — no strike, no marker — while
+        # newsletter grading carries on. Deliberately ABOVE the max-priority
+        # branch below, so a halted email function commits nothing at all, not
+        # even a mark_processed write. Also catches the sibling that tripped the
+        # halt while this thread was fetching, before any LLM request.
+        if halts is not None and halts.email.tripped:
             return False
 
         # Check priority — skip if already classified at max priority
@@ -966,9 +1065,13 @@ async def process_single_thread(
         # Account-wide, not a thread fault (and must precede the RuntimeError arm,
         # which it subclasses): don't count toward give-up, don't mark anything —
         # the thread is re-processed after the admin adds funds and restarts.
+        # Reaching this arm means the fault came from the EMAIL pipeline's tiers
+        # (the newsletter branch traps its own balance faults at the call site),
+        # so it halts email triage only — newsletter grading keeps running
+        # (decision D5's scope rule, D19).
         log.error("Thread %s deferred — %s", thread_id, exc)
-        if halt is not None:
-            halt.trip(str(exc))
+        if halts is not None:
+            halts.email.trip(str(exc))
         return False
     except RuntimeError as exc:
         # Request-specific LLM failure — a non-balance 4xx-shaped response, or an
@@ -1282,9 +1385,14 @@ async def run_daemon() -> None:
     # LLM re-run. Session-scoped, like the tracker.
     result_cache = ResultCache()
 
-    # Account-level fault switch (provider out of funds): once tripped the poll
-    # loop stands down until the admin adds funds and restarts. Session-scoped.
-    halt = DaemonHalt()
+    # Account-level fault switches (provider out of funds), one per function
+    # (decision D5's scope rule, D19): a tripped slot stops that function until
+    # the admin adds funds and restarts; the poll loop stands down only once
+    # every enabled function is halted. Session-scoped.
+    halts = FunctionHalts(
+        email_enabled=not newsletter_only,
+        newsletter_enabled=bool(newsletter_classifier and newsletter_recipient),
+    )
 
     # Wait for a transiently-unreachable api-proxy to come up, then verify labels.
     missing = await verify_labels_with_retry(label_manager)
@@ -1298,8 +1406,10 @@ async def run_daemon() -> None:
     poll_interval = daemon_config["poll_interval_seconds"]
     max_emails = resolve_int_env("MAX_EMAILS_PER_CYCLE", daemon_config["max_emails_per_cycle"])
     gmail_query = daemon_config["gmail_query"]
+    query_narrowed = False  # set once an email-only halt narrows the query below
     if newsletter_only and newsletter_recipient:
         gmail_query += f" to:{newsletter_recipient}"
+        query_narrowed = True
         log.info("Gmail query narrowed to: %s", gmail_query)
     healthcheck_file = Path(daemon_config["healthcheck_file"])
     backoff = poll_interval
@@ -1308,16 +1418,17 @@ async def run_daemon() -> None:
     proxy_lost = False  # set by the lost-connection arm, cleared on the next good poll
 
     while True:
-        if halt.tripped:
-            # An out-of-funds provider fails EVERY request — polling on would
-            # only burn the backlog into agent/attempted. Stand down but stay
-            # alive: the heartbeat stays fresh (deliberately halted, not hung),
-            # and the instruction repeats at ERROR every cycle so it can't
-            # scroll out of the logs. Restarting the daemon is the only reset.
+        if halts.all_halted:
+            # Every enabled function's provider is out of funds, and such a fault
+            # fails EVERY request — polling on would only burn the backlog into
+            # agent/attempted. Stand down but stay alive: the heartbeat stays
+            # fresh (deliberately halted, not hung), and the instruction repeats
+            # at ERROR every cycle so it can't scroll out of the logs.
+            # Restarting the daemon is the only reset.
             log.error(
-                "Daemon halted — %s. Add funds to the provider account, "
-                "then restart the daemon to resume processing.",
-                halt.reason,
+                "Daemon halted — every enabled function stopped (%s). Add funds to "
+                "the provider account, then restart the daemon to resume processing.",
+                halts.halted_summary(),
             )
             try:
                 healthcheck_file.write_text(str(asyncio.get_event_loop().time()))
@@ -1328,6 +1439,30 @@ async def run_daemon() -> None:
                 log.warning("Failed to update healthcheck while halted: %s", exc)
             await asyncio.sleep(poll_interval)
             continue
+        if halts.any_halted:
+            # A PARTIAL halt: one function is stopped, the other still has work
+            # to do, so the loop keeps polling. The halted function must not go
+            # quiet about it — same repeated-ERROR discipline as the full
+            # stand-down, naming which function needs the funds.
+            log.error(
+                "Function halted — %s. Add funds to the provider account, then "
+                "restart the daemon to resume it; the other function keeps running.",
+                halts.halted_summary(),
+            )
+            if halts.email_only_halted and not query_narrowed:
+                # Email triage is stopped but newsletter grading is not: narrow
+                # the query the way NEWSLETTER_ONLY does, so the halted
+                # function's backlog stops costing a get_thread per thread per
+                # cycle and can't crowd newsletter threads out of the
+                # max_results page. Halts are restart-reset, so this holds for
+                # the rest of the session.
+                gmail_query += f" to:{newsletter_recipient}"
+                query_narrowed = True
+                log.info(
+                    "Email triage halted — Gmail query narrowed to the newsletter "
+                    "function: %s",
+                    gmail_query,
+                )
         try:
             response = await proxy_client.list_messages(q=gmail_query, max_results=max_emails)
             messages = response.get("messages", [])
@@ -1372,7 +1507,7 @@ async def run_daemon() -> None:
                         cycle_failures=cycle_failures,
                         fetch_sem=fetch_sem,
                         local_deferrals=local_deferrals,
-                        halt=halt,
+                        halts=halts,
                         result_cache=result_cache,
                     )
                     for tid, msg_ids in thread_items

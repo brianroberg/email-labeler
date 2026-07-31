@@ -107,7 +107,20 @@ Corollaries, each `implementation pending (Wave 2)` until landed:
   cycles neither increment nor reset the counter, and local-tier LLM
   unavailability is excluded entirely (the deliberately-offline MLX host makes
   person-thread deferral routine, issue #24).
-- The halt becomes per-function (today: daemon-wide).
+- The halt is per-function — implemented (Wave 2 T9). `FunctionHalts` holds one
+  first-tripper-wins `DaemonHalt` slot per function; the newsletter branch traps
+  `LLMBalanceError` at its `classify_newsletter` call site (the error carries no
+  function provenance, and the newsletter client is also `tier="cloud"`, so the
+  *call site* is what tells the functions apart) while the outer arm serves the
+  email pipeline. A thread whose own function is halted defers below routing —
+  no strike, no marker, no `CycleFailure`. The poll loop stands down only when
+  every *enabled* function is halted (enabled: newsletter iff configured, email
+  iff not `NEWSLETTER_ONLY`); a partial halt keeps polling, names the halted
+  function at ERROR each cycle, and — email halted, newsletter running — narrows
+  the Gmail query with a `to:{recipient}` clause until restart (the mirror
+  direction accepts the fetch-and-skip churn: the query cannot express "not
+  to:recipient"). A shared client ([newsletter.llm] absent) trips both slots
+  within a cycle or two, which is correct: the fault disables both functions.
 - A keyword-free label reply raises instead of silently defaulting to
   LOW_PRIORITY→archive (Rule 1; completes the issue-#64 fail-loud direction).
   The unknown-sender→SERVICE default *stays* (D2).
@@ -262,8 +275,9 @@ the thread unprocessed rather than labeled-but-lost. Dedup on read: newest
 **Status:** implemented.
 
 Rate-limit phrasing is indistinguishable from quota exhaustion; a wrong
-restart-only halt is worse than retry. Balance-signature 402/400/403 halts
-(today daemon-wide; per-function under D5, pending).
+restart-only halt is worse than retry. Balance-signature 402/400/403 halts the
+function whose provider reported it — per-function under D5, implemented in
+Wave 2 T9 (was daemon-wide).
 
 ## D20 — Content-less grading is a failure, not an outcome (issue #30, 2026-07-08)
 

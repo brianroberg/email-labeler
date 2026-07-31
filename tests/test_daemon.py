@@ -457,35 +457,38 @@ class TestProcessSingleThread:
         mock_label_manager.mark_attempted.assert_not_called()
         mock_label_manager.mark_processed.assert_not_called()
 
-    async def test_balance_error_trips_daemon_halt(
+    async def test_balance_error_trips_the_email_function_halt(
         self, mock_proxy, mock_classifier, mock_label_manager, cloud_sem, local_sem,
         mock_thread_response,
     ):
-        """A balance error signals the poll loop (via DaemonHalt) to stop processing."""
+        """A balance error on the email tiers trips the EMAIL function's halt slot
+        (decision D5's scope rule, D19: halts became per-function in Wave 2 T9),
+        signalling the poll loop to stop that function."""
         mock_proxy.get_thread.return_value = mock_thread_response
         mock_classifier.classify_sender.side_effect = LLMBalanceError("out of funds")
-        halt = DaemonHalt()
+        halts = daemon.FunctionHalts()
 
         result = await process_single_thread(
             "thread_broke", ["msg_1"], mock_proxy, mock_classifier, mock_label_manager,
-            cloud_sem, local_sem, max_thread_chars=16000, halt=halt,
+            cloud_sem, local_sem, max_thread_chars=16000, halts=halts,
         )
 
         assert result is False
-        assert halt.tripped is True
-        assert "out of funds" in halt.reason
+        assert halts.email.tripped is True
+        assert "out of funds" in halts.email.reason
 
     async def test_tripped_halt_short_circuits_before_any_work(
         self, mock_proxy, mock_classifier, mock_label_manager, cloud_sem, local_sem,
     ):
-        """Once the halt is tripped, sibling threads in the same cycle must not keep
-        fetching and hammering the known-dead provider."""
-        halt = DaemonHalt()
-        halt.trip("out of funds")
+        """Once every enabled function is halted, sibling threads in the same cycle
+        must not keep fetching and hammering the known-dead provider. (Here only
+        email triage is enabled, so its halt is the whole daemon's.)"""
+        halts = daemon.FunctionHalts()
+        halts.email.trip("out of funds")
 
         result = await process_single_thread(
             "thread_next", ["msg_1"], mock_proxy, mock_classifier, mock_label_manager,
-            cloud_sem, local_sem, max_thread_chars=16000, halt=halt,
+            cloud_sem, local_sem, max_thread_chars=16000, halts=halts,
         )
 
         assert result is False
@@ -497,18 +500,19 @@ class TestProcessSingleThread:
         mock_thread_response,
     ):
         """A thread already past the entry check when a sibling trips the halt must
-        still skip its LLM calls (the expensive step, including any retry ladder)."""
-        halt = DaemonHalt()
+        still skip its LLM calls (the expensive step, including any retry ladder).
+        The post-fetch check is now function-aware and sits below routing (T9)."""
+        halts = daemon.FunctionHalts()
 
         async def fetch_then_sibling_trips(*args, **kwargs):
-            halt.trip("out of funds")
+            halts.email.trip("out of funds")
             return mock_thread_response
 
         mock_proxy.get_thread.side_effect = fetch_then_sibling_trips
 
         result = await process_single_thread(
             "thread_next", ["msg_1"], mock_proxy, mock_classifier, mock_label_manager,
-            cloud_sem, local_sem, max_thread_chars=16000, halt=halt,
+            cloud_sem, local_sem, max_thread_chars=16000, halts=halts,
         )
 
         assert result is False
@@ -1262,7 +1266,8 @@ class TestFailureTracker:
 
 
 class TestDaemonHalt:
-    """In-memory daemon-wide halt state (out-of-funds). Restart is the only reset."""
+    """In-memory halt state for ONE function (out-of-funds); FunctionHalts pairs
+    two of these (D5 scope, D19). Restart is the only reset."""
 
     def test_starts_untripped(self):
         halt = DaemonHalt()
@@ -1578,15 +1583,25 @@ class TestStartupBuildLog:
 
 
 async def _out_of_funds_process(*args, **kwargs):
-    """process_single_thread stand-in: every thread hits an out-of-funds provider."""
-    kwargs["halt"].trip("LLM provider out of funds — status 403 [tier=cloud]: NOT_ENOUGH_BALANCE")
+    """process_single_thread stand-in: every thread hits an out-of-funds provider.
+
+    Trips the email function's slot (decision D5/D19, Wave 2 T9: halts are
+    per-function now). These tests run without [newsletter], so email triage is
+    the only enabled function and its halt stands the whole daemon down.
+    """
+    kwargs["halts"].email.trip(
+        "LLM provider out of funds — status 403 [tier=cloud]: NOT_ENOUGH_BALANCE"
+    )
     return False
 
 
 class TestOutOfFundsHalt:
-    """Once a balance error trips the halt, the poll loop must stand down: no more
-    polling or processing, a recurring admin instruction at ERROR, and a fresh
-    heartbeat (the daemon is alive by design, not hung). Restart-only reset."""
+    """Once a balance error halts every enabled function, the poll loop must stand
+    down: no more polling or processing, a recurring admin instruction at ERROR,
+    and a fresh heartbeat (the daemon is alive by design, not hung). Restart-only
+    reset. Reworked for per-function halts (D5 scope, D19; Wave 2 T9) — here only
+    email triage is enabled, so the daemon-wide behavior these pin is the
+    all-enabled-functions-halted case. TestPerFunctionHalt covers partial halts."""
 
     async def test_halt_stops_polling(self, monkeypatch, tmp_path):
         proxy = await run_poll_cycles(
@@ -1659,6 +1674,211 @@ class TestOutOfFundsHalt:
         # Both halted cycles survived the failed write and still logged the line.
         halted = [r for r in caplog.records if "restart the daemon" in r.getMessage()]
         assert len(halted) == 2
+
+
+class TestPerFunctionHalt:
+    """Functions fail independently (decision D5's scope rule; resolves D19's
+    "today daemon-wide" note): a provider-balance fault halts the function whose
+    provider reported it — loudly — while the other function keeps working. The
+    daemon stands down entirely only when every enabled function is halted.
+    """
+
+    def _run_cycle(
+        self, halts, mock_proxy, mock_classifier, mock_label_manager,
+        mock_newsletter_classifier, cloud_sem, local_sem, output_file,
+    ):
+        """One miniature poll cycle: a newsletter thread and an email thread."""
+
+        async def cycle():
+            return [
+                await process_single_thread(
+                    tid, [tid], mock_proxy, mock_classifier, mock_label_manager,
+                    cloud_sem, local_sem, max_thread_chars=50000,
+                    newsletter_classifier=mock_newsletter_classifier,
+                    newsletter_recipient="newsletters@dm.org",
+                    newsletter_output_file=str(output_file),
+                    halts=halts,
+                )
+                for tid in ("thread_nl", "thread_001")
+            ]
+
+        return cycle()
+
+    async def test_newsletter_balance_fault_halts_newsletter_only(
+        self, mock_proxy, mock_classifier, mock_label_manager,
+        mock_newsletter_classifier, cloud_sem, local_sem,
+        mock_thread_response, newsletter_thread_response, tmp_path,
+    ):
+        """The newsletter provider running out of funds stops newsletter grading
+        only: the email sibling still classifies, in this cycle and the next."""
+        threads = {
+            "thread_nl": newsletter_thread_response,
+            "thread_001": mock_thread_response,
+        }
+        mock_proxy.get_thread.side_effect = lambda thread_id: threads[thread_id]
+        mock_newsletter_classifier.classify_newsletter.side_effect = LLMBalanceError(
+            "newsletter provider out of funds"
+        )
+        halts = daemon.FunctionHalts(newsletter_enabled=True)
+        args = (
+            mock_proxy, mock_classifier, mock_label_manager,
+            mock_newsletter_classifier, cloud_sem, local_sem,
+            tmp_path / "assessments.jsonl",
+        )
+
+        first = await self._run_cycle(halts, *args)
+        second = await self._run_cycle(halts, *args)
+
+        assert first == [False, True]
+        assert second == [False, True]
+        assert halts.newsletter.tripped is True
+        assert halts.email.tripped is False
+        # Email triage kept running across both cycles...
+        assert mock_classifier.classify.await_count == 2
+        assert mock_label_manager.apply_classification.await_count == 2
+        # ...while the halted newsletter function stopped calling its dead
+        # provider after the trip and committed nothing.
+        assert mock_newsletter_classifier.classify_newsletter.await_count == 1
+        mock_label_manager.apply_newsletter_classification.assert_not_called()
+        assert not (tmp_path / "assessments.jsonl").exists()
+
+    async def test_email_balance_fault_leaves_newsletter_running(
+        self, mock_proxy, mock_classifier, mock_label_manager,
+        mock_newsletter_classifier, cloud_sem, local_sem,
+        mock_thread_response, newsletter_thread_response, tmp_path,
+    ):
+        """The mirror: an out-of-funds email tier halts email triage only —
+        newsletter grading keeps grading and labeling."""
+        threads = {
+            "thread_nl": newsletter_thread_response,
+            "thread_001": mock_thread_response,
+        }
+        mock_proxy.get_thread.side_effect = lambda thread_id: threads[thread_id]
+        mock_classifier.classify_sender.side_effect = LLMBalanceError(
+            "cloud provider out of funds"
+        )
+        mock_newsletter_classifier.classify_newsletter.return_value = [
+            StoryResult(
+                text="Content",
+                scores={"simple": 3, "concrete": 3, "personal": 3, "dynamic": 3},
+                average_score=3.0,
+                tier=NewsletterTier.EXCELLENT,
+                themes={"scripture": "emphasized"},
+            )
+        ]
+        halts = daemon.FunctionHalts(newsletter_enabled=True)
+        args = (
+            mock_proxy, mock_classifier, mock_label_manager,
+            mock_newsletter_classifier, cloud_sem, local_sem,
+            tmp_path / "assessments.jsonl",
+        )
+
+        first = await self._run_cycle(halts, *args)
+        second = await self._run_cycle(halts, *args)
+
+        assert first == [True, False]
+        assert second == [True, False]
+        assert halts.email.tripped is True
+        assert halts.newsletter.tripped is False
+        # Newsletter grading kept running across both cycles...
+        assert mock_newsletter_classifier.classify_newsletter.await_count == 2
+        assert mock_label_manager.apply_newsletter_classification.await_count == 2
+        # ...while the halted email function stopped calling its dead provider
+        # and committed nothing at all (no labels, no marker).
+        assert mock_classifier.classify_sender.await_count == 1
+        mock_label_manager.apply_classification.assert_not_called()
+        mock_label_manager.mark_processed.assert_not_called()
+        mock_label_manager.mark_attempted.assert_not_called()
+
+    async def test_halted_email_function_narrows_the_poll_query(
+        self, monkeypatch, tmp_path
+    ):
+        """While only email triage is halted, the poll query is narrowed to the
+        newsletter recipient (the NEWSLETTER_ONLY precedent) so the halted
+        function's backlog stops costing a get_thread per thread per cycle and
+        can't crowd newsletter threads out of the max_results page. Halts are
+        restart-reset, so the narrowing holds."""
+        recipient = load_config()["newsletter"]["recipient"]
+
+        async def halt_email(*args, **kwargs):
+            kwargs["halts"].email.trip("cloud provider out of funds")
+            return False
+
+        proxy = await run_poll_cycles(
+            monkeypatch, tmp_path,
+            [
+                {"messages": [{"id": "m1", "threadId": "t1"}]},
+                {"messages": []},
+                {"messages": []},
+            ],
+            process_mock=halt_email,
+            keep_newsletter=True,
+            newsletter_output_file=tmp_path / "assessments.jsonl",
+        )
+
+        # A partial halt keeps polling — all three cycles ran.
+        queries = [c.kwargs["q"] for c in proxy.list_messages.call_args_list]
+        assert len(queries) == 3
+        assert f"to:{recipient}" not in queries[0]
+        assert all(f"to:{recipient}" in q for q in queries[1:])
+
+    async def test_partial_halt_keeps_polling_and_names_the_halted_function(
+        self, monkeypatch, tmp_path, caplog
+    ):
+        """A halted newsletter function must not stop the poll loop, and must not
+        go quiet either: one ERROR per cycle names it and repeats the
+        add-funds-and-restart instruction."""
+
+        async def halt_newsletter(*args, **kwargs):
+            kwargs["halts"].newsletter.trip("newsletter provider out of funds")
+            return False
+
+        with caplog.at_level(logging.ERROR, logger="email-labeler"):
+            proxy = await run_poll_cycles(
+                monkeypatch, tmp_path,
+                [
+                    {"messages": [{"id": "m1", "threadId": "t1"}]},
+                    {"messages": []},
+                    {"messages": []},
+                ],
+                process_mock=halt_newsletter,
+                keep_newsletter=True,
+                newsletter_output_file=tmp_path / "assessments.jsonl",
+            )
+
+        assert proxy.list_messages.call_count == 3
+        halted = [r for r in caplog.records if "restart the daemon" in r.getMessage()]
+        # Cycles 2 and 3 (the halt trips during cycle 1's processing).
+        assert len(halted) == 2
+        assert all(r.levelno == logging.ERROR for r in halted)
+        assert all("newsletter" in r.getMessage() for r in halted)
+        assert all("add funds" in r.getMessage().lower() for r in halted)
+
+    async def test_both_functions_halted_stands_down(self, monkeypatch, tmp_path, caplog):
+        """Only when EVERY enabled function is halted does the daemon stand down —
+        and the recurring line names both."""
+
+        async def halt_both(*args, **kwargs):
+            kwargs["halts"].email.trip("cloud provider out of funds")
+            kwargs["halts"].newsletter.trip("newsletter provider out of funds")
+            return False
+
+        with caplog.at_level(logging.ERROR, logger="email-labeler"):
+            proxy = await run_poll_cycles(
+                monkeypatch, tmp_path,
+                [{"messages": [{"id": "m1", "threadId": "t1"}]}],
+                process_mock=halt_both,
+                cycles=3,
+                keep_newsletter=True,
+                newsletter_output_file=tmp_path / "assessments.jsonl",
+            )
+
+        # Cycle 1 polls and trips both halts; cycles 2–3 must not poll again.
+        assert proxy.list_messages.call_count == 1
+        halted = [r for r in caplog.records if "restart the daemon" in r.getMessage()]
+        assert len(halted) == 2
+        assert all("email" in r.getMessage() for r in halted)
+        assert all("newsletter" in r.getMessage() for r in halted)
 
 
 class TestNewsletterOutputPathLogging:

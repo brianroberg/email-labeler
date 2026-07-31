@@ -110,7 +110,7 @@ _BALANCE_SIGNATURE = re.compile(
 # 400/403 when the body matches). 429 is excluded even though some providers
 # phrase hard quota exhaustion identically to a per-minute rate limit
 # ("exceeded your current quota"): wrongly converting a transient rate limit
-# into a restart-only daemon halt is worse than letting a rare 429-signaled
+# into a restart-only function halt is worse than letting a rare 429-signaled
 # out-of-funds be retried as provider unavailability (decision D19) — it
 # defers threads each cycle, never strikes (D5), and a sustained one surfaces
 # through the daemon's shared-cause/masquerade ERROR escalation.
@@ -122,11 +122,15 @@ class LLMBalanceError(RuntimeError):
 
     Account-wide, not request-specific: if one request fails for lack of balance,
     every subsequent request to the same provider will too. The daemon therefore
-    treats this as a halt condition (stop processing, tell the admin to add funds
-    and restart) rather than a per-thread give-up — the failing thread is left
-    unprocessed so it's retried after restart. Subclasses ``RuntimeError`` so
-    callers unaware of it (evals) still see a generic LLM failure; the daemon must
-    catch it *before* its ``except RuntimeError`` arm.
+    treats this as a halt condition (stop the affected function, tell the admin to
+    add funds and restart) rather than a per-thread give-up — the failing thread is
+    left unprocessed so it's retried after restart. The halt is per-FUNCTION
+    (decision D5's scope rule, D19): this error carries no function provenance, so
+    the daemon's call site decides which function stops — email triage keeps
+    running when the newsletter provider is the broke one, and vice versa.
+    Subclasses ``RuntimeError`` so callers unaware of it (evals) still see a
+    generic LLM failure; the daemon must catch it *before* its
+    ``except RuntimeError`` arm.
     """
 
 
@@ -210,8 +214,8 @@ class LLMClient:
                 never counted toward give-up.
             LLMBalanceError: If the non-200 response says the provider account is
                 out of funds (402, or a 400/403 whose body carries a balance
-                signature) — account-wide; the daemon halts rather than giving
-                up per-thread.
+                signature) — account-wide; the function whose provider this is
+                halts (D5 scope, D19) rather than giving up per-thread.
             LLMContentError: If the response carries no usable answer — empty/
                 missing content, or finish_reason "length" (answer truncated at
                 the max_tokens budget) — request-specific, a strike candidate.

@@ -409,20 +409,39 @@ docker inspect --format='{{.State.Health.Status}}' agent-stack-email-labeler-1
 When an LLM provider reports the account is out of funds (HTTP 402, or a
 400/403 whose body carries a balance signature such as Novita's
 `NOT_ENOUGH_BALANCE` or Anthropic's "credit balance is too low" — raised as
-`LLMBalanceError`), the daemon stops polling entirely: the fault is
-account-wide, so per-thread retries would only burn the backlog into
-`agent/attempted`. HTTP 429 never halts, even with quota phrasing — a
+`LLMBalanceError`), the **function whose provider it is** stops: the fault is
+account-wide, so per-thread retries would only burn that function's backlog
+into `agent/attempted`. The halt is per-function (decisions D5, D19): a
+newsletter-tier balance fault halts newsletter grading while email triage keeps
+classifying, and vice versa; when the two share one client (`[newsletter.llm]`
+absent) a shared-provider fault halts both within a cycle or two. HTTP 429 never
+halts, even with quota phrasing — a
 per-minute rate limit is worded identically to hard quota exhaustion, and a
 wrong restart-only halt is worse than treating a rare 429-signaled
 out-of-funds as provider unavailability: deferred and retried each cycle,
 never a strike (decision D5), surfacing through the shared-cause/masquerade
 ERROR escalation if sustained. The triggering thread is left unprocessed. The halt is
-in-memory only; **restarting the daemon is the only reset**. While halted the
-daemon logs this line at ERROR once per poll interval and keeps the healthcheck
-timestamp fresh (deliberately halted, not hung — the container stays healthy):
+in-memory only; **restarting the daemon is the only reset**.
+
+While **one** function is halted the loop keeps polling for the other, and logs
+this line at ERROR once per poll interval. If email triage is the halted one and
+newsletter grading is enabled, the Gmail query also gains a `to:<recipient>`
+clause for the rest of the session, so the halted function's backlog neither
+costs a thread fetch per cycle nor crowds newsletter threads out of the
+`max_emails_per_cycle` page:
 
 ```
-Daemon halted — <reason>. Add funds to the provider account, then restart the daemon to resume processing.
+Function halted — email triage: <reason>. Add funds to the provider account, then restart the daemon to resume it; the other function keeps running.
+```
+
+Once **every enabled** function is halted (newsletter grading counts as enabled
+iff `[newsletter]` is configured, email triage iff `NEWSLETTER_ONLY` is unset)
+the daemon stops polling altogether, logging this line at ERROR once per poll
+interval and keeping the healthcheck timestamp fresh (deliberately halted, not
+hung — the container stays healthy):
+
+```
+Daemon halted — every enabled function stopped (<function: reason>; …). Add funds to the provider account, then restart the daemon to resume processing.
 ```
 
 ## Release Identity
@@ -471,7 +490,7 @@ Conventions shared by every TUI:
 | `test_llm_client.py` | `llm_client.py` | Request format, auth headers, `<think>` tag stripping, separate reasoning-field capture (`reasoning`/`reasoning_content`), `finish_reason: length` handling, error handling, out-of-funds (`LLMBalanceError`) detection, availability checks |
 | `test_classifier.py` | `classifier.py` | `parse_sender` formats, `parse_sender_type` edge cases and defaults, `parse_email_label` edge cases and defaults, cloud/local routing, full pipeline |
 | `test_labeler.py` | `labeler.py` | Label verification (all present, partial, none), label ID mapping, inbox/archive actions, single API call per email, per-write semaphore bound (LabelManager-owned `write_sem`, slot released between messages — issue #33) |
-| `test_daemon.py` | `daemon.py` | Service email path, person email path, MLX-unavailable skip, error isolation, out-of-funds halt, config loading, assessment-sink preflight + write-before-label durability, classification result reuse across write-retry cycles (`ResultCache`, issue #29) |
+| `test_daemon.py` | `daemon.py` | Service email path, person email path, MLX-unavailable skip, error isolation, per-function out-of-funds halt (`FunctionHalts`), config loading, assessment-sink preflight + write-before-label durability, classification result reuse across write-retry cycles (`ResultCache`, issue #29) |
 | `test_privacy.py` | `classifier.py`, `daemon.py` | Negative-form privacy tests (registry D2/D3): person-classified bodies reach only the local tier (classifier and daemon level), Stage 1 whole-call payload discipline, unparseable-Stage-1 SERVICE-default pin, VIP short-circuit, newsletter ownership bypass, no cloud fallback on local failure, metadata-shape allowlist |
 | `test_config_utils.py` | `config_utils.py` | Config loading, `{env.VAR}` substitution |
 | `test_env_var_docs.py` | env-var docs (meta-test) | Every env var referenced by daemon sources or `config.toml` `{env.VAR}` is documented in this file's Environment Variables table |

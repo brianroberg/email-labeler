@@ -564,7 +564,8 @@ class TestClassifyNewsletterTransientOutage:
 
     async def test_balance_error_during_quality_propagates(self, nl_classifier, mock_cloud_llm):
         """An out-of-funds LLMBalanceError affects every story (account-wide), so it
-        must propagate to the daemon's halt handling — not be swallowed per-story."""
+        must propagate to the daemon's halt handling — which halts the newsletter
+        function alone (D5 scope, D19) — not be swallowed per-story."""
         mock_cloud_llm.complete.side_effect = [
             ("STORY: Content", ""),                    # extract_stories
             LLMBalanceError("provider out of funds"),  # assess_quality

@@ -14,9 +14,9 @@ that skips non-newsletter threads (for running the newsletter function alone).
 A symmetric `INBOX_ONLY` filter (email triage alone) would be legitimate — the
 asymmetry is an accident of history, not a decision (registry D1).
 Neither function depends on the other, and design values are scoped
-per-function. The failure model (D5) scopes faults per-function as well — note
-its per-function halt is still pending: today a provider-balance halt stops
-the whole daemon (registry D5/D19).
+per-function. The failure model (D5) scopes faults per-function as well: a
+provider-balance halt stops the affected function and leaves the other running
+(registry D5/D19).
 
 Non-goals: this is a single-owner deployment, not a generic multi-user
 product; org-specific content (the Ends Statement themes, the newsletter

@@ -21,9 +21,9 @@ from llm_client import LLMBalanceError, LLMClient, LLMContentError, LLMUnavailab
 log = logging.getLogger(__name__)
 
 # Errors that affect every story, not just the one being graded: propagate out
-# of the per-story isolation handlers (to daemon give-up or the daemon halt)
-# instead of committing a permanently mis-graded newsletter. Single-sourced so
-# the quality and theme arms can't drift apart.
+# of the per-story isolation handlers (to the daemon's cycle attribution, or to
+# the newsletter function's halt) instead of committing a permanently mis-graded
+# newsletter. Single-sourced so the quality and theme arms can't drift apart.
 _PIPELINE_WIDE_ERRORS = (LLMUnavailableError, LLMContentError, LLMBalanceError)
 
 
@@ -562,8 +562,9 @@ class NewsletterClassifier:
         rather than committing a permanently mis-graded newsletter (empty
         tier/themes) and marking it processed. Mirrors the email pipeline's
         transient-outage guarantee. An out-of-funds provider (LLMBalanceError)
-        propagates likewise: the thread stays unprocessed and the daemon halts
-        until the admin adds funds and restarts.
+        propagates likewise: the thread stays unprocessed and the NEWSLETTER
+        function halts until the admin adds funds and restarts — email triage
+        keeps running on its own tiers (decision D5's scope rule, D19).
         """
         stories = await self.extract_stories(body)
         if not stories:
@@ -583,8 +584,9 @@ class NewsletterClassifier:
             except _PIPELINE_WIDE_ERRORS:
                 # transient outage, a content-less response (issue #30), or an
                 # out-of-funds provider: all affect every story, so propagate
-                # (to give-up or the daemon halt) rather than commit a
-                # permanently mis-graded (empty) newsletter.
+                # (to the cycle attribution, or to the newsletter function's
+                # halt) rather than commit a permanently mis-graded (empty)
+                # newsletter.
                 raise
             except Exception:
                 log.warning("Quality assessment failed for story: %s", text[:60])
