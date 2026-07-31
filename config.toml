@@ -177,9 +177,11 @@ model = "claude-sonnet-4-6"
 # single response, so output scales with newsletter size — 1024 truncated
 # multi-story newsletters mid-story. llm_client now raises LLMContentError on
 # finish_reason "length" (issue #64) instead of silently parsing a truncated
-# story list, so an undersized budget here would abandon long newsletters to
-# agent/attempted rather than mis-grade them. Sized by that reasoning (issue
-# #64's Fix 4); this tier has not been live-probed.
+# story list, so an undersized budget here fails loudly rather than mis-grading:
+# a lone over-budget newsletter strikes out to agent/attempted, and several
+# co-failing over-budget newsletters share a signature and are held as
+# shared-cause (D5) — deferred every cycle, backlog kept. Sized by that
+# reasoning (issue #64's Fix 4); this tier has not been live-probed.
 # NOTE: max_tokens is part of the eval cache key (evals/llm_cache.py), so
 # changing it invalidates every cached newsletter response and the next
 # newsletter_run re-bills the whole golden set — while prompt_hash (prompts
@@ -189,9 +191,11 @@ max_tokens = 4096
 temperature = 0
 # 180, not 60: a full-budget 4096-token Sonnet decode at typical non-streaming
 # throughput (~50-80 tok/s) runs 50-80+ seconds — the old 60s bound only fit
-# responses capped at 1024 tokens. A timeout here is give-up-eligible
-# (agent/attempted after repeated strikes), so the timeout must contain the
-# decode the max_tokens budget above allows.
+# responses capped at 1024 tokens. A timeout here is a strike candidate — the
+# cycle attribution counts it only when it blames this newsletter (D5), so a
+# newsletter that keeps timing out alone ends at agent/attempted while several
+# timing out together are held as shared cause — so the timeout must contain
+# the decode the max_tokens budget above allows.
 timeout = 180
 
 

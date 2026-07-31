@@ -181,7 +181,7 @@ did:
   write-before-label table and the sink-preflight warning text, which both
   documented the give-up ending, changed with it.
 - `max_failures` (the strike bound) is an operator knob — implemented (Wave 2
-  T13). It lives in config.toml `[daemon] max_failures` with its sizing
+  T13, `a40c2c2`). It lives in config.toml `[daemon] max_failures` with its sizing
   rationale (the authoritative home, D7), is overridable per run with
   `MAX_FAILURES` via `resolve_int_env` (the `WRITE_PARALLEL` precedent), and
   is documented in README-technical's env table and `[daemon]` key list. The
@@ -339,7 +339,11 @@ Wave 2 T9 (was daemon-wide).
 **Status:** implemented — the exception path with issue #30, the parse-to-None
 path with D5's corollary in Wave 2 T11.
 
-Stories-exist-but-every-grade-errored raises and reaches the give-up path; so
-do stories-exist-but-every-grade-*unparseable* and an extraction reply that
-parses to no stories without saying `NO_STORIES` (T11). A successful zero-story
-extraction remains a valid `no-stories` outcome — the only one.
+Stories-exist-but-every-grade-errored raises rather than recording an outcome;
+so do stories-exist-but-every-grade-*unparseable* and an extraction reply that
+parses to no stories without saying `NO_STORIES` (T11). The raise is a strike
+candidate under D5's cycle-level attribution — counted only when correlation
+blames the newsletter, so one that keeps failing while its siblings grade ends
+findably under `agent/attempted`, while several failing the same way are held
+as shared cause. A successful zero-story extraction remains a valid
+`no-stories` outcome — the only one.

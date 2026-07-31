@@ -504,7 +504,8 @@ class TestContentlessResponse:
     A reasoning model (or GLM) that exhausts max_tokens mid-<think> returns a message
     with reasoning/reasoning_content but no `content` — previously a raw KeyError. It is
     request-specific/permanent (retrying as-is won't help), so it must surface as a
-    RuntimeError (give-up-eligible), NOT LLMUnavailableError (which would retry forever).
+    RuntimeError — a strike candidate under the daemon's cycle-level attribution
+    (D5) — NOT LLMUnavailableError (which would retry forever).
     """
 
     async def test_missing_content_key_raises_runtime_error(self, cloud_client):
@@ -561,8 +562,10 @@ class TestContentlessResponse:
 
         A reasoning model that exhausts max_tokens mid-think can emit `content: ""`
         rather than null. That must raise the same no-content RuntimeError, not fall
-        through to be parsed as an empty classification (which would default to
-        SERVICE / LOW_PRIORITY and silently mislabel the email)."""
+        through to be parsed as an empty classification: Stage 1 would read it as
+        SERVICE — the deliberate best-effort default (D2) — and route a person
+        thread's body to the cloud. (The Stage-2 LOW_PRIORITY→archive default this
+        docstring used to name is gone since D5 Rule 1, Wave 2 T10.)"""
         mock_response = _mock_response(json_data={
             "choices": [{"message": {"role": "assistant", "content": ""}}]
         })
@@ -652,9 +655,10 @@ class TestFinishReasonLength:
 
     async def test_length_with_truncated_content_raises_not_parses(self, local_client):
         """finish_reason "length" with NON-empty content is a truncated answer:
-        it must raise (give-up-eligible), never return for parsing — the
-        truncation lands mid-scaffold before any label, and a parsed default
-        would silently archive person mail."""
+        it must raise (a strike candidate under the daemon's cycle-level
+        attribution, D5), never return for parsing — the truncation lands
+        mid-scaffold before any label, so any label read out of it is an
+        artifact of where the budget ran out."""
         resp = _mock_response(json_data={
             "choices": [{
                 "finish_reason": "length",

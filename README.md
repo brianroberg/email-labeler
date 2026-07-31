@@ -48,7 +48,7 @@ Newsletter labels (see [Newsletter Classification](#newsletter-classification)):
 | `agent/newsletter/good` | Best story averaged >= 2.25 |
 | `agent/newsletter/fair` | Best story averaged >= 1.75 |
 | `agent/newsletter/poor` | Best story averaged < 1.75 |
-| `agent/newsletter/no-stories` | Extraction succeeded and found no stories to grade — only that (registry D5/D20). An extraction reply that can't be parsed, or a newsletter whose stories none of them graded, is a failure: nothing is labeled or recorded and the thread is retried |
+| `agent/newsletter/no-stories` | Extraction succeeded and found no stories to grade — only that (registry D5/D20). An extraction reply that can't be parsed, or a newsletter none of whose stories graded, is a failure: nothing is labeled or recorded, and the thread is retried next cycle — one that keeps failing while other threads succeed ends findably under `agent/attempted` (see [Resilience](#resilience)) |
 | `agent/newsletter/theme/*` | Theme tags: `scripture`, `christlikeness`, `church`, `vocation-family`, `disciple-making` — applied only when a story grades the theme Emphasized (merely-Present themes are recorded in the assessment JSONL but not labeled) |
 
 ## Architecture

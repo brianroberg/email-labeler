@@ -1332,7 +1332,14 @@ class TestFailureAttribution:
         """Poll-loop wiring: once a suspect exists the distinct ERROR is
         emitted, then throttled to the status heartbeat — not repeated every
         cycle (the eight near-instant cycles here fit inside one
-        status_interval, so exactly one ERROR)."""
+        status_interval, so exactly one ERROR).
+
+        MAX_FAILURES is cleared for the same reason as the marking test below:
+        the cycle count has to outrun config.toml's shipped escalation
+        threshold, which the knob (T13) would otherwise let the environment
+        move."""
+        monkeypatch.delenv("MAX_FAILURES", raising=False)
+
         async def masquerade_process(tid, msg_ids, *args, **kwargs):
             if tid == "masq":
                 kwargs["cycle_failures"].append(daemon.CycleFailure(
@@ -1365,7 +1372,11 @@ class TestFailureAttribution:
         agent/attempted, and the cycle summary says so — is pinned on the
         production path, not only through the tests' miniature-cycle helper.
 
-        max_failures is the hardcoded default 5 until T13 makes it a knob."""
+        The five cycles driven here are config.toml's shipped max_failures, so
+        MAX_FAILURES is cleared: since T13 it is an operator knob (D5), and an
+        exported override would move the threshold out from under the count."""
+        monkeypatch.delenv("MAX_FAILURES", raising=False)
+
         async def poison_process(tid, msg_ids, *args, **kwargs):
             if tid == "poison":
                 kwargs["cycle_failures"].append(daemon.CycleFailure(

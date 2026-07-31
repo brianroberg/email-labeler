@@ -362,11 +362,12 @@ class DaemonHalt:
     """Halt state for ONE function's account-level faults (provider out of funds).
 
     Unlike a poison thread (FailureTracker's territory), an out-of-funds provider
-    fails EVERY request it serves: retrying per-thread just burns that function's
-    backlog into agent/attempted. Tripping this stops the function until the admin
-    adds funds and restarts. In-memory and session-scoped by design — a restart
-    is the only way to clear it. First tripper wins: threads in one
-    asyncio.gather cycle may race to trip, and the reason must stay stable.
+    fails EVERY request it serves: retrying per-thread just re-fails that
+    function's whole backlog every cycle, against a provider that cannot answer
+    any of it. Tripping this stops the function until the admin adds funds and
+    restarts. In-memory and session-scoped by design — a restart is the only way
+    to clear it. First tripper wins: threads in one asyncio.gather cycle may
+    race to trip, and the reason must stay stable.
 
     One slot per function, held together by FunctionHalts.
     """
@@ -691,10 +692,15 @@ async def process_single_thread(
     Failures are never handled inline (decision D5): each failure arm records a
     CycleFailure into ``cycle_failures`` — candidate or provider-shaped — and
     returns False; the poll loop's post-gather attribution step decides strikes
-    and marking (attribute_cycle_failures). The assessment-sink arm
-    (AssessmentSinkError) is the one failure that records nothing at all: a
-    sink fault is shared-cause by construction (the disk, not the thread), so
-    there is nothing for correlation to weigh and it is retried forever.
+    and marking (attribute_cycle_failures). Three arms deliberately record no
+    CycleFailure, for three different reasons: the assessment-sink arm
+    (AssessmentSinkError), because a sink fault is shared-cause by construction
+    (the disk, not the thread) — nothing for correlation to weigh, retried
+    forever; the proxy-403 arm (ProxyForbiddenError), because a rejected write
+    is a human answer rather than a failure (decision D6) and is simply
+    re-offered; and a LOCAL-tier LLMUnavailableError, a routine deferral
+    counted in ``local_deferrals`` for the per-cycle summary instead (issue
+    #24).
 
     Halts are per-function (decision D5's scope rule, D19): a balance fault
     trips only the halted function's slot in ``halts``, and a thread whose own

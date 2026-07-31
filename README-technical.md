@@ -39,7 +39,7 @@ email-labeler/
 ├── docs/
 │   └── runbook-agent-attempted-recovery.md  Owner-run manual sweep of threads
 │                       dropped to agent/attempted by issue #64 (time-sensitive:
-│                       cleanest before the first post-#65 image is deployed)
+│                       cleanest while the daemon is stopped)
 ├── scripts/
 │   ├── eval_model.py           One-command-per-model eval wrapper
 │   ├── migrate_assessments.py  Convert pre-#53 records in an assessments JSONL
@@ -327,6 +327,7 @@ What the conversion can and cannot preserve:
 | `stories[].average_score` | Recomputed from the bucketed scores so it agrees with the labels the detail view renders. |
 | `overall_tier`, `stories[].tier` | **Preserved verbatim, never recomputed.** The tier is what the grader concluded under the old rubric and what was applied to the email as a Gmail label; deriving a new one from re-bucketed dimensions would leave the record disagreeing with the message. |
 | `migrated_from` | Added (`"pre-#53"`). The review TUI's detail view surfaces it, so re-bucketed scores are never mistaken for what the grader emitted. |
+| `schema_version` | Added (`1`) — a converted record is the documented v1 shape (with the carve-out under version semantics above: it may still lack `send_date`/`model`, which the migration does not fabricate). The `1` is frozen in the script, not tied to whatever version `write_assessment` stamps today. Records already in the new scheme pass through byte-identical, so an unversioned post-#53 record stays unversioned. |
 
 #### Write-before-label ordering
 
@@ -389,7 +390,7 @@ A 27B model at 8-bit is ~34 GB, leaving only ~14 GB of headroom. Long transcript
 
 ### Prefill latency and the request timeout
 
-The model prefills the whole transcript before emitting a label, at ~100–200 tokens/sec on consumer hardware. A 50k-char (~17k-token) thread can take minutes — longer than `[llm.local] timeout` (default 180s) — so the client times out and the thread errors. On the stateless daemon that thread would otherwise be retried every cycle forever; **`max_thread_chars`** (cap the input) and the **`FailureTracker`** (give up after repeated failures, see `daemon.py`) are the two guards.
+The model prefills the whole transcript before emitting a label, at ~100–200 tokens/sec on consumer hardware. A 50k-char (~17k-token) thread can take minutes — longer than `[llm.local] timeout` (default 180s) — so the client times out and the thread errors. On the stateless daemon that thread would otherwise be retried every cycle forever; **`max_thread_chars`** (cap the input) is the first guard and the **`FailureTracker`** (see `daemon.py`) is the second. The second one is conditional: a timeout is a strike candidate, so it is counted only when the cycle-level attribution blames the thread (decision D5 Rule 2) — one oversized thread timing out while its siblings classify does converge to `agent/attempted`, but several timing out together share a signature and are held as shared cause, deferred every cycle with the backlog kept. Capping the input is what keeps that case from being the norm.
 
 ## Health Checking
 
@@ -413,9 +414,10 @@ When an LLM provider reports the account is out of funds (HTTP 402, or a
 400/403 whose body carries a balance signature such as Novita's
 `NOT_ENOUGH_BALANCE` or Anthropic's "credit balance is too low" — raised as
 `LLMBalanceError`), the **function whose provider it is** stops: the fault is
-account-wide, so per-thread retries would only burn that function's backlog
-into `agent/attempted`. The halt is per-function (decisions D5, D19): a
-newsletter-tier balance fault halts newsletter grading while email triage keeps
+account-wide, so per-thread retries would only re-fail that function's whole
+backlog every cycle against a provider that cannot answer any of it. The halt
+is per-function (decisions D5, D19): a newsletter-tier balance fault halts
+newsletter grading while email triage keeps
 classifying, and vice versa; when the two share one client (`[newsletter.llm]`
 absent) a shared-provider fault halts both within a cycle or two. HTTP 429 never
 halts, even with quota phrasing — a

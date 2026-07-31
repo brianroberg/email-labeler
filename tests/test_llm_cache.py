@@ -479,7 +479,7 @@ class TestLlmSeconds:
         Under parallelism > 1, a shared accumulator lets the first row to
         finish absorb every concurrent row's LLM time into its
         duration_seconds while the others record ~0 — skewing the persisted
-        results JSONL and the web UI averages."""
+        results JSONL and every timing the report reads out of it."""
         import evals.llm_cache as llm_cache_mod
 
         class _FakeTime:

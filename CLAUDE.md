@@ -30,7 +30,7 @@ recipient) is configuration, not something to abstract away.
 - `evals/README-technical.md` — Agent/reference: complete CLI flags for all eval tools, LLM cache internals, chain-of-thought capture format
 - `docs/decisions.md` — Decisions registry: adjudicated tradeoffs reviews must not re-litigate (see Review Charter)
 - `docs/plans/` — Frozen history: every file carries a status header; superseded plans are records, not instructions
-- `docs/runbook-agent-attempted-recovery.md` — Owner-run manual sweep of threads dropped to `agent/attempted` by the issue-#64 bug; time-sensitive (cleanest before the first post-#65 image is deployed), and not to be executed by an agent with Gmail write access
+- `docs/runbook-agent-attempted-recovery.md` — Owner-run manual sweep of threads dropped to `agent/attempted` by the issue-#64 bug; time-sensitive (cleanest while the daemon is stopped, before fresh give-ups mix into the label), and not to be executed by an agent with Gmail write access
 - `scripts/migrate_assessments.py` — Convert pre-#53 records in an assessments JSONL (list themes → graded dicts, 1-5 scores → Poor/OK/Good) so the review TUI can open a file with old history; tiers are preserved verbatim. Dry-run by default, `--in-place` applies (keeps `.bak`)
 
 Authority map (decision D7): every fact has one home. CLAUDE.md holds
