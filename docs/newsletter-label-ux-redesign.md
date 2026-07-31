@@ -1,5 +1,11 @@
 # `newsletter_label` story-refinement UX redesign
 
+> **Status: partially superseded (2026-07-30).** Decision 1 (auto-seed on
+> open) was reversed by issue #59 — the tool is manual-only; the `r` re-seed
+> hotkey and "Auto-seed safety" notes below describe removed behavior.
+> Decision 2 (remove story titles end-to-end) and the redesigned span-edit UX
+> still reflect the shipped design.
+
 Design record for the redesign of the `evals.newsletter_label` TUI (issue #43).
 This documents *why* the tool works the way it does now; the operational
 reference (flags, hotkeys, behavior) lives in

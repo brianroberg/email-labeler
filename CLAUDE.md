@@ -1,41 +1,87 @@
 # Email Labeler
 
-Background daemon that continuously polls Gmail for unclassified emails and applies labels using a two-tier LLM classification system.
+One system, two independent functions sharing a daemon and chassis:
+
+1. **Email triage** — polls Gmail, classifies each thread with a two-tier LLM
+   pipeline, applies inbox/archive labels.
+2. **Newsletter grading** — grades ministry-newsletter stories for writing
+   quality and thematic alignment, appending assessments to a durable JSONL.
+
+Both functions normally run in one daemon process — hybrid operation is the
+default deployment. Newsletter grading is enabled by the presence of
+`[newsletter]` in config.toml, **not** by `NEWSLETTER_ONLY`, which is a filter
+that skips non-newsletter threads (for running the newsletter function alone).
+A symmetric `INBOX_ONLY` filter (email triage alone) would be legitimate — the
+asymmetry is an accident of history, not a decision (registry D1).
+Neither function depends on the other, and design values are scoped
+per-function. The failure model (D5) scopes faults per-function as well — note
+its per-function halt is still pending: today a provider-balance halt stops
+the whole daemon (registry D5/D19).
+
+Non-goals: this is a single-owner deployment, not a generic multi-user
+product; org-specific content (the Ends Statement themes, the newsletter
+recipient) is configuration, not something to abstract away.
 
 ## Documentation
 
 - `README.md` — Human-oriented overview: privacy model, architecture, setup instructions, running commands
-- `README-technical.md` — Agent/reference: project structure, config.toml reference, environment variables, test coverage
+- `README-technical.md` — Agent/reference: project structure, config key reference, environment variables, test coverage
 - `evals/README.md` — Human-oriented eval suite guide: pipeline stages, common workflows, key commands
 - `evals/README-technical.md` — Agent/reference: complete CLI flags for all eval tools, LLM cache internals, chain-of-thought capture format
+- `docs/decisions.md` — Decisions registry: adjudicated tradeoffs reviews must not re-litigate (see Review Charter)
+- `docs/plans/` — Frozen history: every file carries a status header; superseded plans are records, not instructions
 - `docs/runbook-agent-attempted-recovery.md` — Owner-run manual sweep of threads dropped to `agent/attempted` by the issue-#64 bug; time-sensitive (cleanest before the first post-#65 image is deployed), and not to be executed by an agent with Gmail write access
-
-## Privacy Invariant
-
-Person email bodies NEVER leave the local network. Cloud LLM only sees metadata (sender, subject, snippet) for Stage 1 classification. Person email bodies are processed by local MLX/Qwen3.6 only.
-
-## Package Management
-
-Uses `uv` for dependency management. No pip.
-
-```bash
-uv sync --extra dev          # Install all deps including dev
-uv run --extra dev pytest    # Run tests
-uv run --extra dev ruff check .  # Lint
-```
-
-## Project Structure
-
-- `daemon.py` — Main entry point: polling loop + orchestration
-- `classifier.py` — Two-tier classification logic + parsing
-- `labeler.py` — Label verification + application
-- `llm_client.py` — LLM abstraction (cloud + local endpoints)
-- `proxy_client.py` — Gmail API proxy client (copied from email-agent)
-- `gmail_utils.py` — Header/body parsing (copied from email-agent)
-- `config.toml` — Label definitions, prompts, operational params
-- `newsletter_review/` — Textual TUI for browsing newsletter assessment results (`python -m newsletter_review`)
 - `scripts/migrate_assessments.py` — Convert pre-#53 records in an assessments JSONL (list themes → graded dicts, 1-5 scores → Poor/OK/Good) so the review TUI can open a file with old history; tiers are preserved verbatim. Dry-run by default, `--in-place` applies (keeps `.bak`)
-- `tui_common.py` — Shared Textual widgets/screens for all TUIs (see README-technical "TUI Conventions")
+
+Authority map (decision D7): every fact has one home. CLAUDE.md holds
+principles (no literal values). config.toml is authoritative for operational
+values and their rationale — its comments are the design record for sizing.
+README-technical.md is the operational reference (env vars, config key
+meanings, procedures, test coverage). README.md is the human overview.
+docs/decisions.md is the decisions registry. docs/plans/ is frozen history
+(status header on every file). When editing docs: point, don't restate.
+
+## Privacy Posture (email-triage function)
+
+Bodies of threads **classified as person** are processed only by the local
+LLM; the cloud LLM sees metadata (sender, subject, snippet) for Stage 1
+routing. This is best-effort routing, stated honestly (decision D2): Stage 1
+can misclassify, and unparseable Stage 1 output deliberately defaults to
+SERVICE. The residual misroute risk is measured — the eval suite reports a
+privacy-violation rate — not denied. Do not restate this guarantee in
+absolute ("never") form, and do not "fix" the SERVICE default to PERSON.
+
+Ownership rule (D3): a thread with any message To/Cc-addressed to the
+configured newsletter recipient belongs to the newsletter function and is
+organizational content — its full transcript, including person-written
+replies, goes to the cloud by design, without person/service routing.
+
+Public-API stand-ins for the local endpoint (`MLX_API_KEY`, e.g. Novita.ai)
+are non-production/eval-only (D4): pointing the local tier at a public API
+sends person bodies off-network.
+
+## Failure Model (decision D5)
+
+**Rule 1 — Outcomes only come from successes.** A committed outcome (label,
+archive, grade record, `agent/processed`) is only ever produced by a
+successful classification. Failures never commit anything: they defer, set
+aside findably (`agent/attempted`), or stop the affected function loudly.
+
+**Rule 2 — Blame by correlation.** When processing fails, ask whether sibling
+threads are succeeding. Others succeed → the thread is the problem: bounded
+strikes, then set aside under `agent/attempted` (findable, never silent).
+Others failing the same way → the thread is innocent (provider, proxy, disk,
+or our own config/code): no strikes for anyone, get loud, keep the backlog.
+
+**Scope — functions fail independently.** A fault that disables one function
+(e.g. its LLM provider's balance) stops that function loudly; the other
+function continues.
+
+The registry entry D5 lists the corollaries and their implementation status —
+several are `pending`, and until they land, code deviates from this model
+where D5 says so. Current-behavior descriptions live in README.md
+(Resilience) and README-technical (Health Checking, write-before-label) and
+stay accurate to the code, not the model.
 
 ## Architecture
 
@@ -47,49 +93,41 @@ Poll loop → find unprocessed emails
   → Apply label + action via api-proxy → Gmail
 ```
 
+Per-cycle processing is bounded by the cloud/local/fetch/write semaphores —
+sizing rationale lives in config.toml `[daemon]` comments (authoritative).
+`local_parallel` deliberately defaults to serial; see README-technical
+"Local Model Serving & Memory" and the config.toml `[daemon]` comments
+before raising it.
+
 ## Newsletter Classification
 
-When `NEWSLETTER_ONLY=1`, the daemon switches to a newsletter-specific pipeline that grades ministry newsletter stories on writing quality and thematic alignment.
+Whenever `[newsletter]` is configured (it is in the shipped config), threads
+To/Cc-matching the recipient are routed to the newsletter pipeline before
+person/service routing. `NEWSLETTER_ONLY=1` additionally skips all
+non-newsletter threads.
 
 ```
 Poll loop → find unprocessed newsletters (To/Cc matches config recipient)
   → Extract individual stories from newsletter body (Cloud LLM)
   → Score each story on 4 quality dimensions (simple, concrete, personal, dynamic) as Poor/OK/Good (Cloud LLM)
   → Grade each story against Ends Statement themes as Absent/Present/Emphasized (Cloud LLM)
-  → Compute overall tier (excellent/good/fair/poor) from the averaged dimension scores (Poor/OK/Good → 1/2/3; excellent ≥ 2.75, good ≥ 2.25, fair ≥ 1.75, else poor)
-  → Append assessment record to JSONL file  ← before labeling, see Design Decision 6
+  → Compute each story's tier from its averaged dimension scores; overall tier = best story's tier (bands: registry D15 / config.toml)
+  → Append assessment record to JSONL file  ← before labeling (registry D18)
   → Apply tier + theme labels via api-proxy → Gmail
 ```
 
-Newsletter uses its own `[newsletter.llm]` config (currently Sonnet 4.6) independent of the email classification LLM settings.
-
-### Newsletter Labels (must be pre-created in Gmail)
-
-- `agent/newsletter` — Marker (always applied)
-- `agent/newsletter/excellent|good|fair|poor` — Overall quality tier
-- `agent/newsletter/no-stories` — Newsletter contained no extractable stories
-- `agent/newsletter/theme/*` — Per-story theme labels (scripture, christlikeness, church, vocation-family, disciple-making); applied **only when the theme is graded Emphasized** (merely-Present themes are recorded in the assessment JSONL but not labeled; Absent themes are omitted from the record entirely)
+Newsletter grading uses its own `[newsletter.llm]` config — model and
+endpoint independent of the email-classification tiers (see config.toml and
+README-technical's environment variables).
 
 ### Newsletter Review TUI
 
 ```bash
-python -m newsletter_review                          # Browse all assessments
-python -m newsletter_review --tier poor              # Filter by tier
-python -m newsletter_review --theme scripture        # Filter by theme
-python -m newsletter_review --sender dm.org          # Filter by sender
-python -m newsletter_review --since 2026-01-01       # Filter to sends on/after a local date (YYYY-MM-DD)
-python -m newsletter_review --file path/to/file.jsonl  # Custom JSONL path
+python -m newsletter_review
 ```
 
-The listing shows a send-date column and is sorted by send-date descending (newest
-first; records with no send-date sort last). The header names the resolved file
-path, the newsletter count, and the newest send date, so a stale copy of the
-assessments file is recognizable rather than indistinguishable from a live one
-(printed too when the file holds no records, which is when it matters most).
-Records are deduped per `thread_id` on read (newest `timestamp` wins) — see
-Design Decision 6.
-
-Hotkeys: `f` opens the filter menu (`t` tier → `e/g/f/p/c`, `h` theme → `s/c/h/v/d/x`, `s` sender text input, `d` date → `3`=past 30d / `9`=past 90d / `y`=past 365d / `s`=since YYYY-MM-DD / `x`=clear), `Enter` opens detail, `Esc` back, `q` quit.
+Browses the assessments JSONL. Usage, filters, and hotkeys: README.md
+(guarded by test_tui_docs).
 
 ### Newsletter evaluation
 
@@ -104,41 +142,24 @@ golden stories** so it is decoupled from extraction variability; the shared cach
 cheap and self-identifying. See `evals/README.md` (workflows) and
 `evals/README-technical.md` (every CLI flag, cache/prompt_hash details).
 
-## Key Design Decisions
+## Review Charter
 
-1. **Two-tier classification**: Stage 1 (cloud) determines person vs service. Stage 2 routes person bodies to local LLM only.
-2. **Safe defaults**: Unknown sender type → SERVICE (body goes to cloud, safe for non-person). Unknown email label → LOW_PRIORITY (archived, not deleted).
-3. **MLX degradation**: If local MLX is down, person emails are skipped (retried next cycle). Privacy invariant preserved.
-4. **No web server**: Pure asyncio daemon. Health check via file timestamp + Docker HEALTHCHECK.
-5. **Out-of-funds halt**: A provider balance error (HTTP 402, or a 400/403 whose body carries a balance signature like `NOT_ENOUGH_BALANCE` or Anthropic's "credit balance is too low" → `LLMBalanceError`) is account-wide, not a poison thread: the daemon halts polling entirely (in-memory `DaemonHalt`; restart is the only reset), leaves the thread unprocessed (no `agent/attempted`), logs "add funds … restart the daemon" at ERROR each cycle, and keeps the healthcheck heartbeat fresh (halted by design, not hung). 429s never halt — quota phrasing on a rate limit is indistinguishable from transient throttling.
-6. **Assessment record before labels**: the newsletter JSONL is the only durable copy of a grading (Gmail keeps just the coarse tier/theme labels), and `apply_newsletter_classification` also applies `agent/processed`, which drops the thread out of `gmail_query` for good. So the record is written first: a sink fault (unwritable path, full disk) leaves the thread unprocessed and retried rather than labeled-but-lost, and is logged at ERROR with the resolved path instead of swallowed. The sink is preflighted at startup — resolved path + existing record count, plus an ERROR when it isn't a readable/writable file or (in a container) isn't covered by a durable volume (a tmpfs over it counts as no volume). Cost: a label failure after a successful write re-grades and re-appends next cycle, so `load_assessments` keeps only the newest record per `thread_id`, chosen by the record's own `timestamp` (file position is only the tie-break — files get merged, not just appended).
-7. **Bounded-concurrency processing**: Threads in a poll cycle are processed concurrently, bounded by the `cloud_parallel`/`local_parallel` semaphores. `local_parallel` defaults to **1** (env override: `LOCAL_PARALLEL`): each concurrent local request needs its own KV cache, and long transcripts make those multi-GB, so concurrent requests can exceed the GPU's Metal working set and OOM-crash the local server. Raise it only after confirming the model + N KV caches fit; keep ≤ 8. See README-technical "Local Model Serving & Memory".
+Before flagging any finding, reviewers (human or agent) check
+`docs/decisions.md`. A behavior or tradeoff recorded there is a decision, not
+a finding — do not re-litigate it. A finding that contradicts a registry entry
+is valid only if it names the entry and argues the reversal explicitly. A
+change that reverses a registry decision must update that entry in the same
+change.
 
-## Labels (must be pre-created in Gmail)
+## Package Management
 
-- `agent/needs-response` — Leave in inbox
-- `agent/fyi` — Leave in inbox
-- `agent/low-priority` — Archive
-- `agent/processed` — Marker (applied on success / already-handled)
-- `agent/attempted` — Marker applied on give-up (after repeated failures); excluded from `gmail_query` like `agent/processed`, but kept distinct so abandoned threads stay findable
-- `agent/personal` — Sender classified as person (body processed locally)
-- `agent/non-personal` — Sender classified as service (body processed via cloud)
+Uses `uv` for dependency management. No pip.
 
-## Environment Variables
-
-- `PROXY_URL` — API proxy URL (default: `http://host.docker.internal:8000`)
-- `PROXY_API_KEY` — API proxy authentication key
-- `CLOUD_LLM_URL` — Cloud LLM endpoint (any OpenAI-compatible API)
-- `CLOUD_LLM_API_KEY` — Cloud LLM API key
-- `NEWSLETTER_LLM_URL` — Endpoint for the newsletter grading LLM (`[newsletter.llm]`); defaults to `CLOUD_LLM_URL`. Set when the newsletter model needs a different provider (e.g. a Claude model via Anthropic's OpenAI-compatible endpoint)
-- `NEWSLETTER_LLM_API_KEY` — API key for `NEWSLETTER_LLM_URL`. The override is atomic: once `NEWSLETTER_LLM_URL` is set the key comes only from this var (never the cloud key), so set both together
-- `MLX_URL` — Local MLX LLM endpoint
-- `MLX_MODEL` — Local LLM model name (shared with email-agent, referenced in config.toml as `{env.MLX_MODEL}`)
-- `MLX_API_KEY` — Local LLM API key (empty for real MLX, set for public API stand-ins like Novita.ai)
-- `NEWSLETTER_ONLY` — When `1`/`true`/`yes`, daemon runs newsletter classification pipeline instead of email labeling
-- `LOCAL_PARALLEL` — Override `local_parallel` (max concurrent local MLX requests; default 1, keep ≤ 8)
-- `MAX_EMAILS_PER_CYCLE` — Override `max_emails_per_cycle` (max threads per poll cycle; default 10)
-- `WRITE_PARALLEL` — Override `write_parallel` (max concurrent label-application writes; default 4). Sized separately from reads because writes may block on human approval (`WRITE_TIMEOUT`, 300s)
+```bash
+uv sync --extra dev          # Install all deps including dev
+uv run --extra dev pytest    # Run tests
+uv run --extra dev ruff check .  # Lint
+```
 
 ## Testing
 
@@ -169,17 +190,22 @@ test guards against.
 uv run --extra dev pytest tests/ -v
 ```
 
-All tests use mocks — no external services needed. Test files mirror source files:
-- `test_llm_client.py` — LLM client request format, auth, think-tag stripping
-- `test_classifier.py` — Parsing functions + classification routing
-- `test_labeler.py` — Label verification + application actions
-- `test_daemon.py` — Processing pipeline + config loading
-- `test_newsletter_review.py` — TUI data loading, filtering, formatting + Pilot UI tests (navigation, drill-down, filters, quit)
-- `test_eval_newsletter_schemas.py` — Golden-set dataclass round-trip + missing-key tolerance
-- `test_eval_newsletter_harvest.py` — Newsletter harvest filtering, body build, dedup
-- `test_eval_newsletter_label.py` — Story curation + per-story scoring/theme pure functions + Pilot UI tests (undo, labeling, skip-through)
-- `test_eval_newsletter_run.py` — `prompt_hash`, cache reuse, extraction vs quality/theme modes
-- `test_eval_newsletter_report.py` — `match_stories`, tier/dimension/theme metrics, comparison deltas
-- `test_eval_newsletter_cli_docs.py` — Every newsletter eval `--flag` documented in `README-technical.md`
-- `test_newsletter_eval_docs.py` — Newsletter eval modules/tests listed in `README-technical.md` structure + coverage
-- `test_tui_docs.py` — Every Textual TUI (discovered from disk) documented in its nearest `README.md`: launch command in a code block, or named for flag-reached TUIs
+All tests use mocks — no external services needed. Per-module test coverage:
+README-technical.md "Test Coverage by Module" (authoritative).
+
+## Where Things Live
+
+- Project structure and per-module test coverage: README-technical.md
+  (authoritative).
+- Environment variables: README-technical.md (authoritative, test-guarded by
+  test_env_var_docs).
+- Label names and inbox/archive actions: config.toml `[labels]`,
+  `[labels.actions]`, `[newsletter.labels]` (authoritative). All labels must
+  be pre-created in Gmail; the daemon verifies at startup and exits if any are
+  missing. Markers: `agent/processed` (success), `agent/attempted` (give-up,
+  findable), both excluded from `gmail_query`.
+- TUI usage and hotkeys: README.md and evals/README.md (guarded by
+  test_tui_docs). Shared TUI conventions: README-technical.md "TUI
+  Conventions" + `tui_common.py`.
+- Operational values and their rationale: config.toml comments.
+- Adjudicated tradeoffs: docs/decisions.md.

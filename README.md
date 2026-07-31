@@ -1,22 +1,33 @@
 # Email Labeler
 
-A background daemon that continuously polls Gmail for unclassified emails, classifies them using a two-tier LLM system, and applies labels autonomously.
+A background daemon housing two independent functions: **email triage** (classifies unclassified Gmail threads with a two-tier LLM system and applies labels autonomously) and **newsletter grading** (grades ministry-newsletter stories for writing quality and thematic alignment). Both normally run in one daemon.
 
 > For detailed configuration reference, environment variables, project structure, and test coverage, see [README-technical.md](README-technical.md).
 
 ## Privacy Model
 
-Email labeler enforces a strict privacy invariant: **person email bodies never leave the local network.**
+The email-triage function keeps person-email bodies local, best-effort:
 
-The system uses two classification stages to achieve this:
+1. **Stage 1 (Cloud LLM)** sees only metadata — sender, subject, snippet —
+   and classifies the sender as person or service. Bodies are never sent in
+   this stage.
+2. **Stage 2** routes by that result: service-classified bodies go to the
+   cloud LLM; person-classified bodies go to the local MLX instance and do
+   not leave the local network. If the local LLM is unavailable, person
+   emails are skipped and retried — never sent to the cloud as a fallback.
 
-1. **Stage 1 (Cloud LLM)** receives only email metadata — sender, subject line, and Gmail snippet — and determines whether the sender is a real person or an automated service. The full email body is never sent to the cloud in this stage.
+This is best-effort routing, not an absolute guarantee: Stage 1 classifies
+from metadata and can be wrong, and unparseable Stage 1 output deliberately
+defaults to SERVICE. The residual misroute risk is measured — the eval suite
+reports a privacy-violation rate (person threads that were routed as
+service).
 
-2. **Stage 2** routes based on the Stage 1 result:
-   - **Service emails** have their full body sent to the cloud LLM for classification. This is safe because service emails (receipts, newsletters, notifications) contain no personal correspondence.
-   - **Person emails** have their full body sent to a local MLX/Qwen3.6 instance running on the same network. The body never leaves the local network.
-
-If the local LLM is unavailable, person emails are silently skipped and retried on the next poll cycle. They are never sent to the cloud as a fallback.
+**Newsletter threads are exempt by rule** (decision D3): a thread addressed
+(To/Cc) to the configured newsletter recipient is organizational content, and
+its full transcript — including person-written replies in the thread — is
+graded by the cloud LLM without person/service routing. (Today the recipient
+match is a substring check against the To/Cc headers — broader than an exact
+address; the exact-address fix is pending, decision D3.)
 
 ## Label Taxonomy
 
@@ -39,7 +50,7 @@ Newsletter labels (see [Newsletter Classification](#newsletter-classification)):
 | `agent/newsletter/good` | Best story averaged >= 2.25 |
 | `agent/newsletter/fair` | Best story averaged >= 1.75 |
 | `agent/newsletter/poor` | Best story averaged < 1.75 |
-| `agent/newsletter/no-stories` | No extractable stories found |
+| `agent/newsletter/no-stories` | No gradable stories — today applied when zero stories were extracted *or* when every story's grades were unparseable (restricting it to successful zero-story extraction is pending, registry D5/D20) |
 | `agent/newsletter/theme/*` | Theme tags: `scripture`, `christlikeness`, `church`, `vocation-family`, `disciple-making` — applied only when a story grades the theme Emphasized (merely-Present themes are recorded in the assessment JSONL but not labeled) |
 
 ## Architecture
@@ -180,7 +191,7 @@ docker compose build email-labeler
 docker compose up email-labeler
 ```
 
-To classify only newsletters (skipping all other emails):
+To run only the newsletter function (skip email triage):
 
 ```bash
 NEWSLETTER_ONLY=1 docker compose up email-labeler

@@ -1,5 +1,11 @@
 # Newsletter Assessment TUI
 
+> **Status: executed with major divergence; superseded.** Shipped as
+> newsletter_review/tui.py (Textual, after a curses interlude — see
+> 2026-07-03-tui-framework-evaluation.md); tui_data.py and the
+> [project.scripts] entry point never existed; the t/h cycle-filter UX
+> became the f filter menu. Do not implement.
+
 ## Problem
 
 The email-labeler daemon writes newsletter classification results to `data/newsletter_assessments.jsonl`. There's no way to browse, filter, or inspect these results interactively. Reviewing the raw JSONL is tedious, especially when examining the chain-of-thought reasoning the model recorded during classification.

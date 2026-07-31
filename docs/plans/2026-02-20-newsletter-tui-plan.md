@@ -1,6 +1,7 @@
 # Newsletter Assessment TUI Implementation Plan
 
-> **For Claude:** REQUIRED SUB-SKILL: Use superpowers:executing-plans to implement this plan task-by-task.
+> **Status: executed; superseded (see design doc header). Do not
+> implement.**
 
 **Goal:** Build a Textual TUI to browse and filter newsletter assessment JSONL data with tier/theme filtering and CoT inspection.
 

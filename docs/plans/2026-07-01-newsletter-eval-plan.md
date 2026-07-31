@@ -1,5 +1,9 @@
 # Newsletter-Classification Evaluation System
 
+> **Status: executed July 2026.** Correction: this doc says the pipeline is
+> "active under NEWSLETTER_ONLY=1"; grading is actually enabled by
+> [newsletter] config presence (D1).
+
 ## Context
 
 The daemon's newsletter pipeline (`newsletter.py`, active under `NEWSLETTER_ONLY=1`) grades ministry-newsletter stories: it **extracts stories** from a body, **scores** each on 4 quality dimensions (simple/concrete/personal/dynamic, 1–5) → a **tier** (excellent/good/fair/poor), and tags **themes** (scripture/christlikeness/church/vocation-family/disciple-making). Today there is **no way to measure whether this grading is any good** — assessments are written to JSONL and browsed read-only via the `newsletter_review/` TUI, but never scored against ground truth.

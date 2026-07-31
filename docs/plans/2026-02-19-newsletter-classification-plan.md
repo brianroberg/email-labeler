@@ -1,6 +1,7 @@
 # Newsletter Story Classification — Implementation Plan
 
-> **For Claude:** REQUIRED SUB-SKILL: Use superpowers:executing-plans to implement this plan task-by-task.
+> **Status: executed Feb 2026; superseded (see the design doc's header).
+> Do not implement.**
 
 **Goal:** Add a parallel classification pipeline that detects newsletter emails (sent to `newsletters@dm.org`), extracts individual stories, scores each story on a 4-dimension quality rubric, and tags each story with Ends Statement themes.
 
