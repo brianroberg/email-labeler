@@ -41,6 +41,7 @@ from proxy_client import (
     TRANSIENT_TRANSPORT_ERRORS,
     GmailProxyClient,
     ProxyError,
+    ProxyForbiddenError,
     ProxyUnavailableError,
 )
 
@@ -330,6 +331,20 @@ async def _give_up_if_stuck(
         # issue #29.)
         log.warning(
             "Proxy unavailable marking stuck thread %s attempted — will retry next cycle: %s",
+            thread_id, exc,
+        )
+        return False
+    except ProxyForbiddenError as exc:
+        # A proxy 403 on the marker write is a human answer — the operator rejected
+        # the confirmation, or the op is blocked — not a failure (decision D6). One
+        # clean line, no traceback. The rejection blocks the marker; the thread stays
+        # give-up-eligible (its count is left ≥ max_failures, and this arm returns
+        # False so the poll loop's success-only count-clear never runs), so the
+        # marker write is re-offered next cycle. A rejection never *causes* the
+        # give-up — the strikes that reached the threshold came from elsewhere.
+        log.info(
+            "Marker write rejected/blocked by the proxy for thread %s — "
+            "re-offering next cycle: %s",
             thread_id, exc,
         )
         return False
@@ -753,6 +768,21 @@ async def process_single_thread(
         # never give up, or one MLX outage would abandon every person thread.)
         log.warning("api-proxy unavailable processing thread %s: %s", thread_id, exc)
         return await _give_up_if_stuck(thread_id, ids_to_mark, failure_tracker, label_manager)
+    except ProxyForbiddenError as exc:
+        # A proxy 403 on a gated write is a human answer — the operator said
+        # "not now", or the op is blocked — not a failure (decision D6, issue #28
+        # Option A): one clean line, no strike, no marker, no traceback. The thread
+        # is re-offered next cycle; the ResultCache keeps the finished
+        # classification, so the re-offer costs one write attempt, not an LLM
+        # re-run. (A 403 during startup label verification is different — a blocked
+        # op there is a config error, and verify_labels_with_retry lets it
+        # propagate as permanent.)
+        log.info(
+            "Write rejected/blocked by the proxy for thread %s — "
+            "re-offering next cycle: %s",
+            thread_id, exc,
+        )
+        return False
     except httpx.ConnectError as exc:
         # Defensive: a raw ConnectError shouldn't escape the wrapped clients, but if
         # one does it's still a transient outage — retry next cycle, don't give up.

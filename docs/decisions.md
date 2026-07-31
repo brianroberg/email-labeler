@@ -106,7 +106,7 @@ commit outcomes on failure; give-up counting for provider-shaped faults.
 
 ## D6 — Proxy 403 is a human answer, not a failure (2026-07-09, reaffirmed 2026-07-30)
 
-**Status:** implementation pending (Wave 2; originally issue #28 Option A).
+**Status:** implemented (Wave 2; issue #28 Option A).
 
 A 403 on a gated write means an operator said "not now": log one clean line,
 count nothing, re-offer next cycle. A rejection can never cause

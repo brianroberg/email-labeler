@@ -34,7 +34,12 @@ from daemon import (
 from labeler import LabelManager, _get_priority
 from llm_client import LLMBalanceError, LLMClient, LLMUnavailableError
 from newsletter import NewsletterTier, StoryResult
-from proxy_client import ProxyAuthError, ProxyError, ProxyUnavailableError
+from proxy_client import (
+    ProxyAuthError,
+    ProxyError,
+    ProxyForbiddenError,
+    ProxyUnavailableError,
+)
 
 
 @pytest.fixture
@@ -685,6 +690,69 @@ class TestProcessSingleThread:
         mock_classifier.classify_sender.assert_not_called()
         # ...and give-up marks the FULL thread, not just the query stub.
         mock_label_manager.mark_attempted.assert_called_once_with(["msg_001", "msg_002"])
+
+    async def test_rejected_write_defers_without_strike_or_traceback(
+        self, mock_proxy, mock_classifier, mock_label_manager, cloud_sem, local_sem,
+        mock_thread_response, caplog,
+    ):
+        """A proxy 403 on a gated write is a human answer, not a failure (D6, #28).
+
+        The operator saying "not now" must never strike toward give-up: no matter
+        how many cycles the rejection persists, the thread is re-offered next cycle
+        with one clean INFO line — no traceback, no agent/attempted.
+        """
+        mock_proxy.get_thread.return_value = mock_thread_response
+        mock_label_manager.apply_classification.side_effect = ProxyForbiddenError(
+            "modify_message blocked by proxy"
+        )
+        tracker = FailureTracker(max_failures=2)
+
+        with caplog.at_level(logging.INFO):
+            results = [
+                await process_single_thread(
+                    "thread_001", ["msg_001"], mock_proxy, mock_classifier,
+                    mock_label_manager, cloud_sem, local_sem, max_thread_chars=16000,
+                    failure_tracker=tracker,
+                )
+                for _ in range(3)  # past max_failures: rejections never accumulate
+            ]
+
+        assert results == [False, False, False]  # re-offered every cycle, never "handled"
+        mock_label_manager.mark_attempted.assert_not_called()  # a rejection can never end in give-up
+        assert tracker.take_given_up() == []
+        # One clean line per rejection — never an exception traceback.
+        assert all(r.exc_info is None for r in caplog.records)
+        reoffer_logs = [r for r in caplog.records if "re-offering next cycle" in r.getMessage()]
+        assert reoffer_logs and all(r.levelno == logging.INFO for r in reoffer_logs)
+
+    async def test_rejected_marker_write_re_offers(
+        self, mock_proxy, mock_classifier, mock_label_manager, cloud_sem, local_sem, caplog,
+    ):
+        """A proxy 403 on the agent/attempted marker write is a human answer too (D6).
+
+        The rejection blocks the marker — one clean line, no traceback — and the
+        thread stays give-up-eligible, so the marker write is re-offered next cycle.
+        (The rejection never *causes* the give-up: the strikes that reached the
+        threshold came from elsewhere — here, a RuntimeError during classification.)
+        """
+        mock_proxy.get_thread.side_effect = RuntimeError("classification boom")
+        mock_label_manager.mark_attempted.side_effect = ProxyForbiddenError(
+            "marker write rejected"
+        )
+        tracker = FailureTracker(max_failures=1)  # threshold on the first failure
+
+        with caplog.at_level(logging.INFO):
+            result = await process_single_thread(
+                "thread_x", ["msg_1"], mock_proxy, mock_classifier, mock_label_manager,
+                cloud_sem, local_sem, max_thread_chars=16000, failure_tracker=tracker,
+            )
+
+        assert result is False                # marker blocked → not handled
+        assert tracker.take_given_up() == []  # give-up not recorded: the marker never landed
+        # A clean line for the rejection, no traceback anywhere.
+        assert all(r.exc_info is None for r in caplog.records)
+        reoffer_logs = [r for r in caplog.records if "re-offering next cycle" in r.getMessage()]
+        assert reoffer_logs and all(r.levelno == logging.INFO for r in reoffer_logs)
 
     async def test_get_thread_is_bounded_by_fetch_sem(
         self, mock_proxy, mock_classifier, mock_label_manager, cloud_sem, local_sem,
