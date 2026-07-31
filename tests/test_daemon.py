@@ -1495,6 +1495,7 @@ class _StopLoop(Exception):
 async def run_poll_cycles(
     monkeypatch, tmp_path, poll_outcomes, process_mock=None, cycles=None,
     keep_newsletter=False, newsletter_output_file=None, label_manager=None,
+    daemon_overrides=None,
 ):
     """Drive run_daemon through poll cycles, then stop; returns the proxy mock.
 
@@ -1512,6 +1513,8 @@ async def run_poll_cycles(
     `label_manager` supplies the instance the daemon's LabelManager constructor
     returns, so a test can assert on the writes the poll loop itself performs
     (e.g. the post-gather agent/attempted marking).
+    `daemon_overrides` patches [daemon] config keys (e.g. max_failures) so a
+    test can exercise a value config.toml does not ship.
     """
     config = copy.deepcopy(load_config())
     if not keep_newsletter:
@@ -1519,6 +1522,8 @@ async def run_poll_cycles(
     elif newsletter_output_file is not None:
         config["newsletter"]["output_file"] = str(newsletter_output_file)
     config["daemon"]["healthcheck_file"] = str(tmp_path / "healthcheck")
+    if daemon_overrides:
+        config["daemon"].update(daemon_overrides)
     monkeypatch.setattr(daemon, "load_config", lambda: config)
 
     proxy = MagicMock()
@@ -1634,6 +1639,61 @@ class TestStartupBuildLog:
             r.getMessage() == "email-labeler starting — build abc1234"
             for r in caplog.records
         )
+
+
+def _capture_trackers(monkeypatch):
+    """Record the FailureTracker / MasqueradeTracker instances run_daemon builds.
+
+    Wraps the real classes (rather than mocking them) so the daemon's own
+    ``MasqueradeTracker(max_failures=failure_tracker.max_failures)`` wiring
+    still reads a real threshold.
+    """
+    trackers: list[daemon.FailureTracker] = []
+    masquerades: list[daemon.MasqueradeTracker] = []
+    real_failure = daemon.FailureTracker
+    real_masquerade = daemon.MasqueradeTracker
+
+    def make_failure(*args, **kwargs):
+        tracker = real_failure(*args, **kwargs)
+        trackers.append(tracker)
+        return tracker
+
+    def make_masquerade(*args, **kwargs):
+        tracker = real_masquerade(*args, **kwargs)
+        masquerades.append(tracker)
+        return tracker
+
+    monkeypatch.setattr(daemon, "FailureTracker", make_failure)
+    monkeypatch.setattr(daemon, "MasqueradeTracker", make_masquerade)
+    return trackers, masquerades
+
+
+class TestMaxFailuresKnob:
+    """The strike bound is an operator knob (decision D5's `max_failures`
+    corollary): config.toml `[daemon] max_failures` is its authoritative home
+    (D7), `MAX_FAILURES` overrides it per run, and the same number sets the
+    masquerade escalation threshold (D5's masquerade corollary)."""
+
+    async def test_max_failures_env_override(self, monkeypatch, tmp_path):
+        monkeypatch.setenv("MAX_FAILURES", "2")
+        trackers, masquerades = _capture_trackers(monkeypatch)
+
+        await run_poll_cycles(monkeypatch, tmp_path, [{"messages": []}])
+
+        assert trackers[0].max_failures == 2
+        assert masquerades[0].max_failures == 2
+
+    async def test_max_failures_defaults_to_config_value(self, monkeypatch, tmp_path):
+        monkeypatch.delenv("MAX_FAILURES", raising=False)
+        trackers, masquerades = _capture_trackers(monkeypatch)
+
+        await run_poll_cycles(
+            monkeypatch, tmp_path, [{"messages": []}],
+            daemon_overrides={"max_failures": 7},
+        )
+
+        assert trackers[0].max_failures == 7
+        assert masquerades[0].max_failures == 7
 
 
 async def _out_of_funds_process(*args, **kwargs):

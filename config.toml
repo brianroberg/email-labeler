@@ -29,6 +29,16 @@ fetch_parallel = 4
 # Separate from fetch_parallel because writes may block on human approval
 # (WRITE_TIMEOUT, 300s), so the sizing tradeoff differs. Override: WRITE_PARALLEL.
 write_parallel = 4
+# How many strikes a thread takes before it is set aside under agent/attempted.
+# Only failures the cycle-level attribution blames on the thread itself count
+# (decision D5 Rule 2), so 5 is 5 cycles in which the thread failed while its
+# siblings did not — long enough to ride out a bad afternoon, short enough that
+# a genuinely poison thread stops burning LLM spend within minutes of polling.
+# The same number is the masquerade escalation threshold: after this many
+# cycles of provider-shaped failures on one thread while siblings succeed, the
+# daemon starts shouting about it (that thread is retried forever, never
+# abandoned). Override: MAX_FAILURES.
+max_failures = 5
 healthcheck_file = "/tmp/healthcheck"
 
 [labels]

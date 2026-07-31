@@ -1396,8 +1396,11 @@ async def run_daemon() -> None:
 
     # Breaks infinite retry loops: a thread the cycle-level attribution keeps
     # blaming (decision D5) is marked agent/attempted after a few strikes.
-    # Session-scoped — counts reset on restart.
-    failure_tracker = FailureTracker()
+    # Session-scoped — counts reset on restart. Sizing rationale: config.toml
+    # [daemon] max_failures (authoritative); override per run with MAX_FAILURES.
+    failure_tracker = FailureTracker(
+        max_failures=resolve_int_env("MAX_FAILURES", daemon_config.get("max_failures", 5))
+    )
 
     # Watches the single-thread masquerade (provider-shaped failures on one
     # thread while siblings succeed, decision D5): never abandoned, escalated

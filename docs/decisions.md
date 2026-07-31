@@ -66,7 +66,7 @@ Forecloses: presenting a public stand-in as a routine production configuration.
 
 ## D5 — Failure model: two rules and a scope (2026-07-30)
 
-**Status:** model is the governing design now; corollaries pending (Wave 2).
+**Status:** implemented (model Wave 0; corollaries Wave 2).
 
 **Rule 1 — Outcomes only come from successes.** A committed outcome (label,
 archive, grade record, `agent/processed`) is only ever produced by a
@@ -80,16 +80,19 @@ strikes, get loud, keep the backlog intact.
 (e.g. its provider's balance) fails that function loudly without stopping the
 other.
 
-Corollaries, each `implementation pending (Wave 2)` until landed:
+Corollaries — all landed in Wave 2; each names the commit that implemented it,
+and the code no longer deviates from the model anywhere the entry once said it
+did:
 - Exhausted 429/5xx (LLM and proxy) never count toward give-up — implemented
-  (Wave 2 T8). **This deliberately reverses issue #26.** proxy_client's
-  transient-error docstrings are now true; llm_client raises
+  (Wave 2 T8, `957ba96`). **This deliberately reverses issue #26.**
+  proxy_client's transient-error docstrings are now true; llm_client raises
   LLMUnavailableError for an exhausted 429 or any 5xx (other non-200s stay
   RuntimeError — request-specific strike candidates). A 429-signaled
   out-of-funds is likewise retried as unavailability, never a halt (D19) and
   never give-up.
-- Correlation is the attribution mechanism — implemented (Wave 2 T8). Strikes
-  are decided post-gather, per cycle (`attribute_cycle_failures`): a candidate
+- Correlation is the attribution mechanism — implemented (Wave 2 T8,
+  `957ba96`). Strikes are decided post-gather, per cycle
+  (`attribute_cycle_failures`): a candidate
   failure (Timeout / RuntimeError incl. LLMContentError / unexpected
   Exception) counts iff its signature is unique among the cycle's candidate
   failures and, in a multi-thread cycle, at least one sibling was handled
@@ -107,8 +110,9 @@ Corollaries, each `implementation pending (Wave 2)` until landed:
   cycles neither increment nor reset the counter, and local-tier LLM
   unavailability is excluded entirely (the deliberately-offline MLX host makes
   person-thread deferral routine, issue #24).
-- The halt is per-function — implemented (Wave 2 T9). `FunctionHalts` holds one
-  first-tripper-wins `DaemonHalt` slot per function; the newsletter branch traps
+- The halt is per-function — implemented (Wave 2 T9, `da368e6`).
+  `FunctionHalts` holds one first-tripper-wins `DaemonHalt` slot per function;
+  the newsletter branch traps
   `LLMBalanceError` at its `classify_newsletter` call site (the error carries no
   function provenance, and the newsletter client is also `tier="cloud"`, so the
   *call site* is what tells the functions apart) while the outer arm serves the
@@ -122,7 +126,8 @@ Corollaries, each `implementation pending (Wave 2)` until landed:
   to:recipient"). A shared client ([newsletter.llm] absent) trips both slots
   within a cycle or two, which is correct: the fault disables both functions.
 - A keyword-free label reply raises instead of silently defaulting to
-  LOW_PRIORITY→archive — implemented (Wave 2 T10). `parse_email_label` raises
+  LOW_PRIORITY→archive — implemented (Wave 2 T10, `ee3958d`).
+  `parse_email_label` raises
   `LLMContentError` (quoting the reply) when no keyword survives its three
   passes, so an unusable answer commits nothing (Rule 1) and is a strike
   candidate under the correlation attribution; this completes the issue-#64
@@ -132,8 +137,8 @@ Corollaries, each `implementation pending (Wave 2)` until landed:
   SERVICE default still applies. Evals degrade honestly: run_eval turns the
   raise into an error row instead of a silent LOW_PRIORITY prediction.
 - `agent/newsletter/no-stories` may only result from a successful extraction
-  that found zero stories — implemented (Wave 2 T11), closing **two** false
-  paths. `parse_stories` returns `[]` only for an explicit `NO_STORIES` reply
+  that found zero stories — implemented (Wave 2 T11, `a4005ea`), closing **two**
+  false paths. `parse_stories` returns `[]` only for an explicit `NO_STORIES` reply
   and raises `LLMContentError` for any other reply that yields no story
   (empty/whitespace included — unreachable behind llm_client's content guard,
   but the parser's contract must not lie about it). `classify_newsletter`
@@ -146,8 +151,8 @@ Corollaries, each `implementation pending (Wave 2)` until landed:
   false no-stories record; the eval harness, which shares the parser, degrades
   to error rows.
 - Assessment-sink faults are shared-cause: never counted, retried forever —
-  implemented (Wave 2 T12). The daemon re-raises the sink `OSError` as a
-  dedicated `AssessmentSinkError` (newsletter.py) at the `write_assessment`
+  implemented (Wave 2 T12, `1a9d1fd`). The daemon re-raises the sink `OSError`
+  as a dedicated `AssessmentSinkError` (newsletter.py) at the `write_assessment`
   call site and catches it in its own arm ahead of the candidate arms: no
   strike, no `CycleFailure` (the fault never reaches attribution at all), no
   marker — the newsletter is retried every cycle until the operator fixes the
@@ -158,8 +163,13 @@ Corollaries, each `implementation pending (Wave 2)` until landed:
   JSONL write, so "forever" costs no LLM spend. README-technical's
   write-before-label table and the sink-preflight warning text, which both
   documented the give-up ending, changed with it.
-- `max_failures` (the strike bound, currently 5) becomes env-overridable
-  (`MAX_FAILURES`) and documented with the other knobs.
+- `max_failures` (the strike bound) is an operator knob — implemented (Wave 2
+  T13). It lives in config.toml `[daemon] max_failures` with its sizing
+  rationale (the authoritative home, D7), is overridable per run with
+  `MAX_FAILURES` via `resolve_int_env` (the `WRITE_PARALLEL` precedent), and
+  is documented in README-technical's env table and `[daemon]` key list. The
+  same number is the masquerade escalation threshold, so one knob moves both
+  bounds together.
 Forecloses: per-cell relitigating of the failure table; new error paths that
 commit outcomes on failure; give-up counting for provider-shaped faults.
 

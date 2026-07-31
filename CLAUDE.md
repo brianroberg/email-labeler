@@ -77,9 +77,9 @@ or our own config/code): no strikes for anyone, get loud, keep the backlog.
 (e.g. its LLM provider's balance) stops that function loudly; the other
 function continues.
 
-The registry entry D5 lists the corollaries and their implementation status —
-several are `pending`, and until they land, code deviates from this model
-where D5 says so. Current-behavior descriptions live in README.md
+The registry entry D5 lists the corollaries — all implemented (Wave 2), each
+naming its commit. The code obeys this model; a deviation from it is a bug,
+not a documented gap. Current-behavior descriptions live in README.md
 (Resilience) and README-technical (Health Checking, write-before-label) and
 stay accurate to the code, not the model.
 
