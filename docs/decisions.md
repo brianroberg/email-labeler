@@ -95,13 +95,26 @@ did:
   (`attribute_cycle_failures`): a candidate
   failure (Timeout / RuntimeError incl. LLMContentError / unexpected
   Exception) counts iff its signature is unique among the cycle's candidate
-  failures and, in a multi-thread cycle, at least one sibling was handled
-  successfully; marking derives only from the cycle's own strikes, never raw
-  tracker counts. Adjudicated edges: **singleton cycles count** (no siblings
-  to correlate against; the poison thread typically *is* a singleton —
-  residual: a code bug failing the only pending thread accrues strikes,
-  accepted); **zero-success multi-thread cycles count no strikes** (all
-  shared-cause, one ERROR line, backlog kept); **N same-signature poison
+  failures and, when the cycle has more than one *attempting* thread, at least
+  one sibling was handled successfully; marking derives only from the cycle's
+  own strikes, never raw tracker counts. **The correlation denominator is the
+  threads that attempted work** — those handled successfully or that recorded a
+  `CycleFailure` — not every thread the cycle fetched. A thread that only
+  DEFERRED (its function halted, the local tier offline, a `NEWSLETTER_ONLY`
+  skip, a 403-rejected write, an assessment-sink fault) tried nothing and
+  committed nothing, so it is evidence neither of blame nor of innocence and
+  leaves the denominator; it stays in the cycle summary and in both prunes,
+  since it is still pending. (Refinement found in the Wave 2 review of T8's
+  literal wording, "the cycle contained other threads": counting deferral-only
+  threads let a single permanently-deferred sibling — a halted function
+  re-fetches and re-defers its backlog every cycle — make every cycle look
+  multi-thread-and-zero-success, so a genuinely poisoned thread never struck
+  and never reached `agent/attempted`, silently voiding Rule 1's set-aside
+  guarantee.) Adjudicated edges, unchanged: **singleton cycles count** (no
+  attempting siblings to correlate against; the poison thread typically *is* a
+  singleton — residual: a code bug failing the only pending thread accrues
+  strikes, accepted); **zero-success multi-thread cycles count no strikes**
+  (all shared-cause, one ERROR line, backlog kept); **N same-signature poison
   threads shield each other** while they co-fail (the shared-cause ERROR is
   the loudness). The single-thread masquerade (provider-shaped errors,
   siblings succeeding) retries forever, never abandoned: at `max_failures`
@@ -109,7 +122,11 @@ did:
   once per status interval (`MasqueradeTracker`); singleton and zero-success
   cycles neither increment nor reset the counter, and local-tier LLM
   unavailability is excluded entirely (the deliberately-offline MLX host makes
-  person-thread deferral routine, issue #24).
+  person-thread deferral routine, issue #24). The masquerade half needs no
+  denominator change: it moves only on positive evidence (a succeeding thread,
+  and provider-shaped entries that are attempts by construction), which a
+  deferral-only thread can never supply — the blame rule is the asymmetric one,
+  because its no-sibling fallback is to blame.
 - The halt is per-function — implemented (Wave 2 T9, `da368e6`).
   `FunctionHalts` holds one first-tripper-wins `DaemonHalt` slot per function;
   the newsletter branch traps

@@ -462,14 +462,20 @@ def attribute_cycle_failures(
 
       * A candidate failure (Timeout / RuntimeError / unexpected Exception)
         counts a strike iff its signature is unique among the cycle's candidate
-        failures AND — when the cycle contained other threads — at least one of
-        them was handled successfully. Everything else is treated as shared
-        cause (provider, proxy, disk, or our own config/code): no strikes, one
-        ERROR line, backlog kept.
-      * A singleton cycle counts: with no siblings to correlate against,
-        bounded strikes to a findable agent/attempted is the honest fallback —
-        and the poison-thread case is typically a singleton (everything else
-        processed away).
+        failures AND — when other threads ATTEMPTED work this cycle — at least
+        one of them was handled successfully. Everything else is treated as
+        shared cause (provider, proxy, disk, or our own config/code): no
+        strikes, one ERROR line, backlog kept.
+      * The correlation denominator is the threads that attempted work, not
+        every thread the cycle fetched: only a thread that succeeded or
+        recorded a failure is evidence about anything. Threads that merely
+        DEFERRED — their function halted, the local tier offline, a
+        NEWSLETTER_ONLY skip, a 403-rejected write, an assessment-sink fault —
+        tried nothing and committed nothing, so they neither blame nor absolve.
+      * A singleton cycle counts: with no attempting siblings to correlate
+        against, bounded strikes to a findable agent/attempted is the honest
+        fallback — and the poison-thread case is typically a singleton
+        (everything else processed away).
       * Provider-shaped failures never strike. When exactly one thread failed
         provider-shaped and a sibling succeeded, its masquerade counter
         advances (see MasqueradeTracker); ambiguous cycles (singleton,
@@ -480,7 +486,21 @@ def attribute_cycle_failures(
     write can never mark a thread that has since stopped failing.
     """
     any_success = any(result is True for result in results)
-    multi_thread = len(thread_items) > 1
+    # Correlate over the threads that ATTEMPTED work — handled successfully, or
+    # recorded a CycleFailure. A deferral-only thread is not correlation
+    # evidence: leaving it in the denominator made a cycle of "one poisoned
+    # thread + one permanently-deferred thread" look multi-thread-and-
+    # zero-success forever, so the poisoned thread never struck and never
+    # converged to a findable agent/attempted — silently voiding D5 Rule 1's
+    # set-aside guarantee (a halted function re-fetches and re-defers its
+    # threads every cycle, so the shielding persists until restart).
+    failed_threads = {f.thread_id for f in failures}
+    attempted = {
+        tid
+        for (tid, _msg_ids), result in zip(thread_items, results)
+        if result is not False or tid in failed_threads
+    }
+    multi_thread = len(attempted) > 1
     thread_blame = not multi_thread or any_success
 
     candidates = [f for f in failures if not f.provider_shaped]
@@ -502,6 +522,16 @@ def attribute_cycle_failures(
     # failing thread plus a successful sibling increments. Local-tier LLM
     # deferrals never appear in `failures` at all (see the LLMUnavailableError
     # arm), so a closed MLX laptop can't accrue here.
+    #
+    # This half needs no attempting-denominator treatment: it moves only on
+    # POSITIVE evidence — a thread that succeeded, and provider-shaped entries
+    # that are attempts by construction — and a deferral-only thread is neither,
+    # so it can neither increment nor clear a counter. (The blame rule above is
+    # the asymmetric one: its no-siblings fallback is to blame, so a phantom
+    # sibling actively suppresses strikes.) The prune below stays over every
+    # FETCHED thread, as does FailureTracker's in summarize_cycle: a deferred
+    # thread is still pending, and pruning it would drop a count it needs next
+    # cycle.
     for (tid, _msg_ids), result in zip(thread_items, results):
         if result is True:
             masquerade_tracker.clear(tid)

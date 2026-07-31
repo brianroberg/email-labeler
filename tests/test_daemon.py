@@ -1051,6 +1051,84 @@ class TestFailureAttribution:
         assert tracker.take_given_up() == []
         assert any("shared cause" in r.getMessage() for r in caplog.records)
 
+    async def test_deferral_only_sibling_does_not_shield_a_poisoned_thread(
+        self, mock_proxy, mock_classifier, mock_label_manager, cloud_sem, local_sem,
+        mock_thread_response,
+    ):
+        """Correlation weighs only the threads that ATTEMPTED work (D5 Rule 2).
+        A sibling that merely DEFERRED — here the local tier is offline, so the
+        person thread defers quietly with no CycleFailure; equally a
+        halt-deferred thread, a NEWSLETTER_ONLY skip, a 403-rejected write or an
+        assessment-sink fault — tried nothing and committed nothing, so it is
+        evidence about neither blame nor innocence.
+
+        Counting it as a sibling made this cycle look
+        multi-thread-and-zero-success every time, so the genuinely poisoned
+        thread never struck and never converged to a findable agent/attempted —
+        silently voiding D5 Rule 1's "set aside findably" guarantee. The
+        newsletter-halted direction makes the shielding permanent: the deferring
+        thread is re-fetched and re-deferred every cycle until restart."""
+        def route(tid):
+            if tid == "t_poison":
+                raise ValueError("poison thread")
+            return mock_thread_response
+
+        mock_proxy.get_thread.side_effect = route
+
+        async def sender_route(metadata):
+            raise LLMUnavailableError("MLX endpoint down", tier="local")
+
+        mock_classifier.classify_sender.side_effect = sender_route
+        tracker = FailureTracker(max_failures=2)
+
+        for _ in range(2):
+            results = await drive_attribution_cycle(
+                [("t_poison", ["m1"]), ("t_deferred", ["m2"])],
+                mock_proxy, mock_classifier, mock_label_manager, cloud_sem, local_sem,
+                tracker=tracker,
+            )
+
+        assert results == [False, False]
+        mock_label_manager.mark_attempted.assert_called_once_with(["m1"])
+        assert tracker.take_given_up() == ["t_poison"]
+
+    async def test_deferrals_do_not_turn_a_zero_success_cycle_into_a_singleton(
+        self, mock_proxy, mock_classifier, mock_label_manager, cloud_sem, local_sem,
+        mock_thread_response, caplog,
+    ):
+        """Companion to the test above: dropping deferral-only threads from the
+        denominator must not over-correct. Two threads genuinely ATTEMPTED and
+        failed with different signatures, and a third only deferred — the two
+        attempting threads still correlate as one shared cause under the
+        adjudicated zero-success edge (D5), so nobody strikes. max_failures=1,
+        so a wrongly-counted strike would mark immediately."""
+        def route(tid):
+            if tid == "t_a":
+                raise RuntimeError("boom a")
+            if tid == "t_b":
+                raise ValueError("boom b")
+            return mock_thread_response
+
+        mock_proxy.get_thread.side_effect = route
+
+        async def sender_route(metadata):
+            raise LLMUnavailableError("MLX endpoint down", tier="local")
+
+        mock_classifier.classify_sender.side_effect = sender_route
+        tracker = FailureTracker(max_failures=1)
+
+        with caplog.at_level(logging.ERROR, logger="email-labeler"):
+            results = await drive_attribution_cycle(
+                [("t_a", ["m1"]), ("t_b", ["m2"]), ("t_deferred", ["m3"])],
+                mock_proxy, mock_classifier, mock_label_manager, cloud_sem, local_sem,
+                tracker=tracker,
+            )
+
+        assert results == [False, False, False]
+        mock_label_manager.mark_attempted.assert_not_called()
+        assert tracker.take_given_up() == []
+        assert any("shared cause" in r.getMessage() for r in caplog.records)
+
     async def test_masquerade_suspect_escalates_on_heartbeat_and_is_never_abandoned(
         self, mock_proxy, mock_classifier, mock_label_manager, cloud_sem, local_sem,
         mock_thread_response,
