@@ -925,7 +925,7 @@ staying green, and the acceptance grep
   r in caplog.records)` failed: `ERROR … Could not mark stuck thread thread_x
   attempted` with a full `ProxyForbiddenError` traceback.
 
-**T8 (`957ba96`)** — eleven reds; the machinery is the behavior, so most are
+**T8 (`957ba96`)** — ten reds; the machinery is the behavior, so most are
 missing-API failures.
 - `TestProviderShapedStatuses::test_exhausted_429_raises_unavailable_not_runtime`
   — `RuntimeError: LLM request failed with status 429 [tier=cloud
@@ -1261,10 +1261,15 @@ refinement inline, as it does; review-round provenance belongs here.
 
 ### 5. Wave-level review outcome
 
-After T13, the wave was reviewed as a whole across five lenses (failure-model
-semantics, registry/doc coherence, test integrity, integration, plan
-conformance) with independent verifiers per finding. **24 raw findings → 7
-refuted, 17 confirmed, 0 blocking.** Four commits carry the outcome:
+After T13 the wave got a review pass in two stages. First, three fix commits
+landed work already banked from the task rounds — the correlation-denominator
+correctness change (`348bc36`), the mutation-proved coverage sweep (`d8e8fc4`)
+and the doc/comment coherence sweep (`b32267d`); none of them is a response to
+the review below. Then the whole branch was reviewed across five lenses
+(failure-model semantics, registry/doc coherence, test integrity, integration,
+plan conformance) with independent verifiers per finding: **24 raw findings → 7
+refuted, 17 confirmed, 0 blocking**, of which 12 were fixed in `3d51284` and 5
+were deliberately skipped (all five are §6's list). The four commits:
 
 - `348bc36` — the one correctness change (§4, above).
 - `d8e8fc4` — twelve mutation-proved coverage gaps closed in one commit. Method,
@@ -1280,10 +1285,11 @@ refuted, 17 confirmed, 0 blocking.** Four commits carry the outcome:
   sentence, the write-before-label and out-of-funds rationales, the
   `agent/attempted` runbook, D20's pre-T8 give-up wording, D5's missing
   `a40c2c2`, and stale test docstrings).
-- `3d51284` — the remaining confirmed findings: ResultCache prune/clear and
-  poll-loop wiring coverage, `FunctionHalts` enabled-flag coverage, `write_sem`
-  coverage for the two write paths T5 converted but left unpinned, a
-  **non-vacuous** D19 429 guard, and over-claiming prose scoped honestly.
+- `3d51284` — the twelve confirmed findings that were fixed: ResultCache
+  prune/clear and poll-loop wiring coverage, `FunctionHalts` enabled-flag
+  coverage, `write_sem` coverage for the two write paths T5 converted but left
+  unpinned, a **non-vacuous** D19 429 guard, and over-claiming prose scoped
+  honestly.
 
 Two findings were **blocking**, and both were caught during T8's own review
 round — before `957ba96` was settled — and fixed in a test-only fix round:
@@ -1371,9 +1377,10 @@ docstring/altitude sweep — plus items 1, 3 and 5 above. Issue hygiene for
 #26/#28/#29/#30/#33/#35/#68 is prepared as comment drafts on the PR (owner
 actions on merge).
 
-### 7. Acceptance-pass fixes (this commit)
+### 7. Acceptance-pass fixes (`5204bdc`)
 
-T14's coherence audit found four things to fix; they are in this commit:
+T14's coherence audit found four things to fix; they are in `5204bdc`, the
+commit that first appended this record:
 
 1. **docs/decisions.md, D5.** The masquerade clause read "singleton and
    zero-success cycles neither increment nor reset the counter". The code clears
@@ -1399,14 +1406,50 @@ T14's coherence audit found four things to fix; they are in this commit:
 
 Everything else on the acceptance checklist was verified and needed no change:
 D3, D6, D10, D11 and D12 flipped in their implementing commits; D5's Status line
-and all six corollaries resolved, each naming its task commit — `957ba96`,
-`da368e6`, `ee3958d`, `a4005ea`, `1a9d1fd`, `a40c2c2`, every one verified
-against `git log`; D19's "(today daemon-wide; per-function under D5, pending)"
-clause resolved; D20 closed out; and no other registry entry drifted (the
-`3222a54..HEAD` diff of docs/decisions.md touches exactly D3, D5, D6, D10, D11,
-D12, D19, D20, each by a task entitled to it). CLAUDE.md carries no
+and every corollary resolved across the six task commits that implemented them
+— `957ba96` (T8, which carries two corollaries: the 429/5xx never-count and the
+correlation mechanism), `da368e6` (T9), `ee3958d` (T10), `a4005ea` (T11),
+`1a9d1fd` (T12), `a40c2c2` (T13), each named by the corollary it implements and
+every SHA verified against `git log`; D19's "(today daemon-wide; per-function
+under D5, pending)" clause resolved; D20 closed out; and no other registry
+entry drifted (the `3222a54..HEAD` diff of docs/decisions.md touches exactly
+D3, D5, D6, D10, D11, D12, D19, D20, each by a task entitled to it).
+CLAUDE.md carries no
 pending-language anywhere and still holds principles without literal values
 (D7). README.md (Resilience, labels table, the former Safe-defaults bullet) and
 README-technical (write-before-label, sink preflight, Health Checking, env
 table, Test Coverage by Module, Release Identity) describe the new behavior
 only; the CI note is untouched.
+
+### 8. Acceptance-audit follow-up (this commit)
+
+An audit of `5204bdc` itself found four minor defects — one stale docstring and
+three inaccuracies in the record above. All four are corrected here; none is a
+behavior change, so the suite is untouched by them.
+
+1. **daemon.py, `MasqueradeTracker`'s class docstring.** §7 item 1 corrected the
+   "neither increment nor reset" imprecision in D5 and in
+   `attribute_cycle_failures`' docstring, but the same sentence survived in the
+   third home — the tracker's own class docstring, four lines after it correctly
+   says "success-clears". Now mirrors the other two: singleton and zero-success
+   cycles never increment it; only a thread's own success clears a count,
+   whatever the cycle's shape.
+2. **§2, T8's header** said "eleven reds" and then enumerated ten. The workflow
+   record carries twelve `redTests` entries for T8, of which exactly ten are
+   genuine pre-change reds and two are the fix round's mutation proofs — which
+   the entry already separates in its closing line. Corrected to ten.
+3. **§7's corollary count.** "All six corollaries" conflated corollaries with
+   commits: D5 lists **seven** corollary bullets, implemented across **six**
+   task commits, because T8 carries two (the 429/5xx never-count and the
+   correlation mechanism). The six SHAs were and are correct; only the label was
+   wrong. (The `5204bdc` commit message carries the same slip and stands as
+   history — nothing on this branch is amended.)
+4. **§5's framing sentence** attributed all four review commits to the
+   24-finding five-lens pass, when three of them (`348bc36`, `d8e8fc4`,
+   `b32267d`) landed *before* that review and carry work banked from the task
+   rounds; only `3d51284` responds to the 17 confirmed findings (12 fixed, 5
+   skipped — §6's list). Each commit's own bullet was already accurate; the
+   opener now says which stage each belongs to.
+
+§7 is retitled from "(this commit)" to name `5204bdc`, so the two acceptance
+commits stay distinguishable in the record.

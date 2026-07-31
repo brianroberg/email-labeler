@@ -232,9 +232,10 @@ class MasqueradeTracker:
     session-scoped (so a page miss or a restart costs a suspect its count). A cycle
     only counts when it carries correlation evidence — exactly one thread
     failed provider-shaped AND a sibling was handled successfully. Singleton
-    and zero-success cycles neither increment nor reset (no evidence either
-    way), so a genuine short provider outage with one pending thread never
-    false-alarms; the per-thread WARNING each cycle remains its visibility.
+    and zero-success cycles never increment it, so a genuine short provider
+    outage with one pending thread never false-alarms; the per-thread WARNING
+    each cycle remains its visibility. Only a thread's own success clears a
+    count, whatever the cycle's shape — a success is never ambiguous.
     Local-tier LLM unavailability never lands here at all: the deliberately-
     offline MLX host makes "person threads defer while service siblings
     succeed" the routine local state (issue #24), and tracking it would
