@@ -25,9 +25,7 @@ service).
 **Newsletter threads are exempt by rule** (decision D3): a thread addressed
 (To/Cc) to the configured newsletter recipient is organizational content, and
 its full transcript — including person-written replies in the thread — is
-graded by the cloud LLM without person/service routing. (Today the recipient
-match is a substring check against the To/Cc headers — broader than an exact
-address; the exact-address fix is pending, decision D3.)
+graded by the cloud LLM without person/service routing.
 
 ## Label Taxonomy
 

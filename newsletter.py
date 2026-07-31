@@ -11,7 +11,7 @@ import os
 import re
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
-from email.utils import parsedate_to_datetime
+from email.utils import getaddresses, parsedate_to_datetime
 from enum import Enum
 from pathlib import Path
 
@@ -486,15 +486,22 @@ def count_records(path: Path) -> int | None:
 def is_newsletter(messages: list[dict], recipient: str) -> bool:
     """Check if any message in a thread was sent to the newsletter address.
 
-    Checks both To and Cc headers, case-insensitive.
+    Checks both To and Cc headers. The match is an exact addr-spec comparison
+    (decision D3): each header value is parsed as an address list, and a
+    message matches only when one of its addresses equals the configured
+    recipient, case-insensitively. Display names never match, and neither do
+    superstring addresses.
     """
-    target = recipient.lower()
+    target = recipient.casefold()
     for msg in messages:
         headers = msg.get("payload", {}).get("headers", [])
         for header_name in ("To", "Cc"):
-            value = get_header(headers, header_name).lower()
-            if target in value:
-                return True
+            value = get_header(headers, header_name)
+            if not value:
+                continue
+            for _display_name, addr in getaddresses([value]):
+                if addr.casefold() == target:
+                    return True
     return False
 
 

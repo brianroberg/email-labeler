@@ -793,6 +793,67 @@ class TestIsNewsletter:
     def test_empty_messages(self):
         assert is_newsletter([], "newsletters@dm.org") is False
 
+    # Exact-address matching (decision D3): the recipient match is an exact
+    # addr-spec comparison, not a substring test against the raw header value.
+
+    def test_superstring_address_does_not_match(self):
+        messages = [
+            {
+                "payload": {
+                    "headers": [
+                        {"name": "To", "value": "abcnewsletters@dm.org"},
+                    ]
+                }
+            }
+        ]
+        assert is_newsletter(messages, "newsletters@dm.org") is False
+
+    def test_display_name_containing_recipient_does_not_match(self):
+        messages = [
+            {
+                "payload": {
+                    "headers": [
+                        {
+                            "name": "To",
+                            "value": '"newsletters@dm.org fan club" <other@example.org>',
+                        },
+                    ]
+                }
+            }
+        ]
+        assert is_newsletter(messages, "newsletters@dm.org") is False
+
+    def test_bracketed_display_name_form_matches(self):
+        messages = [
+            {
+                "payload": {
+                    "headers": [
+                        {"name": "To", "value": "Newsletter Desk <newsletters@dm.org>"},
+                    ]
+                }
+            }
+        ]
+        assert is_newsletter(messages, "newsletters@dm.org") is True
+
+    def test_multiple_recipients_with_display_names_match(self):
+        messages = [
+            {
+                "payload": {
+                    "headers": [
+                        {
+                            "name": "To",
+                            "value": (
+                                "Alice Example <alice@example.org>, "
+                                "Newsletter Desk <newsletters@dm.org>, "
+                                "Bob Example <bob@example.org>"
+                            ),
+                        },
+                    ]
+                }
+            }
+        ]
+        assert is_newsletter(messages, "newsletters@dm.org") is True
+
 
 # Real /proc/self/mountinfo excerpts (fields: id parent major:minor root
 # mount-point ...). The container-layer case has only the overlay root; the

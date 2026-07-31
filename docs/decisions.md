@@ -45,14 +45,13 @@ findings that treat the SERVICE default as a privacy bug.
 
 ## D3 — Newsletter ownership rule (2026-07-30)
 
-**Status:** docs implemented (Wave 0); exact-address matching pending (Wave 2).
+**Status:** implemented (docs Wave 0; exact-address matching Wave 2).
 
 A thread with any message To/Cc-addressed to the configured newsletter
 recipient belongs to the newsletter function and is organizational content —
 its full transcript, **including person-written replies**, goes to the cloud
 LLM by design, before and instead of person/service routing. The recipient
-match must be an exact address comparison (current substring matching is a
-convicted bug, fixed in Wave 2).
+match is an exact address comparison.
 Forecloses: routing newsletter threads through Stage 1 "to restore the
 invariant"; privacy findings about person replies inside newsletter threads.
 
