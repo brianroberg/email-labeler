@@ -309,3 +309,29 @@ incidental assertion; same reordering in the newsletter test for M6.
 
 CI evidence: recorded on the PR (pull_request run) and on main after merge
 (push run) — see the PR thread.
+
+### Post-execution review corrections (2026-07-30, xhigh review of PR #69)
+
+- **The P5 baseline and "green in every timezone" claims overstated.** They
+  held for the three zones P5 names, but three further tests in
+  tests/test_newsletter_review.py pinned UTC-morning instants and failed at
+  or west of UTC-10 (verified under `TZ=Pacific/Honolulu`; main under
+  `TZ=Pacific/Pago_Pago` had four west-of-UTC failures, not one). Fixed in
+  the review-fix commit with the same local-midday approach (shared
+  `_local_midday_utc_iso` helper), and CI now runs a three-zone TZ matrix
+  (UTC / Pacific/Pago_Pago / Pacific/Kiritimati) so the property is enforced
+  by the gate rather than spot-checked at acceptance.
+- **T2-table deviation not previously recorded:** the table says the
+  local-failure test's mock raises `httpx.ConnectError`; the shipped test
+  raises `LLMUnavailableError` (now with `tier="local"`, so it pins the
+  daemon's local-tier arm specifically).
+- **Review hardening applied in the same commit:** spec'd LLM mocks
+  (`AsyncMock(spec=LLMClient)`) with an all-method `mock_calls` leak sweep
+  and `mock_calls == []` zero-call pins; Stage 1 positional-arity pin
+  (`len(call.args) == 2`); a third fixture sender making the Stage 1
+  short-circuit observable (`call_count == 2`); env-guard regexes unified on
+  `[A-Z0-9_]+` with whitespace-tolerant prefixes/cells and direction (a)
+  parsing actual table rows; shared daemon fixtures promoted to
+  tests/conftest.py; env-section helper imported from test_env_var_docs; CI
+  concurrency group. Re-proof mutations for the changed assertions recorded
+  in the review-fix commit message.

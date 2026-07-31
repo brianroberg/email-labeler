@@ -16,16 +16,15 @@ interpolation) and full-body leaks are both caught. The fixture snippet
 contains neither marker.
 """
 
-import asyncio
 import base64
 from dataclasses import fields
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import AsyncMock, patch
 
 import pytest
 
 from classifier import EmailClassifier, EmailMetadata, SenderType, ThreadMetadata
 from daemon import process_single_thread
-from llm_client import LLMUnavailableError
+from llm_client import LLMClient, LLMUnavailableError
 
 EARLY_MARKER = "EARLY-BODY-MARKER-3c9d"
 LATE_MARKER = "LATE-BODY-MARKER-7f3a"
@@ -40,11 +39,16 @@ def _body(salutation: str) -> str:
 
 
 def _calls_leaking_markers(mock_llm: AsyncMock) -> list:
-    """Every complete() call on the mock whose args or kwargs carry a marker."""
+    """Every call on the mock — any method — whose args or kwargs carry a marker.
+
+    Sweeps mock_calls rather than complete.call_args_list so content routed
+    through a renamed or added client method is still caught; the spec'd
+    fixtures reject methods LLMClient doesn't have."""
     leaks = []
-    for call in mock_llm.complete.call_args_list:
-        blob = " ".join(str(a) for a in call.args) + " " + " ".join(
-            str(v) for v in call.kwargs.values()
+    for call in mock_llm.mock_calls:
+        _name, args, kwargs = call
+        blob = " ".join(str(a) for a in args) + " " + " ".join(
+            str(v) for v in kwargs.values()
         )
         if any(marker in blob for marker in MARKERS):
             leaks.append(call)
@@ -76,14 +80,14 @@ CONFIG = {
 
 @pytest.fixture
 def mock_cloud_llm():
-    llm = AsyncMock()
+    llm = AsyncMock(spec=LLMClient)
     llm.complete.return_value = ("SERVICE", "")  # every mock configured (tuple contract)
     return llm
 
 
 @pytest.fixture
 def mock_local_llm():
-    llm = AsyncMock()
+    llm = AsyncMock(spec=LLMClient)
     llm.complete.return_value = ("FYI", "")  # every mock configured (tuple contract)
     return llm
 
@@ -94,40 +98,20 @@ def classifier(mock_cloud_llm, mock_local_llm):
         return EmailClassifier(cloud_llm=mock_cloud_llm, local_llm=mock_local_llm, config=CONFIG)
 
 
-@pytest.fixture
-def mock_proxy():
-    return AsyncMock()
-
-
-@pytest.fixture
-def mock_label_manager():
-    mgr = AsyncMock()
-    mgr.get_existing_priority = MagicMock(return_value=None)
-    return mgr
-
-
-@pytest.fixture
-def cloud_sem():
-    return asyncio.Semaphore(2)
-
-
-@pytest.fixture
-def local_sem():
-    return asyncio.Semaphore(1)
-
-
-def _message(msg_id: str, sender: str, subject: str, body: str, date: str, to: str = "") -> dict:
+def _message(
+    msg_id: str, sender: str, subject: str, body: str, internal_date: str, to: str = ""
+) -> dict:
     headers = [
         {"name": "From", "value": sender},
         {"name": "Subject", "value": subject},
-        {"name": "Date", "value": date},
+        {"name": "Date", "value": "Mon, 1 Jan 2024 12:00:00 +0000"},
     ]
     if to:
         headers.append({"name": "To", "value": to})
     return {
         "id": msg_id,
         "threadId": "thread_privacy",
-        "internalDate": "1704067200000" if msg_id.endswith("1") else "1704070800000",
+        "internalDate": internal_date,
         "labelIds": ["INBOX"],
         "payload": {
             "headers": headers,
@@ -137,12 +121,17 @@ def _message(msg_id: str, sender: str, subject: str, body: str, date: str, to: s
 
 
 def _thread_dict(senders: list[str], to: str = "") -> dict:
-    """Two-message thread; marker-bearing bodies; snippet on the latest message."""
+    """One marker-bearing message per sender; snippet on the latest message."""
     messages = [
-        _message("msg_1", senders[0], "Quarterly update", _body("hello"),
-                 "Mon, 1 Jan 2024 12:00:00 +0000", to=to),
-        _message("msg_2", senders[-1], "Re: Quarterly update", _body("thanks"),
-                 "Mon, 1 Jan 2024 13:00:00 +0000", to=to),
+        _message(
+            f"msg_{i}",
+            sender,
+            "Quarterly update" if i == 1 else "Re: Quarterly update",
+            _body("hello" if i == 1 else "thanks"),
+            internal_date=str(1704067200000 + i * 3_600_000),
+            to=to,
+        )
+        for i, sender in enumerate(senders, start=1)
     ]
     messages[-1]["snippet"] = SNIPPET_TEXT  # daemon reads the latest message's snippet
     return {"id": "thread_privacy", "messages": messages}
@@ -183,15 +172,21 @@ class TestPersonRouting:
         pre-routing cloud payload in any slot fails, not just one carrying
         the sentinels.
         """
-        senders = ["Notification Bot <bot@example.com>", "Alice Example <alice@example.com>"]
+        senders = [
+            "Notification Bot <bot@example.com>",
+            "Alice Example <alice@example.com>",
+            "Carol Example <carol@example.com>",
+        ]
         mock_proxy.get_thread.return_value = _thread_dict(senders)
-        # First sender parses SERVICE, second PERSON (exercises the loop + short-circuit).
+        # First sender parses SERVICE, second PERSON; the third sender existing
+        # makes the short-circuit observable — dropping the early return would
+        # issue a third Stage 1 call and fail the call_count pin below.
         mock_cloud_llm.complete.side_effect = [("SERVICE", ""), ("PERSON", "cot")]
         mock_local_llm.complete.return_value = ("NEEDS_RESPONSE", "")
 
         result = await process_single_thread(
             "thread_privacy",
-            ["msg_1", "msg_2"],
+            ["msg_1", "msg_2", "msg_3"],
             mock_proxy,
             classifier,
             mock_label_manager,
@@ -202,8 +197,9 @@ class TestPersonRouting:
 
         assert result is True
         sender_cfg = CONFIG["prompts"]["sender_classification"]
-        assert mock_cloud_llm.complete.call_count == 2
-        for call, sender in zip(mock_cloud_llm.complete.call_args_list, senders):
+        assert mock_cloud_llm.complete.call_count == 2  # short-circuit: carol never classified
+        for call, sender in zip(mock_cloud_llm.complete.call_args_list, senders[:2]):
+            assert len(call.args) == 2  # arity pin: no widening via new positional slots
             assert call.args[0] == sender_cfg["system"]
             assert call.args[1] == sender_cfg["user_template"].format(
                 sender=sender, subject="Quarterly update", snippet=SNIPPET_TEXT
@@ -227,7 +223,7 @@ class TestPersonRouting:
         # Second element exists only so a mutated cloud-fallback path has
         # something to consume — the unmutated flow never reaches it.
         mock_cloud_llm.complete.side_effect = [("PERSON", "cot"), ("FYI", "")]
-        mock_local_llm.complete.side_effect = LLMUnavailableError("local LLM down")
+        mock_local_llm.complete.side_effect = LLMUnavailableError("local LLM down", tier="local")
 
         result = await process_single_thread(
             "thread_privacy",
@@ -268,7 +264,7 @@ class TestServiceRouting:
         result = await classifier.classify(metadata, _body("your order"))
 
         assert result.sender_type == SenderType.SERVICE
-        assert mock_local_llm.complete.call_count == 0
+        assert mock_local_llm.mock_calls == []
         stage2_user = mock_cloud_llm.complete.call_args_list[1].args[1]
         assert all(marker in stage2_user for marker in MARKERS)
 
@@ -294,7 +290,7 @@ class TestServiceRouting:
         result = await classifier.classify(metadata, _body("hello"))
 
         assert result.sender_type == SenderType.SERVICE
-        assert mock_local_llm.complete.call_count == 0
+        assert mock_local_llm.mock_calls == []
 
 
 # ── VIP short-circuit: no cloud involvement at all ───────────────────────
@@ -318,7 +314,7 @@ class TestVipRouting:
         result = await classifier.classify(metadata, _body("hi"))
 
         assert result.sender_type == SenderType.PERSON
-        assert mock_cloud_llm.complete.call_count == 0
+        assert mock_cloud_llm.mock_calls == []
         local_user = mock_local_llm.complete.call_args.args[1]
         assert all(marker in local_user for marker in MARKERS)
 
@@ -360,8 +356,8 @@ class TestNewsletterOwnership:
         )
 
         assert result is True
-        assert mock_cloud_llm.complete.call_count == 0
-        assert mock_local_llm.complete.call_count == 0
+        assert mock_cloud_llm.mock_calls == []
+        assert mock_local_llm.mock_calls == []
         transcript = newsletter_classifier.classify_newsletter.call_args.args[0]
         assert all(marker in transcript for marker in MARKERS)
 
