@@ -1,6 +1,7 @@
 # Wave 1 — Enforcement (privacy negative-form tests, CI, #67)
 
-> **Status: proposed 2026-07-30** (awaiting owner review; not executed).
+> **Status: executed 2026-07-30** (owner-approved with T4 included; see the
+> Execution record at the end for the mutation log).
 > Drafted after the Wave 0.5 issue triage; #67 is absorbed into this wave per
 > the triage disposition on issue #68.
 
@@ -276,3 +277,35 @@ the rest of the meta-test backfill stays with Wave 3.
    (home of the mutation log and any accepted deviations, per the Wave 0
    precedent) and flip this plan's status header `proposed → executed`
    (D8).
+
+## Execution record (2026-07-30)
+
+Executed T1–T4 in order (T4 included by owner decision), one commit each,
+full suite + ruff green after every task. Tri-timezone acceptance
+(`TZ=UTC` / `America/New_York` / `Asia/Tokyo`): 1302 passed + 123 subtests
+in each. `git diff main -- '*.py'` touches only `tests/` (P1 held).
+
+Mutation log (each applied transiently, observed red, reverted — the
+production tree was verified clean after the pass):
+
+| Mutation | Applied | Red observed on |
+|---|---|---|
+| M1 tier expression → always cloud | classifier.py `classify_email` | `test_person_thread_body_reaches_only_local_llm` (+ 3 route-dependent siblings) |
+| M2 snippet → full transcript | daemon.py metadata build | `test_person_thread_end_to_end_daemon` (whole-call equality) + local-failure leak sweep |
+| M3 tier expression → always local | classifier.py `classify_email` | both `TestServiceRouting` tests |
+| M4 unparseable default → PERSON | classifier.py `parse_sender_type` | `test_unparseable_stage1_defaults_to_service_route` |
+| M5 VIP short-circuit disabled | classifier.py `classify_sender` | `test_vip_sender_skips_cloud_entirely` |
+| M6 newsletter branch forced False | daemon.py newsletter check | `test_newsletter_thread_bypasses_stage1_and_local` (on the cloud-count assertion) |
+| M7a `body` field on ThreadMetadata | classifier.py | `test_metadata_shapes_cannot_carry_bodies` |
+| M7b `body` field on EmailMetadata | classifier.py | `test_metadata_shapes_cannot_carry_bodies` (other arm) |
+| M8 cloud fallback on local failure | classifier.py `classify_email` | `test_person_thread_local_failure_never_falls_back_to_cloud` (on the leak sweep) |
+| M9 bogus var in .env.example | .env.example | `test_env_example_vars_are_documented` (subtest `NOT_A_REAL_VAR`) |
+| M10 `PROXY_API_KEY` commented out | .env.example | `test_required_vars_present_and_active` (subtest `PROXY_API_KEY`) |
+
+Accepted implementation refinements (within plan scope): the local-failure
+test's leak assertion is ordered before the result assertion (and its cloud
+mock carries a spare tuple) so M8's red lands on the leak sweep, not on an
+incidental assertion; same reordering in the newsletter test for M6.
+
+CI evidence: recorded on the PR (pull_request run) and on main after merge
+(push run) — see the PR thread.
