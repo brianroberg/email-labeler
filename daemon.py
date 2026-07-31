@@ -194,6 +194,83 @@ class FailureTracker:
         return out
 
 
+@dataclass
+class CachedEmailResult:
+    """ResultCache payload for the email pipeline: recorded after Stage 2
+    succeeds, consumed by a later cycle's label-write retry."""
+
+    label: EmailLabel
+    sender_type: SenderType
+
+
+@dataclass
+class CachedNewsletterResult:
+    """ResultCache payload for the newsletter pipeline.
+
+    ``story_results`` is cached because a sink-fault retry rebuilds the JSONL
+    record from it. ``assessment_written`` flips once ``write_assessment``
+    returns, so a labels-only retry never appends a duplicate record for the
+    same fingerprint; a fingerprint invalidation legitimately re-grades and
+    re-appends, with D18's newest-timestamp dedup as the read-side semantics.
+    """
+
+    best_tier: NewsletterTier | None
+    all_themes: dict[str, str]
+    story_results: list
+    assessment_written: bool = False
+
+
+class ResultCache:
+    """Keeps finished classification results across cycles while their label
+    writes keep failing (issue #29).
+
+    A transient write-phase fault used to discard the whole classification and
+    re-run it every cycle — Stage 1 + Stage 2 (the scarce local GPU pass for
+    person threads), or a full newsletter extraction + grading. Caching the
+    result means a failed write costs only a write retry.
+
+    Maps thread_id → (fingerprint, payload). The fingerprint is the sorted
+    tuple of the thread's message ids: a new message changes the input, so a
+    mismatch drops the entry and the thread classifies fresh. In-memory and
+    session-scoped like FailureTracker; entries are cleared on a successful
+    label write and pruned each cycle to the still-pending set.
+    """
+
+    def __init__(self):
+        self._entries: dict[str, tuple[tuple[str, ...], object]] = {}
+
+    def get(self, thread_id: str, fingerprint: tuple[str, ...]) -> object | None:
+        """Return the cached payload if *fingerprint* still matches, else None.
+
+        A mismatched fingerprint means the thread's messages changed since it
+        was classified — the stale entry is dropped so the caller reclassifies.
+        """
+        entry = self._entries.get(thread_id)
+        if entry is None:
+            return None
+        cached_fingerprint, payload = entry
+        if cached_fingerprint != fingerprint:
+            del self._entries[thread_id]
+            return None
+        return payload
+
+    def put(self, thread_id: str, fingerprint: tuple[str, ...], payload: object) -> None:
+        self._entries[thread_id] = (fingerprint, payload)
+
+    def clear(self, thread_id: str) -> None:
+        self._entries.pop(thread_id, None)
+
+    def prune(self, active_thread_ids) -> None:
+        """Drop entries for threads no longer pending (mirrors FailureTracker.prune).
+
+        A cached result whose thread leaves the query — labeled externally,
+        archived, or given up — would otherwise leak for the daemon's lifetime;
+        a thread with a pending write re-matches every cycle, so it survives.
+        """
+        active = set(active_thread_ids)
+        self._entries = {tid: e for tid, e in self._entries.items() if tid in active}
+
+
 class DaemonHalt:
     """Daemon-wide halt state for account-level faults (provider out of funds).
 
@@ -248,8 +325,9 @@ async def _give_up_if_stuck(
         # count-clear never runs), and the marker write is retried next cycle once the
         # proxy recovers. Log a clean warning rather than spamming a traceback for an
         # expected transient condition. (The thread keeps re-matching the query until it
-        # is actually labeled; skipping the re-classification in that window is a
-        # separate efficiency concern, tracked in #29.)
+        # is actually labeled; if its classification already succeeded, the ResultCache
+        # serves it back in that window, so retry cycles re-attempt only the write —
+        # issue #29.)
         log.warning(
             "Proxy unavailable marking stuck thread %s attempted — will retry next cycle: %s",
             thread_id, exc,
@@ -330,11 +408,15 @@ async def process_single_thread(
     fetch_sem: asyncio.Semaphore | None = None,
     local_deferrals: list[str] | None = None,
     halt: "DaemonHalt | None" = None,
+    result_cache: "ResultCache | None" = None,
 ) -> bool:
     """Process a single thread through the classification pipeline.
 
     Fetches the full thread, formats all messages into a transcript,
     classifies once, and applies labels to all messages in the thread.
+    A classification whose label write failed in a prior cycle is reused from
+    result_cache (issue #29) instead of being re-run, as long as the thread's
+    message ids are unchanged.
 
     Uses semaphores to bound concurrent LLM requests:
     - cloud_sem: acquired for Stage 1 (sender classification) and Stage 2 SERVICE emails
@@ -395,6 +477,11 @@ async def process_single_thread(
         all_msg_ids = [msg["id"] for msg in messages]
         ids_to_mark = all_msg_ids
 
+        # Input fingerprint for the session ResultCache (issue #29): a new
+        # message changes the sorted id tuple, so a cached classification is
+        # only ever reused for exactly the content it was computed from.
+        fingerprint = tuple(sorted(all_msg_ids))
+
         # Re-check after the fetch: a sibling may have tripped the halt while this
         # thread was fetching. Everything past here issues LLM requests (including
         # any retry backoff), which are guaranteed to fail out-of-funds too.
@@ -410,19 +497,44 @@ async def process_single_thread(
                 send_date = parse_send_date(
                     get_header(first_headers, "Date"), messages[0].get("internalDate")
                 )
-                transcript = format_thread_transcript(messages, max_thread_chars)
 
-                async with cloud_sem:
-                    story_results = await newsletter_classifier.classify_newsletter(transcript)
+                # Reuse a finished grading whose write failed in a prior cycle
+                # (issue #29): skip re-extraction/re-grading and go straight to
+                # the writes it still owes.
+                cached_nl = result_cache.get(thread_id, fingerprint) if result_cache else None
+                if cached_nl is not None:
+                    log.info(
+                        "Newsletter thread %s: reusing cached grading from a prior "
+                        "cycle (write still pending)",
+                        thread_id,
+                    )
+                    story_results = cached_nl.story_results
+                    best_tier = cached_nl.best_tier
+                    all_themes = cached_nl.all_themes
+                else:
+                    transcript = format_thread_transcript(messages, max_thread_chars)
 
-                # Determine overall tier (best story's tier)
-                best_tier = None
-                for sr in story_results:
-                    if sr.tier is not None:
-                        if best_tier is None or _TIER_RANK.get(sr.tier, 0) > _TIER_RANK.get(best_tier, 0):
-                            best_tier = sr.tier
-                # Merge graded themes across stories (strongest grade per theme)
-                all_themes = aggregate_theme_grades(story_results)
+                    async with cloud_sem:
+                        story_results = await newsletter_classifier.classify_newsletter(transcript)
+
+                    # Determine overall tier (best story's tier)
+                    best_tier = None
+                    for sr in story_results:
+                        if sr.tier is not None:
+                            if best_tier is None or _TIER_RANK.get(sr.tier, 0) > _TIER_RANK.get(best_tier, 0):
+                                best_tier = sr.tier
+                    # Merge graded themes across stories (strongest grade per theme)
+                    all_themes = aggregate_theme_grades(story_results)
+
+                    # Cache the grading before any write is attempted, so a sink
+                    # or label fault costs a write retry, not an LLM re-run.
+                    cached_nl = CachedNewsletterResult(
+                        best_tier=best_tier,
+                        all_themes=all_themes,
+                        story_results=story_results,
+                    )
+                    if result_cache is not None:
+                        result_cache.put(thread_id, fingerprint, cached_nl)
 
                 # Persist the assessment BEFORE the labels commit. The JSONL record
                 # is the only durable copy of the grading — Gmail keeps just the
@@ -434,7 +546,9 @@ async def process_single_thread(
                 # thread never re-graded. Writing first means a sink fault leaves the
                 # thread unprocessed, so the next cycle retries it (and a persistent
                 # fault ends at the give-up path's findable agent/attempted).
-                if newsletter_output_file:
+                # Skipped once assessment_written: for an unchanged fingerprint
+                # the record never repeats — a retry re-attempts only the labels.
+                if newsletter_output_file and not cached_nl.assessment_written:
                     try:
                         write_assessment(
                             output_file=newsletter_output_file,
@@ -459,12 +573,15 @@ async def process_single_thread(
                             thread_id,
                         )
                         raise
+                    cached_nl.assessment_written = True
 
                 await label_manager.apply_newsletter_classification(
                     message_ids=all_msg_ids,
                     tier=best_tier,
                     themes=all_themes,
                 )
+                if result_cache is not None:
+                    result_cache.clear(thread_id)
 
                 story_count = len(story_results)
                 log.info(
@@ -493,51 +610,79 @@ async def process_single_thread(
             # above the priority check, so a failed write here gives up on the whole
             # thread, not just the query stubs.
             await label_manager.mark_processed(all_msg_ids)
+            if result_cache is not None:
+                result_cache.clear(thread_id)
             log.info("Thread %s already at max priority, marking processed", thread_id)
             return True
 
-        # Extract unique senders (preserve order)
-        senders = []
-        seen = set()
-        for msg in messages:
-            headers = msg["payload"]["headers"]
-            sender = get_header(headers, "From")
-            if sender and sender not in seen:
-                senders.append(sender)
-                seen.add(sender)
-
-        if not senders:
-            log.warning("Thread %s has no valid senders, skipping", thread_id)
-            return False
-
         first_headers = messages[0]["payload"]["headers"]
         subject = get_header(first_headers, "Subject")
-        snippet = messages[-1].get("snippet", "")  # latest message snippet
 
-        metadata = ThreadMetadata(
-            thread_id=thread_id,
-            senders=senders,
-            subject=subject,
-            snippet=snippet,
-        )
-
-        # Format thread transcript
-        transcript = format_thread_transcript(messages, max_thread_chars)
-
-        # Stage 1: classify sender (always cloud LLM)
-        async with cloud_sem:
-            sender_type, sender_raw, sender_cot = await classifier.classify_sender(metadata)
-
-        # Stage 2: classify email (routed by sender type)
-        if sender_type == SenderType.PERSON:
-            async with local_sem:
-                result = await classifier.classify(metadata, transcript, sender_type, sender_raw)
+        # Reuse a finished classification whose label write failed in a prior
+        # cycle (issue #29): skip Stage 1/Stage 2 (the scarce local GPU pass
+        # for person threads) and go straight to the label write. The
+        # no-downgrade check below still runs, against the freshly fetched
+        # thread's labels.
+        result = None
+        cached_email = result_cache.get(thread_id, fingerprint) if result_cache else None
+        if cached_email is not None:
+            log.info(
+                "Thread %s: reusing cached classification from a prior cycle "
+                "(write still pending)",
+                thread_id,
+            )
+            label = cached_email.label
+            applied_sender_type = cached_email.sender_type
         else:
+            # Extract unique senders (preserve order)
+            senders = []
+            seen = set()
+            for msg in messages:
+                headers = msg["payload"]["headers"]
+                sender = get_header(headers, "From")
+                if sender and sender not in seen:
+                    senders.append(sender)
+                    seen.add(sender)
+
+            if not senders:
+                log.warning("Thread %s has no valid senders, skipping", thread_id)
+                return False
+
+            snippet = messages[-1].get("snippet", "")  # latest message snippet
+
+            metadata = ThreadMetadata(
+                thread_id=thread_id,
+                senders=senders,
+                subject=subject,
+                snippet=snippet,
+            )
+
+            # Format thread transcript
+            transcript = format_thread_transcript(messages, max_thread_chars)
+
+            # Stage 1: classify sender (always cloud LLM)
             async with cloud_sem:
-                result = await classifier.classify(metadata, transcript, sender_type, sender_raw)
+                sender_type, sender_raw, sender_cot = await classifier.classify_sender(metadata)
+
+            # Stage 2: classify email (routed by sender type)
+            if sender_type == SenderType.PERSON:
+                async with local_sem:
+                    result = await classifier.classify(metadata, transcript, sender_type, sender_raw)
+            else:
+                async with cloud_sem:
+                    result = await classifier.classify(metadata, transcript, sender_type, sender_raw)
+
+            label = result.label
+            applied_sender_type = result.sender_type
+            # Cache before the write: a write fault must not discard the
+            # finished classification (issue #29).
+            if result_cache is not None:
+                result_cache.put(
+                    thread_id, fingerprint, CachedEmailResult(label, applied_sender_type)
+                )
 
         # Enforce no-downgrade
-        new_priority = _get_priority(result.label)
+        new_priority = _get_priority(label)
         if existing_priority is not None and existing_priority >= new_priority:
             log.info(
                 "Thread %s: existing priority %d >= new %d, skipping downgrade",
@@ -547,23 +692,28 @@ async def process_single_thread(
             )
             # Still mark as processed so the thread isn't retried every cycle
             await label_manager.mark_processed(all_msg_ids)
+            if result_cache is not None:
+                result_cache.clear(thread_id)
             return True
 
         # Apply labels to ALL messages in thread. The proxy-write burst is
         # bounded inside LabelManager (issue #33): its write semaphore gates
         # each modify_message call, so a large max_emails_per_cycle can't
         # burst one concurrent write per message.
-        await label_manager.apply_classification(all_msg_ids, result.label, result.sender_type)
+        await label_manager.apply_classification(all_msg_ids, label, applied_sender_type)
+        if result_cache is not None:
+            result_cache.clear(thread_id)
         log.info(
             "Classified thread %s (%d msgs): sender=%s label=%s — %s",
             thread_id,
             len(all_msg_ids),
-            result.sender_type.value,
-            result.label.value,
+            applied_sender_type.value,
+            label.value,
             subject,
         )
-        log.debug("Thread %s CoT — sender: %s", thread_id, result.sender_cot)
-        log.debug("Thread %s CoT — label: %s", thread_id, result.label_cot)
+        if result is not None:
+            log.debug("Thread %s CoT — sender: %s", thread_id, result.sender_cot)
+            log.debug("Thread %s CoT — label: %s", thread_id, result.label_cot)
         return True
 
     except LLMUnavailableError as exc:
@@ -911,6 +1061,11 @@ async def run_daemon() -> None:
     # a few attempts. Session-scoped — counts reset on restart.
     failure_tracker = FailureTracker()
 
+    # Keeps finished classifications across cycles while their label writes
+    # keep failing (issue #29): a write fault costs a write retry, never an
+    # LLM re-run. Session-scoped, like the tracker.
+    result_cache = ResultCache()
+
     # Account-level fault switch (provider out of funds): once tripped the poll
     # loop stands down until the admin adds funds and restarts. Session-scoped.
     halt = DaemonHalt()
@@ -1001,12 +1156,14 @@ async def run_daemon() -> None:
                         fetch_sem=fetch_sem,
                         local_deferrals=local_deferrals,
                         halt=halt,
+                        result_cache=result_cache,
                     )
                     for tid, msg_ids in thread_items
                 ),
                 return_exceptions=True,
             )
             processed, given_up = summarize_cycle(thread_items, results, failure_tracker)
+            result_cache.prune(tid for tid, _msg_ids in thread_items)
             log_local_deferrals(local_deferrals)
             if threads:
                 if given_up:

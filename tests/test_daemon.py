@@ -2120,6 +2120,142 @@ class TestNewsletterAssessmentDurability:
         ), "no ERROR log line named the assessments path that failed to write"
 
 
+class TestResultReuse:
+    """Issue #29 (Wave 2 T6): a transient label-write fault must not discard the
+    finished classification.
+
+    The session ``ResultCache`` keeps the classified result keyed by the
+    thread's message-id fingerprint, so a later cycle re-attempts only the
+    write — no Stage 1/Stage 2 re-run (the scarce local GPU pass for person
+    threads), no newsletter re-extraction/re-grading, and no duplicate JSONL
+    record for the same thread content.
+    """
+
+    @staticmethod
+    def _story():
+        return StoryResult(
+            text="Content",
+            scores={"simple": 3, "concrete": 3, "personal": 3, "dynamic": 3},
+            average_score=3.0,
+            tier=NewsletterTier.EXCELLENT,
+            themes={"scripture": "emphasized"},
+        )
+
+    async def test_write_failure_then_retry_does_not_reclassify(
+        self, mock_proxy, mock_classifier, mock_label_manager, cloud_sem, local_sem,
+        mock_thread_response,
+    ):
+        """First cycle classifies but the label write fails; the second cycle
+        must land the labels WITHOUT re-running Stage 1/Stage 2."""
+        mock_proxy.get_thread.return_value = mock_thread_response
+        mock_label_manager.apply_classification.side_effect = [
+            ProxyUnavailableError("proxy 503 on write"),
+            None,
+        ]
+        cache = daemon.ResultCache()
+
+        results = [
+            await process_single_thread(
+                "thread_001", ["msg_001", "msg_002"], mock_proxy, mock_classifier,
+                mock_label_manager, cloud_sem, local_sem, max_thread_chars=16000,
+                result_cache=cache,
+            )
+            for _ in range(2)
+        ]
+
+        assert results == [False, True]
+        # Classified exactly once across both cycles — the retry reused the cache.
+        assert mock_classifier.classify_sender.call_count == 1
+        assert mock_classifier.classify.call_count == 1
+        # And the labels landed on the second attempt, on the full thread.
+        assert mock_label_manager.apply_classification.call_count == 2
+        applied = mock_label_manager.apply_classification.call_args
+        assert applied.args[0] == ["msg_001", "msg_002"]
+        assert applied.args[1] == EmailLabel.NEEDS_RESPONSE
+
+    async def test_newsletter_write_failure_reuses_grading_and_does_not_reappend(
+        self, mock_proxy, mock_classifier, mock_label_manager, mock_newsletter_classifier,
+        cloud_sem, local_sem, newsletter_thread_response, tmp_path,
+    ):
+        """Same shape on the newsletter path: the grading is reused and the JSONL
+        append is not repeated — exactly one record for the thread."""
+        mock_proxy.get_thread.return_value = newsletter_thread_response
+        mock_newsletter_classifier.classify_newsletter.return_value = [self._story()]
+        mock_label_manager.apply_newsletter_classification.side_effect = [
+            ProxyUnavailableError("proxy 503 on write"),
+            None,
+        ]
+        out = tmp_path / "assessments.jsonl"
+        cache = daemon.ResultCache()
+
+        results = [
+            await process_single_thread(
+                "thread_nl", ["msg_nl_001"], mock_proxy, mock_classifier,
+                mock_label_manager, cloud_sem, local_sem, max_thread_chars=16000,
+                newsletter_classifier=mock_newsletter_classifier,
+                newsletter_recipient="newsletters@dm.org",
+                newsletter_output_file=str(out),
+                result_cache=cache,
+            )
+            for _ in range(2)
+        ]
+
+        assert results == [False, True]
+        # Graded exactly once across both cycles.
+        mock_newsletter_classifier.classify_newsletter.assert_called_once()
+        assert mock_label_manager.apply_newsletter_classification.call_count == 2
+        # Exactly one JSONL record — the write-retry cycle did not re-append.
+        records = [json.loads(line) for line in out.read_text().splitlines() if line.strip()]
+        assert len(records) == 1
+        assert records[0]["thread_id"] == "thread_nl"
+
+    async def test_new_message_invalidates_cached_result(
+        self, mock_proxy, mock_classifier, mock_label_manager, cloud_sem, local_sem,
+        mock_thread_response,
+    ):
+        """A new message changes the thread's fingerprint: the cached result is
+        dropped and the thread is classified fresh (staleness answer)."""
+        grown = copy.deepcopy(mock_thread_response)
+        grown["messages"].append(
+            {
+                "id": "msg_003",
+                "threadId": "thread_001",
+                "internalDate": "1704074400000",
+                "labelIds": ["INBOX", "UNREAD"],
+                "payload": {
+                    "headers": [
+                        {"name": "From", "value": "John Doe <john@example.com>"},
+                        {"name": "Subject", "value": "Re: Meeting tomorrow"},
+                        {"name": "Date", "value": "Mon, 1 Jan 2024 14:00:00 +0000"},
+                    ],
+                    "body": {"data": base64.urlsafe_b64encode(b"New reply").decode()},
+                },
+            }
+        )
+        mock_proxy.get_thread.side_effect = [mock_thread_response, grown]
+        mock_label_manager.apply_classification.side_effect = [
+            ProxyUnavailableError("proxy 503 on write"),
+            None,
+        ]
+        cache = daemon.ResultCache()
+
+        results = [
+            await process_single_thread(
+                "thread_001", ["msg_001", "msg_002"], mock_proxy, mock_classifier,
+                mock_label_manager, cloud_sem, local_sem, max_thread_chars=16000,
+                result_cache=cache,
+            )
+            for _ in range(2)
+        ]
+
+        assert results == [False, True]
+        # The grown thread was classified fresh, not served from the cache.
+        assert mock_classifier.classify.call_count == 2
+        # The second write covered the new message too.
+        applied = mock_label_manager.apply_classification.call_args
+        assert applied.args[0] == ["msg_001", "msg_002", "msg_003"]
+
+
 class TestVerifyLabelsWithRetry:
     """Startup label verification must survive a transiently-unreachable api-proxy.
 
