@@ -269,9 +269,14 @@ def write_assessment(
     own send date (ISO-8601 UTC, email-intrinsic) and ``model`` is the classifier
     model — both used by the review TUI (issue #35/#36). Old records lacking these
     keys are read with ``.get()`` fallbacks by consumers.
+
+    The record shape is documented in README-technical's "Assessment record
+    schema" (decision D12); ``schema_version`` is bumped there when the shape
+    changes. Absence of the key marks a pre-versioning record.
     """
     record = {
         "timestamp": datetime.now(timezone.utc).isoformat(),
+        "schema_version": 1,
         "message_id": message_id,
         "thread_id": thread_id,
         "from": sender,

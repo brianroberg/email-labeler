@@ -178,7 +178,7 @@ changelog — just enough that "what is deployed?" has an answer in the logs.
 
 ## D12 — Assessments JSONL: documented schema + version field (2026-07-30)
 
-**Status:** implementation pending (Wave 2).
+**Status:** implemented (Wave 2).
 
 The assessments JSONL (the only durable copy of gradings) gets a schema
 document (home: README-technical) and a `schema_version` field on each record,

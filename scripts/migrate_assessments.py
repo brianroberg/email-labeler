@@ -23,7 +23,9 @@ What the conversion can and cannot preserve:
   Gmail label; deriving a new one from re-bucketed dimensions would leave the
   record disagreeing with the label on the message.
 * Migrated records are stamped ``"migrated_from": "pre-#53"`` so their Poor/OK/Good
-  values are recognizable as re-bucketed 5-point judgments.
+  values are recognizable as re-bucketed 5-point judgments, and
+  ``"schema_version": 1`` (decision D12) — the documented shape they are converted
+  *to*. New-scheme records pass through byte-identical, unstamped.
 
 Stop the daemon before migrating in place — it appends to this file.
 
@@ -114,6 +116,12 @@ def migrate_record(record: dict) -> tuple[dict, bool]:
     migrated = dict(record)
     migrated["stories"] = [_migrate_story(story) for story in record.get("stories", [])]
     migrated["migrated_from"] = MIGRATION_STAMP
+    # D12: the conversion target is the documented v1 shape, so converted
+    # records are stamped with that version — a frozen literal, deliberately
+    # not shared with write_assessment's current version (which bumps; this
+    # doesn't). Pass-throughs above stay byte-identical: their versioning, or
+    # lack of it, is not the migration's business.
+    migrated["schema_version"] = 1
     return migrated, True
 
 

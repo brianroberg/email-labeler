@@ -245,6 +245,48 @@ ERROR Newsletter assessments sink is not writable: /app/data. Newsletters will b
 * **An unreadable sink** (the count comes back unknown) is an ERROR too, not a
   footnote on the INFO line: nothing below it can vouch for the path.
 
+#### Assessment record schema
+
+One JSON object per line, appended by `write_assessment` (newsletter.py). The
+documented shape is `schema_version: 1`:
+
+| Field | Meaning |
+|---|---|
+| `timestamp` | *Processed* time, ISO-8601 UTC. Always present. |
+| `schema_version` | `1` (int) for this shape. Absent on pre-versioning records — see version semantics below. |
+| `message_id`, `thread_id` | Gmail message/thread ids of the graded newsletter. |
+| `from` | Sender. The JSON key is the reserved word `from`, not `sender` (the Python parameter's name). |
+| `subject` | Subject header value. |
+| `send_date` | The email's own send date (email-intrinsic), ISO-8601 UTC or null. |
+| `model` | Grading model identifier, or null. |
+| `overall_tier` | Best story's tier as a string, or null. |
+| `stories[]` | One object per extracted story: `text`; `scores` (dict of dimension → 1\|2\|3, or null when grading failed); `average_score` (float or null); `tier` (string or null); `themes` (dict, theme → grade); `quality_cot`; `theme_cot`. |
+
+Two semantics the shape alone does not convey:
+
+* A theme **absent** from `stories[].themes` graded Absent —
+  absence-by-omission (decisions D14/D15); only `present`/`emphasized` grades
+  are recorded.
+* `migrated_from: "pre-#53"` marks a record converted by
+  `scripts/migrate_assessments.py` — what conversion preserves is the
+  migration table in the next section.
+
+Version semantics:
+
+* `schema_version: 1` is the shape above, with one carve-out: records stamped
+  v1 by the migration script (they bear `migrated_from`) may lack
+  `send_date`/`model` entirely — those keys postdate the records being
+  migrated, and the migration deliberately does not fabricate them.
+* **Absence of `schema_version` means a pre-versioning record**, of which two
+  shapes exist: post-#53 current-shape (possibly lacking `send_date`/`model`,
+  which arrived without a bump) and pre-#53 legacy (list-shaped themes, 1-5
+  scores) — the latter readable only after `scripts/migrate_assessments.py`
+  (next section).
+* Files may mix versions: concatenating a rescued copy onto the host file is
+  an expected operation, deduped on read by newest `timestamp` per
+  `thread_id` (decision D18; the read-side rule is documented under
+  write-before-label ordering below). Readers keep `.get()` tolerance.
+
 #### Migrating pre-#53 records
 
 Issue #53 replaced the 1-5 dimension scores with the 3-value Poor/OK/Good rubric

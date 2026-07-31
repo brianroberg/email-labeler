@@ -637,6 +637,8 @@ class TestWriteAssessment:
         assert record["stories"][0]["themes"] == {"scripture": "present", "church": "emphasized"}
         assert record["stories"][0]["quality_cot"] == "quality reasoning"
         assert "timestamp" in record
+        # D12: every new record carries the schema version.
+        assert record["schema_version"] == 1
 
     def test_writes_send_date_and_model(self, tmp_path):
         output_file = tmp_path / "assessments.jsonl"
