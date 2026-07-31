@@ -506,7 +506,7 @@ Conventions shared by every TUI:
 | `test_config_utils.py` | `config_utils.py` | Config loading, `{env.VAR}` substitution |
 | `test_env_var_docs.py` | env-var docs (meta-test) | Every env var referenced by daemon sources or `config.toml` `{env.VAR}` is documented in this file's Environment Variables table |
 | `test_env_example_docs.py` | `.env.example` (meta-test) | Every var the example declares is documented in the env table; every Required var has an active line in the example |
-| `test_newsletter.py` | `newsletter.py` | Newsletter story extraction, quality scoring, theme classification, assessment record writing, sink persistence/writability diagnostics |
+| `test_newsletter.py` | `newsletter.py` | Newsletter story extraction, quality scoring, theme classification, assessment record writing (incl. the `schema_version` stamp), sink persistence/writability diagnostics, and the Rule-1 raises that keep `no-stories` to a successful zero-story extraction (unparseable extraction reply; every story failing to grade — decisions D5/D20) |
 | `test_eval_schemas.py` | `evals/schemas.py` | GoldenThread/PredictionResult/RunMeta serialization round-trips |
 | `test_eval_harvest.py` | `evals/harvest.py` | Ground truth inference from labels, deduplication |
 | `test_eval_report.py` | `evals/report.py` | Confusion matrix, precision/recall/F1, accuracy, privacy violation metrics |
@@ -516,7 +516,7 @@ Conventions shared by every TUI:
 | `test_eval_newsletter_run.py` | `evals/newsletter_run.py` | `prompt_hash`, cache reuse, extraction vs quality/theme modes |
 | `test_eval_newsletter_report.py` | `evals/newsletter_report.py` | `match_stories`, tier/dimension/theme metrics, comparison deltas |
 | `test_newsletter_review.py` | `newsletter_review/tui.py` | Pure helpers (loading, per-thread dedup, filtering, formatting, source line, migrated-record note) + Pilot UI tests (navigation, drill-down, tier/theme/sender filters, source header, quit) |
-| `test_migrate_assessments.py` | `scripts/migrate_assessments.py` | Old-scheme detection, theme/score conversion, tier preservation, atomic in-place rewrite + abort-on-malformed, round-trip through `load_assessments` |
+| `test_migrate_assessments.py` | `scripts/migrate_assessments.py` | Old-scheme detection, theme/score conversion, tier preservation, `schema_version` stamped on converted records only, atomic in-place rewrite + abort-on-malformed, round-trip through `load_assessments` |
 
 ## Continuous Integration
 

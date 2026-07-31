@@ -1,9 +1,11 @@
 # Wave 2 — Behavior changes under the new policy
 
-> **Status: proposed (2026-07-31); owner-approved 2026-07-31 — execution
-> pending.** Drafted from the Wave 0.5 triage feed on issue #68; adversarially
-> verified (6-lens, 56 findings → corrections applied); supersedes nothing.
-> Flips to `executed` with the T14 execution record (D8).
+> **Status: executed (2026-07-31).** Proposed 2026-07-31; owner-approved
+> 2026-07-31; executed 2026-07-31 (T14). Drafted from the Wave 0.5 triage feed
+> on issue #68; adversarially verified (6-lens, 56 findings → corrections
+> applied); supersedes nothing. The **Execution record** at the end of this
+> file is the account of what actually landed (D8) — where it and the task
+> sections above disagree, the execution record is what happened.
 
 Fourth step of the 2026-07-30 clarity effort, after Wave 0 (docs foundation),
 Wave 0.5 (issue triage), and Wave 1 (enforcement) — all executed. Wave 2 is
@@ -813,3 +815,598 @@ after it.
 7. Final commit: append the **Execution record** (deviations, red/green log,
    per-task commit SHAs) and flip this plan's status header
    `proposed → executed` (D8).
+
+---
+
+## Execution record
+
+**Executed 2026-07-31** on branch `claude/wave2-behavior`: 18 commits on top of
+`3222a54` — T1–T13 (one commit each, in plan order), four `Wave 2 review:`
+commits from the wave-level review pass, and this acceptance commit. Gate taken
+at `3d51284`, before this commit: the CI-equivalent TZ matrix run locally in
+three zones (UTC, Pacific/Pago_Pago, Pacific/Kiritimati) — **1363 passed + 122
+subtests in each** — `ruff check .` clean, and `uv sync --locked --extra dev`
+consistent after T1's dependency removal.
+
+Suite accounting: 1302 passed + 123 subtests at `3222a54` → 1363 + 122 here.
+The lost subtest is not a lost test: T1 deleted `evals.run_web`'s two CLI-flag
+subtests (`--host`, `--port`) along with the module, and T3's `GIT_SHA` read
+added one env-var subtest.
+
+### 1. What landed
+
+| Task | Commit | What landed |
+|---|---|---|
+| T1 | `d651904` | D10: eval web app removed — four modules, five templates, four runtime deps (incl. `python-multipart`), lock regen, coupled doc/test removals |
+| T2 | `f6f70da` | D3: `is_newsletter` compares casefolded addr-specs via `email.utils.getaddresses` instead of substring-matching the raw To/Cc value |
+| T3 | `fb1d8d9` | D11: `GIT_SHA` build-arg in the Dockerfile, one startup log line, a Release Identity section with the `deploy-YYYY-MM-DD` tag procedure |
+| T4 | `6618eea` | D12: assessment record schema documented in README-technical; `schema_version: 1` stamped by `write_assessment` and by the migration on converted records |
+| T5 | `43a9bb2` | #33: `write_sem` moves into `LabelManager` and is acquired per `modify_message`, so `write_parallel` bounds writes, not threads |
+| T6 | `2c10c8a` | #29: session `ResultCache` — a label-write fault no longer discards a finished classification or re-appends a grading |
+| T7 | `857a968` | D6: a proxy 403 is a human answer — one INFO line, no strike, no traceback, re-offered next cycle (both the classification and the marker write) |
+| T8 | `957ba96` | D5 core: exhausted 429/5xx typed as `LLMUnavailableError` and never counted; cycle-level correlation decides strikes (`attribute_cycle_failures`); `MasqueradeTracker` escalation |
+| T9 | `da368e6` | D5/D19: `FunctionHalts` — a balance fault halts one function, the other keeps running; function-aware skips, partial-halt ERROR, query narrowing |
+| T10 | `ee3958d` | D5 Rule 1: `parse_email_label` raises `LLMContentError` on a keyword-free reply instead of defaulting to LOW_PRIORITY → archive |
+| T11 | `a4005ea` | D5/D20: `no-stories` only from a successful zero-story extraction — unparseable extraction and all-grades-failed both raise |
+| T12 | `1a9d1fd` | D5: assessment-sink faults become `AssessmentSinkError` with their own arm — never counted, retried forever, never abandoned |
+| T13 | `a40c2c2` | D5: `max_failures` becomes `[daemon] max_failures` + `MAX_FAILURES`; last corollary, D5 Status flipped, CLAUDE.md pending-paragraph resolved |
+| review | `348bc36` | Correlation denominator narrowed to threads that **attempted** work (behavior change; see Deviations) |
+| review | `d8e8fc4` | Twelve mutation-proved coverage gaps in daemon behavior closed (tests + one coverage row; `daemon.py` byte-identical) |
+| review | `b32267d` | Documentation/comment coherence sweep (config.toml, README-technical, runbook, test docstrings, D5/D20 wording, D5's `a40c2c2` SHA) |
+| review | `3d51284` | Remaining confirmed findings: ResultCache/FunctionHalts/write_sem/D19 coverage, over-claiming prose scoped honestly |
+| T14 | *this commit* | Acceptance: coherence fixes (§7), execution record, status flip |
+
+### 2. Red/green log
+
+Every task but T1 started from a test observed red for the expected reason.
+Where a red surfaced as `TypeError`/`AttributeError` rather than a behavioral
+assertion, it is because the API itself was test-driven — the missing
+constructor argument, parameter or class *is* the change. That is stated below
+rather than dressed up as a behavioral red, and where the pre-change behavior
+could still be demonstrated (T6), it was, with a throwaway probe.
+
+**T1 — no RED, by the plan's own P1 exception.** Pure removal, nothing new to
+assert. Its gate was the eight-item coupled-removal checklist, the full suite
+staying green, and the acceptance grep
+(`fastapi|uvicorn|jinja2|run_web|web_app|web_auth|web_data`) hitting only
+`docs/plans/` and the D10 entry.
+
+**T2 (`f6f70da`)**
+- `TestIsNewsletter::test_superstring_address_does_not_match` — `AssertionError:
+  assert True is False`, where `True = is_newsletter([… To:
+  'abcnewsletters@dm.org' …], 'newsletters@dm.org')`.
+- `…::test_display_name_containing_recipient_does_not_match` — same shape, with
+  To = `"newsletters@dm.org fan club" <other@example.org>`.
+- The plan's other two named tests (bracketed form, multi-recipient) were green
+  before the change, exactly as the plan predicted ("green today via substring
+  — include it anyway"); they pin the forms the rewrite had to keep working.
+
+**T3 (`fb1d8d9`)**
+- `TestStartupBuildLog::test_startup_logs_build_sha` — `AssertionError: assert
+  False`: no caplog record equal to `email-labeler starting — build abc1234`;
+  startup logging began at `Concurrency limits: cloud=2, local=1, fetch=4,
+  write=4`.
+- `test_env_var_docs::test_all_daemon_env_vars_documented` —
+  `SUBFAILED(var='GIT_SHA')`: "`GIT_SHA` is referenced in daemon source code but
+  not documented in the README's Environment Variables section", observed after
+  the `os.environ.get("GIT_SHA")` read landed and before the table row — the
+  plan's stated two-step arc.
+
+**T4 (`6618eea`)**
+- `TestWriteAssessment::test_writes_jsonl_record` (extended) — `KeyError:
+  'schema_version'` at tests/test_newsletter.py:641.
+- `TestMigrateRecord::test_converted_records_are_stamped_schema_version_1` —
+  `KeyError: 'schema_version'` at tests/test_migrate_assessments.py:182 on the
+  converted record.
+
+**T5 (`43a9bb2`)** — API test-driven (the constructor signature is the change).
+- `TestWriteSemaphore::test_concurrent_applies_interleave_per_message` —
+  `TypeError: LabelManager.__init__() got an unexpected keyword argument
+  'write_sem'`.
+- `TestProcessSingleThread::test_label_application_is_bounded_by_write_sem`
+  (rework of the old daemon-plumbing pin) — same `TypeError`, observed after the
+  rework and before any production code.
+
+**T6 (`2c10c8a`)** — API test-driven, with the behavior proved separately.
+- All three `TestResultReuse` tests — `AttributeError: module 'daemon' has no
+  attribute 'ResultCache'`.
+- Because that red says nothing about behavior, the implementer ran an
+  uncommitted scratchpad probe of the same shapes without the cache and recorded
+  what the old code did: across two cycles one email thread was classified twice
+  (`classify_sender` and `classify` each called 2×) and one newsletter was
+  graded twice, appending **two** JSONL records for one thread.
+
+**T7 (`857a968`)**
+- `…::test_rejected_write_defers_without_strike_or_traceback` — `assert [False,
+  True, True] == [False, False, False]`: the 403 fell into `except Exception`,
+  struck via `_give_up_if_stuck`, and at `max_failures=2` the second rejection
+  gave the thread up.
+- `…::test_rejected_marker_write_re_offers` — `assert all(r.exc_info is None for
+  r in caplog.records)` failed: `ERROR … Could not mark stuck thread thread_x
+  attempted` with a full `ProxyForbiddenError` traceback.
+
+**T8 (`957ba96`)** — eleven reds; the machinery is the behavior, so most are
+missing-API failures.
+- `TestProviderShapedStatuses::test_exhausted_429_raises_unavailable_not_runtime`
+  — `RuntimeError: LLM request failed with status 429 [tier=cloud
+  model=test-cloud-model url=…]` escaped `pytest.raises(LLMUnavailableError)`.
+- `test_proxy_unavailable_never_counts_toward_give_up` (the #26 reversal) —
+  behavioral red on the pre-change API: `assert True is False` on cycle 2, log
+  `Thread thread_poison failed 2+ times — marked agent/attempted`. Rewritten to
+  the new collector API in the same commit.
+- Four `TestFailureAttribution` tests (`…same_signature_failures_in_one_cycle…`,
+  `…unique_signature_failure_with_succeeding_siblings…`,
+  `…singleton_cycle_candidate_failure…`, `…zero_success_cycle…`) — `TypeError:
+  process_single_thread() got an unexpected keyword argument 'cycle_failures'`.
+- Three masquerade tests (`…escalates_on_heartbeat_and_is_never_abandoned`,
+  `…local_tier_unavailability_never_counts…`,
+  `…not_incremented_in_singleton_cycles`) — `AttributeError: module 'daemon' has
+  no attribute 'MasqueradeTracker'`.
+- `…::test_masquerade_escalation_wired_into_poll_loop_and_throttled` —
+  behavioral: `assert 0 == 1` (`len([])` escalation ERRORs; no emitter existed).
+- Two further tests were added in T8's fix round and proved by mutation — see §5.
+
+**T9 (`da368e6`)**
+- `TestPerFunctionHalt::test_newsletter_balance_fault_halts_newsletter_only` and
+  `…::test_email_balance_fault_leaves_newsletter_running` — `AttributeError:
+  module 'daemon' has no attribute 'FunctionHalts'` (per-function halt state did
+  not exist; the daemon-wide `DaemonHalt` short-circuited the sibling too).
+- `…::test_halted_email_function_narrows_the_poll_query` — `assert False —
+  where False = all(<genexpr>)`: the query was never narrowed to
+  `to:<recipient>`.
+- `…::test_partial_halt_keeps_polling_and_names_the_halted_function` — `assert 0
+  == 2`: a partial halt had no representation, so no per-cycle ERROR named it.
+- `…::test_both_functions_halted_stands_down` — `AssertionError: assert 3 == 1`
+  (`proxy.list_messages.call_count`): the loop kept polling.
+
+**T10 (`ee3958d`)**
+- Five `TestParseEmailLabel` tests — `Failed: DID NOT RAISE <class
+  'llm_client.LLMContentError'>`, each with the captured `WARNING
+  classifier:classifier.py:165 Unexpected email label output (interpreting as
+  LOW_PRIORITY): …` that was the old behavior (`SOMETHING_ELSE`; empty; `some
+  preamble\nstill garbage`; `IMPORTANT`; `NOTIFY the team about this`).
+- `TestFailureAttribution::test_keyword_free_reply_commits_nothing_and_strikes_as_candidate`
+  — `assert True is False`: `process_single_thread` returned True, i.e. it
+  committed the thread off an answerless reply.
+
+**T11 (`a4005ea`)**
+- `TestParseStories::test_garbage_extraction_raises_not_empty` and
+  `…::test_empty_input_raises` — `DID NOT RAISE LLMContentError`;
+  `parse_stories("This is not formatted correctly at all")` and
+  `parse_stories("")` both returned `[]` (the conflation).
+- `TestClassifyNewsletter::test_all_grades_unparseable_raises_instead_of_no_stories`
+  — `DID NOT RAISE`: two stories, both quality replies garbled, returned two
+  tier-less `StoryResult`s.
+- `…::test_single_story_failing_to_grade_raises` — `DID NOT RAISE`: the old
+  single-story shape of `test_quality_failure_still_classifies_themes`, which
+  committed a false `no-stories`.
+- `TestNewsletterRouting::test_unparseable_extraction_commits_nothing` and
+  `…::test_all_grades_unparseable_commits_nothing` — `assert True is False`:
+  the daemon committed a `no-stories` label **and** an assessment record off a
+  failure.
+
+**T12 (`1a9d1fd`)**
+- `TestNewsletterAssessmentDurability::test_sink_failure_leaves_thread_unlabeled_for_retry`
+  — `AssertionError: Expected 'mark_attempted' to not have been called. Called 1
+  times. Calls: [call(['msg_nl_001'])]`, with `ERROR Thread thread_nl failed 3+
+  times — marked agent/attempted to break the retry loop`.
+
+**T13 (`a40c2c2`)**
+- `TestMaxFailuresKnob::test_max_failures_env_override` — `assert 5 == 2`
+  (`MAX_FAILURES=2` set; `run_daemon` still built the hardcoded
+  `FailureTracker()`).
+- `…::test_max_failures_defaults_to_config_value` — `assert 5 == 7` (config
+  `[daemon] max_failures = 7` ignored).
+- The plan predicted a *second* red here (`test_env_var_docs` going red on
+  `MAX_FAILURES`) that cannot exist — see Deviations.
+
+**Review pass**
+- `348bc36`'s RED,
+  `TestFailureAttribution::test_deferral_only_sibling_does_not_shield_a_poisoned_thread`
+  — `AssertionError: Expected 'mark_attempted' to be called once. Called 0
+  times`, with the cause in the log on both cycles: `1 thread(s) failed this
+  cycle with no correlation evidence of a thread-specific fault (signatures:
+  ValueError) — shared cause suspected (D5): no strikes, backlog kept`.
+- The coverage commits (`d8e8fc4`, `3d51284`) add tests over code that was
+  already correct, so they are proved by mutation, not red/green: for each, the
+  named mutation was applied, the new test failed, its siblings stayed green,
+  and the mutation was reverted. The mutations and observed failures are
+  recorded in each commit body.
+
+### 3. Tests updated because they pinned reversed behavior
+
+These were not broken tests. Each pinned a decision the wave reverses, so each
+was rewritten in the same commit as the reversal, citing the entry (P3).
+
+- **T8 / D5 (and the #26 reversal D5 records).**
+  `test_429_quota_phrasing_stays_runtime_error` → renamed
+  `test_429_quota_phrasing_never_halts` (it no longer expects `RuntimeError`;
+  its not-`LLMBalanceError` half, the D19 guard, is preserved);
+  `test_raises_on_http_error` retargeted in place to 500 →
+  `LLMUnavailableError`; the reversal test
+  `test_proxy_unavailable_never_counts_toward_give_up` itself;
+  `test_sink_failure_leaves_thread_unlabeled_for_retry` and
+  `test_content_error_routes_to_give_up_not_empty_commit` swapped from the
+  `failure_tracker=` parameter to the collector (the latter gaining an assertion
+  that the failure is collected as a candidate `LLMContentError` entry);
+  `test_connect_error` / `test_llm_unavailable` / `test_balance_error` reworked
+  mechanically and strengthened with `mark_attempted.assert_not_called()`; and
+  in tests/test_proxy_client.py the non-JSON-2xx test's docstring, which pinned
+  the reversed #26 `FailureTracker` bound, reworded citing D5 (assertion
+  untouched).
+- **T9 / D5 + D19.** `test_balance_error_trips_daemon_halt` →
+  `test_balance_error_trips_the_email_function_halt` (the old name asserted a
+  daemon-wide halt that no longer exists). Docstring-only corrections, same
+  commit: `TestBalanceError` and `test_plain_403_stays_bare_runtime_error`
+  (tests/test_llm_client.py), `test_balance_error_during_quality_propagates`
+  (tests/test_newsletter.py), `TestDaemonHalt` (tests/test_daemon.py).
+- **T10 / D5 Rule 1 — the five parse-default tests** in
+  `TestParseEmailLabel`: `test_unknown_defaults_to_low_priority` →
+  `test_unknown_raises`; `test_empty_defaults_to_low_priority` →
+  `test_empty_raises`; `test_garbage_last_line_defaults_to_low_priority` →
+  `test_garbage_last_line_raises`; `test_warns_on_unrecognized_output` →
+  `test_raise_names_the_unrecognized_output`;
+  `test_scan_no_false_match_on_substring` kept its name and whole-word intent
+  with its asserted outcome reworked. Prose-only: two rationale docstrings in
+  tests/test_llm_client.py (`TestFinishReasonLength`, `TestThinkOnlyResponse`)
+  that claimed a silent LOW_PRIORITY default.
+- **T11 / D5 + D20 — fixture conversions.**
+  `test_quality_failure_still_classifies_themes` and
+  `test_non_transient_quality_error_stays_isolated` became **two-story**
+  fixtures (one story fails, one grades) so they keep pinning the per-story
+  isolation that survives; their old single-story shapes are exactly what the
+  new raise tests assert. `test_garbage_input` →
+  `test_garbage_extraction_raises_not_empty`, `test_empty_input` →
+  `test_empty_input_raises`.
+- **T12 / D5 sink corollary.**
+  `test_sink_failure_leaves_thread_unlabeled_for_retry` reworked again — kept
+  its name deliberately so the plan's named RED test stays traceable — now
+  multi-cycle, asserting the fault is never counted and never marked.
+- **Review pass / D5.**
+  `test_content_error_routes_to_give_up_not_empty_commit` →
+  `test_content_error_is_a_strike_candidate_not_an_empty_commit`, plus
+  pre-T8 "give-up path/handler" docstrings in tests/test_llm_client.py and
+  tests/test_proxy_client.py.
+
+### 4. Deviations from the plan
+
+**T1.** No RED, per the plan's stated P1 exception. The D10 entry was amended
+beyond the plan's item 2 to name `python-multipart`, the two doc edits found
+beyond its list, and (parenthetically) the tui-regression SKILL.md pip-line trim
+that the plan treats as its own checklist item — so the entry is a complete
+record of what was removed. Subtest count fell 123 → 121 in that commit
+(`evals.run_web`'s own CLI-doc subtests).
+
+**T2.** None.
+
+**T3.** The plan named no home for the tag procedure; it became a new `##
+Release Identity` section in README-technical between Health Checking and TUI
+Conventions. The startup log line carries a three-line D11 comment above it.
+
+**T4.** The schema H4 was placed *before* the migration section (the plan said
+only "beside" it) so schema precedes migration. No shared constant for the
+version literal: `write_assessment`'s `1` means "current version" while
+`migrate_record`'s is a frozen conversion target that must stay `1` after a
+future bump — an in-code comment records that so it is not "fixed" as
+duplication. Per the plan's own instruction,
+`.claude/skills/tui-regression/synth_data.py`'s hand-maintained assessment shape
+was not aligned; its synthetic records still lack `schema_version`.
+
+**T5.** Per-call acquisition landed as one private `LabelManager._modify` helper
+(a single `async with (self.write_sem or nullcontext())` site) rather than three
+inline wraps — behaviorally identical, and it keeps the one-slot-per-write rule
+in one place. `WRITE_PARALLEL`'s resolve moved above `LabelManager`
+construction. The interleave test asserts max-in-flight == 1 beyond the plan's
+wording, which relies on fair `asyncio.Semaphore` semantics (3.12+; the
+environment runs 3.14.6). README-technical's coverage row was extended (P4
+judgment, not enumerated by the plan).
+
+**T6.** Reds were missing-API `AttributeError`s plus a behavioral probe (§2).
+Payloads are dataclasses (`CachedEmailResult`, `CachedNewsletterResult`) rather
+than bare tuples. The cache clears after **all four** successful label-write
+paths, including the max-priority and no-downgrade `mark_processed` shortcuts,
+not only the two `apply_*` paths. `prune` is called from the poll loop after
+`summarize_cycle` rather than widening `summarize_cycle`'s signature. README.md
+Resilience was left untouched — the plan conditioned that edit on a bullet
+restating the discard, and no such restatement existed. Two doc touches beyond
+the list (P4): README-technical's coverage row and
+`newsletter_review/tui.py::load_assessments`' docstring, which now states the
+honest residual that a restart mid-retry re-grades and re-appends.
+
+**T7.** The plan specified INFO only for the `process_single_thread` arm and
+"one clean line" for the marker arm; INFO was chosen for both, for symmetry — a
+rejection is a routine human answer. The first test drives `max_failures + 1`
+cycles rather than `max_failures`, proving rejections never accumulate even past
+the old give-up point.
+
+**T8.** Four deviations matter beyond bookkeeping:
+
+1. **The masquerade threshold was wired to `failure_tracker.max_failures` ahead
+   of T13.** The plan's 8c says escalation happens "at `max_failures` qualifying
+   cycles", but `max_failures` was still a hardcoded constructor default until
+   T13. T8 derived `MasqueradeTracker`'s threshold from the failure tracker's,
+   so when T13 landed the knob it needed no masquerade change and one knob moves
+   both bounds — which is what config.toml's `[daemon] max_failures` comment now
+   claims.
+2. **A side effect the plan does not mention.** llm_client now raises
+   `LLMUnavailableError` for any 5xx, and that class is in
+   `newsletter._PIPELINE_WIDE_ERRORS`, so a provider 5xx during **per-story**
+   quality/theme grading propagates pipeline-wide instead of being swallowed by
+   the per-story `except Exception` isolation. This is D5-correct and
+   deliberate — during a provider outage no partially-graded record should be
+   committed (Rule 1) — and it is recorded here rather than left to be
+   rediscovered as an accident. Per-story isolation still holds for
+   non-provider-shaped failures, which is what T11's two-story fixtures pin.
+3. **Marking is now serialized in the poll loop.** `for entry in struck_out:
+   await _mark_thread_attempted(...)` replaced the concurrent
+   `_give_up_if_stuck` calls that previously ran inside the gathered
+   coroutines; marker writes are gated proxy writes with a 300 s approval
+   timeout, so a cycle with *k* struck-out threads can block the loop on *k*
+   sequential writes. Recorded as an accepted consequence: after T8, *k* is 0 or
+   1 in almost every cycle (two threads striking out together now requires two
+   *distinct* signatures both reaching the threshold in the same cycle, since
+   same-signature failures shield each other and provider-shaped ones never
+   strike). The review examined this twice as a finding and refuted the defect
+   framing both times — no outcome changes, and the once-per-cycle healthcheck
+   refresh has the same exposure it had before the wave — so it stands as
+   latency the wave accepted, not a bug it introduced.
+4. **The reversal red was taken against the old API** and the test then
+   rewritten to the collector API in the same commit (the parameter replacement
+   is itself part of the change — the T5 precedent).
+
+Smaller T8 deviations: the escalation emitter is called just after the cycle
+"Processed" summary line (the plan orders attribute → strike → mark → summarize
+→ cycle log and says only "after the attribution sequence");
+tests/test_proxy_client.py was touched though it is not in T8's file list (a
+docstring pinning the reversed #26 bound); plus the renames and retargets in §3.
+
+**T9.** The plan's second RED test needed two homes — the mirror direction is
+observable at `process_single_thread` level, the query narrowing only at
+poll-loop level — and a fifth test was added for the partial-halt ERROR line,
+which no plan-named test covered. `FunctionHalts` carries the enablement flags
+(`email_enabled = not NEWSLETTER_ONLY`, `newsletter_enabled = [newsletter]
+configured`) so "every enabled function is halted" has exactly one home. Query
+narrowing is a one-time mutation guarded by a `query_narrowed` flag shared with
+the pre-existing `NEWSLETTER_ONLY` narrowing, so the two can never
+double-append. Operator lines name functions as "email triage" / "newsletter
+grading". Docstring-only updates beyond the plan's list (P4). No standalone unit
+tests for `FunctionHalts`' accessors at the time — they would have been
+after-the-fact — which the review later closed with mutation-proved ones.
+
+**T10.** The plan's line numbers had drifted with the wave (README.md :303 →
+:309, classifier.py :149-169 → :141ff, llm_client.py :296-304 → ~:317ff);
+everything was re-located by string. Beyond the plan's list (P4):
+README-technical's coverage row and two rationale docstrings in
+tests/test_llm_client.py. T8's carried-over leftover was folded in here (the
+content-guard comment's "give-up-eligible via the daemon" → "a strike candidate
+under the daemon's cycle-level attribution (D5)"), and the guard's justification
+was *rewritten* rather than merely trimmed: it still earns its place because it
+names the budget as the cause and covers Stage 1, whose SERVICE default stays
+(D2). The exception message truncates the offending reply at 200 chars,
+preserving the removed WARNING's `%.200s` diagnostic budget.
+
+**T11.** The reworked empty-input test was renamed too
+(`test_empty_input_raises`), the single-story case got its own named test rather
+than being folded into the all-unparseable one, and the plan's "a daemon-level
+test … on either path" became two. `classify_newsletter`'s guard is `all(r.scores
+is None …)`, so it also fires when a bare per-story `RuntimeError` swallowed
+every story's grading, not only the parse-to-None route — deliberate, because
+the committed outcome (tier-less record + `no-stories` label off a failure) is
+identical either way. `labeler.py`'s `apply_newsletter_classification` docstring
+was left untouched: "tier … or None for no-stories" is still accurate, since
+after T11 `best_tier` is None only for a genuine zero-story result.
+
+**T12.** The RED test kept its original name so the plan's named test stays
+traceable (its docstring and body were fully reworked). The
+`AssessmentSinkError` arm is the **first** except arm rather than merely "before
+the candidate arms" — it is a dedicated `Exception` subclass with no MRO overlap,
+so first position is free and immune to future arm reordering — and it is raised
+`from exc`, keeping the `OSError` as `__cause__`, which is what makes it safe
+from the `TimeoutError`-subclasses-`OSError` hazard the plan names. Beyond the
+plan's three texts, `process_single_thread`'s D5 docstring paragraph (added by
+T8, claiming *every* failure arm records a `CycleFailure`) had to change in the
+same commit because T12 made it false. Flagged and not absorbed: README.md's
+Resilience section never mentioned the disk at all — fixed in this acceptance
+commit (§7).
+
+**T13.** **The plan's parenthetical predicting a second RED signal is
+inaccurate, and no such signal fired.** `test_env_var_docs` cannot see
+`MAX_FAILURES`: its collector matches only literal `os.environ.get("VAR")`,
+`os.environ["VAR"]` and config.toml `{env.VAR}`, while `MAX_FAILURES` is read
+through `resolve_int_env("MAX_FAILURES", …)`, whose own `os.environ` read takes
+a variable. That is the same blind spot that already hides the
+long-documented `WRITE_PARALLEL`, `LOCAL_PARALLEL` and `MAX_EMAILS_PER_CYCLE`.
+The README-technical env row landed anyway — the plan mandates it and the
+table's precedent wants it — but there was no red/green arc from that guard, and
+this record does not pretend otherwise. (Independently re-verified in the review
+pass; widening the guard would newly implicate three existing knobs, so it goes
+to Wave 3 / issue #39.) Also: the plan's single RED was split in two so both
+halves of the knob are convicted separately (an env-only test would pass even if
+the config key were ignored); `run_poll_cycles` gained a `daemon_overrides=`
+kwarg (test harness only); `_capture_trackers` *wraps* rather than mocks the
+trackers so the daemon's real `MasqueradeTracker(max_failures=…)` wiring is
+exercised; and T13 could not name its own SHA in the D5 entry it was committing
+— the review's docs sweep (`b32267d`) supplied `a40c2c2`.
+
+**Review pass (`348bc36`) — a production behavior change beyond the plan's
+literal wording.** Plan 8b conditions thread blame on "the cycle contained other
+threads → at least one of them was handled successfully", i.e. a denominator of
+every thread the cycle *fetched*. Shipped behavior narrows that denominator to
+the threads that **attempted work** — handled successfully, or recorded a
+`CycleFailure`. The defect this fixes is not cosmetic: a thread that merely
+deferred (its function halted, the local tier offline, a `NEWSLETTER_ONLY` skip,
+a 403-rejected write, an assessment-sink fault) tried nothing and committed
+nothing, yet sat in the denominator, making every cycle look
+multi-thread-and-zero-success. A halted function re-fetches and re-defers its
+backlog every cycle, so one permanently-deferred sibling could suppress strikes
+*forever* — a genuinely poisoned thread would never converge to a findable
+`agent/attempted`, silently voiding Rule 1's set-aside guarantee. RED test and
+observed failure are in §2; a companion test pins the over-correction (deferrals
+must not turn a zero-success cycle into a singleton). The implementation uses
+`result is not False` rather than `result is True`, conservatively keeping
+anything unexpected (e.g. an exception object returned by the poll loop's
+`asyncio.gather`) inside the denominator, so the change cannot widen blame
+beyond the defect it fixes; `any_success` is untouched, which preserves the
+zero-success edge. Per the Review Charter the **D5 entry was amended in the same commit** —
+it now states the denominator precisely, records the refinement and the failure
+it fixes, and explains why the masquerade half needs no denominator change (it
+moves only on positive evidence, which a deferral-only thread can never supply).
+The plan document itself was left untouched: it is frozen history (D8), and this
+record is where the divergence is logged.
+
+*Registry convention, for the record:* D5's correlation corollary names
+`957ba96` (the task commit), not `348bc36`. The review adjudicated this
+deliberately — the entry names the implementing *task* commit and discloses the
+refinement inline, as it does; review-round provenance belongs here.
+
+### 5. Wave-level review outcome
+
+After T13, the wave was reviewed as a whole across five lenses (failure-model
+semantics, registry/doc coherence, test integrity, integration, plan
+conformance) with independent verifiers per finding. **24 raw findings → 7
+refuted, 17 confirmed, 0 blocking.** Four commits carry the outcome:
+
+- `348bc36` — the one correctness change (§4, above).
+- `d8e8fc4` — twelve mutation-proved coverage gaps closed in one commit. Method,
+  per item: write the test, run it green against correct code, apply the named
+  mutation, confirm **exactly one** failure (the new test) with the other 246
+  green, revert. One item needed a sharper mutation than the obvious one: for
+  the masquerade increment, deleting `and any_success` outright is already
+  killed by the existing singleton test, so the live gap was the multi-thread
+  direction (`and (any_success or multi_thread)`), which had survived the whole
+  suite.
+- `b32267d` — documentation and comment coherence sweep (config.toml's
+  `[newsletter.llm]` give-up phrasing, README-technical's "two guards"
+  sentence, the write-before-label and out-of-funds rationales, the
+  `agent/attempted` runbook, D20's pre-T8 give-up wording, D5's missing
+  `a40c2c2`, and stale test docstrings).
+- `3d51284` — the remaining confirmed findings: ResultCache prune/clear and
+  poll-loop wiring coverage, `FunctionHalts` enabled-flag coverage, `write_sem`
+  coverage for the two write paths T5 converted but left unpinned, a
+  **non-vacuous** D19 429 guard, and over-claiming prose scoped honestly.
+
+Two findings were **blocking**, and both were caught during T8's own review
+round — before `957ba96` was settled — and fixed in a test-only fix round:
+
+1. **A vacuous test.** `test_same_signature_failures_in_one_cycle_count_no_strikes`
+   was supposed to pin the adjudicated same-signature rule, but its cycle had
+   zero successes, so `thread_blame` was already False and the uniqueness clause
+   never had to hold for the test to pass. Fixed by adding a third, *succeeding*
+   thread so only `signature_counts[f.signature] == 1` prevents the strike, and
+   mutation-proved: deleting the uniqueness clause now fails the test with
+   `Expected 'mark_attempted' to not have been called. Called 2 times. Calls:
+   [call(['m1']), call(['m2'])]`.
+2. **Untested post-gather marking.** The poll loop's marking loop had no
+   coverage at all — `for entry in []:` survived the entire suite. Fixed with
+   `test_struck_out_thread_is_marked_attempted_by_the_poll_loop`, which drives
+   the real `run_daemon`; mutation-proved (`Expected mark_attempted to have been
+   awaited once. Awaited 0 times`, and the "abandoned after repeated failures"
+   summary line absent).
+
+Stated plainly: **the wave's own review found a vacuous test in the wave's
+centrepiece commit.** A test that cannot fail proves nothing, and that one had
+been counted as proof of an adjudicated edge. The lesson the wave took from it
+is visible in the review commits — every after-the-fact test added later was
+required to kill a named mutation before it was allowed to count.
+
+The seven refuted findings were refuted on consequence, not on politeness: two
+about the serialized marking loop (§4), one asking D5 to name review-round SHAs,
+one calling the `attempted` denominator's success half inert (an equivalent
+mutant of a registry-defined concept), one about the idle heartbeat under a
+narrowed query, one about early-return paths that can never converge, and one
+claiming T14 readiness was blocked by an unrecorded deviation — which this
+record now carries.
+
+### 6. Scope check
+
+Wave 2 owes nothing else from the issue-#68 roadmap: D3, D6, D10, D11, D12, D19,
+D20 and every D5 corollary are implemented, and the absorbed #29/#33 write-path
+bundle landed with them. Five things were discovered mid-wave and deliberately
+**not** absorbed:
+
+1. **Write-retry commits `agent/processed` on the messages whose write failed.**
+   On the retry cycle after a mid-thread write failure, `get_existing_priority`
+   reads the label we ourselves wrote on a sibling message, so the
+   no-downgrade / max-priority shortcut fires and `mark_processed(all_msg_ids)`
+   gives the *unwritten* messages only `agent/processed` — no classification
+   label, no path label, and the configured archive action silently dropped.
+   Reproduced by two agents independently, at HEAD **and at the wave baseline
+   `3222a54`** (only the LLM re-run count differs), so it is pre-existing on
+   main, not a Wave 2 regression. Not absorbed because a correct fix has to
+   reason per message and touches the no-downgrade and max-priority shortcuts —
+   a behavior change nobody has adjudicated, needing its own D5 treatment and
+   its own task. **Disposition: file an issue against main** (owner action at
+   merge; the PR carries the draft).
+2. **`ResultCache`'s prune is page-sized, not pending-set-sized** — a thread
+   pushed off a cycle's `max_emails_per_cycle` page loses its cached grading and
+   re-grades once. Documented rather than changed: hardening the prune would
+   alter three trackers' semantics (FailureTracker's predate Wave 2). Every home
+   that describes the cache now says session-scoped and page-pruned, and names
+   D18's newest-timestamp dedup on read as the backstop.
+3. **T5's write-bound wiring gap** — dropping `write_sem=` from `run_daemon`'s
+   `LabelManager` leaves the suite green. Proved pre-existing (the same mutation
+   is green at T5's parent) and **already catalogued as finding 42** in
+   docs/plans/2026-07-30-clarity-audit-findings.md, which this plan explicitly
+   defers to Wave 3. Left there. The per-write granularity T5 was actually about
+   is mutation-pinned by the tests `3d51284` added.
+4. **Escalation option (b)** — emitting a new throttled shared-cause ERROR for
+   all-provider-shaped cycles — **would contradict this plan's 8c**, which
+   deliberately makes the per-thread WARNING the visibility for a short provider
+   outage so a one-pending-thread outage never false-alarms. Option (a) was
+   taken instead: README-technical, llm_client and proxy_client now say honestly
+   that an account-wide 429/outage surfaces as the per-thread WARNING plus a
+   flat `Processed 0/N threads`, not as an ERROR.
+5. **The env-doc guard's `resolve_int_env` blind spot** (T13, §4). Widening it
+   would newly implicate `WRITE_PARALLEL`, `LOCAL_PARALLEL` and
+   `MAX_EMAILS_PER_CYCLE` — Wave 3 / issue #39 territory.
+
+Also unabsorbed by the plan's own instruction:
+`.claude/skills/tui-regression/synth_data.py`'s synthetic assessment records
+still lack `schema_version` (optional, outside the suite; readers tolerate it by
+`.get()`).
+
+**Wave 3 handoff, as this plan specifies:** the findings-catalog sweep, the #39
+gap-list regeneration (now unblocked by T1's web-app removal), and the
+docstring/altitude sweep — plus items 1, 3 and 5 above. Issue hygiene for
+#26/#28/#29/#30/#33/#35/#68 is prepared as comment drafts on the PR (owner
+actions on merge).
+
+### 7. Acceptance-pass fixes (this commit)
+
+T14's coherence audit found four things to fix; they are in this commit:
+
+1. **docs/decisions.md, D5.** The masquerade clause read "singleton and
+   zero-success cycles neither increment nor reset the counter". The code clears
+   a thread's counter on **that thread's own success, whatever the cycle's
+   shape** — the success-clear loop in `attribute_cycle_failures`, pinned by
+   `TestMasqueradeTracker::test_success_clears_the_threads_masquerade_count`.
+   The clause now says never-increment plus success-always-clears. (This is also
+   where the shipped code diverges from plan 8c's literal wording, which pairs
+   an unconditional "success-clears" tracker shape with "a singleton or
+   zero-success cycle neither increments nor resets": the code reads
+   success-clears as unconditional, which is right — a success is unambiguous
+   evidence whatever else the cycle looked like.)
+2. **daemon.py.** `attribute_cycle_failures`' docstring carried the same
+   imprecision ("ambiguous cycles … leave the counter untouched"); corrected to
+   match.
+3. **README.md, Resilience.** The deferral-only examples now include an
+   unwritable assessment sink — the D5 case the human overview never named
+   (flagged during T12, out of that task's scope).
+4. **README-technical, Test Coverage by Module.** The `test_newsletter.py` and
+   `test_migrate_assessments.py` rows now name T4's `schema_version` coverage
+   and T11's Rule-1 raises, matching the practice every other row in the wave
+   followed.
+
+Everything else on the acceptance checklist was verified and needed no change:
+D3, D6, D10, D11 and D12 flipped in their implementing commits; D5's Status line
+and all six corollaries resolved, each naming its task commit — `957ba96`,
+`da368e6`, `ee3958d`, `a4005ea`, `1a9d1fd`, `a40c2c2`, every one verified
+against `git log`; D19's "(today daemon-wide; per-function under D5, pending)"
+clause resolved; D20 closed out; and no other registry entry drifted (the
+`3222a54..HEAD` diff of docs/decisions.md touches exactly D3, D5, D6, D10, D11,
+D12, D19, D20, each by a task entitled to it). CLAUDE.md carries no
+pending-language anywhere and still holds principles without literal values
+(D7). README.md (Resilience, labels table, the former Safe-defaults bullet) and
+README-technical (write-before-label, sink preflight, Health Checking, env
+table, Test Coverage by Module, Release Identity) describe the new behavior
+only; the CI note is untouched.

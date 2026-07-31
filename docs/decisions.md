@@ -120,7 +120,9 @@ did:
   siblings succeeding) retries forever, never abandoned: at `max_failures`
   qualifying cycles it becomes a suspect and a distinct ERROR repeats at most
   once per status interval (`MasqueradeTracker`); singleton and zero-success
-  cycles neither increment nor reset the counter, and local-tier LLM
+  cycles never increment the counter, and nothing but a thread's own success
+  resets it — a lone thread that *succeeds* clears its count like any other,
+  since a success is unambiguous whatever the cycle's shape. Local-tier LLM
   unavailability is excluded entirely (the deliberately-offline MLX host makes
   person-thread deferral routine, issue #24). The masquerade half needs no
   denominator change: it moves only on positive evidence (a succeeding thread,

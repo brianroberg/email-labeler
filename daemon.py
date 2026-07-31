@@ -494,7 +494,8 @@ def attribute_cycle_failures(
       * Provider-shaped failures never strike. When exactly one thread failed
         provider-shaped and a sibling succeeded, its masquerade counter
         advances (see MasqueradeTracker); ambiguous cycles (singleton,
-        zero-success) leave the counter untouched.
+        zero-success) never advance it. Only a thread's own success clears a
+        count, whatever the cycle's shape — a success is never ambiguous.
 
     Marking eligibility derives from THIS cycle's strikes only — never from raw
     tracker counts — so a stale at-threshold count left by a failed marker
