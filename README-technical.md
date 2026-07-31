@@ -211,8 +211,8 @@ ERROR Newsletter assessments resolve to /app/data/newsletter_assessments.jsonl, 
       container is recreated. Mount the directory you review, e.g. '- ./data:/app/data'
       under the service's volumes.
 ERROR Newsletter assessments sink is not writable: /app/data. Newsletters will be left
-      unprocessed (and eventually marked agent/attempted) rather than graded into a
-      record that cannot be saved.
+      unprocessed (retried every cycle until this is fixed, never abandoned) rather
+      than graded into a record that cannot be saved.
 ```
 
 * **The record count** is the tell for a *misdirected* sink: a daemon that has
@@ -337,7 +337,7 @@ never re-graded. Writing first inverts the failure mode:
 
 | Fault | Outcome |
 |---|---|
-| Sink write fails | `OSError` logged at ERROR naming the resolved path, thread left unprocessed → retried next cycle → persistent fault ends at the give-up path's findable `agent/attempted` |
+| Sink write fails | `OSError` logged at ERROR naming the resolved path, re-raised as `AssessmentSinkError` and caught by its own arm: thread left unprocessed → retried next cycle → retried *forever*. A sink fault is shared-cause (decision D5), so it never counts toward give-up and the newsletter is never abandoned to `agent/attempted`; the per-cycle ERROR is the loudness, and the ResultCache means each retry re-attempts only the write |
 | Labels fail after a successful write | Thread unprocessed → retried next cycle from the daemon's session `ResultCache` (issue #29): the cached grading is reused and the JSONL append is skipped, so only the labels write is re-attempted — no LLM re-run and no second record for the same thread content. Only a changed fingerprint (a new message in the thread) re-grades and re-appends; for that case `load_assessments` keeps the newest record per thread — by the record's own `timestamp`, not by file position, so merging a rescued copy of the file cannot resurrect an older grading — and the review TUI still shows one row |
 
 ### Prompt templates

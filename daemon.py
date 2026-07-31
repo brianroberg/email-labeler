@@ -25,6 +25,7 @@ from gmail_utils import decode_body, get_header
 from labeler import LabelManager, _get_priority
 from llm_client import LLMBalanceError, LLMClient, LLMUnavailableError
 from newsletter import (
+    AssessmentSinkError,
     NewsletterClassifier,
     NewsletterTier,
     aggregate_theme_grades,
@@ -660,7 +661,10 @@ async def process_single_thread(
     Failures are never handled inline (decision D5): each failure arm records a
     CycleFailure into ``cycle_failures`` — candidate or provider-shaped — and
     returns False; the poll loop's post-gather attribution step decides strikes
-    and marking (attribute_cycle_failures).
+    and marking (attribute_cycle_failures). The assessment-sink arm
+    (AssessmentSinkError) is the one failure that records nothing at all: a
+    sink fault is shared-cause by construction (the disk, not the thread), so
+    there is nothing for correlation to weigh and it is retried forever.
 
     Halts are per-function (decision D5's scope rule, D19): a balance fault
     trips only the halted function's slot in ``halts``, and a thread whose own
@@ -802,8 +806,10 @@ async def process_single_thread(
                 # fault — a bind mount gone read-only, a full disk, bad permissions —
                 # into permanent silent data loss: labels applied, grading gone,
                 # thread never re-graded. Writing first means a sink fault leaves the
-                # thread unprocessed, so the next cycle retries it (and a persistent
-                # fault ends at the give-up path's findable agent/attempted).
+                # thread unprocessed, so the next cycle retries it — and keeps
+                # retrying: a sink fault is shared-cause (the disk, not the thread),
+                # never counted toward give-up (decision D5's sink corollary), so the
+                # newsletter waits for the operator instead of being abandoned.
                 # Skipped once assessment_written: for an unchanged fingerprint
                 # the record never repeats — a retry re-attempts only the labels.
                 if newsletter_output_file and not cached_nl.assessment_written:
@@ -821,7 +827,10 @@ async def process_single_thread(
                         )
                     except OSError as exc:
                         # Named at ERROR with the resolved path so a sink fault is
-                        # distinguishable from a grading fault at a glance.
+                        # distinguishable from a grading fault at a glance. This
+                        # per-cycle line is the loudness the never-counted retry
+                        # relies on (the startup preflight already screams about an
+                        # unusable sink).
                         log.error(
                             "Cannot write newsletter assessment to %s: %s — thread %s "
                             "left unprocessed for retry (check the path exists, is "
@@ -830,7 +839,11 @@ async def process_single_thread(
                             exc,
                             thread_id,
                         )
-                        raise
+                        # Re-raise as a dedicated type, not the bare OSError: the
+                        # arm below must be able to catch sink faults WITHOUT
+                        # catching TimeoutError, which subclasses OSError and is a
+                        # strike candidate (decision D5).
+                        raise AssessmentSinkError(str(exc)) from exc
                     cached_nl.assessment_written = True
 
                 await label_manager.apply_newsletter_classification(
@@ -983,6 +996,17 @@ async def process_single_thread(
             log.debug("Thread %s CoT — label: %s", thread_id, result.label_cot)
         return True
 
+    except AssessmentSinkError:
+        # The assessments sink itself failed — a read-only bind mount, a full
+        # disk, bad permissions. Shared cause (decision D5's sink corollary):
+        # the disk is the problem, not this newsletter, so it never counts
+        # toward give-up. No strike, no CycleFailure (nothing for the cycle
+        # attribution to weigh), no marker — the thread stays pending and is
+        # retried every cycle, forever, until the operator fixes the sink. The
+        # ERROR line at the raise site (with the resolved path) already fired,
+        # and with the ResultCache (issue #29) the retry re-attempts only the
+        # JSONL write: the grading is cached, so "forever" costs no LLM spend.
+        return False
     except LLMUnavailableError as exc:
         # LLM endpoint can't serve requests right now — unreachable, dropped
         # mid-request, or answering with an exhausted 429/5xx. Provider-shaped

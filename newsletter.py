@@ -263,6 +263,19 @@ def parse_send_date(date_header: str, internal_date_ms: str | None = None) -> st
     return None
 
 
+class AssessmentSinkError(Exception):
+    """The assessments JSONL could not be written (read-only mount, full disk,
+    bad permissions, sink path is a directory).
+
+    Raised by the daemon at the ``write_assessment`` call site, wrapping the
+    underlying ``OSError`` as its cause. Its whole purpose is to be
+    *distinguishable*: under decision D5's sink corollary a sink fault is
+    shared-cause (the disk, not the thread), so it must never count toward
+    give-up — and a bare ``OSError`` cannot be caught for that without also
+    catching ``TimeoutError``, which subclasses it and *is* a strike candidate.
+    """
+
+
 def write_assessment(
     output_file: str,
     message_id: str,
@@ -479,8 +492,8 @@ def sink_writability_warning(path: Path) -> str | None:
 
     return (
         f"Newsletter assessments sink is not writable: {target}. Newsletters will be "
-        "left unprocessed (and eventually marked agent/attempted) rather than graded "
-        "into a record that cannot be saved."
+        "left unprocessed (retried every cycle until this is fixed, never abandoned) "
+        "rather than graded into a record that cannot be saved."
     )
 
 

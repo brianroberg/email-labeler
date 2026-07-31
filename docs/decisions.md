@@ -145,9 +145,19 @@ Corollaries, each `implementation pending (Wave 2)` until landed:
   a poison newsletter converges to a findable `agent/attempted` rather than a
   false no-stories record; the eval harness, which shares the parser, degrades
   to error rows.
-- Assessment-sink faults are shared-cause: never counted, retried forever
-  (README-technical's write-before-label table currently documents the
-  give-up ending, matching the code; this corollary changes both).
+- Assessment-sink faults are shared-cause: never counted, retried forever —
+  implemented (Wave 2 T12). The daemon re-raises the sink `OSError` as a
+  dedicated `AssessmentSinkError` (newsletter.py) at the `write_assessment`
+  call site and catches it in its own arm ahead of the candidate arms: no
+  strike, no `CycleFailure` (the fault never reaches attribution at all), no
+  marker — the newsletter is retried every cycle until the operator fixes the
+  sink. A dedicated class rather than `except OSError`, which would also
+  swallow `TimeoutError` (an OSError subclass, and a strike candidate). The
+  per-cycle ERROR naming the resolved path is the loudness, alongside the
+  startup preflight; with the ResultCache (T6) each retry re-attempts only the
+  JSONL write, so "forever" costs no LLM spend. README-technical's
+  write-before-label table and the sink-preflight warning text, which both
+  documented the give-up ending, changed with it.
 - `max_failures` (the strike bound, currently 5) becomes env-overridable
   (`MAX_FAILURES`) and documented with the other knobs.
 Forecloses: per-cell relitigating of the failure table; new error paths that

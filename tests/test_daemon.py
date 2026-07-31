@@ -2826,7 +2826,16 @@ class TestNewsletterAssessmentDurability:
     ):
         """An unwritable sink must NOT be swallowed: no labels, no
         agent/processed, and a False return so the thread is retried next
-        cycle (and, if the fault persists, given up as agent/attempted)."""
+        cycle — forever.
+
+        A sink fault is shared-cause (disk), so it is never counted toward
+        give-up (decision D5's sink corollary, Wave 2 T12): the newsletter is
+        retried every cycle and is never abandoned to agent/attempted. Before
+        T12 the bare OSError walked into the generic Exception arm as a strike
+        candidate, so a read-only mount abandoned graded newsletters after
+        max_failures cycles — this drives one cycle past the threshold to pin
+        the reversal.
+        """
         mock_proxy.get_thread.return_value = newsletter_thread_response
         mock_newsletter_classifier.classify_newsletter.return_value = [self._story()]
 
@@ -2834,29 +2843,29 @@ class TestNewsletterAssessmentDurability:
             raise OSError(30, "Read-only file system")
 
         monkeypatch.setattr(daemon, "write_assessment", _boom)
-        # The OSError is collected as a strike candidate for the poll loop's
-        # attribution (D5, Wave 2 T8); the sink-fault never-counted corollary
-        # lands separately (T12).
-        failures: list[daemon.CycleFailure] = []
+        tracker = FailureTracker(max_failures=3)
 
-        result = await process_single_thread(
-            "thread_nl",
-            ["msg_nl_001"],
-            mock_proxy,
-            mock_classifier,
-            mock_label_manager,
-            cloud_sem,
-            local_sem,
-            max_thread_chars=50000,
-            newsletter_classifier=mock_newsletter_classifier,
-            newsletter_recipient="newsletters@dm.org",
-            newsletter_output_file="/nonexistent/assessments.jsonl",
-            cycle_failures=failures,
-        )
+        for _ in range(tracker.max_failures + 1):
+            results = await drive_attribution_cycle(
+                [("thread_nl", ["msg_nl_001"])],
+                mock_proxy,
+                mock_classifier,
+                mock_label_manager,
+                cloud_sem,
+                local_sem,
+                tracker=tracker,
+                newsletter_classifier=mock_newsletter_classifier,
+                newsletter_recipient="newsletters@dm.org",
+                newsletter_output_file="/nonexistent/assessments.jsonl",
+            )
+            assert results == [False]
 
-        assert result is False
         mock_label_manager.apply_newsletter_classification.assert_not_called()
         mock_label_manager.mark_processed.assert_not_called()
+        # Never counted: no strike accrued, so no marker and no give-up.
+        mock_label_manager.mark_attempted.assert_not_called()
+        assert tracker.should_give_up("thread_nl") is False
+        assert tracker.take_given_up() == []
 
     async def test_sink_failure_names_the_path_at_error_level(
         self,
