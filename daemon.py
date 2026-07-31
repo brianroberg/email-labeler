@@ -11,6 +11,7 @@ import logging
 import os
 import sys
 import tomllib
+from collections import Counter
 from contextlib import nullcontext
 from dataclasses import dataclass
 from pathlib import Path
@@ -144,15 +145,17 @@ def resolve_newsletter_llm_endpoint() -> tuple[str, str]:
 
 
 class FailureTracker:
-    """Counts consecutive thread-specific failures to break infinite retry loops.
+    """Counts strikes against threads the cycle-level attribution blamed, to
+    break infinite retry loops.
 
-    Records only failures the caller deems give-up-eligible. An endpoint-wide
-    outage never lands here: an LLM outage (ConnectError → LLMUnavailableError) is
-    deferred per-thread without counting, and a proxy outage fails the cycle-level
-    list_messages first, so the whole cycle defers before any thread is counted.
-    A *persistent per-thread* fault — a poison thread, including a deterministic
-    per-request proxy 5xx (issue #26) — does accrue here and is given up once it
-    hits max_failures. In-memory and session-scoped: counts reset on daemon
+    Fed only by the poll loop's post-gather attribution step
+    (attribute_cycle_failures) — never inline from process_single_thread.
+    Provider-shaped faults (LLM/proxy unavailability, exhausted 429s, 5xx)
+    never land here: decision D5, deliberately reversing issue #26's proxy-5xx
+    counting. A candidate failure lands only when correlation says the thread
+    is the problem — its signature unique in the cycle with siblings
+    succeeding, or a singleton cycle. At max_failures the thread is marked
+    agent/attempted. In-memory and session-scoped: counts reset on daemon
     restart, so a thread that failed for a since-resolved reason gets another
     chance after a restart.
     """
@@ -193,6 +196,88 @@ class FailureTracker:
         out = self._given_up
         self._given_up = []
         return out
+
+
+@dataclass
+class CycleFailure:
+    """One thread's failure in one poll cycle, recorded by process_single_thread
+    for the poll loop's post-gather attribution step (decision D5 Rule 2).
+
+    ``signature`` is the exception's class qualname — the correlation key: two
+    threads failing with the same signature in one cycle look like one shared
+    cause, not two coincidental poison threads. ``provider_shaped`` entries
+    (proxy/LLM unavailability) never strike; they exist so the attribution can
+    spot the single-thread masquerade (see MasqueradeTracker).
+    """
+
+    thread_id: str
+    ids_to_mark: list[str]
+    signature: str
+    provider_shaped: bool = False
+
+
+class MasqueradeTracker:
+    """Watches for the single-thread masquerade: provider-shaped errors on one
+    thread while siblings succeed (decision D5; issue #26's poison-thread
+    scenario). Such a thread is retried forever — provider-shaped faults never
+    strike — but must not fail silently: at ``max_failures`` qualifying cycles
+    it becomes a suspect and the poll loop escalates with a distinct ERROR,
+    repeated at most once per status interval while any suspect persists.
+
+    Mirrors FailureTracker's shape: per-thread counter, success-clears, pruned
+    each cycle to the still-pending set, in-memory and session-scoped. A cycle
+    only counts when it carries correlation evidence — exactly one thread
+    failed provider-shaped AND a sibling was handled successfully. Singleton
+    and zero-success cycles neither increment nor reset (no evidence either
+    way), so a genuine short provider outage with one pending thread never
+    false-alarms; the per-thread WARNING each cycle remains its visibility.
+    Local-tier LLM unavailability never lands here at all: the deliberately-
+    offline MLX host makes "person threads defer while service siblings
+    succeed" the routine local state (issue #24), and tracking it would
+    false-alarm every night the laptop is closed.
+    """
+
+    def __init__(self, max_failures: int = 5):
+        self.max_failures = max_failures
+        self._counts: dict[str, int] = {}
+        self._last_escalation: float | None = None
+
+    def record_masquerade(self, thread_id: str) -> None:
+        self._counts[thread_id] = self._counts.get(thread_id, 0) + 1
+
+    def clear(self, thread_id: str) -> None:
+        self._counts.pop(thread_id, None)
+
+    def prune(self, active_thread_ids) -> None:
+        """Drop counts for threads no longer pending (mirrors FailureTracker.prune)."""
+        active = set(active_thread_ids)
+        self._counts = {tid: n for tid, n in self._counts.items() if tid in active}
+
+    def suspects(self) -> dict[str, int]:
+        """Threads at/above the escalation threshold, with their cycle counts."""
+        return {tid: n for tid, n in self._counts.items() if n >= self.max_failures}
+
+    def escalation_line(self, now: float, status_interval: float) -> str | None:
+        """Return the distinct escalation ERROR line, or None when quiet.
+
+        Its own small throttled emitter (idle_report only runs on idle cycles):
+        emits when a suspect first exists, then at most once per
+        ``status_interval`` while any suspect persists. The throttle resets when
+        no suspect remains, so a future suspect escalates immediately.
+        """
+        suspects = self.suspects()
+        if not suspects:
+            self._last_escalation = None
+            return None
+        if self._last_escalation is not None and now - self._last_escalation < status_interval:
+            return None
+        self._last_escalation = now
+        detail = ", ".join(f"{tid} ({n} cycles)" for tid, n in sorted(suspects.items()))
+        return (
+            f"Thread(s) failing with provider-shaped errors while siblings "
+            f"succeed: {detail} — retrying forever per the failure model (D5), "
+            f"never abandoned; investigate the thread or the provider route"
+        )
 
 
 @dataclass
@@ -295,35 +380,97 @@ class DaemonHalt:
         return self.reason is not None
 
 
-async def _give_up_if_stuck(
+def attribute_cycle_failures(
+    thread_items: list[tuple[str, list[str]]],
+    results: list,
+    failures: list["CycleFailure"],
+    failure_tracker: FailureTracker,
+    masquerade_tracker: MasqueradeTracker,
+) -> list["CycleFailure"]:
+    """Post-gather attribution (decision D5 Rule 2): decide which of this cycle's
+    failures were the thread's own fault, strike them, and return the entries
+    that just struck out — the poll loop marks those agent/attempted.
+
+    Blame by correlation, cycle-level:
+
+      * A candidate failure (Timeout / RuntimeError / unexpected Exception)
+        counts a strike iff its signature is unique among the cycle's candidate
+        failures AND — when the cycle contained other threads — at least one of
+        them was handled successfully. Everything else is treated as shared
+        cause (provider, proxy, disk, or our own config/code): no strikes, one
+        ERROR line, backlog kept.
+      * A singleton cycle counts: with no siblings to correlate against,
+        bounded strikes to a findable agent/attempted is the honest fallback —
+        and the poison-thread case is typically a singleton (everything else
+        processed away).
+      * Provider-shaped failures never strike. When exactly one thread failed
+        provider-shaped and a sibling succeeded, its masquerade counter
+        advances (see MasqueradeTracker); ambiguous cycles (singleton,
+        zero-success) leave the counter untouched.
+
+    Marking eligibility derives from THIS cycle's strikes only — never from raw
+    tracker counts — so a stale at-threshold count left by a failed marker
+    write can never mark a thread that has since stopped failing.
+    """
+    any_success = any(result is True for result in results)
+    multi_thread = len(thread_items) > 1
+    thread_blame = not multi_thread or any_success
+
+    candidates = [f for f in failures if not f.provider_shaped]
+    signature_counts = Counter(f.signature for f in candidates)
+    striking = [f for f in candidates if thread_blame and signature_counts[f.signature] == 1]
+    shared = [f for f in candidates if not (thread_blame and signature_counts[f.signature] == 1)]
+    if shared:
+        log.error(
+            "%d thread(s) failed this cycle with no correlation evidence of a "
+            "thread-specific fault (signatures: %s) — shared cause suspected "
+            "(D5): no strikes, backlog kept",
+            len(shared),
+            ", ".join(sorted({f.signature for f in shared})),
+        )
+    for f in striking:
+        failure_tracker.record_failure(f.thread_id)
+
+    # Masquerade bookkeeping (D5): success clears; exactly one provider-shaped
+    # failing thread plus a successful sibling increments. Local-tier LLM
+    # deferrals never appear in `failures` at all (see the LLMUnavailableError
+    # arm), so a closed MLX laptop can't accrue here.
+    for (tid, _msg_ids), result in zip(thread_items, results):
+        if result is True:
+            masquerade_tracker.clear(tid)
+    provider_threads = {f.thread_id for f in failures if f.provider_shaped}
+    if len(provider_threads) == 1 and any_success:
+        masquerade_tracker.record_masquerade(provider_threads.pop())
+    masquerade_tracker.prune(tid for tid, _msg_ids in thread_items)
+
+    return [f for f in striking if failure_tracker.should_give_up(f.thread_id)]
+
+
+async def _mark_thread_attempted(
     thread_id: str,
     msg_ids: list[str],
-    failure_tracker: "FailureTracker | None",
+    failure_tracker: FailureTracker,
     label_manager: LabelManager,
 ) -> bool:
-    """Record a thread-specific failure; if it has failed too many times, mark it
-    agent/attempted so it stops being retried every cycle.
+    """Mark a struck-out thread agent/attempted so it stops being retried every
+    cycle. Called from the poll loop for threads the cycle attribution just
+    struck out — attribute_cycle_failures owns the strike accounting (decision
+    D5); this function owns only the guarded marker write.
 
     Uses agent/attempted (not agent/processed): the thread is excluded from the
     unprocessed query either way, but the distinct label keeps abandoned threads
     findable and separate from successfully-classified mail.
 
-    Returns True if the thread was given up (marked agent/attempted → handled), or
-    False if it should simply be retried next cycle.
+    Returns True if the marker landed (thread abandoned), or False if the write
+    failed and the thread stays pending.
     """
-    if failure_tracker is None:
-        return False
-    failure_tracker.record_failure(thread_id)
-    if not failure_tracker.should_give_up(thread_id):
-        return False
     try:
         await label_manager.mark_attempted(msg_ids)
     except ProxyUnavailableError as exc:
         # The proxy is transiently down, so the agent/attempted marker can't be written
         # right now — expected during an outage, not a bug. We return without recording
-        # the give-up, so the thread stays give-up-eligible: its failure count is left
-        # ≥ max_failures (this arm returns False, so the poll loop's success-only
-        # count-clear never runs), and the marker write is retried next cycle once the
+        # the give-up and without clearing the count, so the count stays at the
+        # threshold and the thread's next strike re-qualifies it for marking once the
         # proxy recovers. Log a clean warning rather than spamming a traceback for an
         # expected transient condition. (The thread keeps re-matching the query until it
         # is actually labeled; if its classification already succeeded, the ResultCache
@@ -338,9 +485,8 @@ async def _give_up_if_stuck(
         # A proxy 403 on the marker write is a human answer — the operator rejected
         # the confirmation, or the op is blocked — not a failure (decision D6). One
         # clean line, no traceback. The rejection blocks the marker; the thread stays
-        # give-up-eligible (its count is left ≥ max_failures, and this arm returns
-        # False so the poll loop's success-only count-clear never runs), so the
-        # marker write is re-offered next cycle. A rejection never *causes* the
+        # give-up-eligible (its count is left at the threshold, so its next strike
+        # re-offers the marker write next cycle). A rejection never *causes* the
         # give-up — the strikes that reached the threshold came from elsewhere.
         log.info(
             "Marker write rejected/blocked by the proxy for thread %s — "
@@ -362,8 +508,10 @@ async def _give_up_if_stuck(
         thread_id, failure_tracker.max_failures,
     )
     failure_tracker.record_give_up(thread_id)
-    # Note: the poll loop clears the failure count on every True result (which a
-    # give-up returns), so the count is reset there — no need to clear it here too.
+    # Give-ups return False from process_single_thread (they are failures, not
+    # handled work — D5), so summarize_cycle's success-clear never runs for
+    # them: clear the count here, beside the successful mark.
+    failure_tracker.clear(thread_id)
     return True
 
 
@@ -419,7 +567,7 @@ async def process_single_thread(
     newsletter_recipient: str = "",
     newsletter_output_file: str = "",
     newsletter_only: bool = False,
-    failure_tracker: "FailureTracker | None" = None,
+    cycle_failures: "list[CycleFailure] | None" = None,
     fetch_sem: asyncio.Semaphore | None = None,
     local_deferrals: list[str] | None = None,
     halt: "DaemonHalt | None" = None,
@@ -442,6 +590,11 @@ async def process_single_thread(
 
     Enforces no-downgrade rule: if the thread already has a classification
     with equal or higher priority, it is skipped.
+
+    Failures are never handled inline (decision D5): each failure arm records a
+    CycleFailure into ``cycle_failures`` — candidate or provider-shaped — and
+    returns False; the poll loop's post-gather attribution step decides strikes
+    and marking (attribute_cycle_failures).
 
     Args:
         thread_id: Gmail thread ID.
@@ -732,42 +885,49 @@ async def process_single_thread(
         return True
 
     except LLMUnavailableError as exc:
-        # LLM endpoint unreachable or dropped mid-request (server down, connect
-        # timeout, reset) — transient. Don't count it toward give-up; just retry
-        # next cycle (preserves graceful degradation of the privacy invariant).
+        # LLM endpoint can't serve requests right now — unreachable, dropped
+        # mid-request, or answering with an exhausted 429/5xx. Provider-shaped
+        # (decision D5): never a strike; defer and retry next cycle (preserves
+        # graceful degradation of the privacy invariant).
         #
         # The LOCAL tier being down is a routine operating condition (the MLX
         # laptop is deliberately offline for hours at a time), not an incident:
         # log per-thread detail at DEBUG and count the deferral so the poll loop
         # can emit a single per-cycle INFO summary instead of N warnings
-        # (issue #24). A cloud (or tier-less) outage stays a WARNING.
+        # (issue #24). Local-tier deferrals are also excluded from masquerade
+        # bookkeeping entirely — person threads deferring while service siblings
+        # succeed is the routine local state, and tracking it would false-alarm
+        # every night the laptop is closed. A cloud (or tier-less) outage stays
+        # a WARNING and is recorded provider-shaped so the cycle attribution can
+        # spot the single-thread masquerade.
         if exc.tier == "local":
             log.debug("Local LLM unavailable processing thread %s: %s", thread_id, exc)
             if local_deferrals is not None:
                 local_deferrals.append(thread_id)
         else:
             log.warning("LLM unavailable processing thread %s: %s", thread_id, exc)
+            if cycle_failures is not None:
+                cycle_failures.append(CycleFailure(
+                    thread_id, ids_to_mark, type(exc).__qualname__, provider_shaped=True,
+                ))
         return False
     except ProxyUnavailableError as exc:
         # api-proxy unavailable for THIS thread's call — connection refused, a timeout,
         # a dropped connection, a 5xx / exhausted-429 response, or a non-JSON 2xx body.
-        #
-        # Unlike LLMUnavailableError above, this is give-up-eligible (issue #26). The
-        # asymmetry is deliberate: a *fully* endpoint-wide PROXY outage is caught one
-        # level up — list_messages (also a proxy call) fails first, so the whole cycle
-        # defers (see the poll loop) and no thread is ever processed or counted. A fault
-        # that reaches here is therefore either thread-specific (e.g. a deterministic
-        # 5xx on one unserializable thread) or a partial/route-selective degradation
-        # (e.g. get_thread garbles while list_messages stays healthy); if it PERSISTS
-        # across cycles it must be bounded like Timeout/RuntimeError below, not retried
-        # forever. A transient blip clears its count via the poll-loop success-clear
-        # before reaching the threshold. The accepted residual is that a *sustained*
-        # partial outage can abandon the backlog — but to the findable, re-processable
-        # agent/attempted (issue #23), not to lost mail. (An LLM outage, by contrast, is
-        # invisible at the cycle level — the proxy is up — so LLMUnavailableError must
-        # never give up, or one MLX outage would abandon every person thread.)
+        # Provider-shaped (decision D5, deliberately reversing issue #26's give-up
+        # counting): the proxy failing to serve a request is never the thread's
+        # blame — no strike, defer and retry next cycle, backlog kept. The residual
+        # #26 worried about — a deterministic per-thread 5xx masquerading as an
+        # outage — is handled by the attribution step instead: provider-shaped
+        # failures on one thread while siblings succeed accrue in the
+        # MasqueradeTracker and escalate with a distinct repeated ERROR, retried
+        # forever rather than abandoned.
         log.warning("api-proxy unavailable processing thread %s: %s", thread_id, exc)
-        return await _give_up_if_stuck(thread_id, ids_to_mark, failure_tracker, label_manager)
+        if cycle_failures is not None:
+            cycle_failures.append(CycleFailure(
+                thread_id, ids_to_mark, type(exc).__qualname__, provider_shaped=True,
+            ))
+        return False
     except ProxyForbiddenError as exc:
         # A proxy 403 on a gated write is a human answer — the operator said
         # "not now", or the op is blocked — not a failure (decision D6, issue #28
@@ -785,15 +945,23 @@ async def process_single_thread(
         return False
     except httpx.ConnectError as exc:
         # Defensive: a raw ConnectError shouldn't escape the wrapped clients, but if
-        # one does it's still a transient outage — retry next cycle, don't give up.
+        # one does it's still a transient outage — provider-shaped (D5): retry next
+        # cycle, never strike.
         log.warning("Connection error processing thread %s: %s", thread_id, exc)
+        if cycle_failures is not None:
+            cycle_failures.append(CycleFailure(
+                thread_id, ids_to_mark, type(exc).__qualname__, provider_shaped=True,
+            ))
         return False
     except TimeoutError as exc:
         # Request-specific slowness (e.g. a transcript too large to prefill within
-        # the timeout) — eligible for give-up so one huge thread can't be retried
+        # the timeout) — a strike candidate: the cycle attribution counts it when
+        # correlation blames the thread, so one huge thread can't be retried
         # forever. (Connect/pool timeouts are LLMUnavailableError, handled above.)
         log.error("Timeout processing thread %s: %s", thread_id, exc)
-        return await _give_up_if_stuck(thread_id, ids_to_mark, failure_tracker, label_manager)
+        if cycle_failures is not None:
+            cycle_failures.append(CycleFailure(thread_id, ids_to_mark, type(exc).__qualname__))
+        return False
     except LLMBalanceError as exc:
         # Account-wide, not a thread fault (and must precede the RuntimeError arm,
         # which it subclasses): don't count toward give-up, don't mark anything —
@@ -803,11 +971,22 @@ async def process_single_thread(
             halt.trip(str(exc))
         return False
     except RuntimeError as exc:
+        # Request-specific LLM failure — a non-balance 4xx-shaped response, or an
+        # unusable reply (LLMContentError): a strike candidate under the cycle
+        # attribution (D5).
         log.error("Thread %s: %s", thread_id, exc)
-        return await _give_up_if_stuck(thread_id, ids_to_mark, failure_tracker, label_manager)
-    except Exception:
+        if cycle_failures is not None:
+            cycle_failures.append(CycleFailure(thread_id, ids_to_mark, type(exc).__qualname__))
+        return False
+    except Exception as exc:
+        # Unexpected failure — keep the traceback. A strike candidate under the
+        # cycle attribution (D5): a poison thread converges to agent/attempted,
+        # while a code bug failing every thread the same way correlates to
+        # shared-cause (no strikes, loud, backlog kept).
         log.exception("Error processing thread %s", thread_id)
-        return await _give_up_if_stuck(thread_id, ids_to_mark, failure_tracker, label_manager)
+        if cycle_failures is not None:
+            cycle_failures.append(CycleFailure(thread_id, ids_to_mark, type(exc).__qualname__))
+        return False
 
 
 def summarize_cycle(
@@ -818,16 +997,18 @@ def summarize_cycle(
     """Tally a poll cycle's outcomes and update the failure tracker.
 
     A thread is "handled" when process_single_thread returned True (classified,
-    skipped at max priority, or given up — all return True); its failure count is
-    cleared. Drains the per-cycle give-up list and prunes counts for threads no
-    longer pending. Returns (handled_count, given_up_thread_ids); given_up is a
-    subset of the handled count (a give-up also returns True).
+    or skipped at max priority); its failure count is cleared. Give-ups return
+    False (they are failures, not handled work — decision D5), so given_up is
+    NOT a subset of the handled count: the poll loop's marking step records
+    them via record_give_up and clears their counts itself. Drains the
+    per-cycle give-up list and prunes counts for threads no longer pending.
+    Returns (handled_count, given_up_thread_ids).
     """
     processed = 0
     for (tid, _msg_ids), result in zip(thread_items, results):
         if result is True:
             processed += 1
-            failure_tracker.clear(tid)  # success/give-up resets the failure count
+            failure_tracker.clear(tid)  # success resets the failure count
     given_up = failure_tracker.take_given_up()
     failure_tracker.prune(tid for tid, _msg_ids in thread_items)
     return processed, given_up
@@ -1086,10 +1267,15 @@ async def run_daemon() -> None:
             local_parallel,
         )
 
-    # Breaks infinite retry loops: a thread that keeps failing for a
-    # thread-specific reason (not a transient outage) is marked processed after
-    # a few attempts. Session-scoped — counts reset on restart.
+    # Breaks infinite retry loops: a thread the cycle-level attribution keeps
+    # blaming (decision D5) is marked agent/attempted after a few strikes.
+    # Session-scoped — counts reset on restart.
     failure_tracker = FailureTracker()
+
+    # Watches the single-thread masquerade (provider-shaped failures on one
+    # thread while siblings succeed, decision D5): never abandoned, escalated
+    # with a distinct ERROR on the status heartbeat. Session-scoped.
+    masquerade_tracker = MasqueradeTracker(max_failures=failure_tracker.max_failures)
 
     # Keeps finished classifications across cycles while their label writes
     # keep failing (issue #29): a write fault costs a write retry, never an
@@ -1167,6 +1353,7 @@ async def run_daemon() -> None:
             max_thread_chars = daemon_config.get("max_thread_chars", DEFAULT_MAX_THREAD_CHARS)
             thread_items = list(threads.items())
             local_deferrals: list[str] = []
+            cycle_failures: list[CycleFailure] = []
             results = await asyncio.gather(
                 *(
                     process_single_thread(
@@ -1182,7 +1369,7 @@ async def run_daemon() -> None:
                         newsletter_recipient=newsletter_recipient,
                         newsletter_output_file=newsletter_output_file,
                         newsletter_only=newsletter_only,
-                        failure_tracker=failure_tracker,
+                        cycle_failures=cycle_failures,
                         fetch_sem=fetch_sem,
                         local_deferrals=local_deferrals,
                         halt=halt,
@@ -1192,17 +1379,31 @@ async def run_daemon() -> None:
                 ),
                 return_exceptions=True,
             )
+            # Post-gather failure handling, strictly ordered (decision D5):
+            # attribute → strike → mark → summarize → cycle log.
+            struck_out = attribute_cycle_failures(
+                thread_items, results, cycle_failures, failure_tracker, masquerade_tracker,
+            )
+            for entry in struck_out:
+                await _mark_thread_attempted(
+                    entry.thread_id, entry.ids_to_mark, failure_tracker, label_manager,
+                )
             processed, given_up = summarize_cycle(thread_items, results, failure_tracker)
             result_cache.prune(tid for tid, _msg_ids in thread_items)
             log_local_deferrals(local_deferrals)
             if threads:
                 if given_up:
                     log.info(
-                        "Processed %d/%d threads (%d of them abandoned after repeated failures: %s)",
+                        "Processed %d/%d threads (%d abandoned after repeated failures: %s)",
                         processed, len(threads), len(given_up), given_up,
                     )
                 else:
                     log.info("Processed %d/%d threads", processed, len(threads))
+            escalation = masquerade_tracker.escalation_line(
+                asyncio.get_event_loop().time(), status_interval
+            )
+            if escalation:
+                log.error(escalation)
 
             # Update healthcheck
             healthcheck_file.write_text(str(asyncio.get_event_loop().time()))

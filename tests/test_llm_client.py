@@ -195,7 +195,13 @@ class TestComplete:
             assert result == "PERSON"
 
     async def test_raises_on_http_error(self, cloud_client):
-        """Non-200 responses raise RuntimeError."""
+        """A 5xx raises LLMUnavailableError — provider-shaped, never a strike.
+
+        Reworked for decision D5 (Wave 2 T8): this test used to pin 500 →
+        RuntimeError, the give-up-eligible path; a 5xx means the provider can't
+        serve anyone and is deferred instead. The RuntimeError pin for
+        request-specific non-200s lives on the 400 in
+        test_http_error_message_identifies_provider below."""
         mock_response = _mock_response(status_code=500, json_data={"error": "Internal Server Error"})
 
         with patch("llm_client.httpx.AsyncClient") as mock_client_cls:
@@ -204,7 +210,7 @@ class TestComplete:
             mock_client_cls.return_value.__aenter__ = AsyncMock(return_value=mock_client)
             mock_client_cls.return_value.__aexit__ = AsyncMock(return_value=False)
 
-            with pytest.raises(RuntimeError, match="LLM request failed"):
+            with pytest.raises(LLMUnavailableError, match="status 500"):
                 await cloud_client.complete("sys", "user")
 
     async def test_http_error_message_identifies_provider(self, cloud_client):
@@ -425,14 +431,17 @@ class TestBalanceError:
         with pytest.raises(LLMBalanceError):
             await _post_canned(cloud_client, _mock_response(status, body))
 
-    async def test_429_quota_phrasing_stays_runtime_error(self, cloud_client):
-        """A 429 must NEVER halt, even with quota phrasing: Gemini-style per-minute
-        rate limits use the same wording as hard quota exhaustion, and wrongly
-        converting a transient rate limit into a restart-only halt is worse than
-        letting a rare 429-signaled out-of-funds fall back to per-thread give-up."""
+    async def test_429_quota_phrasing_never_halts(self, cloud_client):
+        """A 429 must NEVER halt, even with quota phrasing (decision D19):
+        Gemini-style per-minute rate limits use the same wording as hard quota
+        exhaustion, and wrongly converting a transient rate limit into a
+        restart-only halt is worse than retrying it as unavailability. Reworked
+        for D5 (Wave 2 T8): an exhausted 429 is provider-shaped now, so it
+        raises LLMUnavailableError instead of the old RuntimeError strike path —
+        the not-LLMBalanceError half is the load-bearing D19 guard."""
         body = {"error": {"message": "You exceeded your current quota, please check your plan."}}
         with patch("retry.asyncio.sleep", new=AsyncMock()):  # skip real retry backoff
-            with pytest.raises(RuntimeError) as exc_info:
+            with pytest.raises(LLMUnavailableError) as exc_info:
                 await _post_canned(cloud_client, _mock_response(429, body))
         assert not isinstance(exc_info.value, LLMBalanceError)
 
@@ -462,6 +471,30 @@ class TestBalanceError:
         assert "test-cloud-model" in msg
         assert "api.cloud.example.com" in msg
         assert "cloud" in msg
+
+
+class TestProviderShapedStatuses:
+    """Exhausted 429s and 5xx responses are provider-shaped (decision D5, Wave 2
+    T8): the provider can't serve anyone right now, so they surface as
+    LLMUnavailableError — deferred and retried next cycle, never a strike
+    candidate. Request-specific non-200s (400/401/404/422…) stay RuntimeError."""
+
+    async def test_exhausted_429_raises_unavailable_not_runtime(self, cloud_client):
+        """A 429 that survives retry.py's budget is a sustained throttle — the
+        endpoint can't serve anyone, which is never one thread's blame (D5).
+        It must surface as LLMUnavailableError carrying the tier (so the
+        daemon's quiet-local handling still applies), not the RuntimeError
+        strike-candidate path."""
+        client = LLMClient(
+            base_url="https://api.cloud.example.com/v1/chat/completions",
+            api_key="sk-test-key",
+            model="test-cloud-model",
+            tier="cloud",
+        )
+        with patch("retry.asyncio.sleep", new=AsyncMock()):  # skip real retry backoff
+            with pytest.raises(LLMUnavailableError) as exc_info:
+                await _post_canned(client, _mock_response(429, {"error": "rate limited"}))
+        assert exc_info.value.tier == "cloud"
 
 
 class TestContentlessResponse:

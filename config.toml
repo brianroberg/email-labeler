@@ -70,9 +70,12 @@ model = "{env.MLX_MODEL}"
 # threads (issue #64). An over-budget decode truncates content before the label
 # is emitted; llm_client raises LLMContentError on finish_reason "length" (so
 # it can no longer silently parse to the default LOW_PRIORITY → archive), but
-# that backstop turns every over-budget thread into an eventual give-up
-# (agent/attempted) — the budget must fit the honest demand. This raise is
-# therefore coupled to the thinking disable below, not independent tuning.
+# that backstop makes an undersized budget loud rather than cheap: a lone
+# over-budget thread strikes out to agent/attempted, and several co-failing
+# over-budget threads share a signature and are held as shared-cause (D5) —
+# deferred every cycle, backlog kept. Either way the budget must fit the
+# honest demand. This raise is therefore coupled to the thinking disable
+# below, not independent tuning.
 # NOTE: this also quadruples the per-request decode budget each concurrent
 # local request's KV cache can grow into. The documented LOCAL_PARALLEL
 # ceiling ("keep ≤ 8", README-technical "Local Model Serving & Memory") was

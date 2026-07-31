@@ -81,14 +81,32 @@ strikes, get loud, keep the backlog intact.
 other.
 
 Corollaries, each `implementation pending (Wave 2)` until landed:
-- Exhausted 429/5xx (LLM and proxy) never count toward give-up. **This
-  deliberately reverses issue #26.** proxy_client's transient-error docstrings
-  become true; llm_client's non-200 docstring (which currently matches the old
-  counting behavior) is rewritten to the new rule.
-- Correlation is the attribution mechanism (detection mechanics designed in
-  Wave 2). The single-thread masquerade (provider-shaped errors, siblings
-  succeeding) retries forever, never abandoned, with a distinct ERROR
-  escalation line repeated on the status heartbeat.
+- Exhausted 429/5xx (LLM and proxy) never count toward give-up — implemented
+  (Wave 2 T8). **This deliberately reverses issue #26.** proxy_client's
+  transient-error docstrings are now true; llm_client raises
+  LLMUnavailableError for an exhausted 429 or any 5xx (other non-200s stay
+  RuntimeError — request-specific strike candidates). A 429-signaled
+  out-of-funds is likewise retried as unavailability, never a halt (D19) and
+  never give-up.
+- Correlation is the attribution mechanism — implemented (Wave 2 T8). Strikes
+  are decided post-gather, per cycle (`attribute_cycle_failures`): a candidate
+  failure (Timeout / RuntimeError incl. LLMContentError / unexpected
+  Exception) counts iff its signature is unique among the cycle's candidate
+  failures and, in a multi-thread cycle, at least one sibling was handled
+  successfully; marking derives only from the cycle's own strikes, never raw
+  tracker counts. Adjudicated edges: **singleton cycles count** (no siblings
+  to correlate against; the poison thread typically *is* a singleton —
+  residual: a code bug failing the only pending thread accrues strikes,
+  accepted); **zero-success multi-thread cycles count no strikes** (all
+  shared-cause, one ERROR line, backlog kept); **N same-signature poison
+  threads shield each other** while they co-fail (the shared-cause ERROR is
+  the loudness). The single-thread masquerade (provider-shaped errors,
+  siblings succeeding) retries forever, never abandoned: at `max_failures`
+  qualifying cycles it becomes a suspect and a distinct ERROR repeats at most
+  once per status interval (`MasqueradeTracker`); singleton and zero-success
+  cycles neither increment nor reset the counter, and local-tier LLM
+  unavailability is excluded entirely (the deliberately-offline MLX host makes
+  person-thread deferral routine, issue #24).
 - The halt becomes per-function (today: daemon-wide).
 - A keyword-free label reply raises instead of silently defaulting to
   LOW_PRIORITY→archive (Rule 1; completes the issue-#64 fail-loud direction).

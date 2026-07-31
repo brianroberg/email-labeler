@@ -53,17 +53,22 @@ class AvailabilityResult:
 
 
 class LLMUnavailableError(Exception):
-    """The LLM endpoint is unreachable or dropped the connection (transient).
+    """The LLM endpoint can't serve requests right now (provider-shaped, transient).
 
-    Distinct from request-specific failures: a non-200 response or a read/write
-    timeout means the *request* is the problem (too-large input, bad payload) and
-    is eligible for the daemon's give-up logic, whereas an unavailable endpoint is
-    a transient outage that should simply be retried next cycle.
+    Raised for transport-level unavailability — endpoint unreachable, connect/
+    pool timeout, connection dropped mid-request — and for provider-shaped
+    responses: an exhausted 429 (retry.py already spent its budget) or any 5xx.
+    Either way the provider can't serve anyone, so the fault is never one
+    thread's blame: the daemon defers and retries next cycle and never counts
+    it toward give-up (decision D5). Request-specific failures stay distinct —
+    a read/write timeout is TimeoutError and any other non-200 is RuntimeError,
+    both strike candidates under the daemon's cycle-level attribution.
 
     ``tier`` identifies the raising client ("cloud" / "local" / None when the
     client didn't declare one). Both tiers raise this same type; the tier is what
     lets the daemon treat a routine local outage (the MLX laptop is offline for
-    hours at a time) as INFO-grade while a cloud outage stays WARNING (issue #24).
+    hours at a time) as INFO-grade while a cloud outage stays WARNING (issue #24),
+    and what excludes local-tier outages from masquerade tracking (D5).
     """
 
     def __init__(self, message: str, *, tier: str | None = None):
@@ -79,11 +84,12 @@ class LLMContentError(RuntimeError):
     So does a response whose ``finish_reason`` is ``"length"`` even when content
     is non-empty: the answer was cut at the max_tokens budget, and parsing a
     truncated answer silently defaults the label (issue #64). Retrying as-is
-    won't help, so it is request-specific/permanent and give-up-eligible. It
-    subclasses ``RuntimeError`` so the email pipeline's ``except RuntimeError``
-    give-up handler catches it unchanged, while giving the newsletter pipeline a
-    dedicated type to re-raise (a *bare* per-story RuntimeError stays isolated;
-    a content-less one propagates to give-up).
+    won't help, so it is request-specific/permanent — a strike candidate under
+    the daemon's cycle-level attribution (decision D5). It subclasses
+    ``RuntimeError`` so the email pipeline's ``except RuntimeError`` arm catches
+    it unchanged, while giving the newsletter pipeline a dedicated type to
+    re-raise (a *bare* per-story RuntimeError stays isolated; a content-less one
+    propagates pipeline-wide).
     """
 
 
@@ -105,7 +111,9 @@ _BALANCE_SIGNATURE = re.compile(
 # phrase hard quota exhaustion identically to a per-minute rate limit
 # ("exceeded your current quota"): wrongly converting a transient rate limit
 # into a restart-only daemon halt is worse than letting a rare 429-signaled
-# out-of-funds fall back to per-thread give-up.
+# out-of-funds be retried as provider unavailability (decision D19) — it
+# defers threads each cycle, never strikes (D5), and a sustained one surfaces
+# through the daemon's shared-cause/masquerade ERROR escalation.
 _BALANCE_SIGNATURE_STATUSES = frozenset({400, 403})
 
 
@@ -193,18 +201,23 @@ class LLMClient:
 
         Raises:
             TimeoutError: If the request times out (read/write) — request-specific
-                (e.g. input too large to prefill within the timeout).
-            LLMUnavailableError: If the endpoint is unreachable (connection refused
-                or connect/pool timeout) or the connection drops mid-request —
-                transient unavailability.
+                (e.g. input too large to prefill within the timeout); a strike
+                candidate under the daemon's cycle attribution (D5).
+            LLMUnavailableError: If the endpoint can't serve the request right
+                now — unreachable (connection refused, connect/pool timeout),
+                dropped mid-request, or answering with an exhausted 429 or any
+                5xx. Provider-shaped (D5): deferred and retried next cycle,
+                never counted toward give-up.
             LLMBalanceError: If the non-200 response says the provider account is
                 out of funds (402, or a 400/403 whose body carries a balance
                 signature) — account-wide; the daemon halts rather than giving
                 up per-thread.
             LLMContentError: If the response carries no usable answer — empty/
                 missing content, or finish_reason "length" (answer truncated at
-                the max_tokens budget) — request-specific and give-up-eligible.
-            RuntimeError: If the LLM returns any other non-200 response.
+                the max_tokens budget) — request-specific, a strike candidate.
+            RuntimeError: If the LLM returns any other non-200 response
+                (400/401/403/404/422… without a balance signature) —
+                request-specific, a strike candidate.
         """
         headers = {"Content-Type": "application/json"}
         if self.api_key:
@@ -273,6 +286,18 @@ class LLMClient:
                 raise LLMBalanceError(
                     f"LLM provider out of funds — status {response.status_code} "
                     f"[{self._provider()}]: {resp_body}"
+                )
+            if response.status_code == 429 or response.status_code >= 500:
+                # Provider-shaped (decision D5): an exhausted 429 (retry.py already
+                # spent its retry budget, so the throttle is sustained) or a 5xx
+                # means the provider can't serve anyone right now — never one
+                # thread's blame, so never a strike candidate. The daemon defers
+                # and retries next cycle; a sustained fault surfaces through the
+                # shared-cause/masquerade escalation, not give-up.
+                raise LLMUnavailableError(
+                    f"LLM endpoint unavailable — status {response.status_code} "
+                    f"[{self._provider()}]: {resp_body}",
+                    tier=self.tier,
                 )
             raise RuntimeError(
                 f"LLM request failed with status {response.status_code} "

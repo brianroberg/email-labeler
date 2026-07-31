@@ -86,9 +86,10 @@ class TestTransientClassification:
         """A 2xx whose body isn't JSON — a truncated/garbled response, or an upstream
         gateway briefly returning an HTML error page with status 200 — is a transient
         hiccup. It classifies as ProxyUnavailableError (retried next cycle), NOT a
-        give-up-eligible plain ProxyError. With the #26 give-up bound a *persistent*
-        non-JSON 2xx is still bounded by the FailureTracker, so this can't retry forever.
-        Asserted at _handle_response, where the success body is parsed (issue #27)."""
+        strike-candidate plain ProxyError. A *persistent* one surfaces through the
+        daemon's shared-cause/masquerade escalation rather than give-up (decision D5,
+        superseding the issue #26 bound). Asserted at _handle_response, where the
+        success body is parsed (issue #27)."""
         resp = httpx.Response(
             200, text="<html>502 Bad Gateway</html>",
             request=httpx.Request("GET", "http://proxy.test/x"),

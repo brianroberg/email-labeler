@@ -413,7 +413,10 @@ When an LLM provider reports the account is out of funds (HTTP 402, or a
 account-wide, so per-thread retries would only burn the backlog into
 `agent/attempted`. HTTP 429 never halts, even with quota phrasing — a
 per-minute rate limit is worded identically to hard quota exhaustion, and a
-wrong restart-only halt is worse than falling back to per-thread give-up. The triggering thread is left unprocessed. The halt is
+wrong restart-only halt is worse than treating a rare 429-signaled
+out-of-funds as provider unavailability: deferred and retried each cycle,
+never a strike (decision D5), surfacing through the shared-cause/masquerade
+ERROR escalation if sustained. The triggering thread is left unprocessed. The halt is
 in-memory only; **restarting the daemon is the only reset**. While halted the
 daemon logs this line at ERROR once per poll interval and keeps the healthcheck
 timestamp fresh (deliberately halted, not hung — the container stays healthy):

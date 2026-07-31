@@ -100,6 +100,36 @@ def mock_thread_response():
     }
 
 
+async def drive_attribution_cycle(
+    threads, proxy, classifier, label_manager, cloud_sem, local_sem,
+    tracker, masquerade=None, **kwargs,
+):
+    """One poll cycle in miniature (decision D5 Rule 2, Wave 2 T8).
+
+    Processes every thread with a shared per-cycle collector, then runs the
+    post-gather attribution exactly as run_daemon does — attribute → strike →
+    mark. Returns the per-thread results (give-ups return False now: they are
+    failures, not handled work).
+    """
+    failures: list[daemon.CycleFailure] = []
+    results = [
+        await process_single_thread(
+            tid, msg_ids, proxy, classifier, label_manager, cloud_sem, local_sem,
+            max_thread_chars=16000, cycle_failures=failures, **kwargs,
+        )
+        for tid, msg_ids in threads
+    ]
+    struck_out = daemon.attribute_cycle_failures(
+        threads, results, failures, tracker,
+        masquerade if masquerade is not None else daemon.MasqueradeTracker(),
+    )
+    for entry in struck_out:
+        await daemon._mark_thread_attempted(
+            entry.thread_id, entry.ids_to_mark, tracker, label_manager
+        )
+    return results
+
+
 class TestFormatThreadTranscript:
     def test_formats_chronologically(self, mock_thread_response):
         messages = mock_thread_response["messages"]
@@ -337,24 +367,28 @@ class TestProcessSingleThread:
     async def test_gives_up_on_thread_after_repeated_failures(
         self, mock_proxy, mock_classifier, mock_label_manager, cloud_sem, local_sem,
     ):
-        """A thread that keeps failing is marked processed after max_failures, breaking the loop."""
+        """A thread that keeps failing for a thread-attributable reason is marked
+        agent/attempted after max_failures strikes, breaking the loop.
+
+        Reworked for the post-gather attribution path (decision D5, Wave 2 T8):
+        strikes are counted by attribute_cycle_failures, marking happens in the
+        poll loop, and give-ups return False from process_single_thread (a
+        failure, not handled work)."""
         mock_proxy.get_thread.side_effect = RuntimeError("API error")
         tracker = FailureTracker(max_failures=3)
 
         results = [
-            await process_single_thread(
-                "thread_stuck", ["msg_1"], mock_proxy, mock_classifier, mock_label_manager,
-                cloud_sem, local_sem, max_thread_chars=16000, failure_tracker=tracker,
-            )
+            (await drive_attribution_cycle(
+                [("thread_stuck", ["msg_1"])], mock_proxy, mock_classifier,
+                mock_label_manager, cloud_sem, local_sem, tracker=tracker,
+            ))[0]
             for _ in range(3)
         ]
 
-        # First two failures: retry next cycle (not handled), nothing marked processed.
-        assert results[0] is False
-        assert results[1] is False
-        # Third failure hits the threshold: give up — mark agent/attempted (not
-        # agent/processed) so the abandoned thread is findable, and report handled.
-        assert results[2] is True
+        # Every failing cycle defers; the third strike hits the threshold and the
+        # thread is marked agent/attempted (not agent/processed) so the abandoned
+        # thread stays findable.
+        assert results == [False, False, False]
         mock_label_manager.mark_attempted.assert_called_once_with(["msg_1"])
         mock_label_manager.mark_processed.assert_not_called()
         # The give-up is recorded so the cycle summary can report it distinctly.
@@ -363,17 +397,19 @@ class TestProcessSingleThread:
     async def test_connect_error_does_not_count_toward_give_up(
         self, mock_proxy, mock_classifier, mock_label_manager, cloud_sem, local_sem,
     ):
-        """An endpoint outage (ConnectError) is transient and must never trigger give-up."""
+        """An endpoint outage (ConnectError) is provider-shaped (D5) and must
+        never strike — even across many singleton cycles."""
         mock_proxy.get_thread.side_effect = httpx.ConnectError("connection refused")
         tracker = FailureTracker(max_failures=2)
 
         for _ in range(5):
-            result = await process_single_thread(
-                "thread_down", ["msg_1"], mock_proxy, mock_classifier, mock_label_manager,
-                cloud_sem, local_sem, max_thread_chars=16000, failure_tracker=tracker,
+            results = await drive_attribution_cycle(
+                [("thread_down", ["msg_1"])], mock_proxy, mock_classifier,
+                mock_label_manager, cloud_sem, local_sem, tracker=tracker,
             )
-            assert result is False
+            assert results == [False]
 
+        mock_label_manager.mark_attempted.assert_not_called()
         mock_label_manager.mark_processed.assert_not_called()
 
     async def test_llm_unavailable_does_not_count_toward_give_up(
@@ -391,12 +427,13 @@ class TestProcessSingleThread:
         tracker = FailureTracker(max_failures=2)
 
         for _ in range(5):
-            result = await process_single_thread(
-                "thread_001", ["msg_001"], mock_proxy, mock_classifier, mock_label_manager,
-                cloud_sem, local_sem, max_thread_chars=16000, failure_tracker=tracker,
+            results = await drive_attribution_cycle(
+                [("thread_001", ["msg_001"])], mock_proxy, mock_classifier,
+                mock_label_manager, cloud_sem, local_sem, tracker=tracker,
             )
-            assert result is False
+            assert results == [False]
 
+        mock_label_manager.mark_attempted.assert_not_called()
         mock_label_manager.mark_processed.assert_not_called()
 
     async def test_balance_error_never_counts_toward_give_up_or_marks(
@@ -411,11 +448,11 @@ class TestProcessSingleThread:
         tracker = FailureTracker(max_failures=2)
 
         for _ in range(5):
-            result = await process_single_thread(
-                "thread_broke", ["msg_1"], mock_proxy, mock_classifier, mock_label_manager,
-                cloud_sem, local_sem, max_thread_chars=16000, failure_tracker=tracker,
+            results = await drive_attribution_cycle(
+                [("thread_broke", ["msg_1"])], mock_proxy, mock_classifier,
+                mock_label_manager, cloud_sem, local_sem, tracker=tracker,
             )
-            assert result is False
+            assert results == [False]
 
         mock_label_manager.mark_attempted.assert_not_called()
         mock_label_manager.mark_processed.assert_not_called()
@@ -526,37 +563,33 @@ class TestProcessSingleThread:
         outage_logs = [r for r in caplog.records if "unavailable" in r.getMessage().lower()]
         assert any(r.levelno == logging.WARNING for r in outage_logs)
 
-    async def test_proxy_unavailable_is_give_up_eligible_per_thread(
+    async def test_proxy_unavailable_never_counts_toward_give_up(
         self, mock_proxy, mock_classifier, mock_label_manager, cloud_sem, local_sem,
     ):
-        """A per-thread ProxyUnavailableError is give-up-eligible (issue #26).
+        """A per-thread ProxyUnavailableError is provider-shaped and never strikes.
 
-        An endpoint-wide proxy outage is caught one level up: list_messages (also a
-        proxy call) fails first, so the whole cycle defers and no thread is processed
-        or counted. Reaching this per-thread handler means the proxy served other
-        calls this cycle but THIS thread's call failed — a fault that persists is
-        poison (e.g. a deterministic 5xx on one unserializable thread) and must be
-        bounded by the FailureTracker, not retried forever.
-
-        Contrast test_llm_unavailable_does_not_count_toward_give_up: an MLX outage is
-        NOT visible at the cycle level (the proxy is up), so it must never give up.
+        Reversal of issue #26's give-up counting, recorded in decision D5 (Wave 2
+        T8): the proxy failing to serve a request — a 5xx, an exhausted 429, a
+        dropped connection — is never the thread's blame. No matter how many
+        cycles it persists, the thread defers and the backlog is kept. The
+        residual #26 worried about (a deterministic per-thread 5xx masquerading
+        as an outage) is watched by MasqueradeTracker instead: it escalates
+        loudly on the heartbeat, retried forever rather than abandoned — see
+        TestFailureAttribution.
         """
         mock_proxy.get_thread.side_effect = ProxyUnavailableError("proxy 500 for one poison thread")
         tracker = FailureTracker(max_failures=2)
 
-        results = [
-            await process_single_thread(
-                "thread_poison", ["msg_1"], mock_proxy, mock_classifier, mock_label_manager,
-                cloud_sem, local_sem, max_thread_chars=16000, failure_tracker=tracker,
+        for _ in range(5):
+            results = await drive_attribution_cycle(
+                [("thread_poison", ["msg_1"])], mock_proxy, mock_classifier,
+                mock_label_manager, cloud_sem, local_sem, tracker=tracker,
             )
-            for _ in range(2)
-        ]
+            assert results == [False]
 
-        assert results[0] is False  # first failure: retry next cycle
-        assert results[1] is True   # threshold hit: give up
-        mock_label_manager.mark_attempted.assert_called_once_with(["msg_1"])
+        mock_label_manager.mark_attempted.assert_not_called()
         mock_label_manager.mark_processed.assert_not_called()
-        assert tracker.take_given_up() == ["thread_poison"]
+        assert tracker.take_given_up() == []
 
     async def test_give_up_write_transient_failure_logs_clean_warning(
         self, mock_proxy, mock_classifier, mock_label_manager, cloud_sem, local_sem, caplog,
@@ -565,18 +598,20 @@ class TestProcessSingleThread:
         bug (issue #32): log a retryable warning (no traceback) and retry next cycle —
         distinct from an unexpected/permanent marker-write failure. The give-up is not
         recorded, so the thread stays give-up-eligible until the marker write lands.
+        (The marker write moved to the poll loop's post-gather marking step —
+        D5, Wave 2 T8 — and this pin follows it there.)
         """
         mock_proxy.get_thread.side_effect = RuntimeError("classification boom")
         mock_label_manager.mark_attempted.side_effect = ProxyUnavailableError("proxy 503 on write")
-        tracker = FailureTracker(max_failures=1)  # give up on the first failure
+        tracker = FailureTracker(max_failures=1)  # strike out on the first failure
 
         with caplog.at_level(logging.WARNING):
-            result = await process_single_thread(
-                "thread_x", ["msg_1"], mock_proxy, mock_classifier, mock_label_manager,
-                cloud_sem, local_sem, max_thread_chars=16000, failure_tracker=tracker,
+            results = await drive_attribution_cycle(
+                [("thread_x", ["msg_1"])], mock_proxy, mock_classifier,
+                mock_label_manager, cloud_sem, local_sem, tracker=tracker,
             )
 
-        assert result is False                # couldn't mark → retry next cycle
+        assert results == [False]             # couldn't mark → retry next cycle
         assert tracker.take_given_up() == []  # not recorded as given up
         retry_logs = [r for r in caplog.records if "will retry" in r.getMessage()]
         assert retry_logs, "expected a clean retry warning for the transient marker-write failure"
@@ -587,18 +622,19 @@ class TestProcessSingleThread:
         self, mock_proxy, mock_classifier, mock_label_manager, cloud_sem, local_sem, caplog,
     ):
         """An UNEXPECTED (likely permanent) marker-write failure keeps its full traceback
-        so it stays diagnosable rather than being swallowed as benign (issue #32)."""
+        so it stays diagnosable rather than being swallowed as benign (issue #32).
+        (Marker write followed to the post-gather marking step — D5, Wave 2 T8.)"""
         mock_proxy.get_thread.side_effect = RuntimeError("classification boom")
         mock_label_manager.mark_attempted.side_effect = ValueError("unexpected marker bug")
         tracker = FailureTracker(max_failures=1)
 
         with caplog.at_level(logging.WARNING):
-            result = await process_single_thread(
-                "thread_y", ["msg_1"], mock_proxy, mock_classifier, mock_label_manager,
-                cloud_sem, local_sem, max_thread_chars=16000, failure_tracker=tracker,
+            results = await drive_attribution_cycle(
+                [("thread_y", ["msg_1"])], mock_proxy, mock_classifier,
+                mock_label_manager, cloud_sem, local_sem, tracker=tracker,
             )
 
-        assert result is False
+        assert results == [False]
         # A failed marker write must NOT be recorded as a give-up: the thread wasn't
         # labeled, so reporting it abandoned would be misleading and it keeps re-matching.
         assert tracker.take_given_up() == []
@@ -608,25 +644,28 @@ class TestProcessSingleThread:
     async def test_proxy_4xx_is_give_up_eligible(
         self, mock_proxy, mock_classifier, mock_label_manager, cloud_sem, local_sem,
     ):
-        """A request-specific proxy 4xx (plain ProxyError) stays give-up-eligible.
+        """A request-specific proxy 4xx (plain ProxyError) stays a strike candidate.
 
-        The transient subclass defers; the base ProxyError (e.g. a 404 for a thread
-        deleted between listing and fetching) should still be bounded by the
-        FailureTracker so it isn't retried forever.
+        Reworked to the cycle-attribution path (D5, Wave 2 T8): the transient
+        subclass is provider-shaped and defers, but the base ProxyError (e.g. a
+        404 for a thread deleted between listing and fetching) is a candidate —
+        correlation blames the thread in these singleton cycles, so it is
+        bounded by the FailureTracker rather than retried forever.
         """
         mock_proxy.get_thread.side_effect = ProxyError("404 not found")
         tracker = FailureTracker(max_failures=2)
 
         results = [
-            await process_single_thread(
-                "thread_gone", ["msg_1"], mock_proxy, mock_classifier, mock_label_manager,
-                cloud_sem, local_sem, max_thread_chars=16000, failure_tracker=tracker,
-            )
+            (await drive_attribution_cycle(
+                [("thread_gone", ["msg_1"])], mock_proxy, mock_classifier,
+                mock_label_manager, cloud_sem, local_sem, tracker=tracker,
+            ))[0]
             for _ in range(2)
         ]
 
-        assert results[0] is False  # first failure: retry
-        assert results[1] is True   # threshold hit: give up
+        assert results == [False, False]  # give-ups return False now (D5)
+        mock_label_manager.mark_attempted.assert_called_once_with(["msg_1"])
+        assert tracker.take_given_up() == ["thread_gone"]
 
     async def test_give_up_marks_all_thread_messages_not_just_query_stubs(
         self, mock_proxy, mock_classifier, mock_label_manager, cloud_sem, local_sem,
@@ -644,48 +683,52 @@ class TestProcessSingleThread:
         tracker = FailureTracker(max_failures=2)
 
         results = [
-            await process_single_thread(
-                "thread_001", ["msg_001"], mock_proxy, mock_classifier, mock_label_manager,
-                cloud_sem, local_sem, max_thread_chars=16000, failure_tracker=tracker,
-            )
+            (await drive_attribution_cycle(
+                [("thread_001", ["msg_001"])], mock_proxy, mock_classifier,
+                mock_label_manager, cloud_sem, local_sem, tracker=tracker,
+            ))[0]
             for _ in range(2)
         ]
 
-        assert results[0] is False  # first failure: retry
-        assert results[1] is True   # threshold hit: give up
+        assert results == [False, False]  # give-ups return False now (D5, Wave 2 T8)
         mock_label_manager.mark_attempted.assert_called_once_with(["msg_001", "msg_002"])
 
     async def test_already_at_max_priority_give_up_marks_all_thread_messages(
         self, mock_proxy, mock_classifier, mock_label_manager, cloud_sem, local_sem,
         mock_thread_response,
     ):
-        """The max-priority skip now writes a marker, so a failed write is give-up-eligible.
+        """The max-priority skip writes a marker, so a failed write there can strike out.
 
-        The branch calls mark_processed inside the try; a give-up-eligible failure
-        there routes to _give_up_if_stuck. ids_to_mark must already be the full thread
-        (all_msg_ids), not the query stub — otherwise the abandoned-but-findable marker
-        lands on a subset and the unmarked sibling keeps re-surfacing the thread, the
-        very loop the give-up mechanism exists to break. The query surfaced only
-        msg_001 while the thread holds msg_001 + msg_002.
+        The branch calls mark_processed inside the try; a candidate-class failure
+        there is collected for attribution. ids_to_mark must already be the full
+        thread (all_msg_ids), not the query stub — otherwise the
+        abandoned-but-findable marker lands on a subset and the unmarked sibling
+        keeps re-surfacing the thread, the very loop the give-up mechanism exists
+        to break. The query surfaced only msg_001 while the thread holds msg_001 +
+        msg_002.
+
+        Reworked for D5 (Wave 2 T8): the old pin drove the write fault with
+        ProxyUnavailableError, which is provider-shaped now and never strikes —
+        a request-specific ProxyError (4xx) carries the all-thread-ids assertion
+        instead.
         """
         mock_proxy.get_thread.return_value = mock_thread_response
         mock_label_manager.get_existing_priority.return_value = _get_priority(
             EmailLabel.NEEDS_RESPONSE
         )
-        # The mark_processed write fails deterministically (e.g. a per-thread proxy 5xx).
-        mock_label_manager.mark_processed.side_effect = ProxyUnavailableError("proxy 500 on write")
+        # The mark_processed write fails deterministically with a request-specific 4xx.
+        mock_label_manager.mark_processed.side_effect = ProxyError("400 on write")
         tracker = FailureTracker(max_failures=2)
 
         results = [
-            await process_single_thread(
-                "thread_001", ["msg_001"], mock_proxy, mock_classifier, mock_label_manager,
-                cloud_sem, local_sem, max_thread_chars=16000, failure_tracker=tracker,
-            )
+            (await drive_attribution_cycle(
+                [("thread_001", ["msg_001"])], mock_proxy, mock_classifier,
+                mock_label_manager, cloud_sem, local_sem, tracker=tracker,
+            ))[0]
             for _ in range(2)
         ]
 
-        assert results[0] is False  # first failure: retry
-        assert results[1] is True   # threshold hit: give up
+        assert results == [False, False]  # give-ups return False now (D5)
         # No classification was ever attempted (it's the max-priority skip path)...
         mock_classifier.classify_sender.assert_not_called()
         # ...and give-up marks the FULL thread, not just the query stub.
@@ -709,11 +752,10 @@ class TestProcessSingleThread:
 
         with caplog.at_level(logging.INFO):
             results = [
-                await process_single_thread(
-                    "thread_001", ["msg_001"], mock_proxy, mock_classifier,
-                    mock_label_manager, cloud_sem, local_sem, max_thread_chars=16000,
-                    failure_tracker=tracker,
-                )
+                (await drive_attribution_cycle(
+                    [("thread_001", ["msg_001"])], mock_proxy, mock_classifier,
+                    mock_label_manager, cloud_sem, local_sem, tracker=tracker,
+                ))[0]
                 for _ in range(3)  # past max_failures: rejections never accumulate
             ]
 
@@ -733,7 +775,8 @@ class TestProcessSingleThread:
         The rejection blocks the marker — one clean line, no traceback — and the
         thread stays give-up-eligible, so the marker write is re-offered next cycle.
         (The rejection never *causes* the give-up: the strikes that reached the
-        threshold came from elsewhere — here, a RuntimeError during classification.)
+        threshold came from elsewhere — here, a RuntimeError during classification.
+        Marker write followed to the post-gather marking step — D5, Wave 2 T8.)
         """
         mock_proxy.get_thread.side_effect = RuntimeError("classification boom")
         mock_label_manager.mark_attempted.side_effect = ProxyForbiddenError(
@@ -742,12 +785,12 @@ class TestProcessSingleThread:
         tracker = FailureTracker(max_failures=1)  # threshold on the first failure
 
         with caplog.at_level(logging.INFO):
-            result = await process_single_thread(
-                "thread_x", ["msg_1"], mock_proxy, mock_classifier, mock_label_manager,
-                cloud_sem, local_sem, max_thread_chars=16000, failure_tracker=tracker,
+            results = await drive_attribution_cycle(
+                [("thread_x", ["msg_1"])], mock_proxy, mock_classifier,
+                mock_label_manager, cloud_sem, local_sem, tracker=tracker,
             )
 
-        assert result is False                # marker blocked → not handled
+        assert results == [False]             # marker blocked → not handled
         assert tracker.take_given_up() == []  # give-up not recorded: the marker never landed
         # A clean line for the rejection, no traceback anywhere.
         assert all(r.exc_info is None for r in caplog.records)
@@ -884,6 +927,287 @@ class TestProcessSingleThread:
         mock_label_manager.apply_classification.assert_called_once()
 
 
+class TestFailureAttribution:
+    """D5 Rule 2 (Wave 2 T8): strikes are decided post-gather by cycle-level
+    correlation. A candidate failure (Timeout/RuntimeError/unexpected Exception)
+    counts only when its signature is unique among the cycle's candidate
+    failures AND — in a multi-thread cycle — at least one sibling was handled
+    successfully. Provider-shaped failures never strike; the single-thread
+    masquerade (provider-shaped errors while siblings succeed) escalates on the
+    status heartbeat instead of being abandoned."""
+
+    async def test_same_signature_failures_in_one_cycle_count_no_strikes(
+        self, mock_proxy, mock_classifier, mock_label_manager, cloud_sem, local_sem,
+        mock_thread_response, caplog,
+    ):
+        """Adjudicated edge (D5): N same-signature threads shield each other.
+        Two threads failing identically look like one shared cause (a prompt bug,
+        our own code) — no strikes, one shared-cause ERROR, backlog kept.
+
+        A third thread *succeeds* on purpose: that makes thread_blame true, so
+        the signature-uniqueness rule is the only thing standing between these
+        failures and a strike. Without the succeeding sibling this test would
+        merely re-pin the zero-success edge below."""
+        def route(tid):
+            if tid == "t_good":
+                return mock_thread_response
+            raise RuntimeError("same boom")
+
+        mock_proxy.get_thread.side_effect = route
+        tracker = FailureTracker(max_failures=1)  # a wrongly-counted strike would mark
+
+        with caplog.at_level(logging.ERROR, logger="email-labeler"):
+            results = await drive_attribution_cycle(
+                [("t_a", ["m1"]), ("t_b", ["m2"]), ("t_good", ["m3"])],
+                mock_proxy, mock_classifier, mock_label_manager, cloud_sem, local_sem,
+                tracker=tracker,
+            )
+
+        assert results == [False, False, True]
+        mock_label_manager.mark_attempted.assert_not_called()
+        assert tracker.take_given_up() == []
+        shared = [r for r in caplog.records if "shared cause" in r.getMessage()]
+        assert len(shared) == 1
+        assert shared[0].levelno == logging.ERROR
+
+    async def test_unique_signature_failure_with_succeeding_siblings_strikes(
+        self, mock_proxy, mock_classifier, mock_label_manager, cloud_sem, local_sem,
+        mock_thread_response,
+    ):
+        """One thread failing uniquely while a sibling succeeds is the thread's
+        own fault: bounded strikes, then agent/attempted (D5)."""
+        def route(tid):
+            if tid == "t_bad":
+                raise ValueError("poison thread")
+            return mock_thread_response
+
+        mock_proxy.get_thread.side_effect = route
+        tracker = FailureTracker(max_failures=2)
+
+        for _ in range(2):
+            results = await drive_attribution_cycle(
+                [("t_bad", ["m1"]), ("t_good", ["m2"])],
+                mock_proxy, mock_classifier, mock_label_manager, cloud_sem, local_sem,
+                tracker=tracker,
+            )
+
+        # Give-ups return False (a failure, not handled work); the sibling
+        # keeps classifying normally.
+        assert results == [False, True]
+        mock_label_manager.mark_attempted.assert_called_once_with(["m1"])
+        assert tracker.take_given_up() == ["t_bad"]
+
+    async def test_singleton_cycle_candidate_failure_strikes(
+        self, mock_proxy, mock_classifier, mock_label_manager, cloud_sem, local_sem,
+    ):
+        """Adjudicated edge (D5): a lone thread's candidate failure has no
+        siblings to correlate against — bounded strikes to a findable
+        agent/attempted is the honest fallback, and the poison-thread case is
+        typically a singleton (everything else processed away)."""
+        mock_proxy.get_thread.side_effect = RuntimeError("boom")
+        tracker = FailureTracker(max_failures=2)
+
+        results = [
+            (await drive_attribution_cycle(
+                [("t_solo", ["m1"])],
+                mock_proxy, mock_classifier, mock_label_manager, cloud_sem, local_sem,
+                tracker=tracker,
+            ))[0]
+            for _ in range(2)
+        ]
+
+        assert results == [False, False]
+        mock_label_manager.mark_attempted.assert_called_once_with(["m1"])
+        assert tracker.take_given_up() == ["t_solo"]
+
+    async def test_zero_success_cycle_counts_no_strikes(
+        self, mock_proxy, mock_classifier, mock_label_manager, cloud_sem, local_sem, caplog,
+    ):
+        """Adjudicated edge (D5): two different signatures with nothing
+        succeeding is still consistent with one shared cause surfacing through
+        two code paths — Rule 2 conditions thread-blame on siblings
+        *succeeding*. No strikes, one shared-cause ERROR, backlog kept."""
+        def route(tid):
+            if tid == "t_a":
+                raise RuntimeError("boom a")
+            raise ValueError("boom b")
+
+        mock_proxy.get_thread.side_effect = route
+        tracker = FailureTracker(max_failures=1)
+
+        with caplog.at_level(logging.ERROR, logger="email-labeler"):
+            results = await drive_attribution_cycle(
+                [("t_a", ["m1"]), ("t_b", ["m2"])],
+                mock_proxy, mock_classifier, mock_label_manager, cloud_sem, local_sem,
+                tracker=tracker,
+            )
+
+        assert results == [False, False]
+        mock_label_manager.mark_attempted.assert_not_called()
+        assert tracker.take_given_up() == []
+        assert any("shared cause" in r.getMessage() for r in caplog.records)
+
+    async def test_masquerade_suspect_escalates_on_heartbeat_and_is_never_abandoned(
+        self, mock_proxy, mock_classifier, mock_label_manager, cloud_sem, local_sem,
+        mock_thread_response,
+    ):
+        """The single-thread masquerade (D5; issue #26's poison-thread
+        scenario): provider-shaped failures on one thread while siblings
+        succeed. Never marked, retried forever; at max_failures qualifying
+        cycles it becomes a suspect and the distinct ERROR line is emitted,
+        repeated at most once per status_interval while the suspect persists."""
+        def route(tid):
+            if tid == "t_masq":
+                raise ProxyUnavailableError("deterministic 500 for this thread")
+            return mock_thread_response
+
+        mock_proxy.get_thread.side_effect = route
+        tracker = FailureTracker(max_failures=2)
+        masq = daemon.MasqueradeTracker(max_failures=2)
+
+        for _ in range(3):
+            results = await drive_attribution_cycle(
+                [("t_masq", ["m1"]), ("t_good", ["m2"])],
+                mock_proxy, mock_classifier, mock_label_manager, cloud_sem, local_sem,
+                tracker=tracker, masquerade=masq,
+            )
+            assert results == [False, True]
+
+        # Never abandoned — no marker, no give-up, no matter how many cycles.
+        mock_label_manager.mark_attempted.assert_not_called()
+        assert tracker.take_given_up() == []
+        # Suspect at the threshold: the distinct ERROR is emitted...
+        line = masq.escalation_line(now=1000.0, status_interval=900)
+        assert line is not None
+        assert "t_masq" in line
+        # ...throttled inside the interval...
+        assert masq.escalation_line(now=1500.0, status_interval=900) is None
+        # ...and repeated on the next heartbeat while the suspect persists.
+        line2 = masq.escalation_line(now=1900.0, status_interval=900)
+        assert line2 is not None
+        assert "t_masq" in line2
+
+    async def test_local_tier_unavailability_never_counts_as_masquerade(
+        self, mock_proxy, mock_classifier, mock_label_manager, cloud_sem, local_sem,
+        mock_thread_response,
+    ):
+        """Variant (D5): local-tier LLMUnavailableError is excluded from
+        masquerade tracking entirely — the deliberately-offline MLX laptop makes
+        "person threads defer while service siblings succeed" the ROUTINE local
+        state (issue #24), and tracking it would false-alarm every night the
+        laptop is closed."""
+        mock_proxy.get_thread.return_value = mock_thread_response
+
+        async def sender_route(metadata):
+            if metadata.thread_id == "t_local":
+                raise LLMUnavailableError("MLX endpoint down", tier="local")
+            return (SenderType.SERVICE, "SERVICE", "")
+
+        mock_classifier.classify_sender.side_effect = sender_route
+        tracker = FailureTracker(max_failures=2)
+        masq = daemon.MasqueradeTracker(max_failures=1)
+
+        for _ in range(3):
+            results = await drive_attribution_cycle(
+                [("t_local", ["m1"]), ("t_good", ["m2"])],
+                mock_proxy, mock_classifier, mock_label_manager, cloud_sem, local_sem,
+                tracker=tracker, masquerade=masq,
+            )
+            assert results == [False, True]
+
+        assert masq.suspects() == {}
+        assert masq.escalation_line(now=1000.0, status_interval=900) is None
+        mock_label_manager.mark_attempted.assert_not_called()
+
+    async def test_masquerade_not_incremented_in_singleton_cycles(
+        self, mock_proxy, mock_classifier, mock_label_manager, cloud_sem, local_sem,
+    ):
+        """Variant (D5): a singleton cycle carries no correlation evidence
+        either way — a genuine short provider outage with one pending thread
+        must never false-alarm (the per-thread WARNING remains its
+        visibility)."""
+        mock_proxy.get_thread.side_effect = ProxyUnavailableError("proxy down")
+        tracker = FailureTracker(max_failures=2)
+        masq = daemon.MasqueradeTracker(max_failures=1)
+
+        for _ in range(3):
+            results = await drive_attribution_cycle(
+                [("t_solo", ["m1"])],
+                mock_proxy, mock_classifier, mock_label_manager, cloud_sem, local_sem,
+                tracker=tracker, masquerade=masq,
+            )
+            assert results == [False]
+
+        assert masq.suspects() == {}
+        assert masq.escalation_line(now=1000.0, status_interval=900) is None
+        mock_label_manager.mark_attempted.assert_not_called()
+
+    async def test_masquerade_escalation_wired_into_poll_loop_and_throttled(
+        self, monkeypatch, tmp_path, caplog,
+    ):
+        """Poll-loop wiring: once a suspect exists the distinct ERROR is
+        emitted, then throttled to the status heartbeat — not repeated every
+        cycle (the eight near-instant cycles here fit inside one
+        status_interval, so exactly one ERROR)."""
+        async def masquerade_process(tid, msg_ids, *args, **kwargs):
+            if tid == "masq":
+                kwargs["cycle_failures"].append(daemon.CycleFailure(
+                    thread_id=tid, ids_to_mark=list(msg_ids),
+                    signature="ProxyUnavailableError", provider_shaped=True,
+                ))
+                return False
+            return True
+
+        poll = {"messages": [
+            {"id": "m1", "threadId": "masq"}, {"id": "m2", "threadId": "good"},
+        ]}
+        with caplog.at_level(logging.ERROR, logger="email-labeler"):
+            await run_poll_cycles(
+                monkeypatch, tmp_path, [poll] * 8, process_mock=masquerade_process,
+            )
+
+        escalations = [r for r in caplog.records if "provider-shaped" in r.getMessage()]
+        assert len(escalations) == 1
+        assert "masq" in escalations[0].getMessage()
+        assert "retrying forever" in escalations[0].getMessage()
+
+    async def test_struck_out_thread_is_marked_attempted_by_the_poll_loop(
+        self, monkeypatch, tmp_path, caplog,
+    ):
+        """Poll-loop wiring for the marking step (D5): since T8 the only
+        production code that abandons a thread is run_daemon's post-gather loop
+        over attribute_cycle_failures' struck-out entries. Drive the real
+        run_daemon so the convergence property — a blamed thread does reach
+        agent/attempted, and the cycle summary says so — is pinned on the
+        production path, not only through the tests' miniature-cycle helper.
+
+        max_failures is the hardcoded default 5 until T13 makes it a knob."""
+        async def poison_process(tid, msg_ids, *args, **kwargs):
+            if tid == "poison":
+                kwargs["cycle_failures"].append(daemon.CycleFailure(
+                    thread_id=tid, ids_to_mark=list(msg_ids), signature="ValueError",
+                ))
+                return False
+            return True  # the sibling succeeds: correlation blames the thread
+
+        label_manager = MagicMock()
+        label_manager.mark_attempted = AsyncMock()
+        poll = {"messages": [
+            {"id": "m1", "threadId": "poison"}, {"id": "m2", "threadId": "good"},
+        ]}
+        with caplog.at_level(logging.INFO, logger="email-labeler"):
+            await run_poll_cycles(
+                monkeypatch, tmp_path, [poll] * 5,
+                process_mock=poison_process, label_manager=label_manager,
+            )
+
+        label_manager.mark_attempted.assert_awaited_once_with(["m1"])
+        assert any(
+            "abandoned after repeated failures" in r.getMessage() and "poison" in r.getMessage()
+            for r in caplog.records
+        )
+
+
 class TestFailureTracker:
     def test_gives_up_only_at_threshold(self):
         t = FailureTracker(max_failures=3)
@@ -962,13 +1286,16 @@ class TestDaemonHalt:
 
 class TestSummarizeCycle:
     def test_counts_handled_threads_and_drains_give_ups(self):
+        # Give-ups return False from process_single_thread (D5, Wave 2 T8): they
+        # are failures recorded by the poll loop's marking step, so given_up is
+        # no longer a subset of the handled count.
         t = FailureTracker(max_failures=1)
-        t.record_give_up("gaveup")
+        t.record_give_up("gaveup")  # recorded by _mark_thread_attempted
         items = [("ok", ["1"]), ("retry", ["2"]), ("gaveup", ["3"])]
-        results = [True, False, True]  # gaveup returned True (handled via give-up)
+        results = [True, False, False]  # gaveup returned False (a failure)
         processed, given_up = summarize_cycle(items, results, t)
-        assert processed == 2  # ok + gaveup
-        assert given_up == ["gaveup"]  # a subset of processed
+        assert processed == 1  # only ok was handled
+        assert given_up == ["gaveup"]  # reported distinctly, not part of processed
         assert t.take_given_up() == []  # already drained
 
     def test_clears_counts_for_handled_threads(self):
@@ -1108,7 +1435,7 @@ class _StopLoop(Exception):
 
 async def run_poll_cycles(
     monkeypatch, tmp_path, poll_outcomes, process_mock=None, cycles=None,
-    keep_newsletter=False, newsletter_output_file=None,
+    keep_newsletter=False, newsletter_output_file=None, label_manager=None,
 ):
     """Drive run_daemon through poll cycles, then stop; returns the proxy mock.
 
@@ -1123,6 +1450,9 @@ async def run_poll_cycles(
     the assessments-path log line and the sink preflight) can be exercised;
     NEWSLETTER_ONLY stays unset so the loop itself remains on the plain email
     pipeline. `newsletter_output_file` overrides the configured sink path.
+    `label_manager` supplies the instance the daemon's LabelManager constructor
+    returns, so a test can assert on the writes the poll loop itself performs
+    (e.g. the post-gather agent/attempted marking).
     """
     config = copy.deepcopy(load_config())
     if not keep_newsletter:
@@ -1138,7 +1468,10 @@ async def run_poll_cycles(
     monkeypatch.setattr(daemon, "GmailProxyClient", MagicMock(return_value=proxy))
     monkeypatch.setattr(daemon, "LLMClient", MagicMock())
     monkeypatch.setattr(daemon, "EmailClassifier", MagicMock())
-    monkeypatch.setattr(daemon, "LabelManager", MagicMock())
+    monkeypatch.setattr(
+        daemon, "LabelManager",
+        MagicMock(return_value=label_manager) if label_manager is not None else MagicMock(),
+    )
     monkeypatch.setattr(daemon, "verify_labels_with_retry", AsyncMock(return_value=[]))
     monkeypatch.setattr(
         daemon, "process_single_thread",
@@ -1851,7 +2184,7 @@ class TestNewsletterRouting:
         }
         classifier = NewsletterClassifier(cloud_llm=fake_llm, config=nl_config)
         out = tmp_path / "assessments.jsonl"
-        tracker = FailureTracker(max_failures=3)  # below threshold -> retry, not commit
+        failures: list[daemon.CycleFailure] = []
 
         result = await process_single_thread(
             "thread_nl",
@@ -1865,14 +2198,17 @@ class TestNewsletterRouting:
             newsletter_classifier=classifier,
             newsletter_recipient="newsletters@dm.org",
             newsletter_output_file=str(out),
-            failure_tracker=tracker,
+            cycle_failures=failures,
         )
 
-        # Routed to give-up (below threshold -> return False for a later retry),
-        # NOT committed as a (false) no-stories outcome.
+        # Routed to the strike-candidate path (recorded for the poll loop's
+        # attribution — D5, Wave 2 T8), NOT committed as a (false) no-stories
+        # outcome.
         assert result is False
         mock_label_manager.apply_newsletter_classification.assert_not_called()
         assert not out.exists()  # no empty assessment record written
+        assert [f.signature for f in failures] == ["LLMContentError"]
+        assert failures[0].provider_shaped is False
 
     async def test_non_newsletter_uses_priority_pipeline(
         self,
@@ -2123,7 +2459,10 @@ class TestNewsletterAssessmentDurability:
             raise OSError(30, "Read-only file system")
 
         monkeypatch.setattr(daemon, "write_assessment", _boom)
-        tracker = FailureTracker(max_failures=3)  # below threshold -> retry, not give up
+        # The OSError is collected as a strike candidate for the poll loop's
+        # attribution (D5, Wave 2 T8); the sink-fault never-counted corollary
+        # lands separately (T12).
+        failures: list[daemon.CycleFailure] = []
 
         result = await process_single_thread(
             "thread_nl",
@@ -2137,7 +2476,7 @@ class TestNewsletterAssessmentDurability:
             newsletter_classifier=mock_newsletter_classifier,
             newsletter_recipient="newsletters@dm.org",
             newsletter_output_file="/nonexistent/assessments.jsonl",
-            failure_tracker=tracker,
+            cycle_failures=failures,
         )
 
         assert result is False
