@@ -1029,11 +1029,22 @@ class TestReviewAppReviewFindings:
 
 
 def _dated_records():
-    """Records with distinct fixed send-dates (all in 2024) for sort/date tests."""
+    """Records with distinct fixed send-dates (all in 2024) for sort/date tests.
+
+    Instants are local midday converted to UTC; rendering converts back in
+    the same process timezone, an identity round-trip, so each record shows
+    the authored local date in every timezone (issue #67). Midday also keeps
+    the UTC calendar date within a day of the authored date, clear of the
+    date filter's mid-month cutoffs.
+    """
+
+    def utc_iso(y, m, d):
+        return datetime(y, m, d, 12, 0).astimezone(timezone.utc).isoformat()
+
     return [
-        _make_record(subject="Jan", send_date="2024-01-10T00:00:00+00:00"),
-        _make_record(subject="Mar", send_date="2024-03-10T00:00:00+00:00"),
-        _make_record(subject="Feb", send_date="2024-02-10T00:00:00+00:00"),
+        _make_record(subject="Jan", send_date=utc_iso(2024, 1, 10)),
+        _make_record(subject="Mar", send_date=utc_iso(2024, 3, 10)),
+        _make_record(subject="Feb", send_date=utc_iso(2024, 2, 10)),
     ]
 
 
