@@ -1129,6 +1129,108 @@ class TestFailureAttribution:
         assert tracker.take_given_up() == []
         assert any("shared cause" in r.getMessage() for r in caplog.records)
 
+    async def test_timeout_is_a_strike_candidate_and_converges_to_attempted(
+        self, mock_proxy, mock_classifier, mock_label_manager, cloud_sem, local_sem,
+        mock_thread_response,
+    ):
+        """The TimeoutError arm records a CANDIDATE CycleFailure (D5): a request
+        too slow to serve — a transcript too large to prefill within the timeout —
+        is the thread's own problem when siblings are fine, so it must strike and
+        converge to a findable agent/attempted rather than be retried forever.
+        (Connect/pool timeouts arrive as LLMUnavailableError and are
+        provider-shaped; this arm is the request-specific one.) Nothing else in
+        the suite drives a daemon TimeoutError, so the arm's collector append is
+        pinned here."""
+        def route(tid):
+            if tid == "t_slow":
+                raise TimeoutError("prefill exceeded the request timeout")
+            return mock_thread_response
+
+        mock_proxy.get_thread.side_effect = route
+        tracker = FailureTracker(max_failures=2)
+
+        for _ in range(2):
+            results = await drive_attribution_cycle(
+                [("t_slow", ["m1"]), ("t_good", ["m2"])],
+                mock_proxy, mock_classifier, mock_label_manager, cloud_sem, local_sem,
+                tracker=tracker,
+            )
+
+        assert results == [False, True]
+        mock_label_manager.mark_attempted.assert_called_once_with(["m1"])
+        assert tracker.take_given_up() == ["t_slow"]
+
+    async def test_successful_mark_clears_the_count_so_the_thread_is_not_re_marked(
+        self, mock_proxy, mock_classifier, mock_label_manager, cloud_sem, local_sem,
+        mock_thread_response,
+    ):
+        """A landed agent/attempted marker clears the thread's count (D5).
+        Give-ups return False, so summarize_cycle's success-clear never runs for
+        them — _mark_thread_attempted must clear beside the successful mark. Left
+        uncleared, the count sits at the threshold forever and every later strike
+        re-marks the same thread, re-spamming the give-up ERROR and the write.
+        The third cycle here is the one that exposes it: it strikes again, and
+        must NOT re-mark."""
+        def route(tid):
+            if tid == "t_bad":
+                raise ValueError("poison thread")
+            return mock_thread_response
+
+        mock_proxy.get_thread.side_effect = route
+        tracker = FailureTracker(max_failures=2)
+
+        for _ in range(3):
+            await drive_attribution_cycle(
+                [("t_bad", ["m1"]), ("t_good", ["m2"])],
+                mock_proxy, mock_classifier, mock_label_manager, cloud_sem, local_sem,
+                tracker=tracker,
+            )
+
+        mock_label_manager.mark_attempted.assert_called_once_with(["m1"])
+        assert tracker.take_given_up() == ["t_bad"]
+        assert tracker.should_give_up("t_bad") is False  # count restarted from zero
+
+    async def test_marking_eligibility_comes_from_this_cycles_strikes_only(
+        self, mock_proxy, mock_classifier, mock_label_manager, cloud_sem, local_sem,
+        mock_thread_response,
+    ):
+        """Marking derives from THIS cycle's strikes, never from raw tracker
+        counts (D5). A marker write that fails transiently deliberately leaves the
+        count AT the threshold so the thread's next strike re-offers the write —
+        but a stale at-threshold count must not mark a thread that has since
+        stopped being blamed.
+
+        Cycle 1: t_bad fails uniquely beside a success, strikes to the threshold,
+        and the marker write fails (proxy down) — count stays at 1. Cycle 2: the
+        very same failure now has a same-signature twin, so correlation says
+        shared cause and NOBODY strikes; the stale count must not mark t_bad."""
+        def route(tid):
+            if tid in ("t_bad", "t_twin"):
+                raise ValueError("boom")
+            return mock_thread_response
+
+        mock_proxy.get_thread.side_effect = route
+        mock_label_manager.mark_attempted.side_effect = ProxyUnavailableError("proxy down")
+        tracker = FailureTracker(max_failures=1)
+
+        await drive_attribution_cycle(
+            [("t_bad", ["m1"]), ("t_good", ["m2"])],
+            mock_proxy, mock_classifier, mock_label_manager, cloud_sem, local_sem,
+            tracker=tracker,
+        )
+        assert mock_label_manager.mark_attempted.call_count == 1
+        assert tracker.should_give_up("t_bad") is True  # left at the threshold
+
+        await drive_attribution_cycle(
+            [("t_bad", ["m1"]), ("t_twin", ["m3"]), ("t_good", ["m2"])],
+            mock_proxy, mock_classifier, mock_label_manager, cloud_sem, local_sem,
+            tracker=tracker,
+        )
+
+        # No strike this cycle → no marking, however high the stale count is.
+        assert mock_label_manager.mark_attempted.call_count == 1
+        assert tracker.take_given_up() == []
+
     async def test_masquerade_suspect_escalates_on_heartbeat_and_is_never_abandoned(
         self, mock_proxy, mock_classifier, mock_label_manager, cloud_sem, local_sem,
         mock_thread_response,
@@ -1395,6 +1497,108 @@ class TestFailureTracker:
         t.record_failure("active")
         t.prune({"active"})
         assert t.should_give_up("active") is True  # still counted toward give-up
+
+
+class TestMasqueradeTracker:
+    """Mirrors TestFailureTracker for the masquerade counter (D5): the
+    bookkeeping attribute_cycle_failures performs on it — success clears, the
+    per-cycle prune, and the exactly-one-provider-shaped-thread-plus-a-success
+    increment condition — plus escalation_line's throttle."""
+
+    @staticmethod
+    def _attribute(thread_items, results, failures, masq):
+        """Run the real attribution step with a throwaway FailureTracker whose
+        threshold is out of reach, so only masquerade bookkeeping is in play."""
+        return daemon.attribute_cycle_failures(
+            thread_items, results, failures, FailureTracker(max_failures=99), masq,
+        )
+
+    def test_success_clears_the_threads_masquerade_count(self):
+        # A thread that finally processes is no longer a masquerade suspect —
+        # without the success-clear its count only ever grows, so one bad
+        # afternoon leaves a permanent false suspect escalating on every
+        # heartbeat for the rest of the session.
+        masq = daemon.MasqueradeTracker(max_failures=1)
+        masq.record_masquerade("t_recovered")
+        assert masq.suspects() == {"t_recovered": 1}
+
+        self._attribute(
+            [("t_recovered", ["m1"]), ("t_good", ["m2"])], [True, True], [], masq,
+        )
+
+        assert masq.suspects() == {}
+
+    def test_prune_evicts_counts_for_threads_gone_from_the_query(self):
+        # Mirrors FailureTracker.prune (and its wiring in summarize_cycle): a
+        # thread that accrues masquerade cycles and then leaves the query — read,
+        # archived, relabeled externally — must not leak its count for the
+        # daemon's lifetime, nor keep escalating as a suspect that no longer
+        # exists.
+        masq = daemon.MasqueradeTracker(max_failures=1)
+        masq.record_masquerade("t_gone")
+        assert masq.suspects() == {"t_gone": 1}
+
+        self._attribute([("t_still_here", ["m1"])], [True], [], masq)
+
+        assert masq.suspects() == {}
+
+    def test_two_provider_shaped_threads_are_an_outage_not_a_masquerade(self):
+        # The masquerade is a SINGLE thread drawing provider-shaped errors while
+        # siblings succeed (issue #26's deterministic per-thread 5xx). Two threads
+        # failing that way is a provider/proxy problem touching more than one
+        # thread — no thread is singled out, so nobody's counter moves, even
+        # though a third thread succeeded.
+        masq = daemon.MasqueradeTracker(max_failures=1)
+        failures = [
+            daemon.CycleFailure("t_a", ["m1"], "ProxyUnavailableError", provider_shaped=True),
+            daemon.CycleFailure("t_b", ["m2"], "ProxyUnavailableError", provider_shaped=True),
+        ]
+
+        self._attribute(
+            [("t_a", ["m1"]), ("t_b", ["m2"]), ("t_good", ["m3"])],
+            [False, False, True], failures, masq,
+        )
+
+        assert masq.suspects() == {}
+        assert masq.escalation_line(now=1000.0, status_interval=900) is None
+
+    def test_zero_success_multi_thread_cycle_never_increments(self):
+        # The mirror of the adjudicated singleton edge (D5): one provider-shaped
+        # failure in a cycle where nothing succeeded is exactly what a genuine
+        # provider outage looks like. The counter moves only on POSITIVE evidence
+        # (a sibling that actually got work done), so a multi-thread cycle with no
+        # successes must leave it alone.
+        masq = daemon.MasqueradeTracker(max_failures=1)
+        failures = [
+            daemon.CycleFailure("t_masq", ["m1"], "ProxyUnavailableError", provider_shaped=True),
+            daemon.CycleFailure("t_other", ["m2"], "RuntimeError"),
+        ]
+
+        self._attribute(
+            [("t_masq", ["m1"]), ("t_other", ["m2"])], [False, False], failures, masq,
+        )
+
+        assert masq.suspects() == {}
+        assert masq.escalation_line(now=1000.0, status_interval=900) is None
+
+    def test_throttle_resets_once_no_suspect_remains(self):
+        # The throttle is per-suspect-stretch, not a global rate limit: once the
+        # suspects clear, a NEW suspect appearing inside the same status_interval
+        # must escalate immediately rather than be silenced by the previous
+        # stretch's timestamp.
+        masq = daemon.MasqueradeTracker(max_failures=1)
+        masq.record_masquerade("t_a")
+        assert masq.escalation_line(now=1000.0, status_interval=900) is not None
+        # Throttled while that suspect persists.
+        assert masq.escalation_line(now=1100.0, status_interval=900) is None
+
+        masq.clear("t_a")
+        assert masq.escalation_line(now=1200.0, status_interval=900) is None  # quiet
+
+        masq.record_masquerade("t_b")
+        line = masq.escalation_line(now=1300.0, status_interval=900)
+        assert line is not None
+        assert "t_b" in line
 
 
 class TestDaemonHalt:
@@ -2014,6 +2218,101 @@ class TestPerFunctionHalt:
         assert f"to:{recipient}" not in queries[0]
         assert all(f"to:{recipient}" in q for q in queries[1:])
 
+    async def test_halt_deferred_threads_record_no_cycle_failure(
+        self, mock_proxy, mock_classifier, mock_label_manager,
+        mock_newsletter_classifier, cloud_sem, local_sem,
+        mock_thread_response, newsletter_thread_response, tmp_path,
+    ):
+        """A halt is a DEFERRAL, not a failure (D5/T9): neither function-aware
+        skip may record a CycleFailure. One would be poison for the attribution
+        step — a provider-shaped entry every cycle would either look like a
+        single-thread masquerade (escalating a false suspect forever) or, as a
+        candidate, strike the thread all the way to agent/attempted for the sole
+        crime of belonging to the halted function. Both directions are checked
+        against a REAL collector list, one halt at a time, so the partial-halt
+        path runs rather than the all_halted short-circuit."""
+        threads = {
+            "thread_nl": newsletter_thread_response,
+            "thread_001": mock_thread_response,
+        }
+        mock_proxy.get_thread.side_effect = lambda thread_id: threads[thread_id]
+        failures: list[daemon.CycleFailure] = []
+
+        def process(tid, halts):
+            return process_single_thread(
+                tid, [tid], mock_proxy, mock_classifier, mock_label_manager,
+                cloud_sem, local_sem, max_thread_chars=50000,
+                newsletter_classifier=mock_newsletter_classifier,
+                newsletter_recipient="newsletters@dm.org",
+                newsletter_output_file=str(tmp_path / "assessments.jsonl"),
+                halts=halts, cycle_failures=failures,
+            )
+
+        nl_halts = daemon.FunctionHalts(newsletter_enabled=True)
+        nl_halts.newsletter.trip("provider account balance exhausted")
+        email_halts = daemon.FunctionHalts(newsletter_enabled=True)
+        email_halts.email.trip("provider account balance exhausted")
+
+        assert await process("thread_nl", nl_halts) is False
+        assert await process("thread_001", email_halts) is False
+        assert failures == []
+
+    async def test_email_halt_commits_nothing_even_at_max_priority(
+        self, mock_proxy, mock_classifier, mock_label_manager, cloud_sem, local_sem,
+        mock_thread_response,
+    ):
+        """The email-halt skip sits ABOVE the already-at-max-priority branch, so
+        a halted email function commits NOTHING — not even the agent/processed
+        marker that branch would otherwise write (D5 Rule 1: only successes
+        commit outcomes). Marking under a halt would drop the thread out of
+        gmail_query for good without it ever being classified.
+
+        Only email is halted (newsletter grading is enabled and running), so the
+        all_halted short-circuit at the top does not fire and the thread really
+        does reach the priority check."""
+        mock_proxy.get_thread.return_value = mock_thread_response
+        mock_label_manager.get_existing_priority = MagicMock(
+            return_value=_get_priority(EmailLabel.NEEDS_RESPONSE)
+        )
+        halts = daemon.FunctionHalts(newsletter_enabled=True)
+        halts.email.trip("cloud provider out of funds")
+
+        result = await process_single_thread(
+            "thread_001", ["msg_001"], mock_proxy, mock_classifier, mock_label_manager,
+            cloud_sem, local_sem, max_thread_chars=50000, halts=halts,
+        )
+
+        assert result is False
+        mock_label_manager.mark_processed.assert_not_called()
+        mock_label_manager.apply_classification.assert_not_called()
+
+    async def test_query_is_narrowed_exactly_once(self, monkeypatch, tmp_path):
+        """The email-only-halt narrowing appends `to:recipient` ONCE. Halts are
+        restart-reset, so the partial-halt branch runs every cycle for the rest of
+        the session: re-appending would grow the query without bound (and re-log
+        the narrowing line) for as long as the daemon lives."""
+        recipient = load_config()["newsletter"]["recipient"]
+
+        async def halt_email(*args, **kwargs):
+            kwargs["halts"].email.trip("cloud provider out of funds")
+            return False
+
+        proxy = await run_poll_cycles(
+            monkeypatch, tmp_path,
+            [
+                {"messages": [{"id": "m1", "threadId": "t1"}]},
+                {"messages": []},
+                {"messages": []},
+                {"messages": []},
+            ],
+            process_mock=halt_email,
+            keep_newsletter=True,
+            newsletter_output_file=tmp_path / "assessments.jsonl",
+        )
+
+        queries = [c.kwargs["q"] for c in proxy.list_messages.call_args_list]
+        assert [q.count(f"to:{recipient}") for q in queries] == [0, 1, 1, 1]
+
     async def test_partial_halt_keeps_polling_and_names_the_halted_function(
         self, monkeypatch, tmp_path, caplog
     ):
@@ -2045,6 +2344,42 @@ class TestPerFunctionHalt:
         assert all(r.levelno == logging.ERROR for r in halted)
         assert all("newsletter" in r.getMessage() for r in halted)
         assert all("add funds" in r.getMessage().lower() for r in halted)
+
+    async def test_partial_halt_error_names_the_function_not_merely_the_reason(
+        self, monkeypatch, tmp_path, caplog
+    ):
+        """Sharper than the test above, which trips with a reason that happens to
+        contain the word "newsletter" and so cannot tell a named function from a
+        bare reason. The trip reason here mentions neither function, so the ERROR
+        can only satisfy this by carrying halted_summary()'s `function: reason`
+        prefix — the operator's one clue about WHICH function needs funds while
+        the other keeps running."""
+
+        async def halt_newsletter(*args, **kwargs):
+            kwargs["halts"].newsletter.trip("provider account balance exhausted")
+            return False
+
+        with caplog.at_level(logging.ERROR, logger="email-labeler"):
+            await run_poll_cycles(
+                monkeypatch, tmp_path,
+                [
+                    {"messages": [{"id": "m1", "threadId": "t1"}]},
+                    {"messages": []},
+                    {"messages": []},
+                ],
+                process_mock=halt_newsletter,
+                keep_newsletter=True,
+                newsletter_output_file=tmp_path / "assessments.jsonl",
+            )
+
+        halted = [r for r in caplog.records if "restart the daemon" in r.getMessage()]
+        assert len(halted) == 2  # cycles 2 and 3
+        assert all(
+            "newsletter grading: provider account balance exhausted" in r.getMessage()
+            for r in halted
+        )
+        # ...and it must not smear the halt across the function still running.
+        assert all("email triage" not in r.getMessage() for r in halted)
 
     async def test_both_functions_halted_stands_down(self, monkeypatch, tmp_path, caplog):
         """Only when EVERY enabled function is halted does the daemon stand down —
