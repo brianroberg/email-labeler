@@ -435,3 +435,9 @@ Conventions shared by every TUI:
 | `test_eval_newsletter_report.py` | `evals/newsletter_report.py` | `match_stories`, tier/dimension/theme metrics, comparison deltas |
 | `test_newsletter_review.py` | `newsletter_review/tui.py` | Pure helpers (loading, per-thread dedup, filtering, formatting, source line, migrated-record note) + Pilot UI tests (navigation, drill-down, tier/theme/sender filters, source header, quit) |
 | `test_migrate_assessments.py` | `scripts/migrate_assessments.py` | Old-scheme detection, theme/score conversion, tier preservation, atomic in-place rewrite + abort-on-malformed, round-trip through `load_assessments` |
+
+## Continuous Integration
+
+GitHub Actions (`.github/workflows/ci.yml`, authoritative) runs dependency
+sync, lint, and the full mocked suite on every PR and push to main; no
+secrets are required (registry D13).

@@ -180,7 +180,7 @@ so the next schema evolution is a version bump + migration, not shape-sniffing.
 
 ## D13 — Adopt CI (2026-07-30)
 
-**Status:** implementation pending (Wave 1).
+**Status:** implemented (Wave 1).
 
 A minimal GitHub Actions workflow (uv sync, pytest, ruff) on PRs and pushes to
 main. The suite is fully mocked; no secrets. Its absence was not deliberate.
