@@ -189,6 +189,11 @@ docker compose build email-labeler
 docker compose up email-labeler
 ```
 
+Pass `--build-arg GIT_SHA=$(git rev-parse --short HEAD)` to the build to stamp
+the image with its commit — the daemon logs it once at startup, so the logs
+answer "what is deployed?" (decision D11). Builds without the arg default to
+`unknown`.
+
 To run only the newsletter function (skip email triage):
 
 ```bash

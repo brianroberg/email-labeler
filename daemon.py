@@ -815,6 +815,10 @@ def preflight_assessment_sink(output_file: str) -> None:
 
 async def run_daemon() -> None:
     """Main polling loop."""
+    # Release identity (decision D11): the Docker build stamps GIT_SHA into the
+    # image; logging it here (not at import — daemon.py:64-77 contract) answers
+    # "what is deployed?" from the logs alone.
+    log.info("email-labeler starting — build %s", os.environ.get("GIT_SHA", "unknown"))
     config = load_config()
     daemon_config = config["daemon"]
 

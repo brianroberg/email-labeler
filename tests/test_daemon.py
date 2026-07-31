@@ -1134,6 +1134,20 @@ class TestPollLoopObservability:
         assert len(caught_up) == 2
 
 
+class TestStartupBuildLog:
+    """Release identity (decision D11): run_daemon logs the baked build SHA once
+    at startup so "what is deployed?" has an answer in the logs."""
+
+    async def test_startup_logs_build_sha(self, monkeypatch, tmp_path, caplog):
+        monkeypatch.setenv("GIT_SHA", "abc1234")
+        with caplog.at_level(logging.INFO, logger="email-labeler"):
+            await run_poll_cycles(monkeypatch, tmp_path, [{"messages": []}])
+        assert any(
+            r.getMessage() == "email-labeler starting — build abc1234"
+            for r in caplog.records
+        )
+
+
 async def _out_of_funds_process(*args, **kwargs):
     """process_single_thread stand-in: every thread hits an out-of-funds provider."""
     kwargs["halt"].trip("LLM provider out of funds — status 403 [tier=cloud]: NOT_ENOUGH_BALANCE")

@@ -170,7 +170,7 @@ unaffected.
 
 ## D11 — Minimal release identity (2026-07-30)
 
-**Status:** implementation pending (Wave 2).
+**Status:** implemented (Wave 2).
 
 The Dockerfile bakes the git SHA (build-arg), the daemon logs it once at
 startup, and notable releases get a lightweight git tag. No semver, no

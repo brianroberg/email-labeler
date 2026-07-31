@@ -77,6 +77,7 @@ email-labeler/
 | `LOCAL_PARALLEL` | No | `1` (from `config.toml`) | Max concurrent local MLX requests, overriding `local_parallel` in `config.toml`. Modern MLX servers batch these (shared weights), so concurrency mostly costs KV cache. Keep ≤ 8 — mlx-lm has a KV-cache cross-contamination bug at 16+. |
 | `MAX_EMAILS_PER_CYCLE` | No | `10` (from `config.toml`) | Max threads processed per poll cycle, overriding `max_emails_per_cycle` in `config.toml`. Raise temporarily to drain a large backlog faster. |
 | `WRITE_PARALLEL` | No | `4` (from `config.toml`) | Max concurrent label-application writes (`modify_message`), overriding `write_parallel` in `config.toml`. Bounds the proxy-write burst when `max_emails_per_cycle` is large. Sized separately from reads because writes may block on human approval (`WRITE_TIMEOUT`, 300s). |
+| `GIT_SHA` | No | `unknown` | Git commit SHA of the running build, logged once at daemon startup (decision D11). Stamped by the image build (Dockerfile `ARG`/`ENV`); not an operator knob. |
 
 Note: The cloud LLM **model name** is configured in `config.toml` under `[llm.cloud]`, not in `.env`. The local LLM **model name** is set via the `MLX_MODEL` environment variable (shared with email-agent) and referenced in `config.toml` as `{env.MLX_MODEL}`. This keeps secrets (keys, URLs) in `.env` while operational parameters (temperature, prompts) stay in version-controlled `config.toml`.
 
@@ -378,6 +379,10 @@ timestamp fresh (deliberately halted, not hung — the container stays healthy):
 ```
 Daemon halted — <reason>. Add funds to the provider account, then restart the daemon to resume processing.
 ```
+
+## Release Identity
+
+The image build stamps the git SHA into `GIT_SHA` (see the env table and README.md's Docker section), and the daemon logs `email-labeler starting — build <sha>` once at startup. Notable releases get a lightweight tag, applied manually by the owner — no semver, no changelog (decision D11): `git tag deploy-YYYY-MM-DD <sha>`.
 
 ## TUI Conventions (Textual)
 
