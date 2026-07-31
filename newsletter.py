@@ -113,12 +113,19 @@ def parse_stories(raw: str) -> list[str]:
     Expected format (one story per block, blocks separated by blank lines):
         STORY: <story text, possibly multi-line>
 
-    Returns empty list for NO_STORIES or unparseable input.
+    Returns an empty list ONLY for an explicit ``NO_STORIES`` reply — the genuine
+    zero-story extraction, the one thing that may become an
+    ``agent/newsletter/no-stories`` outcome. Any other reply that yields no
+    parsed story is unusable output and raises ``LLMContentError`` (D5 Rule 1 /
+    D20): conflating the two let a *failed* extraction commit a false
+    no-stories label. Empty/whitespace-only input is unreachable in production
+    (llm_client's content guard raises first) but is treated the same way rather
+    than letting this contract lie.
     """
     # Normalize CRLF/CR to LF first so the blank-line split and the verbatim
     # story slices behave identically regardless of the model's line endings.
     stripped = raw.replace("\r\n", "\n").replace("\r", "\n").strip()
-    if not stripped or stripped.upper() == "NO_STORIES":
+    if stripped.upper() == "NO_STORIES":
         return []
 
     stories = []
@@ -141,6 +148,11 @@ def parse_stories(raw: str) -> list[str]:
             if text:
                 stories.append(text)
 
+    if not stories:
+        raise LLMContentError(
+            "story extraction reply was neither NO_STORIES nor parsable into "
+            f"stories: {stripped[:200]!r}"
+        )
     return stories
 
 
@@ -555,7 +567,13 @@ class NewsletterClassifier:
         """Run the full newsletter classification pipeline over story texts.
 
         Individual *per-story* failures are isolated — a quality failure doesn't
-        prevent theme classification, and vice versa.
+        prevent theme classification, and vice versa — but only while some story
+        still grades: if stories were extracted and *not one* produced scores,
+        the whole grading is content-less and raises ``LLMContentError``
+        (D5 Rule 1 / D20, issue #30's parse-to-None route). Committing it would
+        label the newsletter `no-stories` off a failure, indistinguishable from
+        a genuine zero-story extraction. An empty result list therefore means
+        exactly one thing: extraction succeeded and found no stories.
 
         A *transient* LLM outage (LLMUnavailableError) is NOT isolated: it
         propagates so the daemon retries the whole newsletter thread next cycle,
@@ -601,5 +619,14 @@ class NewsletterClassifier:
                 log.warning("Theme classification failed for story: %s", text[:60])
 
             results.append(result)
+
+        # Stories exist but none of them graded (every quality reply unparseable
+        # or per-story-failed): a content-less grading, not a `no-stories`
+        # outcome — raise so the daemon defers the thread instead of committing
+        # a tier-less record plus the no-stories label (D5 Rule 1 / D20).
+        if all(r.scores is None for r in results):
+            raise LLMContentError(
+                f"no story graded: all {len(results)} quality replies were unusable"
+            )
 
         return results

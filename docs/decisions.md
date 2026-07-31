@@ -132,8 +132,19 @@ Corollaries, each `implementation pending (Wave 2)` until landed:
   SERVICE default still applies. Evals degrade honestly: run_eval turns the
   raise into an error row instead of a silent LOW_PRIORITY prediction.
 - `agent/newsletter/no-stories` may only result from a successful extraction
-  that found zero stories; all-grades-unparseable is a failure (extends the
-  issue-#30 principle to the parse-to-None path).
+  that found zero stories — implemented (Wave 2 T11), closing **two** false
+  paths. `parse_stories` returns `[]` only for an explicit `NO_STORIES` reply
+  and raises `LLMContentError` for any other reply that yields no story
+  (empty/whitespace included — unreachable behind llm_client's content guard,
+  but the parser's contract must not lie about it). `classify_newsletter`
+  raises when stories were extracted yet not one produced scores — issue #30's
+  remaining parse-to-None route, whose most common instance is a single-story
+  newsletter whose only story fails to grade. Per-story isolation survives for
+  the partial case (a story that fails while a sibling grades). Both raises are
+  pipeline-wide and are strike candidates under the correlation attribution, so
+  a poison newsletter converges to a findable `agent/attempted` rather than a
+  false no-stories record; the eval harness, which shares the parser, degrades
+  to error rows.
 - Assessment-sink faults are shared-cause: never counted, retried forever
   (README-technical's write-before-label table currently documents the
   give-up ending, matching the code; this corollary changes both).
@@ -288,8 +299,10 @@ Wave 2 T9 (was daemon-wide).
 
 ## D20 — Content-less grading is a failure, not an outcome (issue #30, 2026-07-08)
 
-**Status:** implemented for the exception path; parse-to-None path pending
-(extended by D5, Wave 2).
+**Status:** implemented — the exception path with issue #30, the parse-to-None
+path with D5's corollary in Wave 2 T11.
 
-Stories-exist-but-every-grade-errored raises and reaches the give-up path;
-genuine zero-story extraction remains a valid `no-stories` outcome.
+Stories-exist-but-every-grade-errored raises and reaches the give-up path; so
+do stories-exist-but-every-grade-*unparseable* and an extraction reply that
+parses to no stories without saying `NO_STORIES` (T11). A successful zero-story
+extraction remains a valid `no-stories` outcome — the only one.

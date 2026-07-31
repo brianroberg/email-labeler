@@ -2484,6 +2484,107 @@ class TestNewsletterRouting:
         assert [f.signature for f in failures] == ["LLMContentError"]
         assert failures[0].provider_shaped is False
 
+    @staticmethod
+    def _real_newsletter_classifier(replies):
+        """A real NewsletterClassifier over a fake LLM returning ``replies`` in order."""
+        from newsletter import NewsletterClassifier
+
+        fake_llm = AsyncMock()
+        fake_llm.model = "test-model"
+        fake_llm.complete.side_effect = replies
+        nl_config = {
+            "newsletter": {
+                "prompts": {
+                    "story_extraction": {"system": "s", "user_template": "{body}"},
+                    "quality_assessment": {"system": "s", "user_template": "{text}"},
+                    "theme_classification": {"system": "s", "user_template": "{text}"},
+                }
+            }
+        }
+        return NewsletterClassifier(cloud_llm=fake_llm, config=nl_config)
+
+    async def test_unparseable_extraction_commits_nothing(
+        self,
+        mock_proxy,
+        mock_classifier,
+        mock_label_manager,
+        cloud_sem,
+        local_sem,
+        newsletter_thread_response,
+        tmp_path,
+    ):
+        """D5/D20: an unparseable extraction reply is a failure, not a `no-stories`
+        outcome — no labels, no assessment record, a strike candidate instead."""
+        mock_proxy.get_thread.return_value = newsletter_thread_response
+        classifier = self._real_newsletter_classifier(
+            [("I could not find any stories, sorry!", "")]  # extract_stories
+        )
+        out = tmp_path / "assessments.jsonl"
+        failures: list[daemon.CycleFailure] = []
+
+        result = await process_single_thread(
+            "thread_nl",
+            ["msg_nl_001"],
+            mock_proxy,
+            mock_classifier,
+            mock_label_manager,
+            cloud_sem,
+            local_sem,
+            max_thread_chars=50000,
+            newsletter_classifier=classifier,
+            newsletter_recipient="newsletters@dm.org",
+            newsletter_output_file=str(out),
+            cycle_failures=failures,
+        )
+
+        assert result is False
+        mock_label_manager.apply_newsletter_classification.assert_not_called()
+        assert not out.exists()
+        assert [f.signature for f in failures] == ["LLMContentError"]
+
+    async def test_all_grades_unparseable_commits_nothing(
+        self,
+        mock_proxy,
+        mock_classifier,
+        mock_label_manager,
+        cloud_sem,
+        local_sem,
+        newsletter_thread_response,
+        tmp_path,
+    ):
+        """D5/D20: stories extracted but not one gradable — no `no-stories` label and
+        no tier-less assessment record; the thread defers as a strike candidate."""
+        mock_proxy.get_thread.return_value = newsletter_thread_response
+        classifier = self._real_newsletter_classifier(
+            [
+                ("STORY: A real story about ministry work.", ""),  # extract_stories
+                ("garbled quality output", ""),                    # assess_quality
+                ("SCRIPTURE: PRESENT", ""),                        # classify_themes
+            ]
+        )
+        out = tmp_path / "assessments.jsonl"
+        failures: list[daemon.CycleFailure] = []
+
+        result = await process_single_thread(
+            "thread_nl",
+            ["msg_nl_001"],
+            mock_proxy,
+            mock_classifier,
+            mock_label_manager,
+            cloud_sem,
+            local_sem,
+            max_thread_chars=50000,
+            newsletter_classifier=classifier,
+            newsletter_recipient="newsletters@dm.org",
+            newsletter_output_file=str(out),
+            cycle_failures=failures,
+        )
+
+        assert result is False
+        mock_label_manager.apply_newsletter_classification.assert_not_called()
+        assert not out.exists()
+        assert [f.signature for f in failures] == ["LLMContentError"]
+
     async def test_non_newsletter_uses_priority_pipeline(
         self,
         mock_proxy,
