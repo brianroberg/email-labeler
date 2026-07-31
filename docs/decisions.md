@@ -176,10 +176,15 @@ did:
   sink. A dedicated class rather than `except OSError`, which would also
   swallow `TimeoutError` (an OSError subclass, and a strike candidate). The
   per-cycle ERROR naming the resolved path is the loudness, alongside the
-  startup preflight; with the ResultCache (T6) each retry re-attempts only the
-  JSONL write, so "forever" costs no LLM spend. README-technical's
-  write-before-label table and the sink-preflight warning text, which both
-  documented the give-up ending, changed with it.
+  startup preflight; with the ResultCache (T6) each retry *within a daemon
+  session* re-attempts only the JSONL write, so "forever" costs no LLM spend —
+  the cache is in-memory and pruned to each cycle's page, so a restart, or a
+  backlog that pushes the thread off a page, re-grades it once (refined in the
+  Wave 2 review: the original wording claimed the record could only repeat on a
+  fingerprint change, which the session scope and the page-sized prune both
+  contradict; D18's newest-timestamp dedup on read is the backstop).
+  README-technical's write-before-label table and the sink-preflight warning
+  text, which both documented the give-up ending, changed with it.
 - `max_failures` (the strike bound) is an operator knob — implemented (Wave 2
   T13, `a40c2c2`). It lives in config.toml `[daemon] max_failures` with its sizing
   rationale (the authoritative home, D7), is overridable per run with

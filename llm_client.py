@@ -112,8 +112,11 @@ _BALANCE_SIGNATURE = re.compile(
 # ("exceeded your current quota"): wrongly converting a transient rate limit
 # into a restart-only function halt is worse than letting a rare 429-signaled
 # out-of-funds be retried as provider unavailability (decision D19) — it
-# defers threads each cycle, never strikes (D5), and a sustained one surfaces
-# through the daemon's shared-cause/masquerade ERROR escalation.
+# defers threads each cycle and never strikes (D5). Its visibility is the
+# per-thread WARNING and the cycle summary, not an ERROR: an account-wide 429
+# fails every thread, and neither loud path covers that (the shared-cause line
+# is emitted over candidate failures only, and the masquerade escalation wants
+# exactly one affected thread while siblings succeed).
 _BALANCE_SIGNATURE_STATUSES = frozenset({400, 403})
 
 
@@ -296,8 +299,10 @@ class LLMClient:
                 # spent its retry budget, so the throttle is sustained) or a 5xx
                 # means the provider can't serve anyone right now — never one
                 # thread's blame, so never a strike candidate. The daemon defers
-                # and retries next cycle; a sustained fault surfaces through the
-                # shared-cause/masquerade escalation, not give-up.
+                # and retries next cycle, never gives up. A fault that singles out
+                # ONE thread while siblings succeed gets loud through the
+                # masquerade escalation; a provider-wide one stays at the
+                # per-thread WARNING plus `Processed 0/N threads`.
                 raise LLMUnavailableError(
                     f"LLM endpoint unavailable — status {response.status_code} "
                     f"[{self._provider()}]: {resp_body}",

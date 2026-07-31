@@ -201,7 +201,29 @@ class TestBatchApplyClassification:
 class TestWriteSemaphore:
     """LabelManager owns the write semaphore (issue #33): each modify_message
     call acquires one slot, so `write_parallel` bounds writes in flight, not
-    threads writing — the slot is released between a thread's messages."""
+    threads writing — the slot is released between a thread's messages.
+
+    Every write path is covered, not just apply_classification: the marker
+    writes (mark_processed/mark_attempted) and the newsletter write reach the
+    proxy through the same ``_modify`` helper, and they are the ones that run
+    under the 300 s human-approval WRITE_TIMEOUT most often (a give-up storm is
+    all markers). A path that reached ``self.proxy.modify_message`` directly
+    would silently lose the bound.
+    """
+
+    @staticmethod
+    def _instrumented_modify(order, counters):
+        """A modify_message stub recording call order and peak concurrency."""
+
+        async def modify(message_id, **kwargs):
+            counters["in_flight"] += 1
+            counters["max_in_flight"] = max(counters["max_in_flight"], counters["in_flight"])
+            order.append(message_id)
+            await asyncio.sleep(0)  # hold the slot across a scheduling point
+            counters["in_flight"] -= 1
+            return {"id": message_id}
+
+        return modify
 
     async def test_concurrent_applies_interleave_per_message(
         self, mock_proxy, config, all_labels_response
@@ -241,6 +263,61 @@ class TestWriteSemaphore:
         # ...and the slot was released between messages: the second apply's
         # first write ran before the first apply's second write. Holding the
         # semaphore across a whole apply would force all a* before any b*.
+        assert order.index("b1") < order.index("a2")
+
+    async def test_concurrent_marker_writes_interleave_per_message(
+        self, mock_proxy, config, all_labels_response
+    ):
+        """The marker path (mark_processed/mark_attempted, via _apply_marker) is
+        bounded the same way. These are the writes a give-up storm issues most
+        of, and they block on the same 300 s human-approval WRITE_TIMEOUT."""
+        order: list[str] = []
+        counters = {"in_flight": 0, "max_in_flight": 0}
+
+        manager = LabelManager(
+            proxy_client=mock_proxy, config=config, write_sem=asyncio.Semaphore(1)
+        )
+        mock_proxy.list_labels.return_value = all_labels_response
+        await manager.verify_labels()
+        mock_proxy.modify_message.side_effect = self._instrumented_modify(order, counters)
+
+        await asyncio.gather(
+            manager.mark_processed(["a1", "a2"]),
+            manager.mark_attempted(["b1", "b2"]),
+        )
+
+        assert sorted(order) == ["a1", "a2", "b1", "b2"]
+        assert counters["max_in_flight"] == 1
+        assert order.index("b1") < order.index("a2")
+
+    async def test_concurrent_newsletter_writes_interleave_per_message(
+        self, mock_proxy, newsletter_config, all_labels_with_newsletter
+    ):
+        """And the newsletter write path, which builds its own label list rather
+        than sharing apply_classification's."""
+        order: list[str] = []
+        counters = {"in_flight": 0, "max_in_flight": 0}
+
+        manager = LabelManager(
+            proxy_client=mock_proxy,
+            config=newsletter_config,
+            write_sem=asyncio.Semaphore(1),
+        )
+        mock_proxy.list_labels.return_value = all_labels_with_newsletter
+        await manager.verify_labels()
+        mock_proxy.modify_message.side_effect = self._instrumented_modify(order, counters)
+
+        await asyncio.gather(
+            manager.apply_newsletter_classification(
+                ["a1", "a2"], NewsletterTier.EXCELLENT, {"scripture": "emphasized"}
+            ),
+            manager.apply_newsletter_classification(
+                ["b1", "b2"], NewsletterTier.POOR, {}
+            ),
+        )
+
+        assert sorted(order) == ["a1", "a2", "b1", "b2"]
+        assert counters["max_in_flight"] == 1
         assert order.index("b1") < order.index("a2")
 
 

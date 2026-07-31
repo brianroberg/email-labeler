@@ -181,8 +181,10 @@ class FailureTracker:
         A thread that fails a few times (below the give-up threshold) and then
         disappears from the query — read, archived, or relabeled externally —
         would otherwise leak its count for the daemon's lifetime. Pruning each
-        cycle to the still-pending set keeps the map bounded; a consecutively
-        failing thread reappears every cycle, so it is never pruned.
+        cycle to the threads on that cycle's page keeps the map bounded; a
+        consecutively failing thread reappears every cycle, so it survives —
+        unless a backlog larger than max_emails_per_cycle crowds it off a page,
+        which only forgives strikes it had already accrued.
         """
         active = set(active_thread_ids)
         self._counts = {tid: n for tid, n in self._counts.items() if tid in active}
@@ -226,7 +228,8 @@ class MasqueradeTracker:
     repeated at most once per status interval while any suspect persists.
 
     Mirrors FailureTracker's shape: per-thread counter, success-clears, pruned
-    each cycle to the still-pending set, in-memory and session-scoped. A cycle
+    each cycle to that cycle's page of pending threads, in-memory and
+    session-scoped (so a page miss or a restart costs a suspect its count). A cycle
     only counts when it carries correlation evidence — exactly one thread
     failed provider-shaped AND a sibling was handled successfully. Singleton
     and zero-success cycles neither increment nor reset (no evidence either
@@ -320,7 +323,14 @@ class ResultCache:
     tuple of the thread's message ids: a new message changes the input, so a
     mismatch drops the entry and the thread classifies fresh. In-memory and
     session-scoped like FailureTracker; entries are cleared on a successful
-    label write and pruned each cycle to the still-pending set.
+    label write and pruned each cycle to the threads on that cycle's page.
+
+    Best-effort by construction, not a durability guarantee: a restart drops
+    the whole cache, and a backlog larger than max_emails_per_cycle can push a
+    still-pending thread off a cycle's page. Either way the thread reclassifies
+    when it next comes round — the cost is LLM spend, plus (for a newsletter) a
+    second assessment record for the same content, which D18's newest-timestamp
+    dedup on read absorbs.
     """
 
     def __init__(self):
@@ -348,11 +358,15 @@ class ResultCache:
         self._entries.pop(thread_id, None)
 
     def prune(self, active_thread_ids) -> None:
-        """Drop entries for threads no longer pending (mirrors FailureTracker.prune).
+        """Drop entries for threads absent from this cycle (mirrors FailureTracker.prune).
 
         A cached result whose thread leaves the query — labeled externally,
         archived, or given up — would otherwise leak for the daemon's lifetime;
-        a thread with a pending write re-matches every cycle, so it survives.
+        a thread with a pending write re-matches the query every cycle, so it
+        normally survives. Normally, because *active_thread_ids* is the cycle's
+        max_emails_per_cycle page rather than the whole pending set: a large
+        backlog can evict a still-pending thread, which then reclassifies when
+        it comes back (class docstring — an optimisation, not a guarantee).
         """
         active = set(active_thread_ids)
         self._entries = {tid: e for tid, e in self._entries.items() if tid in active}
@@ -846,8 +860,12 @@ async def process_single_thread(
                 # retrying: a sink fault is shared-cause (the disk, not the thread),
                 # never counted toward give-up (decision D5's sink corollary), so the
                 # newsletter waits for the operator instead of being abandoned.
-                # Skipped once assessment_written: for an unchanged fingerprint
-                # the record never repeats — a retry re-attempts only the labels.
+                # Skipped once assessment_written: within a daemon session an
+                # unchanged fingerprint re-attempts only the labels. The cache is
+                # session-scoped and pruned to the cycle's page, so a restart —
+                # or a backlog that pushes the thread off a page — mid-retry
+                # re-grades and re-appends; D18's newest-timestamp dedup on read
+                # is the backstop for that record.
                 if newsletter_output_file and not cached_nl.assessment_written:
                     try:
                         write_assessment(

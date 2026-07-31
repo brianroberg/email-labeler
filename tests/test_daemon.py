@@ -1612,6 +1612,36 @@ class TestMasqueradeTracker:
         assert "t_b" in line
 
 
+class TestResultCache:
+    """Mirrors TestFailureTracker/TestMasqueradeTracker for the session result
+    cache (issue #29, Wave 2 T6): the memory hygiene its class docstring
+    promises — cleared on a successful label write, pruned each cycle — which
+    the process_single_thread-level reuse tests never observe (they only ever
+    drive cycles whose write is still failing)."""
+
+    def test_clear_drops_the_entry(self):
+        # Called after a successful label write: the thread is done, and its
+        # payload (for a newsletter, the whole story_results list) must not
+        # linger for the daemon's session.
+        cache = daemon.ResultCache()
+        cache.put("t1", ("m1",), "payload")
+        cache.clear("t1")
+        assert cache.get("t1", ("m1",)) is None
+
+    def test_prune_evicts_entries_for_threads_absent_this_cycle(self):
+        # A thread that leaves the query — labeled externally, archived, or
+        # given up to agent/attempted (the give-up path does NOT clear the
+        # cache) — would otherwise leak its payload for the daemon's lifetime.
+        cache = daemon.ResultCache()
+        cache.put("t_gone", ("m1",), "payload")
+        cache.put("t_here", ("m2",), "kept")
+
+        cache.prune(["t_here"])
+
+        assert cache.get("t_gone", ("m1",)) is None
+        assert cache.get("t_here", ("m2",)) == "kept"
+
+
 class TestDaemonHalt:
     """In-memory halt state for ONE function (out-of-funds); FunctionHalts pairs
     two of these (D5 scope, D19). Restart is the only reset."""
@@ -1801,8 +1831,9 @@ async def run_poll_cycles(
     cycles sleep without polling, so cycles may exceed len(poll_outcomes).
     `keep_newsletter` retains the [newsletter] config so startup wiring (e.g.
     the assessments-path log line and the sink preflight) can be exercised;
-    NEWSLETTER_ONLY stays unset so the loop itself remains on the plain email
-    pipeline. `newsletter_output_file` overrides the configured sink path.
+    NEWSLETTER_ONLY stays unset unless the test sets it itself, so the loop
+    remains on the plain email pipeline by default.
+    `newsletter_output_file` overrides the configured sink path.
     `label_manager` supplies the instance the daemon's LabelManager constructor
     returns, so a test can assert on the writes the poll loop itself performs
     (e.g. the post-gather agent/attempted marking).
@@ -2089,6 +2120,40 @@ class TestPerFunctionHalt:
     provider reported it — loudly — while the other function keeps working. The
     daemon stands down entirely only when every enabled function is halted.
     """
+
+    def test_no_enabled_function_is_not_all_halted(self):
+        """Enabled-ness is a deployment fact, and `all([])` is True — without the
+        `bool(slots)` guard a daemon with nothing enabled (NEWSLETTER_ONLY=1 on a
+        config with no [newsletter]) would stand down on cycle 1 claiming every
+        function had stopped, with an empty reason list."""
+        halts = daemon.FunctionHalts(email_enabled=False, newsletter_enabled=False)
+        assert halts.all_halted is False
+        assert halts.any_halted is False
+
+    def test_a_disabled_function_is_never_counted_as_halted(self):
+        """The whole point of the enabled flags: a function that isn't running
+        can't be halted, so the one enabled function's halt is the ONLY thing
+        that decides the stand-down. Tripping the disabled slot changes nothing."""
+        halts = daemon.FunctionHalts(email_enabled=False, newsletter_enabled=True)
+        halts.email.trip("email provider out of funds")
+        assert halts.all_halted is False
+        assert halts.any_halted is False
+        assert halts.halted_summary() == ""
+
+        halts.newsletter.trip("newsletter provider out of funds")
+        assert halts.all_halted is True
+        assert halts.halted_summary() == "newsletter grading: newsletter provider out of funds"
+
+    def test_email_only_halt_needs_both_functions_enabled(self):
+        """The query narrowing it gates only makes sense when email triage is
+        actually running and newsletter grading is there to narrow to."""
+        no_newsletter = daemon.FunctionHalts(email_enabled=True, newsletter_enabled=False)
+        no_newsletter.email.trip("cloud provider out of funds")
+        assert no_newsletter.email_only_halted is False
+
+        no_email = daemon.FunctionHalts(email_enabled=False, newsletter_enabled=True)
+        no_email.email.trip("cloud provider out of funds")
+        assert no_email.email_only_halted is False
 
     def _run_cycle(
         self, halts, mock_proxy, mock_classifier, mock_label_manager,
@@ -2417,6 +2482,46 @@ class TestPerFunctionHalt:
         assert len(halted) == 2
         assert all("email" in r.getMessage() for r in halted)
         assert all("newsletter" in r.getMessage() for r in halted)
+
+    async def test_newsletter_only_stands_down_on_a_newsletter_halt(
+        self, monkeypatch, tmp_path, caplog
+    ):
+        """Under NEWSLETTER_ONLY email triage is not an enabled function — the
+        skip sits above every email-tier call, so its halt slot can never trip.
+        A newsletter-provider halt is therefore ALL of them: the daemon must
+        stand down, not keep polling while logging the partial-halt line's false
+        "the other function keeps running"."""
+        monkeypatch.setenv("NEWSLETTER_ONLY", "1")
+
+        async def halt_newsletter(*args, **kwargs):
+            kwargs["halts"].newsletter.trip("newsletter provider out of funds")
+            return False
+
+        with caplog.at_level(logging.ERROR, logger="email-labeler"):
+            proxy = await run_poll_cycles(
+                monkeypatch, tmp_path,
+                # Two spare outcomes so a daemon that wrongly keeps polling fails
+                # on the assertion below rather than on an exhausted side_effect.
+                [
+                    {"messages": [{"id": "m1", "threadId": "t1"}]},
+                    {"messages": []},
+                    {"messages": []},
+                ],
+                process_mock=halt_newsletter,
+                cycles=3,
+                keep_newsletter=True,
+                newsletter_output_file=tmp_path / "assessments.jsonl",
+            )
+
+        # Cycle 1 polls and trips the halt; cycles 2–3 must not poll again.
+        assert proxy.list_messages.call_count == 1
+        stood_down = [
+            r for r in caplog.records if "every enabled function stopped" in r.getMessage()
+        ]
+        assert len(stood_down) == 2
+        # ...and never the partial-halt line, which would claim email triage is
+        # still working through a backlog it skips unconditionally.
+        assert not any("the other function keeps running" in r.getMessage() for r in caplog.records)
 
 
 class TestNewsletterOutputPathLogging:
@@ -2908,7 +3013,7 @@ class TestNewsletterRouting:
         # send-date (email-intrinsic) is distinct from the processed timestamp.
         assert record["timestamp"] != record["send_date"]
 
-    async def test_content_error_routes_to_give_up_not_empty_commit(
+    async def test_content_error_is_a_strike_candidate_not_an_empty_commit(
         self,
         mock_proxy,
         mock_classifier,
@@ -2919,8 +3024,10 @@ class TestNewsletterRouting:
         tmp_path,
     ):
         """#30 end-to-end: a content-less grade error must route the newsletter to
-        the give-up path — it must NOT commit an empty no-stories label/assessment
-        (which would be indistinguishable from a genuine NO_STORIES newsletter)."""
+        the strike-candidate path — recorded as a CycleFailure for the poll loop's
+        correlation attribution (D5), which decides whether it strikes — and must
+        NOT commit an empty no-stories label/assessment (which would be
+        indistinguishable from a genuine NO_STORIES newsletter)."""
         from llm_client import LLMContentError
         from newsletter import NewsletterClassifier
 
@@ -3529,6 +3636,64 @@ class TestResultReuse:
         # The second write covered the new message too.
         applied = mock_label_manager.apply_classification.call_args
         assert applied.args[0] == ["msg_001", "msg_002", "msg_003"]
+
+    async def test_poll_loop_hands_every_cycle_the_same_cache(self, monkeypatch, tmp_path):
+        """The wiring the tests above assume: run_daemon builds ONE session cache
+        and passes it to every thread of every cycle. Dropping the kwarg reverts
+        the daemon to pre-T6 behaviour silently — Stage 1 + Stage 2 (the scarce
+        local GPU pass) re-run every cycle while a write keeps failing — which
+        matters because T8 removed the strike bound on write-phase faults on the
+        strength of this reuse."""
+        seen = []
+
+        async def process(tid, msg_ids, *args, **kwargs):
+            seen.append(kwargs.get("result_cache"))
+            return True
+
+        await run_poll_cycles(
+            monkeypatch, tmp_path,
+            [
+                {"messages": [{"id": "m1", "threadId": "t1"}]},
+                {"messages": [{"id": "m2", "threadId": "t2"}]},
+            ],
+            process_mock=process,
+        )
+
+        assert len(seen) == 2
+        assert all(isinstance(c, daemon.ResultCache) for c in seen)
+        assert seen[0] is seen[1]  # one session cache, not one per cycle
+
+    async def test_poll_loop_prunes_cached_results_for_threads_that_left(
+        self, monkeypatch, tmp_path
+    ):
+        """The per-cycle prune is the ONLY eviction path for a thread that never
+        gets a successful write and then leaves the query — given up to
+        agent/attempted (the give-up path does not clear the cache), archived, or
+        relabeled externally. Without it the payload (for a newsletter, the whole
+        story_results list) leaks for the daemon's lifetime."""
+        caches = []
+
+        async def process(tid, msg_ids, *args, **kwargs):
+            cache = kwargs.get("result_cache")
+            caches.append(cache)
+            cache.put(tid, tuple(msg_ids), f"payload-{tid}")
+            return False
+
+        await run_poll_cycles(
+            monkeypatch, tmp_path,
+            [
+                {"messages": [{"id": "m1", "threadId": "t1"}]},
+                {"messages": [{"id": "m2", "threadId": "t2"}]},
+            ],
+            process_mock=process,
+        )
+
+        assert len(caches) == 2
+        cache = caches[0]
+        # t1 was absent from cycle 2's page, so its entry is gone...
+        assert cache.get("t1", ("m1",)) is None
+        # ...while the thread this cycle did see kept its cached result.
+        assert cache.get("t2", ("m2",)) == "payload-t2"
 
 
 class TestVerifyLabelsWithRetry:

@@ -177,9 +177,11 @@ class GmailProxyClient:
             # A non-empty, non-JSON 2xx body — a truncated/garbled response, or an
             # upstream gateway briefly returning an HTML error page with status 200.
             # Transient like a 5xx, so raise the transient subclass: the daemon defers
-            # and retries rather than abandoning the thread, and a *persistent* one
-            # surfaces through the shared-cause/masquerade escalation instead of
-            # give-up (decision D5, superseding the issue #27/#26 give-up bound).
+            # and retries rather than abandoning the thread (decision D5, superseding
+            # the issue #27/#26 give-up bound). A *persistent* one that singles out
+            # one thread while siblings succeed surfaces through the masquerade
+            # escalation; a proxy-wide one stays at the per-thread WARNING plus the
+            # cycle summary — never give-up either way.
             raise ProxyUnavailableError("Proxy returned non-JSON response for successful request")
 
     async def _send(self, do_request, operation: str) -> dict:

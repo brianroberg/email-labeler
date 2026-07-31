@@ -341,8 +341,8 @@ never re-graded. Writing first inverts the failure mode:
 
 | Fault | Outcome |
 |---|---|
-| Sink write fails | `OSError` logged at ERROR naming the resolved path, re-raised as `AssessmentSinkError` and caught by its own arm: thread left unprocessed → retried next cycle → retried *forever*. A sink fault is shared-cause (decision D5), so it never counts toward give-up and the newsletter is never abandoned to `agent/attempted`; the per-cycle ERROR is the loudness, and the ResultCache means each retry re-attempts only the write |
-| Labels fail after a successful write | Thread unprocessed → retried next cycle from the daemon's session `ResultCache` (issue #29): the cached grading is reused and the JSONL append is skipped, so only the labels write is re-attempted — no LLM re-run and no second record for the same thread content. Only a changed fingerprint (a new message in the thread) re-grades and re-appends; for that case `load_assessments` keeps the newest record per thread — by the record's own `timestamp`, not by file position, so merging a rescued copy of the file cannot resurrect an older grading — and the review TUI still shows one row |
+| Sink write fails | `OSError` logged at ERROR naming the resolved path, re-raised as `AssessmentSinkError` and caught by its own arm: thread left unprocessed → retried next cycle → retried *forever*. A sink fault is shared-cause (decision D5), so it never counts toward give-up and the newsletter is never abandoned to `agent/attempted`; the per-cycle ERROR is the loudness, and the ResultCache means each retry within the session re-attempts only the write |
+| Labels fail after a successful write | Thread unprocessed → retried next cycle from the daemon's session `ResultCache` (issue #29): the cached grading is reused and the JSONL append is skipped, so only the labels write is re-attempted — no LLM re-run and no second record for the same thread content **within a daemon session**. The cache is in-memory and pruned to each cycle's `max_emails_per_cycle` page, so three things re-grade and re-append: a changed fingerprint (a new message in the thread), a daemon restart mid-retry, and a backlog large enough to push the pending thread off a page. For all of them `load_assessments` keeps the newest record per thread — by the record's own `timestamp`, not by file position, so merging a rescued copy of the file cannot resurrect an older grading — and the review TUI still shows one row |
 
 ### Prompt templates
 
@@ -424,9 +424,15 @@ halts, even with quota phrasing — a
 per-minute rate limit is worded identically to hard quota exhaustion, and a
 wrong restart-only halt is worse than treating a rare 429-signaled
 out-of-funds as provider unavailability: deferred and retried each cycle,
-never a strike (decision D5), surfacing through the shared-cause/masquerade
-ERROR escalation if sustained. The triggering thread is left unprocessed. The halt is
-in-memory only; **restarting the daemon is the only reset**.
+never a strike (decision D5). Note what that costs in visibility. Neither
+loud-failure ERROR covers it: the shared-cause line is emitted only over
+*candidate* (thread-attributable) failures, and the masquerade escalation
+requires exactly one affected thread while siblings succeed. An account-wide
+429 fails every thread, so a sustained one is visible as the per-thread
+`LLM unavailable processing thread …` WARNING each cycle and a flat
+`Processed 0/N threads` summary — no ERROR. The triggering thread is left
+unprocessed. The halt is in-memory only; **restarting the daemon is the only
+reset**.
 
 While **one** function is halted the loop keeps polling for the other, and logs
 this line at ERROR once per poll interval. If email triage is the halted one and
@@ -492,10 +498,10 @@ Conventions shared by every TUI:
 
 | Test file | Module | What's covered |
 |---|---|---|
-| `test_llm_client.py` | `llm_client.py` | Request format, auth headers, `<think>` tag stripping, separate reasoning-field capture (`reasoning`/`reasoning_content`), `finish_reason: length` handling, error handling, out-of-funds (`LLMBalanceError`) detection, availability checks |
+| `test_llm_client.py` | `llm_client.py` | Request format, auth headers, `<think>` tag stripping, separate reasoning-field capture (`reasoning`/`reasoning_content`), `finish_reason: length` handling, error handling, out-of-funds (`LLMBalanceError`) detection including the 429 exclusion asserted against balance-signature bodies (decision D19), availability checks |
 | `test_classifier.py` | `classifier.py` | `parse_sender` formats, `parse_sender_type` edge cases and its SERVICE default, `parse_email_label` edge cases and its keyword-free raise, cloud/local routing, full pipeline |
-| `test_labeler.py` | `labeler.py` | Label verification (all present, partial, none), label ID mapping, inbox/archive actions, single API call per email, per-write semaphore bound (LabelManager-owned `write_sem`, slot released between messages — issue #33) |
-| `test_daemon.py` | `daemon.py` | Service email path, person email path, MLX-unavailable skip, error isolation, per-function out-of-funds halt (`FunctionHalts`), config loading, assessment-sink preflight + write-before-label durability, classification result reuse across write-retry cycles (`ResultCache`, issue #29), cycle-level failure attribution (correlation strikes, timeout candidates, marking from this cycle's strikes only, count cleared beside a landed marker, adjudicated singleton/zero-success edges, deferral-only threads excluded from the correlation denominator — decision D5 Rule 2), masquerade bookkeeping and escalation (`MasqueradeTracker`: success-clear, prune, single-suspect + success increment condition, throttle reset), halt deferrals that record no failure and commit nothing, the `MAX_FAILURES` knob |
+| `test_labeler.py` | `labeler.py` | Label verification (all present, partial, none), label ID mapping, inbox/archive actions, single API call per email, per-write semaphore bound on every write path (LabelManager-owned `write_sem`, slot released between messages — classification, markers, and newsletter writes; issue #33) |
+| `test_daemon.py` | `daemon.py` | Service email path, person email path, MLX-unavailable skip, error isolation, per-function out-of-funds halt (`FunctionHalts`: enabled-slot arithmetic, the `NEWSLETTER_ONLY` stand-down), config loading, assessment-sink preflight + write-before-label durability, classification result reuse across write-retry cycles (`ResultCache`, issue #29 — reuse, fingerprint invalidation, clear/prune, and the poll-loop session wiring), cycle-level failure attribution (correlation strikes, timeout candidates, marking from this cycle's strikes only, count cleared beside a landed marker, adjudicated singleton/zero-success edges, deferral-only threads excluded from the correlation denominator — decision D5 Rule 2), masquerade bookkeeping and escalation (`MasqueradeTracker`: success-clear, prune, single-suspect + success increment condition, throttle reset), halt deferrals that record no failure and commit nothing, the `MAX_FAILURES` knob |
 | `test_privacy.py` | `classifier.py`, `daemon.py` | Negative-form privacy tests (registry D2/D3): person-classified bodies reach only the local tier (classifier and daemon level), Stage 1 whole-call payload discipline, unparseable-Stage-1 SERVICE-default pin, VIP short-circuit, newsletter ownership bypass, no cloud fallback on local failure, metadata-shape allowlist |
 | `test_config_utils.py` | `config_utils.py` | Config loading, `{env.VAR}` substitution |
 | `test_env_var_docs.py` | env-var docs (meta-test) | Every env var referenced by daemon sources or `config.toml` `{env.VAR}` is documented in this file's Environment Variables table |

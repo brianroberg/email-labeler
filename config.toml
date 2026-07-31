@@ -31,9 +31,12 @@ fetch_parallel = 4
 write_parallel = 4
 # How many strikes a thread takes before it is set aside under agent/attempted.
 # Only failures the cycle-level attribution blames on the thread itself count
-# (decision D5 Rule 2), so 5 is 5 cycles in which the thread failed while its
-# siblings did not — long enough to ride out a bad afternoon, short enough that
-# a genuinely poison thread stops burning LLM spend within minutes of polling.
+# (decision D5 Rule 2): a failure signature unique among the cycle's candidates,
+# with at least one sibling that succeeded — or a cycle in which this thread was
+# the only one that attempted anything, the adjudicated singleton edge and the
+# usual shape of a poison thread (everything else has processed away). So 5 is 5
+# such cycles: long enough to ride out a bad afternoon, short enough that a
+# genuinely poison thread stops burning LLM spend within minutes of polling.
 # The same number is the masquerade escalation threshold: after this many
 # cycles of provider-shaped failures on one thread while siblings succeed, the
 # daemon starts shouting about it (that thread is retried forever, never

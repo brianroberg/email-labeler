@@ -438,9 +438,39 @@ class TestBalanceError:
         exhaustion, and wrongly converting a transient rate limit into a
         restart-only halt is worse than retrying it as unavailability. Reworked
         for D5 (Wave 2 T8): an exhausted 429 is provider-shaped now, so it
-        raises LLMUnavailableError instead of the old RuntimeError strike path —
-        the not-LLMBalanceError half is the load-bearing D19 guard."""
+        raises LLMUnavailableError instead of the old RuntimeError strike path.
+
+        This body carries no balance signature, so it pins only the
+        wording-collision rationale; the parametrized test below is the one that
+        actually holds 429 out of the balance statuses."""
         body = {"error": {"message": "You exceeded your current quota, please check your plan."}}
+        with patch("retry.asyncio.sleep", new=AsyncMock()):  # skip real retry backoff
+            with pytest.raises(LLMUnavailableError) as exc_info:
+                await _post_canned(cloud_client, _mock_response(429, body))
+        assert not isinstance(exc_info.value, LLMBalanceError)
+
+    @pytest.mark.parametrize(
+        "message",
+        [
+            "Insufficient_Quota: request rejected",
+            "Your credit balance is too low to access the Anthropic API.",
+            "NOT_ENOUGH_BALANCE",
+        ],
+    )
+    async def test_429_carrying_a_balance_signature_still_never_halts(
+        self, cloud_client, message
+    ):
+        """The load-bearing D19 guard: the SAME phrasings that trip
+        LLMBalanceError on 400/403 must not trip it on 429. The balance branch
+        is a two-condition guard (status in the balance set AND the body matches
+        the signature), so a 429 body with no signature — the test above —
+        cannot tell whether 429 is in that set. These bodies satisfy the
+        signature half, leaving the status exclusion as the only thing between a
+        429 and a restart-only function halt.
+
+        The live case: OpenAI returns 429 with `insufficient_quota` for an
+        exhausted account, wording a per-minute throttle shares."""
+        body = {"error": {"message": message, "code": "billing"}}
         with patch("retry.asyncio.sleep", new=AsyncMock()):  # skip real retry backoff
             with pytest.raises(LLMUnavailableError) as exc_info:
                 await _post_canned(cloud_client, _mock_response(429, body))
@@ -528,8 +558,10 @@ class TestContentlessResponse:
 
     async def test_content_less_raises_llm_content_error(self, cloud_client):
         """The content-less guard raises the dedicated LLMContentError type so the
-        newsletter pipeline can re-raise it to the give-up path (issue #30). It must
-        subclass RuntimeError to preserve the email pipeline's give-up handler."""
+        newsletter pipeline can re-raise it pipeline-wide (issue #30). It must
+        subclass RuntimeError so the email pipeline's `except RuntimeError` arm
+        still records it as a strike candidate for the cycle-level attribution
+        (D5) — give-up is then decided post-gather by correlation."""
         assert issubclass(LLMContentError, RuntimeError)
         mock_response = _mock_response(json_data={
             "choices": [{"message": {"role": "assistant", "content": None}}]
