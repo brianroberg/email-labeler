@@ -11,7 +11,7 @@ import os
 import re
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
-from email.utils import parsedate_to_datetime
+from email.utils import getaddresses, parsedate_to_datetime
 from enum import Enum
 from pathlib import Path
 
@@ -21,9 +21,9 @@ from llm_client import LLMBalanceError, LLMClient, LLMContentError, LLMUnavailab
 log = logging.getLogger(__name__)
 
 # Errors that affect every story, not just the one being graded: propagate out
-# of the per-story isolation handlers (to daemon give-up or the daemon halt)
-# instead of committing a permanently mis-graded newsletter. Single-sourced so
-# the quality and theme arms can't drift apart.
+# of the per-story isolation handlers (to the daemon's cycle attribution, or to
+# the newsletter function's halt) instead of committing a permanently mis-graded
+# newsletter. Single-sourced so the quality and theme arms can't drift apart.
 _PIPELINE_WIDE_ERRORS = (LLMUnavailableError, LLMContentError, LLMBalanceError)
 
 
@@ -113,12 +113,19 @@ def parse_stories(raw: str) -> list[str]:
     Expected format (one story per block, blocks separated by blank lines):
         STORY: <story text, possibly multi-line>
 
-    Returns empty list for NO_STORIES or unparseable input.
+    Returns an empty list ONLY for an explicit ``NO_STORIES`` reply — the genuine
+    zero-story extraction, the one thing that may become an
+    ``agent/newsletter/no-stories`` outcome. Any other reply that yields no
+    parsed story is unusable output and raises ``LLMContentError`` (D5 Rule 1 /
+    D20): conflating the two let a *failed* extraction commit a false
+    no-stories label. Empty/whitespace-only input is unreachable in production
+    (llm_client's content guard raises first) but is treated the same way rather
+    than letting this contract lie.
     """
     # Normalize CRLF/CR to LF first so the blank-line split and the verbatim
     # story slices behave identically regardless of the model's line endings.
     stripped = raw.replace("\r\n", "\n").replace("\r", "\n").strip()
-    if not stripped or stripped.upper() == "NO_STORIES":
+    if stripped.upper() == "NO_STORIES":
         return []
 
     stories = []
@@ -141,6 +148,11 @@ def parse_stories(raw: str) -> list[str]:
             if text:
                 stories.append(text)
 
+    if not stories:
+        raise LLMContentError(
+            "story extraction reply was neither NO_STORIES nor parsable into "
+            f"stories: {stripped[:200]!r}"
+        )
     return stories
 
 
@@ -251,6 +263,19 @@ def parse_send_date(date_header: str, internal_date_ms: str | None = None) -> st
     return None
 
 
+class AssessmentSinkError(Exception):
+    """The assessments JSONL could not be written (read-only mount, full disk,
+    bad permissions, sink path is a directory).
+
+    Raised by the daemon at the ``write_assessment`` call site, wrapping the
+    underlying ``OSError`` as its cause. Its whole purpose is to be
+    *distinguishable*: under decision D5's sink corollary a sink fault is
+    shared-cause (the disk, not the thread), so it must never count toward
+    give-up — and a bare ``OSError`` cannot be caught for that without also
+    catching ``TimeoutError``, which subclasses it and *is* a strike candidate.
+    """
+
+
 def write_assessment(
     output_file: str,
     message_id: str,
@@ -269,9 +294,14 @@ def write_assessment(
     own send date (ISO-8601 UTC, email-intrinsic) and ``model`` is the classifier
     model — both used by the review TUI (issue #35/#36). Old records lacking these
     keys are read with ``.get()`` fallbacks by consumers.
+
+    The record shape is documented in README-technical's "Assessment record
+    schema" (decision D12); ``schema_version`` is bumped there when the shape
+    changes. Absence of the key marks a pre-versioning record.
     """
     record = {
         "timestamp": datetime.now(timezone.utc).isoformat(),
+        "schema_version": 1,
         "message_id": message_id,
         "thread_id": thread_id,
         "from": sender,
@@ -462,8 +492,8 @@ def sink_writability_warning(path: Path) -> str | None:
 
     return (
         f"Newsletter assessments sink is not writable: {target}. Newsletters will be "
-        "left unprocessed (and eventually marked agent/attempted) rather than graded "
-        "into a record that cannot be saved."
+        "left unprocessed (retried every cycle until this is fixed, never abandoned) "
+        "rather than graded into a record that cannot be saved."
     )
 
 
@@ -486,15 +516,22 @@ def count_records(path: Path) -> int | None:
 def is_newsletter(messages: list[dict], recipient: str) -> bool:
     """Check if any message in a thread was sent to the newsletter address.
 
-    Checks both To and Cc headers, case-insensitive.
+    Checks both To and Cc headers. The match is an exact addr-spec comparison
+    (decision D3): each header value is parsed as an address list, and a
+    message matches only when one of its addresses equals the configured
+    recipient, case-insensitively. Display names never match, and neither do
+    superstring addresses.
     """
-    target = recipient.lower()
+    target = recipient.casefold()
     for msg in messages:
         headers = msg.get("payload", {}).get("headers", [])
         for header_name in ("To", "Cc"):
-            value = get_header(headers, header_name).lower()
-            if target in value:
-                return True
+            value = get_header(headers, header_name)
+            if not value:
+                continue
+            for _display_name, addr in getaddresses([value]):
+                if addr.casefold() == target:
+                    return True
     return False
 
 
@@ -543,15 +580,22 @@ class NewsletterClassifier:
         """Run the full newsletter classification pipeline over story texts.
 
         Individual *per-story* failures are isolated — a quality failure doesn't
-        prevent theme classification, and vice versa.
+        prevent theme classification, and vice versa — but only while some story
+        still grades: if stories were extracted and *not one* produced scores,
+        the whole grading is content-less and raises ``LLMContentError``
+        (D5 Rule 1 / D20, issue #30's parse-to-None route). Committing it would
+        label the newsletter `no-stories` off a failure, indistinguishable from
+        a genuine zero-story extraction. An empty result list therefore means
+        exactly one thing: extraction succeeded and found no stories.
 
         A *transient* LLM outage (LLMUnavailableError) is NOT isolated: it
         propagates so the daemon retries the whole newsletter thread next cycle,
         rather than committing a permanently mis-graded newsletter (empty
         tier/themes) and marking it processed. Mirrors the email pipeline's
         transient-outage guarantee. An out-of-funds provider (LLMBalanceError)
-        propagates likewise: the thread stays unprocessed and the daemon halts
-        until the admin adds funds and restarts.
+        propagates likewise: the thread stays unprocessed and the NEWSLETTER
+        function halts until the admin adds funds and restarts — email triage
+        keeps running on its own tiers (decision D5's scope rule, D19).
         """
         stories = await self.extract_stories(body)
         if not stories:
@@ -571,8 +615,9 @@ class NewsletterClassifier:
             except _PIPELINE_WIDE_ERRORS:
                 # transient outage, a content-less response (issue #30), or an
                 # out-of-funds provider: all affect every story, so propagate
-                # (to give-up or the daemon halt) rather than commit a
-                # permanently mis-graded (empty) newsletter.
+                # (to the cycle attribution, or to the newsletter function's
+                # halt) rather than commit a permanently mis-graded (empty)
+                # newsletter.
                 raise
             except Exception:
                 log.warning("Quality assessment failed for story: %s", text[:60])
@@ -587,5 +632,14 @@ class NewsletterClassifier:
                 log.warning("Theme classification failed for story: %s", text[:60])
 
             results.append(result)
+
+        # Stories exist but none of them graded (every quality reply unparseable
+        # or per-story-failed): a content-less grading, not a `no-stories`
+        # outcome — raise so the daemon defers the thread instead of committing
+        # a tier-less record plus the no-stories label (D5 Rule 1 / D20).
+        if all(r.scores is None for r in results):
+            raise LLMContentError(
+                f"no story graded: all {len(results)} quality replies were unusable"
+            )
 
         return results

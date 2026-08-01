@@ -98,13 +98,20 @@ class TestParseStories:
         assert "First paragraph" in stories[0]
         assert "Third paragraph" in stories[0]
 
-    def test_empty_input(self):
-        stories = parse_stories("")
-        assert stories == []
+    def test_empty_input_raises(self):
+        # Reworked (D5 Rule 1 / D20): empty output is unusable, not a genuine
+        # zero-story extraction. Unreachable in production — llm_client's
+        # content guard raises first — but the parser's contract must not lie.
+        with pytest.raises(LLMContentError):
+            parse_stories("")
 
-    def test_garbage_input(self):
-        stories = parse_stories("This is not formatted correctly at all")
-        assert stories == []
+    def test_garbage_extraction_raises_not_empty(self):
+        # Reworked (D5 Rule 1 / D20): this used to pin the conflation of
+        # unparseable output with a genuine zero-story extraction, which let a
+        # failed extraction commit a false `no-stories` outcome. Only an
+        # explicit NO_STORIES reply may yield [].
+        with pytest.raises(LLMContentError):
+            parse_stories("This is not formatted correctly at all")
 
     def test_inner_line_starting_with_story_stays_one_story(self):
         # A story whose own body contains a line starting with "STORY:" must not
@@ -481,16 +488,51 @@ class TestClassifyNewsletter:
         assert mock_cloud_llm.complete.call_count == 1
 
     async def test_quality_failure_still_classifies_themes(self, nl_classifier, mock_cloud_llm):
+        """Per-story isolation survives D5/D20's all-grades-unparseable guard.
+
+        Reworked to a two-story fixture (D5/D20): one story's unparseable quality
+        reply still leaves its themes classified, because a *sibling* story
+        graded — the guard only fires when every story fails to score.
+        """
+        mock_cloud_llm.complete.side_effect = [
+            ("STORY: Content here\n\nSTORY: Sibling content", ""),
+            ("garbled quality output", ""),
+            ("SCRIPTURE: PRESENT", "theme cot"),
+            ("SIMPLE: OK\nCONCRETE: OK\nPERSONAL: OK\nDYNAMIC: OK", ""),
+            ("CHURCH: PRESENT", ""),
+        ]
+        results = await nl_classifier.classify_newsletter("body")
+        assert len(results) == 2
+        assert results[0].scores is None
+        assert results[0].tier is None
+        assert results[0].themes == {"scripture": "present"}
+        assert results[1].scores is not None
+
+    async def test_all_grades_unparseable_raises_instead_of_no_stories(
+        self, nl_classifier, mock_cloud_llm
+    ):
+        """D5/D20: stories were extracted but not one could be graded — a failure,
+        not a `no-stories` outcome (issue #30's remaining parse-to-None route)."""
+        mock_cloud_llm.complete.side_effect = [
+            ("STORY: Content A\n\nSTORY: Content B", ""),
+            ("garbled quality output", ""),
+            ("SCRIPTURE: PRESENT", ""),
+            ("also garbled", ""),
+            ("CHURCH: PRESENT", ""),
+        ]
+        with pytest.raises(LLMContentError):
+            await nl_classifier.classify_newsletter("body")
+
+    async def test_single_story_failing_to_grade_raises(self, nl_classifier, mock_cloud_llm):
+        """The guard's most common instance (D5/D20): a single-story newsletter whose
+        only story fails to grade used to commit a false no-stories."""
         mock_cloud_llm.complete.side_effect = [
             ("STORY: Content here", ""),
             ("garbled quality output", ""),
             ("SCRIPTURE: PRESENT", "theme cot"),
         ]
-        results = await nl_classifier.classify_newsletter("body")
-        assert len(results) == 1
-        assert results[0].scores is None
-        assert results[0].tier is None
-        assert results[0].themes == {"scripture": "present"}
+        with pytest.raises(LLMContentError):
+            await nl_classifier.classify_newsletter("body")
 
     async def test_theme_failure_preserves_quality(self, nl_classifier, mock_cloud_llm):
         mock_cloud_llm.complete.side_effect = [
@@ -564,7 +606,8 @@ class TestClassifyNewsletterTransientOutage:
 
     async def test_balance_error_during_quality_propagates(self, nl_classifier, mock_cloud_llm):
         """An out-of-funds LLMBalanceError affects every story (account-wide), so it
-        must propagate to the daemon's halt handling — not be swallowed per-story."""
+        must propagate to the daemon's halt handling — which halts the newsletter
+        function alone (D5 scope, D19) — not be swallowed per-story."""
         mock_cloud_llm.complete.side_effect = [
             ("STORY: Content", ""),                    # extract_stories
             LLMBalanceError("provider out of funds"),  # assess_quality
@@ -585,17 +628,22 @@ class TestClassifyNewsletterTransientOutage:
         """A non-transient per-story error (bare RuntimeError) is still swallowed: the
         story gets no scores but themes are still classified and the result is returned.
 
-        (Issue #30 will add a dedicated LLMContentError subclass that DOES propagate; a
-        bare RuntimeError like this one must remain isolated.)"""
+        A content-less LLMContentError DOES propagate (issue #30); a bare RuntimeError
+        like this one must remain isolated. Reworked to a two-story fixture (D5/D20):
+        the isolation is only observable while a sibling story still grades — a
+        newsletter where *no* story scores now raises."""
         mock_cloud_llm.complete.side_effect = [
-            ("STORY: Content", ""),  # extract_stories
-            RuntimeError("malformed story crashed scoring"),  # assess_quality
+            ("STORY: Content\n\nSTORY: Sibling content", ""),  # extract_stories
+            RuntimeError("malformed story crashed scoring"),  # assess_quality (story 1)
             ("SCRIPTURE: PRESENT", "theme cot"),  # classify_themes still runs
+            ("SIMPLE: OK\nCONCRETE: OK\nPERSONAL: OK\nDYNAMIC: OK", ""),  # story 2 scores
+            ("CHURCH: PRESENT", ""),
         ]
         results = await nl_classifier.classify_newsletter("body")
-        assert len(results) == 1
+        assert len(results) == 2
         assert results[0].scores is None
         assert results[0].themes == {"scripture": "present"}
+        assert results[1].scores is not None
 
 
 class TestWriteAssessment:
@@ -637,6 +685,8 @@ class TestWriteAssessment:
         assert record["stories"][0]["themes"] == {"scripture": "present", "church": "emphasized"}
         assert record["stories"][0]["quality_cot"] == "quality reasoning"
         assert "timestamp" in record
+        # D12: every new record carries the schema version.
+        assert record["schema_version"] == 1
 
     def test_writes_send_date_and_model(self, tmp_path):
         output_file = tmp_path / "assessments.jsonl"
@@ -792,6 +842,67 @@ class TestIsNewsletter:
 
     def test_empty_messages(self):
         assert is_newsletter([], "newsletters@dm.org") is False
+
+    # Exact-address matching (decision D3): the recipient match is an exact
+    # addr-spec comparison, not a substring test against the raw header value.
+
+    def test_superstring_address_does_not_match(self):
+        messages = [
+            {
+                "payload": {
+                    "headers": [
+                        {"name": "To", "value": "abcnewsletters@dm.org"},
+                    ]
+                }
+            }
+        ]
+        assert is_newsletter(messages, "newsletters@dm.org") is False
+
+    def test_display_name_containing_recipient_does_not_match(self):
+        messages = [
+            {
+                "payload": {
+                    "headers": [
+                        {
+                            "name": "To",
+                            "value": '"newsletters@dm.org fan club" <other@example.org>',
+                        },
+                    ]
+                }
+            }
+        ]
+        assert is_newsletter(messages, "newsletters@dm.org") is False
+
+    def test_bracketed_display_name_form_matches(self):
+        messages = [
+            {
+                "payload": {
+                    "headers": [
+                        {"name": "To", "value": "Newsletter Desk <newsletters@dm.org>"},
+                    ]
+                }
+            }
+        ]
+        assert is_newsletter(messages, "newsletters@dm.org") is True
+
+    def test_multiple_recipients_with_display_names_match(self):
+        messages = [
+            {
+                "payload": {
+                    "headers": [
+                        {
+                            "name": "To",
+                            "value": (
+                                "Alice Example <alice@example.org>, "
+                                "Newsletter Desk <newsletters@dm.org>, "
+                                "Bob Example <bob@example.org>"
+                            ),
+                        },
+                    ]
+                }
+            }
+        ]
+        assert is_newsletter(messages, "newsletters@dm.org") is True
 
 
 # Real /proc/self/mountinfo excerpts (fields: id parent major:minor root

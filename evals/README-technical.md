@@ -115,13 +115,6 @@ the dialect it accepts via `--extra-body`/`--local-extra-body`.
 | `--verbose` | Show per-thread disagreements |
 | `--format` | `table` (default) or `json` |
 
-### run_web
-
-| Flag | Description |
-|---|---|
-| `--host` | Host to bind to (default: `127.0.0.1`) |
-| `--port` | Port to bind to (default: `5000`) |
-
 ## Newsletter Evaluation CLI Reference
 
 The newsletter eval harness mirrors the email eval's 4-stage shape
@@ -474,5 +467,3 @@ uv run python -m evals.run_eval --no-cache
 When running evaluations with the LLM cache enabled (the default), chain-of-thought content is automatically captured and stored in sidecar files alongside results. Capture reads, in order: the response's separate reasoning field for any model (`reasoning_content` — GLM; `reasoning` — Ollama), then inline `<think>...</think>` blocks in content. With native thinking disabled (the shipped local config), neither exists — the model's step-by-step reasoning is the untagged content itself, preserved in `label_raw`; that's where to look when inspecting a thinking-off run's reasoning (e.g. issue #14).
 
 **Sidecar format:** `evals/results/<run>.cot.jsonl` — one JSON line per thread with `stage1_thinking` and `stage2_thinking` fields.
-
-Chain-of-thought is viewable in the web UI on the run detail page.

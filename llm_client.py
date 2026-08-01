@@ -53,17 +53,22 @@ class AvailabilityResult:
 
 
 class LLMUnavailableError(Exception):
-    """The LLM endpoint is unreachable or dropped the connection (transient).
+    """The LLM endpoint can't serve requests right now (provider-shaped, transient).
 
-    Distinct from request-specific failures: a non-200 response or a read/write
-    timeout means the *request* is the problem (too-large input, bad payload) and
-    is eligible for the daemon's give-up logic, whereas an unavailable endpoint is
-    a transient outage that should simply be retried next cycle.
+    Raised for transport-level unavailability — endpoint unreachable, connect/
+    pool timeout, connection dropped mid-request — and for provider-shaped
+    responses: an exhausted 429 (retry.py already spent its budget) or any 5xx.
+    Either way the provider can't serve anyone, so the fault is never one
+    thread's blame: the daemon defers and retries next cycle and never counts
+    it toward give-up (decision D5). Request-specific failures stay distinct —
+    a read/write timeout is TimeoutError and any other non-200 is RuntimeError,
+    both strike candidates under the daemon's cycle-level attribution.
 
     ``tier`` identifies the raising client ("cloud" / "local" / None when the
     client didn't declare one). Both tiers raise this same type; the tier is what
     lets the daemon treat a routine local outage (the MLX laptop is offline for
-    hours at a time) as INFO-grade while a cloud outage stays WARNING (issue #24).
+    hours at a time) as INFO-grade while a cloud outage stays WARNING (issue #24),
+    and what excludes local-tier outages from masquerade tracking (D5).
     """
 
     def __init__(self, message: str, *, tier: str | None = None):
@@ -77,13 +82,14 @@ class LLMContentError(RuntimeError):
     A reasoning model that exhausts max_tokens mid-<think>, a GLM reply carrying
     only ``reasoning_content``, or an empty string all yield an unusable response.
     So does a response whose ``finish_reason`` is ``"length"`` even when content
-    is non-empty: the answer was cut at the max_tokens budget, and parsing a
-    truncated answer silently defaults the label (issue #64). Retrying as-is
-    won't help, so it is request-specific/permanent and give-up-eligible. It
-    subclasses ``RuntimeError`` so the email pipeline's ``except RuntimeError``
-    give-up handler catches it unchanged, while giving the newsletter pipeline a
-    dedicated type to re-raise (a *bare* per-story RuntimeError stays isolated;
-    a content-less one propagates to give-up).
+    is non-empty: the answer was cut at the max_tokens budget, so any label read
+    out of it is an artifact of the truncation (issue #64). Retrying as-is
+    won't help, so it is request-specific/permanent — a strike candidate under
+    the daemon's cycle-level attribution (decision D5). It subclasses
+    ``RuntimeError`` so the email pipeline's ``except RuntimeError`` arm catches
+    it unchanged, while giving the newsletter pipeline a dedicated type to
+    re-raise (a *bare* per-story RuntimeError stays isolated; a content-less one
+    propagates pipeline-wide).
     """
 
 
@@ -104,8 +110,13 @@ _BALANCE_SIGNATURE = re.compile(
 # 400/403 when the body matches). 429 is excluded even though some providers
 # phrase hard quota exhaustion identically to a per-minute rate limit
 # ("exceeded your current quota"): wrongly converting a transient rate limit
-# into a restart-only daemon halt is worse than letting a rare 429-signaled
-# out-of-funds fall back to per-thread give-up.
+# into a restart-only function halt is worse than letting a rare 429-signaled
+# out-of-funds be retried as provider unavailability (decision D19) — it
+# defers threads each cycle and never strikes (D5). Its visibility is the
+# per-thread WARNING and the cycle summary, not an ERROR: an account-wide 429
+# fails every thread, and neither loud path covers that (the shared-cause line
+# is emitted over candidate failures only, and the masquerade escalation wants
+# exactly one affected thread while siblings succeed).
 _BALANCE_SIGNATURE_STATUSES = frozenset({400, 403})
 
 
@@ -114,11 +125,15 @@ class LLMBalanceError(RuntimeError):
 
     Account-wide, not request-specific: if one request fails for lack of balance,
     every subsequent request to the same provider will too. The daemon therefore
-    treats this as a halt condition (stop processing, tell the admin to add funds
-    and restart) rather than a per-thread give-up — the failing thread is left
-    unprocessed so it's retried after restart. Subclasses ``RuntimeError`` so
-    callers unaware of it (evals) still see a generic LLM failure; the daemon must
-    catch it *before* its ``except RuntimeError`` arm.
+    treats this as a halt condition (stop the affected function, tell the admin to
+    add funds and restart) rather than a per-thread give-up — the failing thread is
+    left unprocessed so it's retried after restart. The halt is per-FUNCTION
+    (decision D5's scope rule, D19): this error carries no function provenance, so
+    the daemon's call site decides which function stops — email triage keeps
+    running when the newsletter provider is the broke one, and vice versa.
+    Subclasses ``RuntimeError`` so callers unaware of it (evals) still see a
+    generic LLM failure; the daemon must catch it *before* its
+    ``except RuntimeError`` arm.
     """
 
 
@@ -193,18 +208,23 @@ class LLMClient:
 
         Raises:
             TimeoutError: If the request times out (read/write) — request-specific
-                (e.g. input too large to prefill within the timeout).
-            LLMUnavailableError: If the endpoint is unreachable (connection refused
-                or connect/pool timeout) or the connection drops mid-request —
-                transient unavailability.
+                (e.g. input too large to prefill within the timeout); a strike
+                candidate under the daemon's cycle attribution (D5).
+            LLMUnavailableError: If the endpoint can't serve the request right
+                now — unreachable (connection refused, connect/pool timeout),
+                dropped mid-request, or answering with an exhausted 429 or any
+                5xx. Provider-shaped (D5): deferred and retried next cycle,
+                never counted toward give-up.
             LLMBalanceError: If the non-200 response says the provider account is
                 out of funds (402, or a 400/403 whose body carries a balance
-                signature) — account-wide; the daemon halts rather than giving
-                up per-thread.
+                signature) — account-wide; the function whose provider this is
+                halts (D5 scope, D19) rather than giving up per-thread.
             LLMContentError: If the response carries no usable answer — empty/
                 missing content, or finish_reason "length" (answer truncated at
-                the max_tokens budget) — request-specific and give-up-eligible.
-            RuntimeError: If the LLM returns any other non-200 response.
+                the max_tokens budget) — request-specific, a strike candidate.
+            RuntimeError: If the LLM returns any other non-200 response
+                (400/401/403/404/422… without a balance signature) —
+                request-specific, a strike candidate.
         """
         headers = {"Content-Type": "application/json"}
         if self.api_key:
@@ -274,6 +294,20 @@ class LLMClient:
                     f"LLM provider out of funds — status {response.status_code} "
                     f"[{self._provider()}]: {resp_body}"
                 )
+            if response.status_code == 429 or response.status_code >= 500:
+                # Provider-shaped (decision D5): an exhausted 429 (retry.py already
+                # spent its retry budget, so the throttle is sustained) or a 5xx
+                # means the provider can't serve anyone right now — never one
+                # thread's blame, so never a strike candidate. The daemon defers
+                # and retries next cycle, never gives up. A fault that singles out
+                # ONE thread while siblings succeed gets loud through the
+                # masquerade escalation; a provider-wide one stays at the
+                # per-thread WARNING plus `Processed 0/N threads`.
+                raise LLMUnavailableError(
+                    f"LLM endpoint unavailable — status {response.status_code} "
+                    f"[{self._provider()}]: {resp_body}",
+                    tier=self.tier,
+                )
             raise RuntimeError(
                 f"LLM request failed with status {response.status_code} "
                 f"[{self._provider()}] "
@@ -287,21 +321,25 @@ class LLMClient:
         stripped = self._strip_thinking(content) if content else ""
         if not stripped or finish_reason == "length":
             # Three unusable-response shapes, all request-specific/permanent
-            # (retrying as-is won't help), so all raise LLMContentError —
-            # give-up-eligible via the daemon, never LLMUnavailableError (would
-            # retry forever) or a raw KeyError (issue #64):
+            # (retrying as-is won't help), so all raise LLMContentError — a
+            # strike candidate under the daemon's cycle-level attribution (D5),
+            # never LLMUnavailableError (would retry forever) or a raw KeyError
+            # (issue #64):
             #   - No `content` (null, missing key, or empty string): a reasoning
             #     model exhausted max_tokens in its thinking channel, or GLM
             #     returned only reasoning_content.
             #   - Content that strips to nothing: a fully-closed think-only
             #     response — the model spent its whole turn inside <think> and
-            #     never answered. Both empty shapes would otherwise parse to a
-            #     default SERVICE / LOW_PRIORITY label and silently mislabel
-            #     the email.
+            #     never answered.
             #   - finish_reason "length" with non-empty content: the answer was
             #     cut at the max_tokens budget, usually mid-reasoning before any
-            #     label. Parsing it would silently default to LOW_PRIORITY and
-            #     archive the email, so a truncated answer is never returned.
+            #     label.
+            # Guarding here keeps the failure at its source, with the response
+            # diagnostics attached: a Stage-2 reply carrying no label keyword
+            # now raises downstream too (parse_email_label, D5 Rule 1), but
+            # Stage 1 still reads a content-less reply as SERVICE (D2's
+            # best-effort routing), so an unguarded empty answer would quietly
+            # route a person thread's body to the cloud.
             # The diagnostics report the response's actual finish_reason and
             # where the reasoning actually sat — a separate field (Ollama uses
             # `reasoning`, GLM uses `reasoning_content`) or inline <think>

@@ -195,7 +195,13 @@ class TestComplete:
             assert result == "PERSON"
 
     async def test_raises_on_http_error(self, cloud_client):
-        """Non-200 responses raise RuntimeError."""
+        """A 5xx raises LLMUnavailableError — provider-shaped, never a strike.
+
+        Reworked for decision D5 (Wave 2 T8): this test used to pin 500 →
+        RuntimeError, the give-up-eligible path; a 5xx means the provider can't
+        serve anyone and is deferred instead. The RuntimeError pin for
+        request-specific non-200s lives on the 400 in
+        test_http_error_message_identifies_provider below."""
         mock_response = _mock_response(status_code=500, json_data={"error": "Internal Server Error"})
 
         with patch("llm_client.httpx.AsyncClient") as mock_client_cls:
@@ -204,7 +210,7 @@ class TestComplete:
             mock_client_cls.return_value.__aenter__ = AsyncMock(return_value=mock_client)
             mock_client_cls.return_value.__aexit__ = AsyncMock(return_value=False)
 
-            with pytest.raises(RuntimeError, match="LLM request failed"):
+            with pytest.raises(LLMUnavailableError, match="status 500"):
                 await cloud_client.complete("sys", "user")
 
     async def test_http_error_message_identifies_provider(self, cloud_client):
@@ -386,11 +392,12 @@ NOVITA_BALANCE_BODY = {
 
 
 class TestBalanceError:
-    """Out-of-funds responses raise LLMBalanceError (account-wide: halts the daemon).
+    """Out-of-funds responses raise LLMBalanceError (account-wide: halts the
+    function that provider serves — decision D5's scope rule, D19).
 
     Detection must be conservative enough that an ordinary 403 (bad key, forbidden
     route) stays a bare RuntimeError — only a payment-required status or a body
-    carrying a known balance/quota signature may trip the daemon-wide halt.
+    carrying a known balance/quota signature may trip a restart-only halt.
     """
 
     async def test_403_with_balance_body_raises_balance_error(self, cloud_client):
@@ -404,7 +411,7 @@ class TestBalanceError:
             await _post_canned(cloud_client, _mock_response(402, {"error": "payment required"}))
 
     async def test_plain_403_stays_bare_runtime_error(self, cloud_client):
-        """A 403 without a balance signature (bad key etc.) must NOT halt the daemon."""
+        """A 403 without a balance signature (bad key etc.) must NOT halt anything."""
         with pytest.raises(RuntimeError) as exc_info:
             await _post_canned(cloud_client, _mock_response(403, {"error": "forbidden"}))
         assert not isinstance(exc_info.value, LLMBalanceError)
@@ -425,14 +432,47 @@ class TestBalanceError:
         with pytest.raises(LLMBalanceError):
             await _post_canned(cloud_client, _mock_response(status, body))
 
-    async def test_429_quota_phrasing_stays_runtime_error(self, cloud_client):
-        """A 429 must NEVER halt, even with quota phrasing: Gemini-style per-minute
-        rate limits use the same wording as hard quota exhaustion, and wrongly
-        converting a transient rate limit into a restart-only halt is worse than
-        letting a rare 429-signaled out-of-funds fall back to per-thread give-up."""
+    async def test_429_quota_phrasing_never_halts(self, cloud_client):
+        """A 429 must NEVER halt, even with quota phrasing (decision D19):
+        Gemini-style per-minute rate limits use the same wording as hard quota
+        exhaustion, and wrongly converting a transient rate limit into a
+        restart-only halt is worse than retrying it as unavailability. Reworked
+        for D5 (Wave 2 T8): an exhausted 429 is provider-shaped now, so it
+        raises LLMUnavailableError instead of the old RuntimeError strike path.
+
+        This body carries no balance signature, so it pins only the
+        wording-collision rationale; the parametrized test below is the one that
+        actually holds 429 out of the balance statuses."""
         body = {"error": {"message": "You exceeded your current quota, please check your plan."}}
         with patch("retry.asyncio.sleep", new=AsyncMock()):  # skip real retry backoff
-            with pytest.raises(RuntimeError) as exc_info:
+            with pytest.raises(LLMUnavailableError) as exc_info:
+                await _post_canned(cloud_client, _mock_response(429, body))
+        assert not isinstance(exc_info.value, LLMBalanceError)
+
+    @pytest.mark.parametrize(
+        "message",
+        [
+            "Insufficient_Quota: request rejected",
+            "Your credit balance is too low to access the Anthropic API.",
+            "NOT_ENOUGH_BALANCE",
+        ],
+    )
+    async def test_429_carrying_a_balance_signature_still_never_halts(
+        self, cloud_client, message
+    ):
+        """The load-bearing D19 guard: the SAME phrasings that trip
+        LLMBalanceError on 400/403 must not trip it on 429. The balance branch
+        is a two-condition guard (status in the balance set AND the body matches
+        the signature), so a 429 body with no signature — the test above —
+        cannot tell whether 429 is in that set. These bodies satisfy the
+        signature half, leaving the status exclusion as the only thing between a
+        429 and a restart-only function halt.
+
+        The live case: OpenAI returns 429 with `insufficient_quota` for an
+        exhausted account, wording a per-minute throttle shares."""
+        body = {"error": {"message": message, "code": "billing"}}
+        with patch("retry.asyncio.sleep", new=AsyncMock()):  # skip real retry backoff
+            with pytest.raises(LLMUnavailableError) as exc_info:
                 await _post_canned(cloud_client, _mock_response(429, body))
         assert not isinstance(exc_info.value, LLMBalanceError)
 
@@ -464,13 +504,38 @@ class TestBalanceError:
         assert "cloud" in msg
 
 
+class TestProviderShapedStatuses:
+    """Exhausted 429s and 5xx responses are provider-shaped (decision D5, Wave 2
+    T8): the provider can't serve anyone right now, so they surface as
+    LLMUnavailableError — deferred and retried next cycle, never a strike
+    candidate. Request-specific non-200s (400/401/404/422…) stay RuntimeError."""
+
+    async def test_exhausted_429_raises_unavailable_not_runtime(self, cloud_client):
+        """A 429 that survives retry.py's budget is a sustained throttle — the
+        endpoint can't serve anyone, which is never one thread's blame (D5).
+        It must surface as LLMUnavailableError carrying the tier (so the
+        daemon's quiet-local handling still applies), not the RuntimeError
+        strike-candidate path."""
+        client = LLMClient(
+            base_url="https://api.cloud.example.com/v1/chat/completions",
+            api_key="sk-test-key",
+            model="test-cloud-model",
+            tier="cloud",
+        )
+        with patch("retry.asyncio.sleep", new=AsyncMock()):  # skip real retry backoff
+            with pytest.raises(LLMUnavailableError) as exc_info:
+                await _post_canned(client, _mock_response(429, {"error": "rate limited"}))
+        assert exc_info.value.tier == "cloud"
+
+
 class TestContentlessResponse:
     """A response message lacking usable content must raise a clear, non-KeyError error.
 
     A reasoning model (or GLM) that exhausts max_tokens mid-<think> returns a message
     with reasoning/reasoning_content but no `content` — previously a raw KeyError. It is
     request-specific/permanent (retrying as-is won't help), so it must surface as a
-    RuntimeError (give-up-eligible), NOT LLMUnavailableError (which would retry forever).
+    RuntimeError — a strike candidate under the daemon's cycle-level attribution
+    (D5) — NOT LLMUnavailableError (which would retry forever).
     """
 
     async def test_missing_content_key_raises_runtime_error(self, cloud_client):
@@ -493,8 +558,10 @@ class TestContentlessResponse:
 
     async def test_content_less_raises_llm_content_error(self, cloud_client):
         """The content-less guard raises the dedicated LLMContentError type so the
-        newsletter pipeline can re-raise it to the give-up path (issue #30). It must
-        subclass RuntimeError to preserve the email pipeline's give-up handler."""
+        newsletter pipeline can re-raise it pipeline-wide (issue #30). It must
+        subclass RuntimeError so the email pipeline's `except RuntimeError` arm
+        still records it as a strike candidate for the cycle-level attribution
+        (D5) — give-up is then decided post-gather by correlation."""
         assert issubclass(LLMContentError, RuntimeError)
         mock_response = _mock_response(json_data={
             "choices": [{"message": {"role": "assistant", "content": None}}]
@@ -527,8 +594,10 @@ class TestContentlessResponse:
 
         A reasoning model that exhausts max_tokens mid-think can emit `content: ""`
         rather than null. That must raise the same no-content RuntimeError, not fall
-        through to be parsed as an empty classification (which would default to
-        SERVICE / LOW_PRIORITY and silently mislabel the email)."""
+        through to be parsed as an empty classification: Stage 1 would read it as
+        SERVICE — the deliberate best-effort default (D2) — and route a person
+        thread's body to the cloud. (The Stage-2 LOW_PRIORITY→archive default this
+        docstring used to name is gone since D5 Rule 1, Wave 2 T10.)"""
         mock_response = _mock_response(json_data={
             "choices": [{"message": {"role": "assistant", "content": ""}}]
         })
@@ -574,10 +643,15 @@ class TestContentlessResponse:
 class TestFinishReasonLength:
     """A finish_reason of "length" must be loud, never silently parsed (issue #64).
 
-    Measured hazard: with thinking off, an over-budget decode returns non-empty
-    but truncated content, cut before any label — parse_email_label would
-    silently default to LOW_PRIORITY (action: ARCHIVE) with only a parse
-    WARNING. And the empty-content variant's old error message hardcoded a
+    Measured hazard (as it stood in #64): with thinking off, an over-budget
+    decode returns non-empty but truncated content, cut before any label, and
+    parse_email_label silently defaulted it to LOW_PRIORITY (action: ARCHIVE)
+    with only a parse WARNING. That default is gone (D5 Rule 1, Wave 2 T10),
+    but the guard here is still the right place to fail: it names the real
+    cause — the budget — with the response diagnostics attached, instead of
+    surfacing as an unexplained unparseable reply a cycle later, and it also
+    covers Stage 1, whose SERVICE default deliberately stays (D2).
+    And the empty-content variant's old error message hardcoded a
     guess ("max_tokens likely exhausted; reasoning_content ...") instead of
     reporting the response's actual finish_reason and which reasoning field was
     populated (Ollama's is `reasoning`, not `reasoning_content`).
@@ -613,9 +687,10 @@ class TestFinishReasonLength:
 
     async def test_length_with_truncated_content_raises_not_parses(self, local_client):
         """finish_reason "length" with NON-empty content is a truncated answer:
-        it must raise (give-up-eligible), never return for parsing — the
-        truncation lands mid-scaffold before any label, and a parsed default
-        would silently archive person mail."""
+        it must raise (a strike candidate under the daemon's cycle-level
+        attribution, D5), never return for parsing — the truncation lands
+        mid-scaffold before any label, so any label read out of it is an
+        artifact of where the budget ran out."""
         resp = _mock_response(json_data={
             "choices": [{
                 "finish_reason": "length",
@@ -700,8 +775,9 @@ class TestFinishReasonLength:
 class TestThinkOnlyResponse:
     """Non-empty content that strips to NOTHING — a fully-closed think-only
     response (finish_reason "stop") — is as unusable as no content: returning
-    "" would let parse_email_label default to LOW_PRIORITY and silently archive
-    the email, the exact silent-default shape issue #64 eliminates. Reachable
+    "" would carry a non-answer downstream, where Stage 1 still reads it as
+    SERVICE (D2) and Stage 2 raises a cause-less parse failure instead of
+    naming the empty reply. Reachable
     whenever a backend leaves thinking effectively on (e.g. mlx_lm.server
     ignoring reasoning_effort) and the model closes its think block without an
     answer."""

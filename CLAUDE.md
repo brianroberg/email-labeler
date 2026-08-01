@@ -14,9 +14,9 @@ that skips non-newsletter threads (for running the newsletter function alone).
 A symmetric `INBOX_ONLY` filter (email triage alone) would be legitimate — the
 asymmetry is an accident of history, not a decision (registry D1).
 Neither function depends on the other, and design values are scoped
-per-function. The failure model (D5) scopes faults per-function as well — note
-its per-function halt is still pending: today a provider-balance halt stops
-the whole daemon (registry D5/D19).
+per-function. The failure model (D5) scopes faults per-function as well: a
+provider-balance halt stops the affected function and leaves the other running
+(registry D5/D19).
 
 Non-goals: this is a single-owner deployment, not a generic multi-user
 product; org-specific content (the Ends Statement themes, the newsletter
@@ -30,7 +30,7 @@ recipient) is configuration, not something to abstract away.
 - `evals/README-technical.md` — Agent/reference: complete CLI flags for all eval tools, LLM cache internals, chain-of-thought capture format
 - `docs/decisions.md` — Decisions registry: adjudicated tradeoffs reviews must not re-litigate (see Review Charter)
 - `docs/plans/` — Frozen history: every file carries a status header; superseded plans are records, not instructions
-- `docs/runbook-agent-attempted-recovery.md` — Owner-run manual sweep of threads dropped to `agent/attempted` by the issue-#64 bug; time-sensitive (cleanest before the first post-#65 image is deployed), and not to be executed by an agent with Gmail write access
+- `docs/runbook-agent-attempted-recovery.md` — Owner-run manual sweep of threads dropped to `agent/attempted` by the issue-#64 bug; time-sensitive (cleanest while the daemon is stopped, before fresh give-ups mix into the label), and not to be executed by an agent with Gmail write access
 - `scripts/migrate_assessments.py` — Convert pre-#53 records in an assessments JSONL (list themes → graded dicts, 1-5 scores → Poor/OK/Good) so the review TUI can open a file with old history; tiers are preserved verbatim. Dry-run by default, `--in-place` applies (keeps `.bak`)
 
 Authority map (decision D7): every fact has one home. CLAUDE.md holds
@@ -77,9 +77,9 @@ or our own config/code): no strikes for anyone, get loud, keep the backlog.
 (e.g. its LLM provider's balance) stops that function loudly; the other
 function continues.
 
-The registry entry D5 lists the corollaries and their implementation status —
-several are `pending`, and until they land, code deviates from this model
-where D5 says so. Current-behavior descriptions live in README.md
+The registry entry D5 lists the corollaries — all implemented (Wave 2), each
+naming its commit. The code obeys this model; a deviation from it is a bug,
+not a documented gap. Current-behavior descriptions live in README.md
 (Resilience) and README-technical (Health Checking, write-before-label) and
 stay accurate to the code, not the model.
 

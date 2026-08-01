@@ -11,6 +11,7 @@ import logging
 import os
 import sys
 import tomllib
+from collections import Counter
 from contextlib import nullcontext
 from dataclasses import dataclass
 from pathlib import Path
@@ -24,6 +25,7 @@ from gmail_utils import decode_body, get_header
 from labeler import LabelManager, _get_priority
 from llm_client import LLMBalanceError, LLMClient, LLMUnavailableError
 from newsletter import (
+    AssessmentSinkError,
     NewsletterClassifier,
     NewsletterTier,
     aggregate_theme_grades,
@@ -41,6 +43,7 @@ from proxy_client import (
     TRANSIENT_TRANSPORT_ERRORS,
     GmailProxyClient,
     ProxyError,
+    ProxyForbiddenError,
     ProxyUnavailableError,
 )
 
@@ -143,15 +146,17 @@ def resolve_newsletter_llm_endpoint() -> tuple[str, str]:
 
 
 class FailureTracker:
-    """Counts consecutive thread-specific failures to break infinite retry loops.
+    """Counts strikes against threads the cycle-level attribution blamed, to
+    break infinite retry loops.
 
-    Records only failures the caller deems give-up-eligible. An endpoint-wide
-    outage never lands here: an LLM outage (ConnectError → LLMUnavailableError) is
-    deferred per-thread without counting, and a proxy outage fails the cycle-level
-    list_messages first, so the whole cycle defers before any thread is counted.
-    A *persistent per-thread* fault — a poison thread, including a deterministic
-    per-request proxy 5xx (issue #26) — does accrue here and is given up once it
-    hits max_failures. In-memory and session-scoped: counts reset on daemon
+    Fed only by the poll loop's post-gather attribution step
+    (attribute_cycle_failures) — never inline from process_single_thread.
+    Provider-shaped faults (LLM/proxy unavailability, exhausted 429s, 5xx)
+    never land here: decision D5, deliberately reversing issue #26's proxy-5xx
+    counting. A candidate failure lands only when correlation says the thread
+    is the problem — its signature unique in the cycle with siblings
+    succeeding, or a singleton cycle. At max_failures the thread is marked
+    agent/attempted. In-memory and session-scoped: counts reset on daemon
     restart, so a thread that failed for a since-resolved reason gets another
     chance after a restart.
     """
@@ -176,8 +181,10 @@ class FailureTracker:
         A thread that fails a few times (below the give-up threshold) and then
         disappears from the query — read, archived, or relabeled externally —
         would otherwise leak its count for the daemon's lifetime. Pruning each
-        cycle to the still-pending set keeps the map bounded; a consecutively
-        failing thread reappears every cycle, so it is never pruned.
+        cycle to the threads on that cycle's page keeps the map bounded; a
+        consecutively failing thread reappears every cycle, so it survives —
+        unless a backlog larger than max_emails_per_cycle crowds it off a page,
+        which only forgives strikes it had already accrued.
         """
         active = set(active_thread_ids)
         self._counts = {tid: n for tid, n in self._counts.items() if tid in active}
@@ -194,15 +201,190 @@ class FailureTracker:
         return out
 
 
+@dataclass
+class CycleFailure:
+    """One thread's failure in one poll cycle, recorded by process_single_thread
+    for the poll loop's post-gather attribution step (decision D5 Rule 2).
+
+    ``signature`` is the exception's class qualname — the correlation key: two
+    threads failing with the same signature in one cycle look like one shared
+    cause, not two coincidental poison threads. ``provider_shaped`` entries
+    (proxy/LLM unavailability) never strike; they exist so the attribution can
+    spot the single-thread masquerade (see MasqueradeTracker).
+    """
+
+    thread_id: str
+    ids_to_mark: list[str]
+    signature: str
+    provider_shaped: bool = False
+
+
+class MasqueradeTracker:
+    """Watches for the single-thread masquerade: provider-shaped errors on one
+    thread while siblings succeed (decision D5; issue #26's poison-thread
+    scenario). Such a thread is retried forever — provider-shaped faults never
+    strike — but must not fail silently: at ``max_failures`` qualifying cycles
+    it becomes a suspect and the poll loop escalates with a distinct ERROR,
+    repeated at most once per status interval while any suspect persists.
+
+    Mirrors FailureTracker's shape: per-thread counter, success-clears, pruned
+    each cycle to that cycle's page of pending threads, in-memory and
+    session-scoped (so a page miss or a restart costs a suspect its count). A cycle
+    only counts when it carries correlation evidence — exactly one thread
+    failed provider-shaped AND a sibling was handled successfully. Singleton
+    and zero-success cycles never increment it, so a genuine short provider
+    outage with one pending thread never false-alarms; the per-thread WARNING
+    each cycle remains its visibility. Only a thread's own success clears a
+    count, whatever the cycle's shape — a success is never ambiguous.
+    Local-tier LLM unavailability never lands here at all: the deliberately-
+    offline MLX host makes "person threads defer while service siblings
+    succeed" the routine local state (issue #24), and tracking it would
+    false-alarm every night the laptop is closed.
+    """
+
+    def __init__(self, max_failures: int = 5):
+        self.max_failures = max_failures
+        self._counts: dict[str, int] = {}
+        self._last_escalation: float | None = None
+
+    def record_masquerade(self, thread_id: str) -> None:
+        self._counts[thread_id] = self._counts.get(thread_id, 0) + 1
+
+    def clear(self, thread_id: str) -> None:
+        self._counts.pop(thread_id, None)
+
+    def prune(self, active_thread_ids) -> None:
+        """Drop counts for threads no longer pending (mirrors FailureTracker.prune)."""
+        active = set(active_thread_ids)
+        self._counts = {tid: n for tid, n in self._counts.items() if tid in active}
+
+    def suspects(self) -> dict[str, int]:
+        """Threads at/above the escalation threshold, with their cycle counts."""
+        return {tid: n for tid, n in self._counts.items() if n >= self.max_failures}
+
+    def escalation_line(self, now: float, status_interval: float) -> str | None:
+        """Return the distinct escalation ERROR line, or None when quiet.
+
+        Its own small throttled emitter (idle_report only runs on idle cycles):
+        emits when a suspect first exists, then at most once per
+        ``status_interval`` while any suspect persists. The throttle resets when
+        no suspect remains, so a future suspect escalates immediately.
+        """
+        suspects = self.suspects()
+        if not suspects:
+            self._last_escalation = None
+            return None
+        if self._last_escalation is not None and now - self._last_escalation < status_interval:
+            return None
+        self._last_escalation = now
+        detail = ", ".join(f"{tid} ({n} cycles)" for tid, n in sorted(suspects.items()))
+        return (
+            f"Thread(s) failing with provider-shaped errors while siblings "
+            f"succeed: {detail} — retrying forever per the failure model (D5), "
+            f"never abandoned; investigate the thread or the provider route"
+        )
+
+
+@dataclass
+class CachedEmailResult:
+    """ResultCache payload for the email pipeline: recorded after Stage 2
+    succeeds, consumed by a later cycle's label-write retry."""
+
+    label: EmailLabel
+    sender_type: SenderType
+
+
+@dataclass
+class CachedNewsletterResult:
+    """ResultCache payload for the newsletter pipeline.
+
+    ``story_results`` is cached because a sink-fault retry rebuilds the JSONL
+    record from it. ``assessment_written`` flips once ``write_assessment``
+    returns, so a labels-only retry never appends a duplicate record for the
+    same fingerprint; a fingerprint invalidation legitimately re-grades and
+    re-appends, with D18's newest-timestamp dedup as the read-side semantics.
+    """
+
+    best_tier: NewsletterTier | None
+    all_themes: dict[str, str]
+    story_results: list
+    assessment_written: bool = False
+
+
+class ResultCache:
+    """Keeps finished classification results across cycles while their label
+    writes keep failing (issue #29).
+
+    A transient write-phase fault used to discard the whole classification and
+    re-run it every cycle — Stage 1 + Stage 2 (the scarce local GPU pass for
+    person threads), or a full newsletter extraction + grading. Caching the
+    result means a failed write costs only a write retry.
+
+    Maps thread_id → (fingerprint, payload). The fingerprint is the sorted
+    tuple of the thread's message ids: a new message changes the input, so a
+    mismatch drops the entry and the thread classifies fresh. In-memory and
+    session-scoped like FailureTracker; entries are cleared on a successful
+    label write and pruned each cycle to the threads on that cycle's page.
+
+    Best-effort by construction, not a durability guarantee: a restart drops
+    the whole cache, and a backlog larger than max_emails_per_cycle can push a
+    still-pending thread off a cycle's page. Either way the thread reclassifies
+    when it next comes round — the cost is LLM spend, plus (for a newsletter) a
+    second assessment record for the same content, which D18's newest-timestamp
+    dedup on read absorbs.
+    """
+
+    def __init__(self):
+        self._entries: dict[str, tuple[tuple[str, ...], object]] = {}
+
+    def get(self, thread_id: str, fingerprint: tuple[str, ...]) -> object | None:
+        """Return the cached payload if *fingerprint* still matches, else None.
+
+        A mismatched fingerprint means the thread's messages changed since it
+        was classified — the stale entry is dropped so the caller reclassifies.
+        """
+        entry = self._entries.get(thread_id)
+        if entry is None:
+            return None
+        cached_fingerprint, payload = entry
+        if cached_fingerprint != fingerprint:
+            del self._entries[thread_id]
+            return None
+        return payload
+
+    def put(self, thread_id: str, fingerprint: tuple[str, ...], payload: object) -> None:
+        self._entries[thread_id] = (fingerprint, payload)
+
+    def clear(self, thread_id: str) -> None:
+        self._entries.pop(thread_id, None)
+
+    def prune(self, active_thread_ids) -> None:
+        """Drop entries for threads absent from this cycle (mirrors FailureTracker.prune).
+
+        A cached result whose thread leaves the query — labeled externally,
+        archived, or given up — would otherwise leak for the daemon's lifetime;
+        a thread with a pending write re-matches the query every cycle, so it
+        normally survives. Normally, because *active_thread_ids* is the cycle's
+        max_emails_per_cycle page rather than the whole pending set: a large
+        backlog can evict a still-pending thread, which then reclassifies when
+        it comes back (class docstring — an optimisation, not a guarantee).
+        """
+        active = set(active_thread_ids)
+        self._entries = {tid: e for tid, e in self._entries.items() if tid in active}
+
+
 class DaemonHalt:
-    """Daemon-wide halt state for account-level faults (provider out of funds).
+    """Halt state for ONE function's account-level faults (provider out of funds).
 
     Unlike a poison thread (FailureTracker's territory), an out-of-funds provider
-    fails EVERY request: retrying per-thread just burns the backlog into
-    agent/attempted. Tripping this halts the poll loop entirely until the admin
-    adds funds and restarts. In-memory and session-scoped by design — a restart
-    is the only way to clear it. First tripper wins: threads in one
-    asyncio.gather cycle may race to trip, and the reason must stay stable.
+    fails EVERY request it serves: retrying per-thread just re-fails that
+    function's whole backlog every cycle, against a provider that cannot answer
+    any of it. Tripping this stops the function until the admin adds funds and
+    restarts. In-memory and session-scoped by design — a restart is the only way
+    to clear it. First tripper wins: threads in one asyncio.gather cycle may
+    race to trip, and the reason must stay stable.
+
+    One slot per function, held together by FunctionHalts.
     """
 
     def __init__(self):
@@ -217,43 +399,212 @@ class DaemonHalt:
         return self.reason is not None
 
 
-async def _give_up_if_stuck(
+class FunctionHalts:
+    """Per-function halt state (decision D5's scope rule; D19).
+
+    The two functions fail independently, so an out-of-funds provider stops only
+    the function whose requests it was serving: a newsletter-tier balance fault
+    halts newsletter grading while email triage keeps classifying, and vice
+    versa. Each function owns a DaemonHalt slot (first-tripper-wins,
+    restart-only reset); the poll loop stands down entirely only when EVERY
+    enabled function is halted.
+
+    "Enabled" is a deployment fact, not a runtime one: newsletter grading iff
+    [newsletter] is configured, email triage iff NEWSLETTER_ONLY is unset. A
+    function that isn't running can't be halted, and must never be counted as
+    halted when deciding whether anything is left to do.
+
+    When the two functions share one LLM client ([newsletter.llm] absent), a
+    shared-provider fault trips both slots within a cycle or two as each
+    function hits its own request — correct, since the fault does disable both.
+    """
+
+    def __init__(self, email_enabled: bool = True, newsletter_enabled: bool = False):
+        self.email = DaemonHalt()
+        self.newsletter = DaemonHalt()
+        self.email_enabled = email_enabled
+        self.newsletter_enabled = newsletter_enabled
+
+    def _enabled_slots(self) -> list[tuple[str, DaemonHalt]]:
+        slots = []
+        if self.email_enabled:
+            slots.append(("email triage", self.email))
+        if self.newsletter_enabled:
+            slots.append(("newsletter grading", self.newsletter))
+        return slots
+
+    @property
+    def all_halted(self) -> bool:
+        """True when every enabled function is halted — nothing is left to poll for."""
+        slots = self._enabled_slots()
+        return bool(slots) and all(h.tripped for _name, h in slots)
+
+    @property
+    def any_halted(self) -> bool:
+        return any(h.tripped for _name, h in self._enabled_slots())
+
+    @property
+    def email_only_halted(self) -> bool:
+        """Email triage is halted while newsletter grading still runs — the one
+        direction the Gmail query can narrow (a `to:recipient` clause keeps the
+        halted function's backlog from crowding the page; the mirror direction
+        can't be expressed as "not to:recipient" reliably)."""
+        return (
+            self.email_enabled
+            and self.email.tripped
+            and self.newsletter_enabled
+            and not self.newsletter.tripped
+        )
+
+    def halted_summary(self) -> str:
+        """`function: reason` for each halted enabled function — the operator line."""
+        return "; ".join(
+            f"{name}: {h.reason}" for name, h in self._enabled_slots() if h.tripped
+        )
+
+
+def attribute_cycle_failures(
+    thread_items: list[tuple[str, list[str]]],
+    results: list,
+    failures: list["CycleFailure"],
+    failure_tracker: FailureTracker,
+    masquerade_tracker: MasqueradeTracker,
+) -> list["CycleFailure"]:
+    """Post-gather attribution (decision D5 Rule 2): decide which of this cycle's
+    failures were the thread's own fault, strike them, and return the entries
+    that just struck out — the poll loop marks those agent/attempted.
+
+    Blame by correlation, cycle-level:
+
+      * A candidate failure (Timeout / RuntimeError / unexpected Exception)
+        counts a strike iff its signature is unique among the cycle's candidate
+        failures AND — when other threads ATTEMPTED work this cycle — at least
+        one of them was handled successfully. Everything else is treated as
+        shared cause (provider, proxy, disk, or our own config/code): no
+        strikes, one ERROR line, backlog kept.
+      * The correlation denominator is the threads that attempted work, not
+        every thread the cycle fetched: only a thread that succeeded or
+        recorded a failure is evidence about anything. Threads that merely
+        DEFERRED — their function halted, the local tier offline, a
+        NEWSLETTER_ONLY skip, a 403-rejected write, an assessment-sink fault —
+        tried nothing and committed nothing, so they neither blame nor absolve.
+      * A singleton cycle counts: with no attempting siblings to correlate
+        against, bounded strikes to a findable agent/attempted is the honest
+        fallback — and the poison-thread case is typically a singleton
+        (everything else processed away).
+      * Provider-shaped failures never strike. When exactly one thread failed
+        provider-shaped and a sibling succeeded, its masquerade counter
+        advances (see MasqueradeTracker); ambiguous cycles (singleton,
+        zero-success) never advance it. Only a thread's own success clears a
+        count, whatever the cycle's shape — a success is never ambiguous.
+
+    Marking eligibility derives from THIS cycle's strikes only — never from raw
+    tracker counts — so a stale at-threshold count left by a failed marker
+    write can never mark a thread that has since stopped failing.
+    """
+    any_success = any(result is True for result in results)
+    # Correlate over the threads that ATTEMPTED work — handled successfully, or
+    # recorded a CycleFailure. A deferral-only thread is not correlation
+    # evidence: leaving it in the denominator made a cycle of "one poisoned
+    # thread + one permanently-deferred thread" look multi-thread-and-
+    # zero-success forever, so the poisoned thread never struck and never
+    # converged to a findable agent/attempted — silently voiding D5 Rule 1's
+    # set-aside guarantee (a halted function re-fetches and re-defers its
+    # threads every cycle, so the shielding persists until restart).
+    failed_threads = {f.thread_id for f in failures}
+    attempted = {
+        tid
+        for (tid, _msg_ids), result in zip(thread_items, results)
+        if result is not False or tid in failed_threads
+    }
+    multi_thread = len(attempted) > 1
+    thread_blame = not multi_thread or any_success
+
+    candidates = [f for f in failures if not f.provider_shaped]
+    signature_counts = Counter(f.signature for f in candidates)
+    striking = [f for f in candidates if thread_blame and signature_counts[f.signature] == 1]
+    shared = [f for f in candidates if not (thread_blame and signature_counts[f.signature] == 1)]
+    if shared:
+        log.error(
+            "%d thread(s) failed this cycle with no correlation evidence of a "
+            "thread-specific fault (signatures: %s) — shared cause suspected "
+            "(D5): no strikes, backlog kept",
+            len(shared),
+            ", ".join(sorted({f.signature for f in shared})),
+        )
+    for f in striking:
+        failure_tracker.record_failure(f.thread_id)
+
+    # Masquerade bookkeeping (D5): success clears; exactly one provider-shaped
+    # failing thread plus a successful sibling increments. Local-tier LLM
+    # deferrals never appear in `failures` at all (see the LLMUnavailableError
+    # arm), so a closed MLX laptop can't accrue here.
+    #
+    # This half needs no attempting-denominator treatment: it moves only on
+    # POSITIVE evidence — a thread that succeeded, and provider-shaped entries
+    # that are attempts by construction — and a deferral-only thread is neither,
+    # so it can neither increment nor clear a counter. (The blame rule above is
+    # the asymmetric one: its no-siblings fallback is to blame, so a phantom
+    # sibling actively suppresses strikes.) The prune below stays over every
+    # FETCHED thread, as does FailureTracker's in summarize_cycle: a deferred
+    # thread is still pending, and pruning it would drop a count it needs next
+    # cycle.
+    for (tid, _msg_ids), result in zip(thread_items, results):
+        if result is True:
+            masquerade_tracker.clear(tid)
+    provider_threads = {f.thread_id for f in failures if f.provider_shaped}
+    if len(provider_threads) == 1 and any_success:
+        masquerade_tracker.record_masquerade(provider_threads.pop())
+    masquerade_tracker.prune(tid for tid, _msg_ids in thread_items)
+
+    return [f for f in striking if failure_tracker.should_give_up(f.thread_id)]
+
+
+async def _mark_thread_attempted(
     thread_id: str,
     msg_ids: list[str],
-    failure_tracker: "FailureTracker | None",
+    failure_tracker: FailureTracker,
     label_manager: LabelManager,
-    write_sem: asyncio.Semaphore | None = None,
 ) -> bool:
-    """Record a thread-specific failure; if it has failed too many times, mark it
-    agent/attempted so it stops being retried every cycle.
+    """Mark a struck-out thread agent/attempted so it stops being retried every
+    cycle. Called from the poll loop for threads the cycle attribution just
+    struck out — attribute_cycle_failures owns the strike accounting (decision
+    D5); this function owns only the guarded marker write.
 
     Uses agent/attempted (not agent/processed): the thread is excluded from the
     unprocessed query either way, but the distinct label keeps abandoned threads
     findable and separate from successfully-classified mail.
 
-    Returns True if the thread was given up (marked agent/attempted → handled), or
-    False if it should simply be retried next cycle.
+    Returns True if the marker landed (thread abandoned), or False if the write
+    failed and the thread stays pending.
     """
-    if failure_tracker is None:
-        return False
-    failure_tracker.record_failure(thread_id)
-    if not failure_tracker.should_give_up(thread_id):
-        return False
     try:
-        async with (write_sem or nullcontext()):
-            await label_manager.mark_attempted(msg_ids)
+        await label_manager.mark_attempted(msg_ids)
     except ProxyUnavailableError as exc:
         # The proxy is transiently down, so the agent/attempted marker can't be written
         # right now — expected during an outage, not a bug. We return without recording
-        # the give-up, so the thread stays give-up-eligible: its failure count is left
-        # ≥ max_failures (this arm returns False, so the poll loop's success-only
-        # count-clear never runs), and the marker write is retried next cycle once the
+        # the give-up and without clearing the count, so the count stays at the
+        # threshold and the thread's next strike re-qualifies it for marking once the
         # proxy recovers. Log a clean warning rather than spamming a traceback for an
         # expected transient condition. (The thread keeps re-matching the query until it
-        # is actually labeled; skipping the re-classification in that window is a
-        # separate efficiency concern, tracked in #29.)
+        # is actually labeled; if its classification already succeeded, the ResultCache
+        # serves it back in that window, so retry cycles re-attempt only the write —
+        # issue #29.)
         log.warning(
             "Proxy unavailable marking stuck thread %s attempted — will retry next cycle: %s",
+            thread_id, exc,
+        )
+        return False
+    except ProxyForbiddenError as exc:
+        # A proxy 403 on the marker write is a human answer — the operator rejected
+        # the confirmation, or the op is blocked — not a failure (decision D6). One
+        # clean line, no traceback. The rejection blocks the marker; the thread stays
+        # give-up-eligible (its count is left at the threshold, so its next strike
+        # re-offers the marker write next cycle). A rejection never *causes* the
+        # give-up — the strikes that reached the threshold came from elsewhere.
+        log.info(
+            "Marker write rejected/blocked by the proxy for thread %s — "
+            "re-offering next cycle: %s",
             thread_id, exc,
         )
         return False
@@ -271,8 +622,10 @@ async def _give_up_if_stuck(
         thread_id, failure_tracker.max_failures,
     )
     failure_tracker.record_give_up(thread_id)
-    # Note: the poll loop clears the failure count on every True result (which a
-    # give-up returns), so the count is reset there — no need to clear it here too.
+    # Give-ups return False from process_single_thread (they are failures, not
+    # handled work — D5), so summarize_cycle's success-clear never runs for
+    # them: clear the count here, beside the successful mark.
+    failure_tracker.clear(thread_id)
     return True
 
 
@@ -328,16 +681,19 @@ async def process_single_thread(
     newsletter_recipient: str = "",
     newsletter_output_file: str = "",
     newsletter_only: bool = False,
-    failure_tracker: "FailureTracker | None" = None,
+    cycle_failures: "list[CycleFailure] | None" = None,
     fetch_sem: asyncio.Semaphore | None = None,
-    write_sem: asyncio.Semaphore | None = None,
     local_deferrals: list[str] | None = None,
-    halt: "DaemonHalt | None" = None,
+    halts: "FunctionHalts | None" = None,
+    result_cache: "ResultCache | None" = None,
 ) -> bool:
     """Process a single thread through the classification pipeline.
 
     Fetches the full thread, formats all messages into a transcript,
     classifies once, and applies labels to all messages in the thread.
+    A classification whose label write failed in a prior cycle is reused from
+    result_cache (issue #29) instead of being re-run, as long as the thread's
+    message ids are unchanged.
 
     Uses semaphores to bound concurrent LLM requests:
     - cloud_sem: acquired for Stage 1 (sender classification) and Stage 2 SERVICE emails
@@ -348,6 +704,24 @@ async def process_single_thread(
 
     Enforces no-downgrade rule: if the thread already has a classification
     with equal or higher priority, it is skipped.
+
+    Failures are never handled inline (decision D5): each failure arm records a
+    CycleFailure into ``cycle_failures`` — candidate or provider-shaped — and
+    returns False; the poll loop's post-gather attribution step decides strikes
+    and marking (attribute_cycle_failures). Three arms deliberately record no
+    CycleFailure, for three different reasons: the assessment-sink arm
+    (AssessmentSinkError), because a sink fault is shared-cause by construction
+    (the disk, not the thread) — nothing for correlation to weigh, retried
+    forever; the proxy-403 arm (ProxyForbiddenError), because a rejected write
+    is a human answer rather than a failure (decision D6) and is simply
+    re-offered; and a LOCAL-tier LLMUnavailableError, a routine deferral
+    counted in ``local_deferrals`` for the per-cycle summary instead (issue
+    #24).
+
+    Halts are per-function (decision D5's scope rule, D19): a balance fault
+    trips only the halted function's slot in ``halts``, and a thread whose own
+    function is halted defers (returns False) without a CycleFailure — a halt
+    is a deferral, not a failure to attribute.
 
     Args:
         thread_id: Gmail thread ID.
@@ -370,11 +744,12 @@ async def process_single_thread(
     # give-up exists to break never converges).
     ids_to_mark = msg_ids
     try:
-        # A sibling thread in this cycle may already have tripped the halt (the
-        # provider is out of funds account-wide): don't fetch or classify —
-        # every further request is a known failure. Checked again after the
-        # fetch, before the expensive LLM stage.
-        if halt is not None and halt.tripped:
+        # Nothing this daemon still does can succeed: every enabled function is
+        # halted (each one's provider is out of funds account-wide), so don't
+        # even fetch. A PARTIAL halt keeps going — this thread's function isn't
+        # known until it is routed, so the function-aware checks sit below
+        # newsletter detection instead (decision D5's scope rule).
+        if halts is not None and halts.all_halted:
             return False
 
         # Fetch full thread (all messages in one API call). Bounded by fetch_sem so
@@ -398,34 +773,82 @@ async def process_single_thread(
         all_msg_ids = [msg["id"] for msg in messages]
         ids_to_mark = all_msg_ids
 
-        # Re-check after the fetch: a sibling may have tripped the halt while this
-        # thread was fetching. Everything past here issues LLM requests (including
-        # any retry backoff), which are guaranteed to fail out-of-funds too.
-        if halt is not None and halt.tripped:
-            return False
+        # Input fingerprint for the session ResultCache (issue #29): a new
+        # message changes the sorted id tuple, so a cached classification is
+        # only ever reused for exactly the content it was computed from.
+        fingerprint = tuple(sorted(all_msg_ids))
 
         # Newsletter detection — route to newsletter pipeline if applicable
         if newsletter_classifier and newsletter_recipient:
             if is_newsletter(messages, newsletter_recipient):
+                # This thread belongs to the newsletter function, and that
+                # function is halted (its provider is out of funds): defer —
+                # no strike, no marker, nothing committed — and let email
+                # triage carry on. Also catches the sibling that tripped the
+                # halt while this thread was fetching, before any LLM request.
+                if halts is not None and halts.newsletter.tripped:
+                    return False
+
                 first_headers = messages[0]["payload"]["headers"]
                 subject = get_header(first_headers, "Subject")
                 sender = get_header(first_headers, "From")
                 send_date = parse_send_date(
                     get_header(first_headers, "Date"), messages[0].get("internalDate")
                 )
-                transcript = format_thread_transcript(messages, max_thread_chars)
 
-                async with cloud_sem:
-                    story_results = await newsletter_classifier.classify_newsletter(transcript)
+                # Reuse a finished grading whose write failed in a prior cycle
+                # (issue #29): skip re-extraction/re-grading and go straight to
+                # the writes it still owes.
+                cached_nl = result_cache.get(thread_id, fingerprint) if result_cache else None
+                if cached_nl is not None:
+                    log.info(
+                        "Newsletter thread %s: reusing cached grading from a prior "
+                        "cycle (write still pending)",
+                        thread_id,
+                    )
+                    story_results = cached_nl.story_results
+                    best_tier = cached_nl.best_tier
+                    all_themes = cached_nl.all_themes
+                else:
+                    transcript = format_thread_transcript(messages, max_thread_chars)
 
-                # Determine overall tier (best story's tier)
-                best_tier = None
-                for sr in story_results:
-                    if sr.tier is not None:
-                        if best_tier is None or _TIER_RANK.get(sr.tier, 0) > _TIER_RANK.get(best_tier, 0):
-                            best_tier = sr.tier
-                # Merge graded themes across stories (strongest grade per theme)
-                all_themes = aggregate_theme_grades(story_results)
+                    try:
+                        async with cloud_sem:
+                            story_results = await newsletter_classifier.classify_newsletter(
+                                transcript
+                            )
+                    except LLMBalanceError as exc:
+                        # The NEWSLETTER function's provider is out of funds. Its
+                        # [newsletter.llm] endpoint is configured independently of
+                        # the email tiers (and LLMBalanceError carries no function
+                        # provenance), so the call site is what tells the two
+                        # functions apart: halt newsletter grading only — email
+                        # triage keeps running (decision D5's scope rule, D19).
+                        # The thread is left unprocessed, no strike, and is
+                        # re-graded after the admin adds funds and restarts.
+                        log.error("Newsletter thread %s deferred — %s", thread_id, exc)
+                        if halts is not None:
+                            halts.newsletter.trip(str(exc))
+                        return False
+
+                    # Determine overall tier (best story's tier)
+                    best_tier = None
+                    for sr in story_results:
+                        if sr.tier is not None:
+                            if best_tier is None or _TIER_RANK.get(sr.tier, 0) > _TIER_RANK.get(best_tier, 0):
+                                best_tier = sr.tier
+                    # Merge graded themes across stories (strongest grade per theme)
+                    all_themes = aggregate_theme_grades(story_results)
+
+                    # Cache the grading before any write is attempted, so a sink
+                    # or label fault costs a write retry, not an LLM re-run.
+                    cached_nl = CachedNewsletterResult(
+                        best_tier=best_tier,
+                        all_themes=all_themes,
+                        story_results=story_results,
+                    )
+                    if result_cache is not None:
+                        result_cache.put(thread_id, fingerprint, cached_nl)
 
                 # Persist the assessment BEFORE the labels commit. The JSONL record
                 # is the only durable copy of the grading — Gmail keeps just the
@@ -435,9 +858,17 @@ async def process_single_thread(
                 # fault — a bind mount gone read-only, a full disk, bad permissions —
                 # into permanent silent data loss: labels applied, grading gone,
                 # thread never re-graded. Writing first means a sink fault leaves the
-                # thread unprocessed, so the next cycle retries it (and a persistent
-                # fault ends at the give-up path's findable agent/attempted).
-                if newsletter_output_file:
+                # thread unprocessed, so the next cycle retries it — and keeps
+                # retrying: a sink fault is shared-cause (the disk, not the thread),
+                # never counted toward give-up (decision D5's sink corollary), so the
+                # newsletter waits for the operator instead of being abandoned.
+                # Skipped once assessment_written: within a daemon session an
+                # unchanged fingerprint re-attempts only the labels. The cache is
+                # session-scoped and pruned to the cycle's page, so a restart —
+                # or a backlog that pushes the thread off a page — mid-retry
+                # re-grades and re-appends; D18's newest-timestamp dedup on read
+                # is the backstop for that record.
+                if newsletter_output_file and not cached_nl.assessment_written:
                     try:
                         write_assessment(
                             output_file=newsletter_output_file,
@@ -452,7 +883,10 @@ async def process_single_thread(
                         )
                     except OSError as exc:
                         # Named at ERROR with the resolved path so a sink fault is
-                        # distinguishable from a grading fault at a glance.
+                        # distinguishable from a grading fault at a glance. This
+                        # per-cycle line is the loudness the never-counted retry
+                        # relies on (the startup preflight already screams about an
+                        # unusable sink).
                         log.error(
                             "Cannot write newsletter assessment to %s: %s — thread %s "
                             "left unprocessed for retry (check the path exists, is "
@@ -461,14 +895,20 @@ async def process_single_thread(
                             exc,
                             thread_id,
                         )
-                        raise
+                        # Re-raise as a dedicated type, not the bare OSError: the
+                        # arm below must be able to catch sink faults WITHOUT
+                        # catching TimeoutError, which subclasses OSError and is a
+                        # strike candidate (decision D5).
+                        raise AssessmentSinkError(str(exc)) from exc
+                    cached_nl.assessment_written = True
 
-                async with (write_sem or nullcontext()):
-                    await label_manager.apply_newsletter_classification(
-                        message_ids=all_msg_ids,
-                        tier=best_tier,
-                        themes=all_themes,
-                    )
+                await label_manager.apply_newsletter_classification(
+                    message_ids=all_msg_ids,
+                    tier=best_tier,
+                    themes=all_themes,
+                )
+                if result_cache is not None:
+                    result_cache.clear(thread_id)
 
                 story_count = len(story_results)
                 log.info(
@@ -486,6 +926,15 @@ async def process_single_thread(
             log.debug("Skipping non-newsletter thread %s (newsletter-only mode)", thread_id)
             return False
 
+        # This thread belongs to the email function, and that function is halted
+        # (its provider is out of funds): defer — no strike, no marker — while
+        # newsletter grading carries on. Deliberately ABOVE the max-priority
+        # branch below, so a halted email function commits nothing at all, not
+        # even a mark_processed write. Also catches the sibling that tripped the
+        # halt while this thread was fetching, before any LLM request.
+        if halts is not None and halts.email.tripped:
+            return False
+
         # Check priority — skip if already classified at max priority
         existing_priority = label_manager.get_existing_priority(messages)
         if existing_priority is not None and existing_priority >= _get_priority(EmailLabel.NEEDS_RESPONSE):
@@ -496,53 +945,80 @@ async def process_single_thread(
             # as the no-downgrade branch below). ids_to_mark was upgraded to all_msg_ids
             # above the priority check, so a failed write here gives up on the whole
             # thread, not just the query stubs.
-            async with (write_sem or nullcontext()):
-                await label_manager.mark_processed(all_msg_ids)
+            await label_manager.mark_processed(all_msg_ids)
+            if result_cache is not None:
+                result_cache.clear(thread_id)
             log.info("Thread %s already at max priority, marking processed", thread_id)
             return True
 
-        # Extract unique senders (preserve order)
-        senders = []
-        seen = set()
-        for msg in messages:
-            headers = msg["payload"]["headers"]
-            sender = get_header(headers, "From")
-            if sender and sender not in seen:
-                senders.append(sender)
-                seen.add(sender)
-
-        if not senders:
-            log.warning("Thread %s has no valid senders, skipping", thread_id)
-            return False
-
         first_headers = messages[0]["payload"]["headers"]
         subject = get_header(first_headers, "Subject")
-        snippet = messages[-1].get("snippet", "")  # latest message snippet
 
-        metadata = ThreadMetadata(
-            thread_id=thread_id,
-            senders=senders,
-            subject=subject,
-            snippet=snippet,
-        )
-
-        # Format thread transcript
-        transcript = format_thread_transcript(messages, max_thread_chars)
-
-        # Stage 1: classify sender (always cloud LLM)
-        async with cloud_sem:
-            sender_type, sender_raw, sender_cot = await classifier.classify_sender(metadata)
-
-        # Stage 2: classify email (routed by sender type)
-        if sender_type == SenderType.PERSON:
-            async with local_sem:
-                result = await classifier.classify(metadata, transcript, sender_type, sender_raw)
+        # Reuse a finished classification whose label write failed in a prior
+        # cycle (issue #29): skip Stage 1/Stage 2 (the scarce local GPU pass
+        # for person threads) and go straight to the label write. The
+        # no-downgrade check below still runs, against the freshly fetched
+        # thread's labels.
+        result = None
+        cached_email = result_cache.get(thread_id, fingerprint) if result_cache else None
+        if cached_email is not None:
+            log.info(
+                "Thread %s: reusing cached classification from a prior cycle "
+                "(write still pending)",
+                thread_id,
+            )
+            label = cached_email.label
+            applied_sender_type = cached_email.sender_type
         else:
+            # Extract unique senders (preserve order)
+            senders = []
+            seen = set()
+            for msg in messages:
+                headers = msg["payload"]["headers"]
+                sender = get_header(headers, "From")
+                if sender and sender not in seen:
+                    senders.append(sender)
+                    seen.add(sender)
+
+            if not senders:
+                log.warning("Thread %s has no valid senders, skipping", thread_id)
+                return False
+
+            snippet = messages[-1].get("snippet", "")  # latest message snippet
+
+            metadata = ThreadMetadata(
+                thread_id=thread_id,
+                senders=senders,
+                subject=subject,
+                snippet=snippet,
+            )
+
+            # Format thread transcript
+            transcript = format_thread_transcript(messages, max_thread_chars)
+
+            # Stage 1: classify sender (always cloud LLM)
             async with cloud_sem:
-                result = await classifier.classify(metadata, transcript, sender_type, sender_raw)
+                sender_type, sender_raw, sender_cot = await classifier.classify_sender(metadata)
+
+            # Stage 2: classify email (routed by sender type)
+            if sender_type == SenderType.PERSON:
+                async with local_sem:
+                    result = await classifier.classify(metadata, transcript, sender_type, sender_raw)
+            else:
+                async with cloud_sem:
+                    result = await classifier.classify(metadata, transcript, sender_type, sender_raw)
+
+            label = result.label
+            applied_sender_type = result.sender_type
+            # Cache before the write: a write fault must not discard the
+            # finished classification (issue #29).
+            if result_cache is not None:
+                result_cache.put(
+                    thread_id, fingerprint, CachedEmailResult(label, applied_sender_type)
+                )
 
         # Enforce no-downgrade
-        new_priority = _get_priority(result.label)
+        new_priority = _get_priority(label)
         if existing_priority is not None and existing_priority >= new_priority:
             log.info(
                 "Thread %s: existing priority %d >= new %d, skipping downgrade",
@@ -551,88 +1027,149 @@ async def process_single_thread(
                 new_priority,
             )
             # Still mark as processed so the thread isn't retried every cycle
-            async with (write_sem or nullcontext()):
-                await label_manager.mark_processed(all_msg_ids)
+            await label_manager.mark_processed(all_msg_ids)
+            if result_cache is not None:
+                result_cache.clear(thread_id)
             return True
 
-        # Apply labels to ALL messages in thread (bounded by write_sem so a large
-        # max_emails_per_cycle can't burst one concurrent write per thread).
-        async with (write_sem or nullcontext()):
-            await label_manager.apply_classification(all_msg_ids, result.label, result.sender_type)
+        # Apply labels to ALL messages in thread. The proxy-write burst is
+        # bounded inside LabelManager (issue #33): its write semaphore gates
+        # each modify_message call, so a large max_emails_per_cycle can't
+        # burst one concurrent write per message.
+        await label_manager.apply_classification(all_msg_ids, label, applied_sender_type)
+        if result_cache is not None:
+            result_cache.clear(thread_id)
         log.info(
             "Classified thread %s (%d msgs): sender=%s label=%s — %s",
             thread_id,
             len(all_msg_ids),
-            result.sender_type.value,
-            result.label.value,
+            applied_sender_type.value,
+            label.value,
             subject,
         )
-        log.debug("Thread %s CoT — sender: %s", thread_id, result.sender_cot)
-        log.debug("Thread %s CoT — label: %s", thread_id, result.label_cot)
+        if result is not None:
+            log.debug("Thread %s CoT — sender: %s", thread_id, result.sender_cot)
+            log.debug("Thread %s CoT — label: %s", thread_id, result.label_cot)
         return True
 
+    except AssessmentSinkError:
+        # The assessments sink itself failed — a read-only bind mount, a full
+        # disk, bad permissions. Shared cause (decision D5's sink corollary):
+        # the disk is the problem, not this newsletter, so it never counts
+        # toward give-up. No strike, no CycleFailure (nothing for the cycle
+        # attribution to weigh), no marker — the thread stays pending and is
+        # retried every cycle, forever, until the operator fixes the sink. The
+        # ERROR line at the raise site (with the resolved path) already fired,
+        # and with the ResultCache (issue #29) the retry re-attempts only the
+        # JSONL write: the grading is cached, so "forever" costs no LLM spend.
+        return False
     except LLMUnavailableError as exc:
-        # LLM endpoint unreachable or dropped mid-request (server down, connect
-        # timeout, reset) — transient. Don't count it toward give-up; just retry
-        # next cycle (preserves graceful degradation of the privacy invariant).
+        # LLM endpoint can't serve requests right now — unreachable, dropped
+        # mid-request, or answering with an exhausted 429/5xx. Provider-shaped
+        # (decision D5): never a strike; defer and retry next cycle (preserves
+        # graceful degradation of the privacy invariant).
         #
         # The LOCAL tier being down is a routine operating condition (the MLX
         # laptop is deliberately offline for hours at a time), not an incident:
         # log per-thread detail at DEBUG and count the deferral so the poll loop
         # can emit a single per-cycle INFO summary instead of N warnings
-        # (issue #24). A cloud (or tier-less) outage stays a WARNING.
+        # (issue #24). Local-tier deferrals are also excluded from masquerade
+        # bookkeeping entirely — person threads deferring while service siblings
+        # succeed is the routine local state, and tracking it would false-alarm
+        # every night the laptop is closed. A cloud (or tier-less) outage stays
+        # a WARNING and is recorded provider-shaped so the cycle attribution can
+        # spot the single-thread masquerade.
         if exc.tier == "local":
             log.debug("Local LLM unavailable processing thread %s: %s", thread_id, exc)
             if local_deferrals is not None:
                 local_deferrals.append(thread_id)
         else:
             log.warning("LLM unavailable processing thread %s: %s", thread_id, exc)
+            if cycle_failures is not None:
+                cycle_failures.append(CycleFailure(
+                    thread_id, ids_to_mark, type(exc).__qualname__, provider_shaped=True,
+                ))
         return False
     except ProxyUnavailableError as exc:
         # api-proxy unavailable for THIS thread's call — connection refused, a timeout,
         # a dropped connection, a 5xx / exhausted-429 response, or a non-JSON 2xx body.
-        #
-        # Unlike LLMUnavailableError above, this is give-up-eligible (issue #26). The
-        # asymmetry is deliberate: a *fully* endpoint-wide PROXY outage is caught one
-        # level up — list_messages (also a proxy call) fails first, so the whole cycle
-        # defers (see the poll loop) and no thread is ever processed or counted. A fault
-        # that reaches here is therefore either thread-specific (e.g. a deterministic
-        # 5xx on one unserializable thread) or a partial/route-selective degradation
-        # (e.g. get_thread garbles while list_messages stays healthy); if it PERSISTS
-        # across cycles it must be bounded like Timeout/RuntimeError below, not retried
-        # forever. A transient blip clears its count via the poll-loop success-clear
-        # before reaching the threshold. The accepted residual is that a *sustained*
-        # partial outage can abandon the backlog — but to the findable, re-processable
-        # agent/attempted (issue #23), not to lost mail. (An LLM outage, by contrast, is
-        # invisible at the cycle level — the proxy is up — so LLMUnavailableError must
-        # never give up, or one MLX outage would abandon every person thread.)
+        # Provider-shaped (decision D5, deliberately reversing issue #26's give-up
+        # counting): the proxy failing to serve a request is never the thread's
+        # blame — no strike, defer and retry next cycle, backlog kept. The residual
+        # #26 worried about — a deterministic per-thread 5xx masquerading as an
+        # outage — is handled by the attribution step instead: provider-shaped
+        # failures on one thread while siblings succeed accrue in the
+        # MasqueradeTracker and escalate with a distinct repeated ERROR, retried
+        # forever rather than abandoned.
         log.warning("api-proxy unavailable processing thread %s: %s", thread_id, exc)
-        return await _give_up_if_stuck(thread_id, ids_to_mark, failure_tracker, label_manager, write_sem)
+        if cycle_failures is not None:
+            cycle_failures.append(CycleFailure(
+                thread_id, ids_to_mark, type(exc).__qualname__, provider_shaped=True,
+            ))
+        return False
+    except ProxyForbiddenError as exc:
+        # A proxy 403 on a gated write is a human answer — the operator said
+        # "not now", or the op is blocked — not a failure (decision D6, issue #28
+        # Option A): one clean line, no strike, no marker, no traceback. The thread
+        # is re-offered next cycle; the ResultCache keeps the finished
+        # classification, so the re-offer costs one write attempt, not an LLM
+        # re-run. (A 403 during startup label verification is different — a blocked
+        # op there is a config error, and verify_labels_with_retry lets it
+        # propagate as permanent.)
+        log.info(
+            "Write rejected/blocked by the proxy for thread %s — "
+            "re-offering next cycle: %s",
+            thread_id, exc,
+        )
+        return False
     except httpx.ConnectError as exc:
         # Defensive: a raw ConnectError shouldn't escape the wrapped clients, but if
-        # one does it's still a transient outage — retry next cycle, don't give up.
+        # one does it's still a transient outage — provider-shaped (D5): retry next
+        # cycle, never strike.
         log.warning("Connection error processing thread %s: %s", thread_id, exc)
+        if cycle_failures is not None:
+            cycle_failures.append(CycleFailure(
+                thread_id, ids_to_mark, type(exc).__qualname__, provider_shaped=True,
+            ))
         return False
     except TimeoutError as exc:
         # Request-specific slowness (e.g. a transcript too large to prefill within
-        # the timeout) — eligible for give-up so one huge thread can't be retried
+        # the timeout) — a strike candidate: the cycle attribution counts it when
+        # correlation blames the thread, so one huge thread can't be retried
         # forever. (Connect/pool timeouts are LLMUnavailableError, handled above.)
         log.error("Timeout processing thread %s: %s", thread_id, exc)
-        return await _give_up_if_stuck(thread_id, ids_to_mark, failure_tracker, label_manager, write_sem)
+        if cycle_failures is not None:
+            cycle_failures.append(CycleFailure(thread_id, ids_to_mark, type(exc).__qualname__))
+        return False
     except LLMBalanceError as exc:
         # Account-wide, not a thread fault (and must precede the RuntimeError arm,
         # which it subclasses): don't count toward give-up, don't mark anything —
         # the thread is re-processed after the admin adds funds and restarts.
+        # Reaching this arm means the fault came from the EMAIL pipeline's tiers
+        # (the newsletter branch traps its own balance faults at the call site),
+        # so it halts email triage only — newsletter grading keeps running
+        # (decision D5's scope rule, D19).
         log.error("Thread %s deferred — %s", thread_id, exc)
-        if halt is not None:
-            halt.trip(str(exc))
+        if halts is not None:
+            halts.email.trip(str(exc))
         return False
     except RuntimeError as exc:
+        # Request-specific LLM failure — a non-balance 4xx-shaped response, or an
+        # unusable reply (LLMContentError): a strike candidate under the cycle
+        # attribution (D5).
         log.error("Thread %s: %s", thread_id, exc)
-        return await _give_up_if_stuck(thread_id, ids_to_mark, failure_tracker, label_manager, write_sem)
-    except Exception:
+        if cycle_failures is not None:
+            cycle_failures.append(CycleFailure(thread_id, ids_to_mark, type(exc).__qualname__))
+        return False
+    except Exception as exc:
+        # Unexpected failure — keep the traceback. A strike candidate under the
+        # cycle attribution (D5): a poison thread converges to agent/attempted,
+        # while a code bug failing every thread the same way correlates to
+        # shared-cause (no strikes, loud, backlog kept).
         log.exception("Error processing thread %s", thread_id)
-        return await _give_up_if_stuck(thread_id, ids_to_mark, failure_tracker, label_manager, write_sem)
+        if cycle_failures is not None:
+            cycle_failures.append(CycleFailure(thread_id, ids_to_mark, type(exc).__qualname__))
+        return False
 
 
 def summarize_cycle(
@@ -643,16 +1180,18 @@ def summarize_cycle(
     """Tally a poll cycle's outcomes and update the failure tracker.
 
     A thread is "handled" when process_single_thread returned True (classified,
-    skipped at max priority, or given up — all return True); its failure count is
-    cleared. Drains the per-cycle give-up list and prunes counts for threads no
-    longer pending. Returns (handled_count, given_up_thread_ids); given_up is a
-    subset of the handled count (a give-up also returns True).
+    or skipped at max priority); its failure count is cleared. Give-ups return
+    False (they are failures, not handled work — decision D5), so given_up is
+    NOT a subset of the handled count: the poll loop's marking step records
+    them via record_give_up and clears their counts itself. Drains the
+    per-cycle give-up list and prunes counts for threads no longer pending.
+    Returns (handled_count, given_up_thread_ids).
     """
     processed = 0
     for (tid, _msg_ids), result in zip(thread_items, results):
         if result is True:
             processed += 1
-            failure_tracker.clear(tid)  # success/give-up resets the failure count
+            failure_tracker.clear(tid)  # success resets the failure count
     given_up = failure_tracker.take_given_up()
     failure_tracker.prune(tid for tid, _msg_ids in thread_items)
     return processed, given_up
@@ -815,6 +1354,10 @@ def preflight_assessment_sink(output_file: str) -> None:
 
 async def run_daemon() -> None:
     """Main polling loop."""
+    # Release identity (decision D11): the Docker build stamps GIT_SHA into the
+    # image; logging it here (not at import — daemon.py:64-77 contract) answers
+    # "what is deployed?" from the logs alone.
+    log.info("email-labeler starting — build %s", os.environ.get("GIT_SHA", "unknown"))
     config = load_config()
     daemon_config = config["daemon"]
 
@@ -845,7 +1388,12 @@ async def run_daemon() -> None:
         local_llm=local_llm,
         config=config,
     )
-    label_manager = LabelManager(proxy_client=proxy_client, config=config)
+    # The write semaphore is owned by the LabelManager (issue #33): each
+    # modify_message write acquires one slot, so write_parallel bounds writes
+    # in flight, not threads writing. Sizing rationale: config.toml [daemon].
+    write_parallel = resolve_int_env("WRITE_PARALLEL", daemon_config.get("write_parallel", 4))
+    write_sem = asyncio.Semaphore(write_parallel)
+    label_manager = LabelManager(proxy_client=proxy_client, config=config, write_sem=write_sem)
 
     # Newsletter classifier (if configured)
     nl_config = config.get("newsletter")
@@ -891,8 +1439,6 @@ async def run_daemon() -> None:
     local_parallel = resolve_int_env("LOCAL_PARALLEL", daemon_config.get("local_parallel", 1))
     local_sem = asyncio.Semaphore(local_parallel)
     fetch_sem = asyncio.Semaphore(daemon_config.get("fetch_parallel", 4))
-    write_parallel = resolve_int_env("WRITE_PARALLEL", daemon_config.get("write_parallel", 4))
-    write_sem = asyncio.Semaphore(write_parallel)
     log.info(
         "Concurrency limits: cloud=%d, local=%d, fetch=%d, write=%d",
         cloud_sem._value, local_sem._value, fetch_sem._value, write_sem._value,
@@ -904,14 +1450,32 @@ async def run_daemon() -> None:
             local_parallel,
         )
 
-    # Breaks infinite retry loops: a thread that keeps failing for a
-    # thread-specific reason (not a transient outage) is marked processed after
-    # a few attempts. Session-scoped — counts reset on restart.
-    failure_tracker = FailureTracker()
+    # Breaks infinite retry loops: a thread the cycle-level attribution keeps
+    # blaming (decision D5) is marked agent/attempted after a few strikes.
+    # Session-scoped — counts reset on restart. Sizing rationale: config.toml
+    # [daemon] max_failures (authoritative); override per run with MAX_FAILURES.
+    failure_tracker = FailureTracker(
+        max_failures=resolve_int_env("MAX_FAILURES", daemon_config.get("max_failures", 5))
+    )
 
-    # Account-level fault switch (provider out of funds): once tripped the poll
-    # loop stands down until the admin adds funds and restarts. Session-scoped.
-    halt = DaemonHalt()
+    # Watches the single-thread masquerade (provider-shaped failures on one
+    # thread while siblings succeed, decision D5): never abandoned, escalated
+    # with a distinct ERROR on the status heartbeat. Session-scoped.
+    masquerade_tracker = MasqueradeTracker(max_failures=failure_tracker.max_failures)
+
+    # Keeps finished classifications across cycles while their label writes
+    # keep failing (issue #29): a write fault costs a write retry, never an
+    # LLM re-run. Session-scoped, like the tracker.
+    result_cache = ResultCache()
+
+    # Account-level fault switches (provider out of funds), one per function
+    # (decision D5's scope rule, D19): a tripped slot stops that function until
+    # the admin adds funds and restarts; the poll loop stands down only once
+    # every enabled function is halted. Session-scoped.
+    halts = FunctionHalts(
+        email_enabled=not newsletter_only,
+        newsletter_enabled=bool(newsletter_classifier and newsletter_recipient),
+    )
 
     # Wait for a transiently-unreachable api-proxy to come up, then verify labels.
     missing = await verify_labels_with_retry(label_manager)
@@ -925,8 +1489,10 @@ async def run_daemon() -> None:
     poll_interval = daemon_config["poll_interval_seconds"]
     max_emails = resolve_int_env("MAX_EMAILS_PER_CYCLE", daemon_config["max_emails_per_cycle"])
     gmail_query = daemon_config["gmail_query"]
+    query_narrowed = False  # set once an email-only halt narrows the query below
     if newsletter_only and newsletter_recipient:
         gmail_query += f" to:{newsletter_recipient}"
+        query_narrowed = True
         log.info("Gmail query narrowed to: %s", gmail_query)
     healthcheck_file = Path(daemon_config["healthcheck_file"])
     backoff = poll_interval
@@ -935,16 +1501,17 @@ async def run_daemon() -> None:
     proxy_lost = False  # set by the lost-connection arm, cleared on the next good poll
 
     while True:
-        if halt.tripped:
-            # An out-of-funds provider fails EVERY request — polling on would
-            # only burn the backlog into agent/attempted. Stand down but stay
-            # alive: the heartbeat stays fresh (deliberately halted, not hung),
-            # and the instruction repeats at ERROR every cycle so it can't
-            # scroll out of the logs. Restarting the daemon is the only reset.
+        if halts.all_halted:
+            # Every enabled function's provider is out of funds, and such a fault
+            # fails EVERY request — polling on would only burn the backlog into
+            # agent/attempted. Stand down but stay alive: the heartbeat stays
+            # fresh (deliberately halted, not hung), and the instruction repeats
+            # at ERROR every cycle so it can't scroll out of the logs.
+            # Restarting the daemon is the only reset.
             log.error(
-                "Daemon halted — %s. Add funds to the provider account, "
-                "then restart the daemon to resume processing.",
-                halt.reason,
+                "Daemon halted — every enabled function stopped (%s). Add funds to "
+                "the provider account, then restart the daemon to resume processing.",
+                halts.halted_summary(),
             )
             try:
                 healthcheck_file.write_text(str(asyncio.get_event_loop().time()))
@@ -955,6 +1522,30 @@ async def run_daemon() -> None:
                 log.warning("Failed to update healthcheck while halted: %s", exc)
             await asyncio.sleep(poll_interval)
             continue
+        if halts.any_halted:
+            # A PARTIAL halt: one function is stopped, the other still has work
+            # to do, so the loop keeps polling. The halted function must not go
+            # quiet about it — same repeated-ERROR discipline as the full
+            # stand-down, naming which function needs the funds.
+            log.error(
+                "Function halted — %s. Add funds to the provider account, then "
+                "restart the daemon to resume it; the other function keeps running.",
+                halts.halted_summary(),
+            )
+            if halts.email_only_halted and not query_narrowed:
+                # Email triage is stopped but newsletter grading is not: narrow
+                # the query the way NEWSLETTER_ONLY does, so the halted
+                # function's backlog stops costing a get_thread per thread per
+                # cycle and can't crowd newsletter threads out of the
+                # max_results page. Halts are restart-reset, so this holds for
+                # the rest of the session.
+                gmail_query += f" to:{newsletter_recipient}"
+                query_narrowed = True
+                log.info(
+                    "Email triage halted — Gmail query narrowed to the newsletter "
+                    "function: %s",
+                    gmail_query,
+                )
         try:
             response = await proxy_client.list_messages(q=gmail_query, max_results=max_emails)
             messages = response.get("messages", [])
@@ -980,6 +1571,7 @@ async def run_daemon() -> None:
             max_thread_chars = daemon_config.get("max_thread_chars", DEFAULT_MAX_THREAD_CHARS)
             thread_items = list(threads.items())
             local_deferrals: list[str] = []
+            cycle_failures: list[CycleFailure] = []
             results = await asyncio.gather(
                 *(
                     process_single_thread(
@@ -995,26 +1587,41 @@ async def run_daemon() -> None:
                         newsletter_recipient=newsletter_recipient,
                         newsletter_output_file=newsletter_output_file,
                         newsletter_only=newsletter_only,
-                        failure_tracker=failure_tracker,
+                        cycle_failures=cycle_failures,
                         fetch_sem=fetch_sem,
-                        write_sem=write_sem,
                         local_deferrals=local_deferrals,
-                        halt=halt,
+                        halts=halts,
+                        result_cache=result_cache,
                     )
                     for tid, msg_ids in thread_items
                 ),
                 return_exceptions=True,
             )
+            # Post-gather failure handling, strictly ordered (decision D5):
+            # attribute → strike → mark → summarize → cycle log.
+            struck_out = attribute_cycle_failures(
+                thread_items, results, cycle_failures, failure_tracker, masquerade_tracker,
+            )
+            for entry in struck_out:
+                await _mark_thread_attempted(
+                    entry.thread_id, entry.ids_to_mark, failure_tracker, label_manager,
+                )
             processed, given_up = summarize_cycle(thread_items, results, failure_tracker)
+            result_cache.prune(tid for tid, _msg_ids in thread_items)
             log_local_deferrals(local_deferrals)
             if threads:
                 if given_up:
                     log.info(
-                        "Processed %d/%d threads (%d of them abandoned after repeated failures: %s)",
+                        "Processed %d/%d threads (%d abandoned after repeated failures: %s)",
                         processed, len(threads), len(given_up), given_up,
                     )
                 else:
                     log.info("Processed %d/%d threads", processed, len(threads))
+            escalation = masquerade_tracker.escalation_line(
+                asyncio.get_event_loop().time(), status_interval
+            )
+            if escalation:
+                log.error(escalation)
 
             # Update healthcheck
             healthcheck_file.write_text(str(asyncio.get_event_loop().time()))

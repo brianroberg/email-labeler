@@ -172,6 +172,19 @@ class TestMigrateRecord:
             assert out[key] == _old_record()[key]
         assert out["stories"][0]["quality_cot"] == "reasoning"
 
+    def test_converted_records_are_stamped_schema_version_1(self):
+        """D12: migration converts a record to the documented v1 shape, so it
+        stamps ``schema_version: 1`` — but only on records it converts.
+        Pass-throughs stay byte-identical (their versioning, or lack of it, is
+        not the migration's business)."""
+        out, changed = migrate_record(_old_record())
+        assert changed is True
+        assert out["schema_version"] == 1
+
+        passthrough, changed = migrate_record(_new_record())
+        assert changed is False
+        assert "schema_version" not in passthrough
+
     def test_new_scheme_record_passes_through_unchanged(self):
         out, changed = migrate_record(_new_record())
         assert changed is False

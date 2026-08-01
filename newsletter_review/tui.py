@@ -61,9 +61,11 @@ def load_assessments(path: Path) -> list[dict]:
     One row per newsletter: a thread graded more than once keeps only its NEWEST
     record, decided by the record's own ``timestamp`` rather than by its position
     in the file. The daemon persists the assessment *before* committing the Gmail
-    labels, so a newsletter whose labels fail to apply stays unprocessed and is
-    re-graded — and re-appended — next cycle. Deduping on read keeps that
-    durability guarantee from showing up as duplicate rows here.
+    labels; a newsletter whose labels fail to apply stays unprocessed, and while
+    its retries reuse the cached grading without re-appending (issue #29), a
+    thread whose content changes — or a daemon restart mid-retry — legitimately
+    re-grades and re-appends. Deduping on read keeps that durability guarantee
+    from showing up as duplicate rows here.
 
     Position is only the tie-break (later line wins) when neither record carries a
     comparable timestamp: files get *merged*, not just appended — README.md has

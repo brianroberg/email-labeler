@@ -1,6 +1,6 @@
 # Evaluation Suite
 
-A 4-stage pipeline for measuring classification accuracy against human-reviewed threads, plus a web UI for browsing results.
+A 4-stage pipeline for measuring classification accuracy against human-reviewed threads.
 
 ```
 harvest → review → run_eval → report
@@ -138,21 +138,6 @@ uv run python -m evals.report --compare evals/results/run_a.jsonl evals/results/
 # Trend view across all runs
 uv run python -m evals.report --results-dir evals/results/
 ```
-
-## 5. Web UI — Interactive reporting and comparison
-
-Launch a local web server to browse runs, view metrics, compare results, and inspect chain-of-thought reasoning.
-
-```bash
-export EVAL_WEB_SECRET="your-secret-here"
-uv run python -m evals.run_web
-```
-
-Navigate to `http://localhost:5000`. Features:
-
-- **Run list**: Filter by model, stages, tag. Click any run to view details.
-- **Run detail**: Metrics, confusion matrices, per-class P/R/F1, per-thread results with chain-of-thought.
-- **Compare**: Select a baseline and comparison runs to see side-by-side accuracy deltas.
 
 ## Newsletter evaluation
 

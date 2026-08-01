@@ -39,7 +39,7 @@ email-labeler/
 ├── docs/
 │   └── runbook-agent-attempted-recovery.md  Owner-run manual sweep of threads
 │                       dropped to agent/attempted by issue #64 (time-sensitive:
-│                       cleanest before the first post-#65 image is deployed)
+│                       cleanest while the daemon is stopped)
 ├── scripts/
 │   ├── eval_model.py           One-command-per-model eval wrapper
 │   ├── migrate_assessments.py  Convert pre-#53 records in an assessments JSONL
@@ -77,6 +77,8 @@ email-labeler/
 | `LOCAL_PARALLEL` | No | `1` (from `config.toml`) | Max concurrent local MLX requests, overriding `local_parallel` in `config.toml`. Modern MLX servers batch these (shared weights), so concurrency mostly costs KV cache. Keep ≤ 8 — mlx-lm has a KV-cache cross-contamination bug at 16+. |
 | `MAX_EMAILS_PER_CYCLE` | No | `10` (from `config.toml`) | Max threads processed per poll cycle, overriding `max_emails_per_cycle` in `config.toml`. Raise temporarily to drain a large backlog faster. |
 | `WRITE_PARALLEL` | No | `4` (from `config.toml`) | Max concurrent label-application writes (`modify_message`), overriding `write_parallel` in `config.toml`. Bounds the proxy-write burst when `max_emails_per_cycle` is large. Sized separately from reads because writes may block on human approval (`WRITE_TIMEOUT`, 300s). |
+| `GIT_SHA` | No | `unknown` | Git commit SHA of the running build, logged once at daemon startup (decision D11). Stamped by the image build (Dockerfile `ARG`/`ENV`); not an operator knob. |
+| `MAX_FAILURES` | No | `5` (from `config.toml`) | Strikes a thread takes before it is set aside under `agent/attempted`, overriding `max_failures` in `config.toml`. Only failures the cycle-level attribution blames on the thread count (decision D5 Rule 2). Also sets the masquerade escalation threshold. |
 
 Note: The cloud LLM **model name** is configured in `config.toml` under `[llm.cloud]`, not in `.env`. The local LLM **model name** is set via the `MLX_MODEL` environment variable (shared with email-agent) and referenced in `config.toml` as `{env.MLX_MODEL}`. This keeps secrets (keys, URLs) in `.env` while operational parameters (temperature, prompts) stay in version-controlled `config.toml`.
 
@@ -94,7 +96,9 @@ search; excludes the `agent/processed` and `agent/attempted` markers) ·
 `max_thread_chars` (transcript cap — see below) · `cloud_parallel` /
 `local_parallel` / `fetch_parallel` / `write_parallel` (concurrency
 semaphores; env overrides `LOCAL_PARALLEL` / `WRITE_PARALLEL`) ·
-`healthcheck_file` (heartbeat path).
+`max_failures` (strikes before `agent/attempted`, and the masquerade
+escalation threshold; env override `MAX_FAILURES`) · `healthcheck_file`
+(heartbeat path).
 
 Threads found in a poll cycle are processed concurrently, bounded by the
 `cloud_parallel` and `local_parallel` semaphores. **`local_parallel` defaults to 1**:
@@ -210,8 +214,8 @@ ERROR Newsletter assessments resolve to /app/data/newsletter_assessments.jsonl, 
       container is recreated. Mount the directory you review, e.g. '- ./data:/app/data'
       under the service's volumes.
 ERROR Newsletter assessments sink is not writable: /app/data. Newsletters will be left
-      unprocessed (and eventually marked agent/attempted) rather than graded into a
-      record that cannot be saved.
+      unprocessed (retried every cycle until this is fixed, never abandoned) rather
+      than graded into a record that cannot be saved.
 ```
 
 * **The record count** is the tell for a *misdirected* sink: a daemon that has
@@ -243,6 +247,48 @@ ERROR Newsletter assessments sink is not writable: /app/data. Newsletters will b
   calls a directory writable.
 * **An unreadable sink** (the count comes back unknown) is an ERROR too, not a
   footnote on the INFO line: nothing below it can vouch for the path.
+
+#### Assessment record schema
+
+One JSON object per line, appended by `write_assessment` (newsletter.py). The
+documented shape is `schema_version: 1`:
+
+| Field | Meaning |
+|---|---|
+| `timestamp` | *Processed* time, ISO-8601 UTC. Always present. |
+| `schema_version` | `1` (int) for this shape. Absent on pre-versioning records — see version semantics below. |
+| `message_id`, `thread_id` | Gmail message/thread ids of the graded newsletter. |
+| `from` | Sender. The JSON key is the reserved word `from`, not `sender` (the Python parameter's name). |
+| `subject` | Subject header value. |
+| `send_date` | The email's own send date (email-intrinsic), ISO-8601 UTC or null. |
+| `model` | Grading model identifier, or null. |
+| `overall_tier` | Best story's tier as a string, or null. |
+| `stories[]` | One object per extracted story: `text`; `scores` (dict of dimension → 1\|2\|3, or null when grading failed); `average_score` (float or null); `tier` (string or null); `themes` (dict, theme → grade); `quality_cot`; `theme_cot`. |
+
+Two semantics the shape alone does not convey:
+
+* A theme **absent** from `stories[].themes` graded Absent —
+  absence-by-omission (decisions D14/D15); only `present`/`emphasized` grades
+  are recorded.
+* `migrated_from: "pre-#53"` marks a record converted by
+  `scripts/migrate_assessments.py` — what conversion preserves is the
+  migration table in the next section.
+
+Version semantics:
+
+* `schema_version: 1` is the shape above, with one carve-out: records stamped
+  v1 by the migration script (they bear `migrated_from`) may lack
+  `send_date`/`model` entirely — those keys postdate the records being
+  migrated, and the migration deliberately does not fabricate them.
+* **Absence of `schema_version` means a pre-versioning record**, of which two
+  shapes exist: post-#53 current-shape (possibly lacking `send_date`/`model`,
+  which arrived without a bump) and pre-#53 legacy (list-shaped themes, 1-5
+  scores) — the latter readable only after `scripts/migrate_assessments.py`
+  (next section).
+* Files may mix versions: concatenating a rescued copy onto the host file is
+  an expected operation, deduped on read by newest `timestamp` per
+  `thread_id` (decision D18; the read-side rule is documented under
+  write-before-label ordering below). Readers keep `.get()` tolerance.
 
 #### Migrating pre-#53 records
 
@@ -281,6 +327,7 @@ What the conversion can and cannot preserve:
 | `stories[].average_score` | Recomputed from the bucketed scores so it agrees with the labels the detail view renders. |
 | `overall_tier`, `stories[].tier` | **Preserved verbatim, never recomputed.** The tier is what the grader concluded under the old rubric and what was applied to the email as a Gmail label; deriving a new one from re-bucketed dimensions would leave the record disagreeing with the message. |
 | `migrated_from` | Added (`"pre-#53"`). The review TUI's detail view surfaces it, so re-bucketed scores are never mistaken for what the grader emitted. |
+| `schema_version` | Added (`1`) — a converted record is the documented v1 shape (with the carve-out under version semantics above: it may still lack `send_date`/`model`, which the migration does not fabricate). The `1` is frozen in the script, not tied to whatever version `write_assessment` stamps today. Records already in the new scheme pass through byte-identical, so an unversioned post-#53 record stays unversioned. |
 
 #### Write-before-label ordering
 
@@ -294,8 +341,8 @@ never re-graded. Writing first inverts the failure mode:
 
 | Fault | Outcome |
 |---|---|
-| Sink write fails | `OSError` logged at ERROR naming the resolved path, thread left unprocessed → retried next cycle → persistent fault ends at the give-up path's findable `agent/attempted` |
-| Labels fail after a successful write | Thread unprocessed → re-graded next cycle → a second record for that `thread_id`; `load_assessments` keeps the newest per thread — by the record's own `timestamp`, not by file position, so merging a rescued copy of the file cannot resurrect an older grading — and the review TUI still shows one row |
+| Sink write fails | `OSError` logged at ERROR naming the resolved path, re-raised as `AssessmentSinkError` and caught by its own arm: thread left unprocessed → retried next cycle → retried *forever*. A sink fault is shared-cause (decision D5), so it never counts toward give-up and the newsletter is never abandoned to `agent/attempted`; the per-cycle ERROR is the loudness, and the ResultCache means each retry within the session re-attempts only the write |
+| Labels fail after a successful write | Thread unprocessed → retried next cycle from the daemon's session `ResultCache` (issue #29): the cached grading is reused and the JSONL append is skipped, so only the labels write is re-attempted — no LLM re-run and no second record for the same thread content **within a daemon session**. The cache is in-memory and pruned to each cycle's `max_emails_per_cycle` page, so three things re-grade and re-append: a changed fingerprint (a new message in the thread), a daemon restart mid-retry, and a backlog large enough to push the pending thread off a page. For all of them `load_assessments` keeps the newest record per thread — by the record's own `timestamp`, not by file position, so merging a rescued copy of the file cannot resurrect an older grading — and the review TUI still shows one row |
 
 ### Prompt templates
 
@@ -343,7 +390,7 @@ A 27B model at 8-bit is ~34 GB, leaving only ~14 GB of headroom. Long transcript
 
 ### Prefill latency and the request timeout
 
-The model prefills the whole transcript before emitting a label, at ~100–200 tokens/sec on consumer hardware. A 50k-char (~17k-token) thread can take minutes — longer than `[llm.local] timeout` (default 180s) — so the client times out and the thread errors. On the stateless daemon that thread would otherwise be retried every cycle forever; **`max_thread_chars`** (cap the input) and the **`FailureTracker`** (give up after repeated failures, see `daemon.py`) are the two guards.
+The model prefills the whole transcript before emitting a label, at ~100–200 tokens/sec on consumer hardware. A 50k-char (~17k-token) thread can take minutes — longer than `[llm.local] timeout` (default 180s) — so the client times out and the thread errors. On the stateless daemon that thread would otherwise be retried every cycle forever; **`max_thread_chars`** (cap the input) is the first guard and the **`FailureTracker`** (see `daemon.py`) is the second. The second one is conditional: a timeout is a strike candidate, so it is counted only when the cycle-level attribution blames the thread (decision D5 Rule 2) — one oversized thread timing out while its siblings classify does converge to `agent/attempted`, but several timing out together share a signature and are held as shared cause, deferred every cycle with the backlog kept. Capping the input is what keeps that case from being the norm.
 
 ## Health Checking
 
@@ -366,18 +413,51 @@ docker inspect --format='{{.State.Health.Status}}' agent-stack-email-labeler-1
 When an LLM provider reports the account is out of funds (HTTP 402, or a
 400/403 whose body carries a balance signature such as Novita's
 `NOT_ENOUGH_BALANCE` or Anthropic's "credit balance is too low" — raised as
-`LLMBalanceError`), the daemon stops polling entirely: the fault is
-account-wide, so per-thread retries would only burn the backlog into
-`agent/attempted`. HTTP 429 never halts, even with quota phrasing — a
+`LLMBalanceError`), the **function whose provider it is** stops: the fault is
+account-wide, so per-thread retries would only re-fail that function's whole
+backlog every cycle against a provider that cannot answer any of it. The halt
+is per-function (decisions D5, D19): a newsletter-tier balance fault halts
+newsletter grading while email triage keeps
+classifying, and vice versa; when the two share one client (`[newsletter.llm]`
+absent) a shared-provider fault halts both within a cycle or two. HTTP 429 never
+halts, even with quota phrasing — a
 per-minute rate limit is worded identically to hard quota exhaustion, and a
-wrong restart-only halt is worse than falling back to per-thread give-up. The triggering thread is left unprocessed. The halt is
-in-memory only; **restarting the daemon is the only reset**. While halted the
-daemon logs this line at ERROR once per poll interval and keeps the healthcheck
-timestamp fresh (deliberately halted, not hung — the container stays healthy):
+wrong restart-only halt is worse than treating a rare 429-signaled
+out-of-funds as provider unavailability: deferred and retried each cycle,
+never a strike (decision D5). Note what that costs in visibility. Neither
+loud-failure ERROR covers it: the shared-cause line is emitted only over
+*candidate* (thread-attributable) failures, and the masquerade escalation
+requires exactly one affected thread while siblings succeed. An account-wide
+429 fails every thread, so a sustained one is visible as the per-thread
+`LLM unavailable processing thread …` WARNING each cycle and a flat
+`Processed 0/N threads` summary — no ERROR. The triggering thread is left
+unprocessed. The halt is in-memory only; **restarting the daemon is the only
+reset**.
+
+While **one** function is halted the loop keeps polling for the other, and logs
+this line at ERROR once per poll interval. If email triage is the halted one and
+newsletter grading is enabled, the Gmail query also gains a `to:<recipient>`
+clause for the rest of the session, so the halted function's backlog neither
+costs a thread fetch per cycle nor crowds newsletter threads out of the
+`max_emails_per_cycle` page:
 
 ```
-Daemon halted — <reason>. Add funds to the provider account, then restart the daemon to resume processing.
+Function halted — email triage: <reason>. Add funds to the provider account, then restart the daemon to resume it; the other function keeps running.
 ```
+
+Once **every enabled** function is halted (newsletter grading counts as enabled
+iff `[newsletter]` is configured, email triage iff `NEWSLETTER_ONLY` is unset)
+the daemon stops polling altogether, logging this line at ERROR once per poll
+interval and keeping the healthcheck timestamp fresh (deliberately halted, not
+hung — the container stays healthy):
+
+```
+Daemon halted — every enabled function stopped (<function: reason>; …). Add funds to the provider account, then restart the daemon to resume processing.
+```
+
+## Release Identity
+
+The image build stamps the git SHA into `GIT_SHA` (see the env table and README.md's Docker section), and the daemon logs `email-labeler starting — build <sha>` once at startup. Notable releases get a lightweight tag, applied manually by the owner — no semver, no changelog (decision D11): `git tag deploy-YYYY-MM-DD <sha>`.
 
 ## TUI Conventions (Textual)
 
@@ -418,15 +498,15 @@ Conventions shared by every TUI:
 
 | Test file | Module | What's covered |
 |---|---|---|
-| `test_llm_client.py` | `llm_client.py` | Request format, auth headers, `<think>` tag stripping, separate reasoning-field capture (`reasoning`/`reasoning_content`), `finish_reason: length` handling, error handling, out-of-funds (`LLMBalanceError`) detection, availability checks |
-| `test_classifier.py` | `classifier.py` | `parse_sender` formats, `parse_sender_type` edge cases and defaults, `parse_email_label` edge cases and defaults, cloud/local routing, full pipeline |
-| `test_labeler.py` | `labeler.py` | Label verification (all present, partial, none), label ID mapping, inbox/archive actions, single API call per email |
-| `test_daemon.py` | `daemon.py` | Service email path, person email path, MLX-unavailable skip, error isolation, out-of-funds halt, config loading, assessment-sink preflight + write-before-label durability |
+| `test_llm_client.py` | `llm_client.py` | Request format, auth headers, `<think>` tag stripping, separate reasoning-field capture (`reasoning`/`reasoning_content`), `finish_reason: length` handling, error handling, out-of-funds (`LLMBalanceError`) detection including the 429 exclusion asserted against balance-signature bodies (decision D19), availability checks |
+| `test_classifier.py` | `classifier.py` | `parse_sender` formats, `parse_sender_type` edge cases and its SERVICE default, `parse_email_label` edge cases and its keyword-free raise, cloud/local routing, full pipeline |
+| `test_labeler.py` | `labeler.py` | Label verification (all present, partial, none), label ID mapping, inbox/archive actions, single API call per email, per-write semaphore bound on every write path (LabelManager-owned `write_sem`, slot released between messages — classification, markers, and newsletter writes; issue #33) |
+| `test_daemon.py` | `daemon.py` | Service email path, person email path, MLX-unavailable skip, error isolation, per-function out-of-funds halt (`FunctionHalts`: enabled-slot arithmetic, the `NEWSLETTER_ONLY` stand-down), config loading, assessment-sink preflight + write-before-label durability, classification result reuse across write-retry cycles (`ResultCache`, issue #29 — reuse, fingerprint invalidation, clear/prune, and the poll-loop session wiring), cycle-level failure attribution (correlation strikes, timeout candidates, marking from this cycle's strikes only, count cleared beside a landed marker, adjudicated singleton/zero-success edges, deferral-only threads excluded from the correlation denominator — decision D5 Rule 2), masquerade bookkeeping and escalation (`MasqueradeTracker`: success-clear, prune, single-suspect + success increment condition, throttle reset), halt deferrals that record no failure and commit nothing, the `MAX_FAILURES` knob |
 | `test_privacy.py` | `classifier.py`, `daemon.py` | Negative-form privacy tests (registry D2/D3): person-classified bodies reach only the local tier (classifier and daemon level), Stage 1 whole-call payload discipline, unparseable-Stage-1 SERVICE-default pin, VIP short-circuit, newsletter ownership bypass, no cloud fallback on local failure, metadata-shape allowlist |
 | `test_config_utils.py` | `config_utils.py` | Config loading, `{env.VAR}` substitution |
 | `test_env_var_docs.py` | env-var docs (meta-test) | Every env var referenced by daemon sources or `config.toml` `{env.VAR}` is documented in this file's Environment Variables table |
 | `test_env_example_docs.py` | `.env.example` (meta-test) | Every var the example declares is documented in the env table; every Required var has an active line in the example |
-| `test_newsletter.py` | `newsletter.py` | Newsletter story extraction, quality scoring, theme classification, assessment record writing, sink persistence/writability diagnostics |
+| `test_newsletter.py` | `newsletter.py` | Newsletter story extraction, quality scoring, theme classification, assessment record writing (incl. the `schema_version` stamp), sink persistence/writability diagnostics, and the Rule-1 raises that keep `no-stories` to a successful zero-story extraction (unparseable extraction reply; every story failing to grade — decisions D5/D20) |
 | `test_eval_schemas.py` | `evals/schemas.py` | GoldenThread/PredictionResult/RunMeta serialization round-trips |
 | `test_eval_harvest.py` | `evals/harvest.py` | Ground truth inference from labels, deduplication |
 | `test_eval_report.py` | `evals/report.py` | Confusion matrix, precision/recall/F1, accuracy, privacy violation metrics |
@@ -436,7 +516,7 @@ Conventions shared by every TUI:
 | `test_eval_newsletter_run.py` | `evals/newsletter_run.py` | `prompt_hash`, cache reuse, extraction vs quality/theme modes |
 | `test_eval_newsletter_report.py` | `evals/newsletter_report.py` | `match_stories`, tier/dimension/theme metrics, comparison deltas |
 | `test_newsletter_review.py` | `newsletter_review/tui.py` | Pure helpers (loading, per-thread dedup, filtering, formatting, source line, migrated-record note) + Pilot UI tests (navigation, drill-down, tier/theme/sender filters, source header, quit) |
-| `test_migrate_assessments.py` | `scripts/migrate_assessments.py` | Old-scheme detection, theme/score conversion, tier preservation, atomic in-place rewrite + abort-on-malformed, round-trip through `load_assessments` |
+| `test_migrate_assessments.py` | `scripts/migrate_assessments.py` | Old-scheme detection, theme/score conversion, tier preservation, `schema_version` stamped on converted records only, atomic in-place rewrite + abort-on-malformed, round-trip through `load_assessments` |
 
 ## Continuous Integration
 

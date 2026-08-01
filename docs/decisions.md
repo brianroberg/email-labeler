@@ -45,14 +45,13 @@ findings that treat the SERVICE default as a privacy bug.
 
 ## D3 — Newsletter ownership rule (2026-07-30)
 
-**Status:** docs implemented (Wave 0); exact-address matching pending (Wave 2).
+**Status:** implemented (docs Wave 0; exact-address matching Wave 2).
 
 A thread with any message To/Cc-addressed to the configured newsletter
 recipient belongs to the newsletter function and is organizational content —
 its full transcript, **including person-written replies**, goes to the cloud
 LLM by design, before and instead of person/service routing. The recipient
-match must be an exact address comparison (current substring matching is a
-convicted bug, fixed in Wave 2).
+match is an exact address comparison.
 Forecloses: routing newsletter threads through Stage 1 "to restore the
 invariant"; privacy findings about person replies inside newsletter threads.
 
@@ -67,7 +66,7 @@ Forecloses: presenting a public stand-in as a routine production configuration.
 
 ## D5 — Failure model: two rules and a scope (2026-07-30)
 
-**Status:** model is the governing design now; corollaries pending (Wave 2).
+**Status:** implemented (model Wave 0; corollaries Wave 2).
 
 **Rule 1 — Outcomes only come from successes.** A committed outcome (label,
 archive, grade record, `agent/processed`) is only ever produced by a
@@ -81,33 +80,126 @@ strikes, get loud, keep the backlog intact.
 (e.g. its provider's balance) fails that function loudly without stopping the
 other.
 
-Corollaries, each `implementation pending (Wave 2)` until landed:
-- Exhausted 429/5xx (LLM and proxy) never count toward give-up. **This
-  deliberately reverses issue #26.** proxy_client's transient-error docstrings
-  become true; llm_client's non-200 docstring (which currently matches the old
-  counting behavior) is rewritten to the new rule.
-- Correlation is the attribution mechanism (detection mechanics designed in
-  Wave 2). The single-thread masquerade (provider-shaped errors, siblings
-  succeeding) retries forever, never abandoned, with a distinct ERROR
-  escalation line repeated on the status heartbeat.
-- The halt becomes per-function (today: daemon-wide).
+Corollaries — all landed in Wave 2; each names the commit that implemented it,
+and the code no longer deviates from the model anywhere the entry once said it
+did:
+- Exhausted 429/5xx (LLM and proxy) never count toward give-up — implemented
+  (Wave 2 T8, `957ba96`). **This deliberately reverses issue #26.**
+  proxy_client's transient-error docstrings are now true; llm_client raises
+  LLMUnavailableError for an exhausted 429 or any 5xx (other non-200s stay
+  RuntimeError — request-specific strike candidates). A 429-signaled
+  out-of-funds is likewise retried as unavailability, never a halt (D19) and
+  never give-up.
+- Correlation is the attribution mechanism — implemented (Wave 2 T8,
+  `957ba96`). Strikes are decided post-gather, per cycle
+  (`attribute_cycle_failures`): a candidate
+  failure (Timeout / RuntimeError incl. LLMContentError / unexpected
+  Exception) counts iff its signature is unique among the cycle's candidate
+  failures and, when the cycle has more than one *attempting* thread, at least
+  one sibling was handled successfully; marking derives only from the cycle's
+  own strikes, never raw tracker counts. **The correlation denominator is the
+  threads that attempted work** — those handled successfully or that recorded a
+  `CycleFailure` — not every thread the cycle fetched. A thread that only
+  DEFERRED (its function halted, the local tier offline, a `NEWSLETTER_ONLY`
+  skip, a 403-rejected write, an assessment-sink fault) tried nothing and
+  committed nothing, so it is evidence neither of blame nor of innocence and
+  leaves the denominator; it stays in the cycle summary and in both prunes,
+  since it is still pending. (Refinement found in the Wave 2 review of T8's
+  literal wording, "the cycle contained other threads": counting deferral-only
+  threads let a single permanently-deferred sibling — a halted function
+  re-fetches and re-defers its backlog every cycle — make every cycle look
+  multi-thread-and-zero-success, so a genuinely poisoned thread never struck
+  and never reached `agent/attempted`, silently voiding Rule 1's set-aside
+  guarantee.) Adjudicated edges, unchanged: **singleton cycles count** (no
+  attempting siblings to correlate against; the poison thread typically *is* a
+  singleton — residual: a code bug failing the only pending thread accrues
+  strikes, accepted); **zero-success multi-thread cycles count no strikes**
+  (all shared-cause, one ERROR line, backlog kept); **N same-signature poison
+  threads shield each other** while they co-fail (the shared-cause ERROR is
+  the loudness). The single-thread masquerade (provider-shaped errors,
+  siblings succeeding) retries forever, never abandoned: at `max_failures`
+  qualifying cycles it becomes a suspect and a distinct ERROR repeats at most
+  once per status interval (`MasqueradeTracker`); singleton and zero-success
+  cycles never increment the counter, and nothing but a thread's own success
+  resets it — a lone thread that *succeeds* clears its count like any other,
+  since a success is unambiguous whatever the cycle's shape. Local-tier LLM
+  unavailability is excluded entirely (the deliberately-offline MLX host makes
+  person-thread deferral routine, issue #24). The masquerade half needs no
+  denominator change: it moves only on positive evidence (a succeeding thread,
+  and provider-shaped entries that are attempts by construction), which a
+  deferral-only thread can never supply — the blame rule is the asymmetric one,
+  because its no-sibling fallback is to blame.
+- The halt is per-function — implemented (Wave 2 T9, `da368e6`).
+  `FunctionHalts` holds one first-tripper-wins `DaemonHalt` slot per function;
+  the newsletter branch traps
+  `LLMBalanceError` at its `classify_newsletter` call site (the error carries no
+  function provenance, and the newsletter client is also `tier="cloud"`, so the
+  *call site* is what tells the functions apart) while the outer arm serves the
+  email pipeline. A thread whose own function is halted defers below routing —
+  no strike, no marker, no `CycleFailure`. The poll loop stands down only when
+  every *enabled* function is halted (enabled: newsletter iff configured, email
+  iff not `NEWSLETTER_ONLY`); a partial halt keeps polling, names the halted
+  function at ERROR each cycle, and — email halted, newsletter running — narrows
+  the Gmail query with a `to:{recipient}` clause until restart (the mirror
+  direction accepts the fetch-and-skip churn: the query cannot express "not
+  to:recipient"). A shared client ([newsletter.llm] absent) trips both slots
+  within a cycle or two, which is correct: the fault disables both functions.
 - A keyword-free label reply raises instead of silently defaulting to
-  LOW_PRIORITY→archive (Rule 1; completes the issue-#64 fail-loud direction).
-  The unknown-sender→SERVICE default *stays* (D2).
+  LOW_PRIORITY→archive — implemented (Wave 2 T10, `ee3958d`).
+  `parse_email_label` raises
+  `LLMContentError` (quoting the reply) when no keyword survives its three
+  passes, so an unusable answer commits nothing (Rule 1) and is a strike
+  candidate under the correlation attribution; this completes the issue-#64
+  fail-loud direction, which had closed only the empty/truncated-reply half.
+  The unknown-sender→SERVICE default *stays* (D2). llm_client's content guard
+  stays too — it names the budget as the cause and covers Stage 1, where the
+  SERVICE default still applies. Evals degrade honestly: run_eval turns the
+  raise into an error row instead of a silent LOW_PRIORITY prediction.
 - `agent/newsletter/no-stories` may only result from a successful extraction
-  that found zero stories; all-grades-unparseable is a failure (extends the
-  issue-#30 principle to the parse-to-None path).
-- Assessment-sink faults are shared-cause: never counted, retried forever
-  (README-technical's write-before-label table currently documents the
-  give-up ending, matching the code; this corollary changes both).
-- `max_failures` (the strike bound, currently 5) becomes env-overridable
-  (`MAX_FAILURES`) and documented with the other knobs.
+  that found zero stories — implemented (Wave 2 T11, `a4005ea`), closing **two**
+  false paths. `parse_stories` returns `[]` only for an explicit `NO_STORIES` reply
+  and raises `LLMContentError` for any other reply that yields no story
+  (empty/whitespace included — unreachable behind llm_client's content guard,
+  but the parser's contract must not lie about it). `classify_newsletter`
+  raises when stories were extracted yet not one produced scores — issue #30's
+  remaining parse-to-None route, whose most common instance is a single-story
+  newsletter whose only story fails to grade. Per-story isolation survives for
+  the partial case (a story that fails while a sibling grades). Both raises are
+  pipeline-wide and are strike candidates under the correlation attribution, so
+  a poison newsletter converges to a findable `agent/attempted` rather than a
+  false no-stories record; the eval harness, which shares the parser, degrades
+  to error rows.
+- Assessment-sink faults are shared-cause: never counted, retried forever —
+  implemented (Wave 2 T12, `1a9d1fd`). The daemon re-raises the sink `OSError`
+  as a dedicated `AssessmentSinkError` (newsletter.py) at the `write_assessment`
+  call site and catches it in its own arm ahead of the candidate arms: no
+  strike, no `CycleFailure` (the fault never reaches attribution at all), no
+  marker — the newsletter is retried every cycle until the operator fixes the
+  sink. A dedicated class rather than `except OSError`, which would also
+  swallow `TimeoutError` (an OSError subclass, and a strike candidate). The
+  per-cycle ERROR naming the resolved path is the loudness, alongside the
+  startup preflight; with the ResultCache (T6) each retry *within a daemon
+  session* re-attempts only the JSONL write, so "forever" costs no LLM spend —
+  the cache is in-memory and pruned to each cycle's page, so a restart, or a
+  backlog that pushes the thread off a page, re-grades it once (refined in the
+  Wave 2 review: the original wording claimed the record could only repeat on a
+  fingerprint change, which the session scope and the page-sized prune both
+  contradict; D18's newest-timestamp dedup on read is the backstop).
+  README-technical's write-before-label table and the sink-preflight warning
+  text, which both documented the give-up ending, changed with it.
+- `max_failures` (the strike bound) is an operator knob — implemented (Wave 2
+  T13, `a40c2c2`). It lives in config.toml `[daemon] max_failures` with its sizing
+  rationale (the authoritative home, D7), is overridable per run with
+  `MAX_FAILURES` via `resolve_int_env` (the `WRITE_PARALLEL` precedent), and
+  is documented in README-technical's env table and `[daemon]` key list. The
+  same number is the masquerade escalation threshold, so one knob moves both
+  bounds together.
 Forecloses: per-cell relitigating of the failure table; new error paths that
 commit outcomes on failure; give-up counting for provider-shaped faults.
 
 ## D6 — Proxy 403 is a human answer, not a failure (2026-07-09, reaffirmed 2026-07-30)
 
-**Status:** implementation pending (Wave 2; originally issue #28 Option A).
+**Status:** implemented (Wave 2; issue #28 Option A).
 
 A 403 on a gated write means an operator said "not now": log one clean line,
 count nothing, re-offer next cycle. A rejection can never cause
@@ -150,21 +242,28 @@ and no re-convergence is intended. Never "sync" them with email-agent.
 
 ## D10 — Remove the eval web app (2026-07-30)
 
-**Status:** implementation pending (Wave 2).
+**Status:** implemented (Wave 2).
 
 `evals/web_app.py`, `web_auth.py`, `web_data.py`, `run_web.py`,
 `evals/templates/`, and evals/README.md §5 are removed; `fastapi`, `jinja2`,
-`uvicorn` leave the runtime dependencies. Coupled removals the implementer
+`uvicorn`, and `python-multipart` leave the runtime dependencies
+(`python-multipart` was web-only in fact — FastAPI form parsing — though
+this entry originally omitted it; the `multipart` strings in gmail_utils.py
+are MIME types, not the package). Coupled removals the implementer
 must include or the suite fails: drop `evals.run_web` from
 `tests/test_eval_cli_docs.py`'s `_CLI_MODULES` (it imports the module), and
-delete the `### run_web` section of evals/README-technical.md. Rationale:
+delete the `### run_web` section of evals/README-technical.md. Implementation
+found two doc edits beyond this list: the "plus a web UI" clause in
+evals/README.md's intro and the web-UI sentence in README-technical's
+Chain-of-Thought section (the tui-regression skill's venv pip line also
+dropped the four packages). Rationale:
 forgotten by the owner, workflows CLI-covered, zero tests, and it contradicted
 the no-web-server posture at the dependency level. CoT capture/sidecars are
 unaffected.
 
 ## D11 — Minimal release identity (2026-07-30)
 
-**Status:** implementation pending (Wave 2).
+**Status:** implemented (Wave 2).
 
 The Dockerfile bakes the git SHA (build-arg), the daemon logs it once at
 startup, and notable releases get a lightweight git tag. No semver, no
@@ -172,7 +271,7 @@ changelog — just enough that "what is deployed?" has an answer in the logs.
 
 ## D12 — Assessments JSONL: documented schema + version field (2026-07-30)
 
-**Status:** implementation pending (Wave 2).
+**Status:** implemented (Wave 2).
 
 The assessments JSONL (the only durable copy of gradings) gets a schema
 document (home: README-technical) and a `schema_version` field on each record,
@@ -238,13 +337,20 @@ the thread unprocessed rather than labeled-but-lost. Dedup on read: newest
 **Status:** implemented.
 
 Rate-limit phrasing is indistinguishable from quota exhaustion; a wrong
-restart-only halt is worse than retry. Balance-signature 402/400/403 halts
-(today daemon-wide; per-function under D5, pending).
+restart-only halt is worse than retry. Balance-signature 402/400/403 halts the
+function whose provider reported it — per-function under D5, implemented in
+Wave 2 T9 (was daemon-wide).
 
 ## D20 — Content-less grading is a failure, not an outcome (issue #30, 2026-07-08)
 
-**Status:** implemented for the exception path; parse-to-None path pending
-(extended by D5, Wave 2).
+**Status:** implemented — the exception path with issue #30, the parse-to-None
+path with D5's corollary in Wave 2 T11.
 
-Stories-exist-but-every-grade-errored raises and reaches the give-up path;
-genuine zero-story extraction remains a valid `no-stories` outcome.
+Stories-exist-but-every-grade-errored raises rather than recording an outcome;
+so do stories-exist-but-every-grade-*unparseable* and an extraction reply that
+parses to no stories without saying `NO_STORIES` (T11). The raise is a strike
+candidate under D5's cycle-level attribution — counted only when correlation
+blames the newsletter, so one that keeps failing while its siblings grade ends
+findably under `agent/attempted`, while several failing the same way are held
+as shared cause. A successful zero-story extraction remains a valid
+`no-stories` outcome — the only one.

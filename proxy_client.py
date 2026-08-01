@@ -35,8 +35,9 @@ class ProxyForbiddenError(Exception):
 
 class ProxyError(Exception):
     """Raised for a request-specific proxy fault — a 4xx response other than 401/403.
-    These are eligible for the daemon's give-up logic: retrying the same request as-is
-    won't help, so a persistent one is bounded by the FailureTracker.
+    Retrying the same request as-is won't help, so these are strike candidates for
+    the daemon's cycle-level attribution (decision D5): counted toward give-up only
+    when correlation blames the thread.
 
     The transient subset — endpoint unavailable, a 5xx, an exhausted 429, or a non-empty
     non-JSON 2xx body — is raised as the more specific ProxyUnavailableError below;
@@ -47,13 +48,13 @@ class ProxyError(Exception):
 
 
 class ProxyUnavailableError(ProxyError):
-    """The api-proxy is transiently unreachable — connection refused, a timeout, a
-    dropped/garbled connection, or a 5xx server error.
+    """The api-proxy can't serve the request right now — connection refused, a
+    timeout, a dropped/garbled connection, a 5xx server error, or an exhausted 429.
 
-    Mirrors llm_client.LLMUnavailableError: a transient outage that should be
-    deferred and retried next cycle, NOT counted toward giving up on a thread.
-    Subclasses ProxyError so existing `except ProxyError` sites (e.g. startup label
-    verification) keep treating it as retryable.
+    Mirrors llm_client.LLMUnavailableError: provider-shaped (decision D5), so the
+    daemon defers and retries next cycle and NEVER counts it toward giving up on a
+    thread. Subclasses ProxyError so existing `except ProxyError` sites (e.g. startup
+    label verification) keep treating it as retryable.
     """
 
     pass
@@ -66,7 +67,8 @@ class ProxyUnavailableError(ProxyError):
 # can't silently disagree about what counts as transient.
 #
 # Two TransportError siblings are DELIBERATELY excluded because they are permanent, not
-# transient, and must surface / be give-up-eligible rather than retried forever:
+# transient, and must surface / stay strike candidates (decision D5) rather than be
+# retried forever:
 #   * httpx.UnsupportedProtocol — a missing/unsupported PROXY_URL scheme.
 #   * httpx.LocalProtocolError — a client-side request-construction fault (e.g. an
 #     illegal header built from our own inputs). It is a subclass of httpx.ProtocolError,
@@ -136,7 +138,7 @@ class GmailProxyClient:
             ProxyForbiddenError: For 403 responses.
             ProxyUnavailableError: For transient faults — 5xx, an exhausted 429, or a
                 non-JSON 2xx body. (Subclass of ProxyError; the daemon defers on it.)
-            ProxyError: For a request-specific 4xx (give-up-eligible).
+            ProxyError: For a request-specific 4xx (a strike candidate, D5).
         """
         if response.status_code == 401:
             message = self._parse_error_message(response, "Unauthorized - invalid or missing API key")
@@ -175,8 +177,11 @@ class GmailProxyClient:
             # A non-empty, non-JSON 2xx body — a truncated/garbled response, or an
             # upstream gateway briefly returning an HTML error page with status 200.
             # Transient like a 5xx, so raise the transient subclass: the daemon defers
-            # and retries rather than abandoning the thread, and a *persistent* one is
-            # still bounded by the FailureTracker give-up path (issue #27, building on #26).
+            # and retries rather than abandoning the thread (decision D5, superseding
+            # the issue #27/#26 give-up bound). A *persistent* one that singles out
+            # one thread while siblings succeed surfaces through the masquerade
+            # escalation; a proxy-wide one stays at the per-thread WARNING plus the
+            # cycle summary — never give-up either way.
             raise ProxyUnavailableError("Proxy returned non-JSON response for successful request")
 
     async def _send(self, do_request, operation: str) -> dict:

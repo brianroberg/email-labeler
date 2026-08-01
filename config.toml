@@ -29,6 +29,19 @@ fetch_parallel = 4
 # Separate from fetch_parallel because writes may block on human approval
 # (WRITE_TIMEOUT, 300s), so the sizing tradeoff differs. Override: WRITE_PARALLEL.
 write_parallel = 4
+# How many strikes a thread takes before it is set aside under agent/attempted.
+# Only failures the cycle-level attribution blames on the thread itself count
+# (decision D5 Rule 2): a failure signature unique among the cycle's candidates,
+# with at least one sibling that succeeded — or a cycle in which this thread was
+# the only one that attempted anything, the adjudicated singleton edge and the
+# usual shape of a poison thread (everything else has processed away). So 5 is 5
+# such cycles: long enough to ride out a bad afternoon, short enough that a
+# genuinely poison thread stops burning LLM spend within minutes of polling.
+# The same number is the masquerade escalation threshold: after this many
+# cycles of provider-shaped failures on one thread while siblings succeed, the
+# daemon starts shouting about it (that thread is retried forever, never
+# abandoned). Override: MAX_FAILURES.
+max_failures = 5
 healthcheck_file = "/tmp/healthcheck"
 
 [labels]
@@ -68,11 +81,15 @@ model = "{env.MLX_MODEL}"
 # step-by-step scaffold the prompt asks for — as untagged prose in content,
 # label last — and observed demand ran to ~1,300 completion tokens on hard
 # threads (issue #64). An over-budget decode truncates content before the label
-# is emitted; llm_client raises LLMContentError on finish_reason "length" (so
-# it can no longer silently parse to the default LOW_PRIORITY → archive), but
-# that backstop turns every over-budget thread into an eventual give-up
-# (agent/attempted) — the budget must fit the honest demand. This raise is
-# therefore coupled to the thinking disable below, not independent tuning.
+# is emitted; llm_client raises LLMContentError on finish_reason "length" (and
+# a keyword-free reply that reaches the parser raises there — since D5 Rule 1
+# there is no LOW_PRIORITY → archive default left to land in), but
+# that backstop makes an undersized budget loud rather than cheap: a lone
+# over-budget thread strikes out to agent/attempted, and several co-failing
+# over-budget threads share a signature and are held as shared-cause (D5) —
+# deferred every cycle, backlog kept. Either way the budget must fit the
+# honest demand. This raise is therefore coupled to the thinking disable
+# below, not independent tuning.
 # NOTE: this also quadruples the per-request decode budget each concurrent
 # local request's KV cache can grow into. The documented LOCAL_PARALLEL
 # ceiling ("keep ≤ 8", README-technical "Local Model Serving & Memory") was
@@ -163,9 +180,11 @@ model = "claude-sonnet-4-6"
 # single response, so output scales with newsletter size — 1024 truncated
 # multi-story newsletters mid-story. llm_client now raises LLMContentError on
 # finish_reason "length" (issue #64) instead of silently parsing a truncated
-# story list, so an undersized budget here would abandon long newsletters to
-# agent/attempted rather than mis-grade them. Sized by that reasoning (issue
-# #64's Fix 4); this tier has not been live-probed.
+# story list, so an undersized budget here fails loudly rather than mis-grading:
+# a lone over-budget newsletter strikes out to agent/attempted, and several
+# co-failing over-budget newsletters share a signature and are held as
+# shared-cause (D5) — deferred every cycle, backlog kept. Sized by that
+# reasoning (issue #64's Fix 4); this tier has not been live-probed.
 # NOTE: max_tokens is part of the eval cache key (evals/llm_cache.py), so
 # changing it invalidates every cached newsletter response and the next
 # newsletter_run re-bills the whole golden set — while prompt_hash (prompts
@@ -175,9 +194,11 @@ max_tokens = 4096
 temperature = 0
 # 180, not 60: a full-budget 4096-token Sonnet decode at typical non-streaming
 # throughput (~50-80 tok/s) runs 50-80+ seconds — the old 60s bound only fit
-# responses capped at 1024 tokens. A timeout here is give-up-eligible
-# (agent/attempted after repeated strikes), so the timeout must contain the
-# decode the max_tokens budget above allows.
+# responses capped at 1024 tokens. A timeout here is a strike candidate — the
+# cycle attribution counts it only when it blames this newsletter (D5), so a
+# newsletter that keeps timing out alone ends at agent/attempted while several
+# timing out together are held as shared cause — so the timeout must contain
+# the decode the max_tokens budget above allows.
 timeout = 180
 
 

@@ -41,7 +41,7 @@ The repo pins `requires-python >=3.14`, but the code runs fine on 3.11–3.13 wi
 
 ```bash
 python3 -m venv /tmp/tuivenv && /tmp/tuivenv/bin/pip install -q \
-  httpx python-dotenv fastapi jinja2 uvicorn python-multipart "textual>=8.2.8" \
+  httpx python-dotenv "textual>=8.2.8" \
   pytest pytest-asyncio pytest-subtests ruff
 ```
 
