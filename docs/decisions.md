@@ -455,3 +455,24 @@ hourly push for an unchanged halt; forwarding the provider's response body in
 a push; a balance-*endpoint* check replacing the completion probe (a separate issue records it as a possible complement — the
 2026-08-25 fault was a completion 403 with funds present, which a balance
 check would have called fine).
+
+## D23 — The newsletter grading rubric is the spec; the newsletter prompts implement it (2026-09-09)
+
+**Status:** docs implemented (`docs/newsletter-rubric.md`); the prompt and eval changes it proposes are
+pending.
+
+What the newsletter grader's outputs mean — story extraction, the four storytelling dimensions and their
+grades, the tier, the five Ends-Statement themes and their grades — and how golden-set stories are
+labeled live in **`docs/newsletter-rubric.md`**, not in `config.toml`. The prompts are an implementation
+of that rubric; a disagreement is resolved by changing the prompt. The rubric records Brian's rulings of
+2026-09-09: the grader's primary purpose is **coaching staff storytelling and Ends alignment**, with
+DM-newsletter shortlisting a slice; the error-cost order therefore puts over-grading first; when torn the
+grader grades down and states why; the newsletter-level Gmail label (best story's tier, strongest theme
+grade — D14) is a shortlist filter, not a grade of the newsletter; each grade carries a one-sentence
+reason naming the test applied; qualification boundaries are shown by short excerpt examples (minimal
+pairs may be written), degree boundaries (OK/GOOD, PRESENT/EMPHASIZED) are decided by tests; scarcity of
+EMPHASIZED stories for a theme is a coaching finding, reported as "no support", never 0%. D14 is to be
+read as a cost rule (a wrong theme label costs more than a missed one).
+Forecloses: prompt edits that introduce a rule the rubric does not state; relabeling golden stories to
+match model output; ranking prompts or models on tier accuracy alone; treating the newsletter-level
+label as a grade of the newsletter.
