@@ -611,3 +611,318 @@ class TestVerboseGoldenContext:
         out = capsys.readouterr().out
         assert "Project update" in out
         assert "coworker@corp.com" in out
+
+
+# ---------------------------------------------------------------------------
+# Assistant field metrics (issue #78 groundwork)
+# ---------------------------------------------------------------------------
+
+def _asst_result(
+    expected_lb: str,
+    expected_assistant: bool | None,
+    predicted_assistant: bool | None = None,
+    thread_id: str = "t",
+) -> PredictionResult:
+    return PredictionResult(
+        thread_id=thread_id,
+        expected_sender_type="person",
+        expected_label=expected_lb,
+        predicted_sender_type="person",
+        predicted_label=expected_lb,
+        sender_type_correct=True,
+        label_correct=True,
+        expected_assistant=expected_assistant,
+        predicted_assistant=predicted_assistant,
+    )
+
+
+class TestAssistantMetrics:
+    def test_scored_population_is_annotated_needs_response_threads_only(self):
+        results = [
+            _asst_result("needs_response", True, True, "a"),
+            _asst_result("needs_response", None, None, "b"),   # not annotated
+            _asst_result("fyi", None, None, "c"),              # not needs_response
+        ]
+        a = compute_metrics(results)["assistant"]
+        assert a["needs_response_threads"] == 2
+        assert a["annotated"] == 1
+        assert a["count"] == 1
+
+    def test_binary_precision_recall_f1(self):
+        # 2 true positives, 1 false positive, 2 false negatives.
+        results = [
+            _asst_result("needs_response", True, True, "tp1"),
+            _asst_result("needs_response", True, True, "tp2"),
+            _asst_result("needs_response", False, True, "fp1"),
+            _asst_result("needs_response", True, False, "fn1"),
+            _asst_result("needs_response", True, False, "fn2"),
+            _asst_result("needs_response", False, False, "tn1"),
+        ]
+        a = compute_metrics(results)["assistant"]
+        assert a["true_positives"] == 2
+        assert a["false_positives"] == 1
+        assert a["false_negatives"] == 2
+        assert a["precision"] == 2 / 3
+        assert a["recall"] == 0.5
+        assert abs(a["f1"] - 2 * (2 / 3) * 0.5 / ((2 / 3) + 0.5)) < 1e-9
+        assert a["count"] == 6
+
+    def test_prediction_outside_the_scored_set_is_a_false_positive_on_its_own_line(self):
+        results = [
+            _asst_result("needs_response", True, True, "in"),
+            _asst_result("fyi", None, True, "out_label"),          # wrong label
+            _asst_result("needs_response", None, True, "out_annot"),  # unannotated
+            _asst_result("fyi", None, False, "negative"),          # not a positive
+        ]
+        a = compute_metrics(results)["assistant"]
+        assert a["out_of_scope_positives"] == 2
+        # ...and it does not contaminate the scored precision.
+        assert a["true_positives"] == 1
+        assert a["false_positives"] == 0
+        assert a["precision"] == 1.0
+
+    def test_no_predictions_reports_annotation_progress_instead_of_metrics(self):
+        results = [
+            _asst_result("needs_response", True, None, "a"),
+            _asst_result("needs_response", None, None, "b"),
+            _asst_result("needs_response", False, None, "c"),
+            _asst_result("fyi", None, None, "d"),
+        ]
+        a = compute_metrics(results)["assistant"]
+        assert a["predictions"] == 0
+        assert a["precision"] is None
+        assert a["recall"] is None
+        assert a["f1"] is None
+        assert a["annotated"] == 2
+        assert a["needs_response_threads"] == 3
+
+    def test_error_results_are_excluded(self):
+        results = [
+            _asst_result("needs_response", True, True, "ok"),
+            PredictionResult(
+                thread_id="boom", expected_sender_type="person",
+                expected_label="needs_response", expected_assistant=True,
+                error="timeout",
+            ),
+        ]
+        a = compute_metrics(results)["assistant"]
+        assert a["annotated"] == 1
+        assert a["needs_response_threads"] == 1
+
+    def test_predictions_are_counted_over_the_scored_set_only(self):
+        # A prediction that lands outside the scored population is reported on
+        # its own line and leaves the score undefined -- it is not a denominator.
+        results = [
+            _asst_result("needs_response", True, None, "scored_unpredicted"),
+            _asst_result("fyi", None, True, "out_of_scope"),
+        ]
+        a = compute_metrics(results)["assistant"]
+        assert a["predictions"] == 0
+        assert a["out_of_scope_positives"] == 1
+        assert a["precision"] is None
+        assert a["recall"] is None
+        assert a["f1"] is None
+
+    def test_unannotated_thread_with_a_prediction_scores_nothing(self):
+        # The golden set's state before any annotation pass: predictions exist,
+        # nothing is annotated, so there is no score -- not a score of zero.
+        results = [
+            _asst_result("needs_response", None, True, "unannotated_pos"),
+            _asst_result("needs_response", None, False, "unannotated_neg"),
+        ]
+        a = compute_metrics(results)["assistant"]
+        assert a["annotated"] == 0
+        assert a["predictions"] == 0
+        assert a["precision"] is None
+        assert a["recall"] is None
+        assert a["f1"] is None
+
+    def test_all_negative_expectations_predicted_correctly_are_undefined(self):
+        # tp+fp and tp+fn are both zero: a perfect all-negative run. Precision
+        # and recall have no denominator, so they are None rather than 0.0.
+        results = [
+            _asst_result("needs_response", False, False, "tn1"),
+            _asst_result("needs_response", False, False, "tn2"),
+        ]
+        a = compute_metrics(results)["assistant"]
+        assert a["predictions"] == 2
+        assert a["true_positives"] == 0
+        assert a["false_positives"] == 0
+        assert a["false_negatives"] == 0
+        assert a["precision"] is None
+        assert a["recall"] is None
+        assert a["f1"] is None
+
+    def test_zero_precision_and_recall_leave_f1_undefined(self):
+        # Both figures are measured and both are 0.0; their sum is F1's
+        # denominator, so F1 itself is undefined.
+        results = [
+            _asst_result("needs_response", True, False, "fn"),
+            _asst_result("needs_response", False, True, "fp"),
+        ]
+        a = compute_metrics(results)["assistant"]
+        assert a["precision"] == 0.0
+        assert a["recall"] == 0.0
+        assert a["f1"] is None
+
+    def test_missing_in_scope_prediction_counts_as_a_false_negative(self):
+        # No marker label on a thread the owner annotated "yes" is a miss, not
+        # an abstention: the mail lands in his own pile.
+        results = [_asst_result("needs_response", True, None, "no_prediction")]
+        a = compute_metrics(results)["assistant"]
+        assert a["false_negatives"] == 1
+
+    def test_a_missing_prediction_drags_recall_down(self):
+        results = [
+            _asst_result("needs_response", True, True, "hit"),
+            _asst_result("needs_response", True, None, "miss"),
+        ]
+        a = compute_metrics(results)["assistant"]
+        assert a["predictions"] == 1
+        assert a["true_positives"] == 1
+        assert a["false_negatives"] == 1
+        assert a["precision"] == 1.0
+        assert a["recall"] == 0.5
+
+    def test_empty_results_have_no_assistant_section(self):
+        assert "assistant" not in compute_metrics([])
+
+
+class TestAssistantJson:
+    def test_json_output_carries_the_assistant_section(self, capsys):
+        from evals.report import report_as_json
+
+        metrics = compute_metrics([_asst_result("needs_response", True, None, "a")])
+        report_as_json(_make_meta(), metrics)
+        payload = __import__("json").loads(capsys.readouterr().out)
+        assert payload["metrics"]["assistant"]["annotated"] == 1
+        assert payload["metrics"]["assistant"]["predictions"] == 0
+
+
+class TestPrintAssistantSection:
+    def test_no_predictions_prints_annotation_progress(self, capsys):
+        results = [
+            _asst_result("needs_response", True, None, "a"),
+            _asst_result("needs_response", False, None, "b"),
+            _asst_result("needs_response", None, None, "c"),
+            _asst_result("fyi", None, None, "d"),
+        ]
+        print_report(_make_meta(), compute_metrics(results))
+        out = capsys.readouterr().out
+        assert (
+            "assistant: no predictions in this run "
+            "(2 of 3 needs_response threads annotated)"
+        ) in out
+        assert "Precision" not in out.split("--- Assistant Field ---")[1]
+
+    def test_metrics_printed_with_n_on_every_figure(self, capsys):
+        results = [
+            _asst_result("needs_response", True, True, "tp1"),
+            _asst_result("needs_response", True, True, "tp2"),
+            _asst_result("needs_response", False, True, "fp1"),
+            _asst_result("needs_response", True, False, "fn1"),
+        ]
+        print_report(_make_meta(), compute_metrics(results))
+        section = capsys.readouterr().out.split("--- Assistant Field ---")[1]
+        assert "Precision: 66.7% (n=4)" in section
+        assert "Recall:    66.7% (n=4)" in section
+        assert "F1:        66.7% (n=4)" in section
+
+    def test_undefined_figures_print_na_rather_than_zero(self, capsys):
+        results = [
+            _asst_result("needs_response", False, False, "tn1"),
+            _asst_result("needs_response", False, False, "tn2"),
+        ]
+        print_report(_make_meta(), compute_metrics(results))
+        # Just the assistant block, not the sections printed after it.
+        section = capsys.readouterr().out.split("--- Assistant Field ---")[1].split("\n\n")[0]
+        assert "Precision: N/A" in section
+        assert "Recall:    N/A" in section
+        assert "F1:        N/A" in section
+        assert "0.0%" not in section
+
+    def test_out_of_scope_positives_are_reported_with_no_in_scope_predictions(self, capsys):
+        results = [
+            _asst_result("needs_response", True, None, "scored_unpredicted"),
+            _asst_result("fyi", None, True, "out_of_scope"),
+        ]
+        print_report(_make_meta(), compute_metrics(results))
+        section = capsys.readouterr().out.split("--- Assistant Field ---")[1].split("\n\n")[0]
+        assert "no predictions in this run" in section
+        assert "outside the scored set: 1" in section
+        assert "0.0%" not in section
+
+    def test_out_of_scope_positives_get_their_own_line(self, capsys):
+        results = [
+            _asst_result("needs_response", True, True, "in"),
+            _asst_result("fyi", None, True, "out"),
+        ]
+        print_report(_make_meta(), compute_metrics(results))
+        section = capsys.readouterr().out.split("--- Assistant Field ---")[1]
+        assert "outside the scored set: 1" in section
+
+
+def _write_run(path, results, **meta_kw):
+    """Write a results JSONL (run_meta line + prediction lines) at *path*."""
+    import json
+
+    meta = _make_meta(**meta_kw)
+    with open(path, "w") as f:
+        f.write(json.dumps(meta.to_dict()) + "\n")
+        for r in results:
+            f.write(json.dumps(r.to_dict()) + "\n")
+
+
+class TestTrendAssistantColumn:
+    def test_trend_has_an_assistant_column(self, tmp_path, capsys):
+        from evals.report import print_trend
+
+        _write_run(tmp_path / "a.jsonl", [
+            _asst_result("needs_response", True, True, "tp"),
+            _asst_result("needs_response", False, True, "fp"),
+        ], run_id="run-a", tag="with-preds")
+        print_trend(tmp_path)
+        out = capsys.readouterr().out
+        assert "Assistant" in out
+        assert "66.7%" in out  # F1 for 1 tp / 1 fp / 0 fn: P=50%, R=100%
+
+    def test_trend_shows_na_when_a_run_has_no_assistant_predictions(self, tmp_path, capsys):
+        from evals.report import print_trend
+
+        _write_run(tmp_path / "a.jsonl", [
+            _asst_result("needs_response", True, None, "unpredicted"),
+        ], run_id="run-a", tag="no-preds")
+        print_trend(tmp_path)
+        out = capsys.readouterr().out
+        assert "Assistant" in out
+        assert "N/A" in out
+
+
+class TestCompareAssistant:
+    def _metrics(self, *results):
+        return compute_metrics(list(results))
+
+    def test_comparison_shows_assistant_precision_recall_f1_with_delta(self, capsys):
+        a = self._metrics(
+            _asst_result("needs_response", True, True, "tp"),
+            _asst_result("needs_response", False, True, "fp"),
+        )
+        b = self._metrics(
+            _asst_result("needs_response", True, True, "tp"),
+            _asst_result("needs_response", False, False, "tn"),
+        )
+        print_comparison(_make_meta(), a, _make_meta(), b)
+        out = capsys.readouterr().out
+        assert "--- Assistant Field ---" in out
+        section = out.split("--- Assistant Field ---")[1]
+        assert "Precision" in section
+        assert "Recall" in section
+        assert "F1" in section
+        assert "+50.0%" in section  # precision 50% -> 100%
+
+    def test_comparison_omits_the_block_when_a_run_has_no_predictions(self, capsys):
+        a = self._metrics(_asst_result("needs_response", True, True, "tp"))
+        b = self._metrics(_asst_result("needs_response", True, None, "none"))
+        print_comparison(_make_meta(), a, _make_meta(), b)
+        out = capsys.readouterr().out
+        assert "--- Assistant Field ---" not in out

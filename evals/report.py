@@ -119,6 +119,70 @@ def compute_accuracy(results: list[PredictionResult], correct_field: str) -> flo
     return correct / len(applicable)
 
 
+def compute_assistant_metrics(valid: list[PredictionResult]) -> dict:
+    """Binary metrics for the assistant field (issue #78).
+
+    Scored population: threads whose expected label is ``needs_response`` AND
+    which carry a non-null ``expected_assistant`` annotation. ``count`` is that
+    n, and every reported figure is over it.
+
+    Within that population a thread counts as a positive prediction only when
+    ``predicted_assistant`` is True; a thread with no prediction counts as a
+    negative, which is what the absence of the marker label means in practice
+    (the owner sees the mail as his own).
+
+    A positive prediction on any thread OUTSIDE the scored population — wrong
+    label, or annotation not yet made — is reported separately as
+    ``out_of_scope_positives`` rather than folded into precision, so an
+    unfinished annotation pass cannot flatter or punish the score.
+
+    ``predictions`` counts non-null ``predicted_assistant`` values WITHIN the
+    scored population, because those are the only ones the figures are computed
+    over. While it is 0, precision/recall/f1 are None: there is nothing to
+    score, and a 0.0 would read as a measured failure.
+
+    Each figure is also None when its own denominator is zero — precision when
+    ``tp + fp`` is 0 (nothing was predicted positive), recall when ``tp + fn``
+    is 0 (nothing was annotated positive), F1 when ``precision + recall`` is 0.
+    A run that correctly predicts an all-negative scored set therefore reads
+    N/A rather than 0.0%.
+    """
+    needs_response = [r for r in valid if r.expected_label == "needs_response"]
+    scored = [r for r in needs_response if r.expected_assistant is not None]
+    scored_ids = {id(r) for r in scored}
+    predictions = [r for r in scored if r.predicted_assistant is not None]
+    out_of_scope_positives = sum(
+        1 for r in valid if r.predicted_assistant is True and id(r) not in scored_ids
+    )
+
+    tp = sum(1 for r in scored if r.expected_assistant is True and r.predicted_assistant is True)
+    fp = sum(1 for r in scored if r.expected_assistant is False and r.predicted_assistant is True)
+    fn = sum(1 for r in scored if r.expected_assistant is True and r.predicted_assistant is not True)
+
+    metrics: dict = {
+        "needs_response_threads": len(needs_response),
+        "annotated": len(scored),
+        "count": len(scored),
+        "predictions": len(predictions),
+        "true_positives": tp,
+        "false_positives": fp,
+        "false_negatives": fn,
+        "out_of_scope_positives": out_of_scope_positives,
+        "precision": None,
+        "recall": None,
+        "f1": None,
+    }
+    if predictions:
+        precision = tp / (tp + fp) if (tp + fp) > 0 else None
+        recall = tp / (tp + fn) if (tp + fn) > 0 else None
+        if precision is not None and recall is not None and (precision + recall) > 0:
+            f1 = 2 * precision * recall / (precision + recall)
+        else:
+            f1 = None
+        metrics.update({"precision": precision, "recall": recall, "f1": f1})
+    return metrics
+
+
 def compute_metrics(results: list[PredictionResult]) -> dict:
     """Compute all metrics from prediction results.
 
@@ -164,6 +228,10 @@ def compute_metrics(results: list[PredictionResult]) -> dict:
             "per_class": lb_prf,
             "count": len(lb_results),
         }
+
+    # Assistant field (issue #78): scored separately from the three-way label.
+    if valid:
+        metrics["assistant"] = compute_assistant_metrics(valid)
 
     # Combined (both stages correct)
     both_results = [r for r in valid
@@ -223,6 +291,44 @@ def format_per_class_table(prf: dict[str, dict[str, float]], classes: list[str])
     return "\n".join(lines)
 
 
+def _out_of_scope_line(a: dict) -> str:
+    return (
+        f"  Predicted assistant outside the scored set: {a['out_of_scope_positives']} "
+        f"(counted separately, not in the figures above)"
+    )
+
+
+def format_assistant_section(a: dict) -> list[str]:
+    """Lines for the assistant-field block of a report.
+
+    With no predictions inside the scored set the block states annotation
+    progress instead — how much of the needs_response population has been
+    annotated — because that is the only thing the run can actually say about
+    the field; any positives predicted outside that set are still listed.
+    An undefined figure prints ``N/A`` (see ``compute_assistant_metrics``).
+    """
+    if not a["predictions"]:
+        lines = [
+            f"  assistant: no predictions in this run ({a['annotated']} of "
+            f"{a['needs_response_threads']} needs_response threads annotated)"
+        ]
+        if a["out_of_scope_positives"]:
+            lines.append(_out_of_scope_line(a))
+        return lines
+    n = a["count"]
+    lines = [
+        f"  Scored: {n} needs_response threads carrying an expected_assistant annotation",
+        f"  Precision: {format_pct(a['precision'])} (n={n})",
+        f"  Recall:    {format_pct(a['recall'])} (n={n})",
+        f"  F1:        {format_pct(a['f1'])} (n={n})",
+        f"  Counts:    tp={a['true_positives']}  fp={a['false_positives']}  "
+        f"fn={a['false_negatives']} (n={n})",
+    ]
+    if a["out_of_scope_positives"]:
+        lines.append(_out_of_scope_line(a))
+    return lines
+
+
 def print_report(meta: RunMeta, metrics: dict, verbose: bool = False,
                  results: list[PredictionResult] | None = None,
                  golden_context: dict[str, GoldenThread] | None = None) -> None:
@@ -258,6 +364,11 @@ def print_report(meta: RunMeta, metrics: dict, verbose: bool = False,
         print(format_confusion_matrix(s2["confusion_matrix"], LABEL_CLASSES))
         print("\n  Per-class metrics:")
         print(format_per_class_table(s2["per_class"], LABEL_CLASSES))
+
+    if "assistant" in metrics:
+        print("\n--- Assistant Field ---")
+        for line in format_assistant_section(metrics["assistant"]):
+            print(line)
 
     if "combined" in metrics:
         c = metrics["combined"]
@@ -342,6 +453,17 @@ def print_comparison(
                     format_pct(s2b["per_class"][cls]["f1"]),
                     delta(s2a["per_class"][cls]["f1"], s2b["per_class"][cls]["f1"]),
                 ], widths))
+
+    aa, ab = metrics1.get("assistant"), metrics2.get("assistant")
+    if aa and ab and aa["predictions"] and ab["predictions"]:
+        print("\n--- Assistant Field ---")
+        print("  " + format_table_row(["Metric", "Run A", "Run B", "Delta"], widths))
+        print("  " + "-" * sum(w + 2 for w in widths))
+        for name, key in [("Precision", "precision"), ("Recall", "recall"), ("F1", "f1")]:
+            print("  " + format_table_row([
+                f"{name} (n={aa['count']}/{ab['count']})",
+                format_pct(aa[key]), format_pct(ab[key]), delta(aa[key], ab[key]),
+            ], widths))
 
     if "combined" in metrics1 and "combined" in metrics2:
         ca, cb = metrics1["combined"], metrics2["combined"]
@@ -429,9 +551,10 @@ def print_trend(results_dir: Path) -> None:
     print(f"Trend Report ({len(files)} runs)")
     print(f"{'=' * 60}")
 
-    widths = [12, 10, 20, 12, 12, 12, 8]
+    widths = [12, 10, 20, 12, 12, 12, 12, 8]
     print("  " + format_table_row(
-        ["Run ID", "Stages", "Tag/Config", "Stage 1", "Stage 2", "Combined", "Errors"],
+        ["Run ID", "Stages", "Tag/Config", "Stage 1", "Stage 2", "Combined", "Assistant",
+         "Errors"],
         widths,
     ))
     print("  " + "-" * sum(w + 2 for w in widths))
@@ -444,6 +567,9 @@ def print_trend(results_dir: Path) -> None:
             s1_acc = format_pct(metrics.get("stage1", {}).get("accuracy"))
             s2_acc = format_pct(metrics.get("stage2", {}).get("accuracy"))
             comb = format_pct(metrics.get("combined", {}).get("accuracy"))
+            # Assistant F1 is None until a run actually predicts the field, so
+            # an unscored run reads N/A rather than 0.0%.
+            asst = format_pct(metrics.get("assistant", {}).get("f1"))
 
             print("  " + format_table_row([
                 meta.run_id[:8],
@@ -452,6 +578,7 @@ def print_trend(results_dir: Path) -> None:
                 s1_acc,
                 s2_acc,
                 comb,
+                asst,
                 str(metrics["errors"]),
             ], widths))
         except Exception as exc:
