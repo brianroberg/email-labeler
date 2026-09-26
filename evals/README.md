@@ -47,6 +47,25 @@ is the way to boost a rare class (e.g. `needs_response`) in the golden set:
 harvested threads still carry their inferred labels into `evals.review` for
 manual confirmation, so the manual classification step is not bypassed.
 
+**Hand-picking threads.** Sometimes the threads you want are ones the daemon
+got wrong — cold sales pitches it filed as `service`/`low_priority`, say — so
+no `--sender-type`/`--label` combination will find them. Instead, pick them in
+Gmail: create a label (e.g. `eval/harvest`), apply it to threads the daemon
+has already processed, then harvest exactly those and correct their labels:
+
+```bash
+uv run python -m evals.harvest --proxy-url http://localhost:8000 --gmail-label eval/harvest
+uv run python -m evals.review --unreviewed-only
+```
+
+The new rows carry the daemon's inferred labels as ground truth and a note
+naming the Gmail label, so they are recognizable in `evals.review`. Leave the
+Gmail label in place: a re-run skips threads already in the golden set before
+fetching them — until the label outgrows one fetch's message window, when the
+run warns and you either raise `--max-threads` or remove the label from
+threads already harvested. Flag semantics, and what the harvest can and cannot
+reach: [README-technical.md](README-technical.md#harvest).
+
 ## 2. Review — Manually verify ground truth labels
 
 Interactive CLI for reviewing and correcting labels in the golden set. Saves atomically after each session. Press `z` at any prompt to undo the last classification — undo works as a stack, walking back through previous decisions.

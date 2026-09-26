@@ -10,6 +10,7 @@ To start fresh, delete the file manually.
 Usage:
     python -m evals.harvest --output evals/golden_set.jsonl --max-threads 200
     python -m evals.harvest --output evals/golden_set.jsonl --sender-type person
+    python -m evals.harvest --gmail-label eval/harvest   # hand-picked threads
 """
 
 import argparse
@@ -105,16 +106,8 @@ def infer_ground_truth(
     return sender_type, label
 
 
-def deduplicate(new_threads: list[GoldenThread], existing_path: Path) -> list[GoldenThread]:
-    """Remove threads already present in the existing golden set file.
-
-    Args:
-        new_threads: Newly harvested threads.
-        existing_path: Path to existing golden set JSONL file.
-
-    Returns:
-        Threads not already in the file.
-    """
+def load_existing_thread_ids(existing_path: Path) -> set[str]:
+    """Thread IDs already present in the golden set file (empty if absent)."""
     existing_ids: set[str] = set()
     if existing_path.exists():
         with open(existing_path) as f:
@@ -134,8 +127,61 @@ def deduplicate(new_threads: list[GoldenThread], existing_path: Path) -> list[Go
                 thread_id = entry.get("thread_id")
                 if thread_id:
                     existing_ids.add(thread_id)
+    return existing_ids
 
+
+def deduplicate(new_threads: list[GoldenThread], existing_path: Path) -> list[GoldenThread]:
+    """Remove threads already present in the existing golden set file.
+
+    Args:
+        new_threads: Newly harvested threads.
+        existing_path: Path to existing golden set JSONL file.
+
+    Returns:
+        Threads not already in the file.
+    """
+    existing_ids = load_existing_thread_ids(existing_path)
     return [t for t in new_threads if t.thread_id not in existing_ids]
+
+
+def gmail_label_arg(value: str) -> str:
+    """argparse type for --gmail-label: a non-empty Gmail label name, trimmed.
+
+    An empty value (e.g. an unset shell variable) is rejected rather than
+    treated as "no filter", which would silently widen a hand-picked harvest
+    to the whole processed pool. A double quote is rejected because the name
+    is embedded in a quoted Gmail search term and Gmail has no escape for it.
+    """
+    name = value.strip()
+    if not name:
+        raise argparse.ArgumentTypeError("expected a non-empty Gmail label name")
+    if '"' in name:
+        raise argparse.ArgumentTypeError("a Gmail label name cannot contain a double quote here")
+    return name
+
+
+def build_query(
+    processed_label: str,
+    filter_label: str | None = None,
+    gmail_label: str | None = None,
+) -> str:
+    """Build the Gmail search query for the harvest fetch from resolved label names.
+
+    Always matches ``processed_label``; ``filter_label`` (the classification
+    label's Gmail name, not its config key) and ``gmail_label`` are ANDed in,
+    in that order, when given.
+
+    The appended labels are passed quoted (``label:"eval/harvest"``) so a
+    user-supplied name containing spaces stays a single search term. Gmail's
+    own search box shows labels in a hyphen-substituted form
+    (``label:my-label``); if a quoted name returns nothing, that form is the
+    documented fallback.
+    """
+    terms = [f"label:{processed_label}"]
+    for name in (filter_label, gmail_label):
+        if name:
+            terms.append(f'label:"{name}"')
+    return " ".join(terms)
 
 
 async def harvest_threads(
@@ -144,6 +190,8 @@ async def harvest_threads(
     max_threads: int = 200,
     sender_type_filter: str | None = None,
     label_filter: str | None = None,
+    gmail_label: str | None = None,
+    skip_thread_ids: set[str] | None = None,
 ) -> list[GoldenThread]:
     """Fetch processed threads and build golden set entries.
 
@@ -153,11 +201,16 @@ async def harvest_threads(
         max_threads: Maximum threads to fetch.
         sender_type_filter: Optional filter for "person" or "service".
         label_filter: Optional filter for classification label.
+        gmail_label: Optional Gmail label name ANDed into the query, for
+            hand-picked threads (e.g. eval/harvest). Must exist in Gmail.
+        skip_thread_ids: Threads to leave unfetched (already in the golden
+            set); they do not count against ``max_threads``.
 
     Returns:
         List of GoldenThread objects.
     """
     labels_config = config["labels"]
+    skip_thread_ids = skip_thread_ids or set()
     now = datetime.now(timezone.utc).isoformat()
 
     # Build label ID -> name map
@@ -168,23 +221,35 @@ async def harvest_threads(
         sys.exit(1)
     label_id_to_name = {lbl["id"]: lbl["name"] for lbl in labels_response["labels"]}
 
-    # Fetch message stubs with agent/processed label. When a classification
-    # filter is set, AND it into the Gmail query so the fetch returns a dense
-    # pool of matching threads instead of relying on the recent processed
-    # window happening to contain them (label_filter is also re-checked per
-    # thread below, since a thread's messages can carry multiple labels).
-    processed_label = labels_config["processed"]
-    query = f"label:{processed_label}"
+    # Resolve the classification filter to its Gmail label name. An unmapped
+    # key can never match a harvested thread (infer_ground_truth only knows
+    # mapped keys), so it is an error, not a degraded query.
+    filter_label_name = None
     if label_filter:
-        filter_label_name = labels_config.get(label_filter, "")
-        if filter_label_name:
-            # Quote the label name: classification labels contain hyphens
-            # (agent/needs-response, agent/low-priority) and an unquoted '-'
-            # can be read by Gmail as the NOT operator, silently matching nothing.
-            query += f' label:"{filter_label_name}"'
-        else:
-            print(f"Warning: --label '{label_filter}' has no mapping in [labels]; "
-                  "querying processed-only.", file=sys.stderr)
+        filter_label_name = labels_config.get(label_filter)
+        if not filter_label_name:
+            print(f"Error: --label '{label_filter}' has no mapping in [labels]", file=sys.stderr)
+            sys.exit(1)
+
+    # A hand-picked label must exist in Gmail, or "no messages found" would
+    # be indistinguishable from "nothing labeled yet". Match case-insensitively
+    # but query with the spelling list_labels reported — the one known to
+    # exist — so how Gmail treats case in label: search does not matter here.
+    if gmail_label:
+        canonical_names = {name.lower(): name for name in label_id_to_name.values()}
+        canonical = canonical_names.get(gmail_label.lower())
+        if canonical is None:
+            print(f"Error: --gmail-label '{gmail_label}' is not a label in this Gmail account",
+                  file=sys.stderr)
+            sys.exit(1)
+        gmail_label = canonical
+
+    # Fetch message stubs with agent/processed label. Filters are ANDed into
+    # the Gmail query so the fetch returns a dense pool of matching threads
+    # instead of relying on the recent processed window happening to contain
+    # them (label_filter is also re-checked per thread below, since a
+    # thread's messages can carry multiple labels).
+    query = build_query(labels_config["processed"], filter_label_name, gmail_label)
     try:
         response = await proxy.list_messages(
             q=query,
@@ -207,13 +272,35 @@ async def harvest_threads(
 
     print(f"Found {len(thread_ids)} unique threads from {len(msg_stubs)} messages", file=sys.stderr)
 
+    # Threads already in the golden set are skipped before fetching and do
+    # not consume max_threads slots — otherwise a hand-picked label larger
+    # than the cap could never reach its older picks on a re-run.
+    candidates = [tid for tid in thread_ids if tid not in skip_thread_ids]
+    if len(candidates) < len(thread_ids):
+        print(f"Skipping {len(thread_ids) - len(candidates)} threads already in the golden set",
+              file=sys.stderr)
+
+    # The fetch is a message-level budget with no pagination, so long threads
+    # can exhaust it before max_threads distinct threads have surfaced. Say so
+    # when that happened, since matching threads are then missing silently.
+    # Counted AFTER the skip: on a re-run the window may hold only known
+    # threads while the unharvested picks sit beyond it.
+    if len(candidates) < max_threads and (
+        response.get("nextPageToken") or len(msg_stubs) >= max_threads * 3
+    ):
+        print("Warning: message budget exhausted (max_threads * 3) before reaching "
+              "--max-threads with new threads; some matching threads were not "
+              "fetched — raise --max-threads, narrow the query, or remove the label "
+              "from already-harvested threads", file=sys.stderr)
+
     # Fetch each thread and build golden entries
     results: list[GoldenThread] = []
-    for i, tid in enumerate(list(thread_ids.keys())[:max_threads]):
+    for i, tid in enumerate(candidates[:max_threads]):
         try:
             thread_data = await proxy.get_thread(tid)
             messages = thread_data.get("messages", [])
             if not messages:
+                print(f"  Skipping thread {tid}: no messages", file=sys.stderr)
                 continue
 
             # Sort chronologically
@@ -226,10 +313,14 @@ async def harvest_threads(
                       file=sys.stderr)
                 continue
 
-            # Apply filters
+            # Apply filters, naming the thread so a hand-picked shortfall is diagnosable
             if sender_type_filter and sender_type != sender_type_filter:
+                print(f"  Skipping thread {tid}: sender_type={sender_type}, "
+                      f"filter wants {sender_type_filter}", file=sys.stderr)
                 continue
             if label_filter and label != label_filter:
+                print(f"  Skipping thread {tid}: label={label}, filter wants {label_filter}",
+                      file=sys.stderr)
                 continue
 
             # Extract metadata
@@ -255,11 +346,14 @@ async def harvest_threads(
                 expected_label=label,
                 source="harvested",
                 harvested_at=now,
+                # Hand-picked rows carry labels the daemon (by hypothesis) got
+                # wrong; the review TUI shows notes, so name the label there.
+                notes=f"hand-picked via Gmail label {gmail_label}" if gmail_label else "",
             )
             results.append(golden)
 
             if (i + 1) % 10 == 0:
-                print(f"  Processed {i + 1}/{min(len(thread_ids), max_threads)} threads...", file=sys.stderr)
+                print(f"  Processed {i + 1}/{min(len(candidates), max_threads)} threads...", file=sys.stderr)
 
         except _NETWORK_ERRORS as exc:
             print(f"  Error fetching thread {tid}: {format_network_error(exc, 'api-proxy')}",
@@ -286,6 +380,7 @@ def write_golden_set(threads: list[GoldenThread], output_path: Path) -> None:
 async def main(args: argparse.Namespace) -> None:
     config = load_eval_config(args.config)
     proxy = GmailProxyClient(proxy_url=args.proxy_url)
+    output_path = Path(args.output)
 
     threads = await harvest_threads(
         proxy=proxy,
@@ -293,13 +388,16 @@ async def main(args: argparse.Namespace) -> None:
         max_threads=args.max_threads,
         sender_type_filter=args.sender_type,
         label_filter=args.label,
+        gmail_label=args.gmail_label,
+        skip_thread_ids=load_existing_thread_ids(output_path),
     )
 
     if not threads:
         print("No threads to write.", file=sys.stderr)
         return
 
-    output_path = Path(args.output)
+    # Backstop: known threads were skipped before fetching, but the file may
+    # have gained rows during the run.
     threads = deduplicate(threads, output_path)
     if not threads:
         print("All threads already in golden set.", file=sys.stderr)
@@ -317,6 +415,10 @@ def cli():
     parser.add_argument("--sender-type", choices=["person", "service"], help="Filter by sender type")
     parser.add_argument("--label", choices=list(_CLASSIFICATION_LABELS),
                         help="Filter by classification label")
+    parser.add_argument(
+        "--gmail-label", metavar="LABEL", type=gmail_label_arg,
+        help="Only harvest threads also carrying this Gmail label (hand-picked test cases)",
+    )
     parser.add_argument("--config", help="Path to config.toml (default: ./config.toml)")
     parser.add_argument("--proxy-url", help="API proxy URL (overrides PROXY_URL env var)")
     # Deprecated no-op: harvest always appends now. Kept so existing automation
