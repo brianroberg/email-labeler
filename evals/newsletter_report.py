@@ -15,7 +15,7 @@ import re
 import sys
 from pathlib import Path
 
-from evals import plural
+from evals import clean_for_display, plural
 from evals.newsletter_schemas import (
     ExtractionPrediction,
     NewsletterRunMeta,
@@ -29,7 +29,7 @@ from evals.report import (
     format_per_class_table,
     format_table_row,
 )
-from newsletter import _VALID_THEMES, classify_theme_line
+from newsletter import _VALID_THEMES, THEME_GRADE_RANK, classify_theme_line
 
 TIERS = ["excellent", "good", "fair", "poor"]
 DIMENSIONS = ["simple", "concrete", "personal", "dynamic"]
@@ -79,6 +79,124 @@ def compute_dimension_exact_match(results: list[StoryPrediction]) -> dict[str, f
     return _dimension_mean(results, lambda e, p: e == p)
 
 
+def _rate(count: int, of: int) -> float | None:
+    return count / of if of else None
+
+
+def _direction(pairs: list[tuple[int, int]], bottom: int, top: int) -> dict:
+    """Direction of (expected, predicted) pairs on a scale from *bottom* to *top*.
+
+    A label already at the top cannot be graded too high, nor one at the bottom
+    too low, so each rate is taken over the labels that could move that way
+    (``over_of`` / ``under_of``). Measured over every pair instead, a rate would
+    shrink with the share of labels at the far end and move with the label mix.
+    ``signed`` is the mean of predicted - expected over all pairs. A rate with
+    nothing to measure is None: "no data", not zero.
+    """
+    over_of = sum(e < top for e, _ in pairs)
+    under_of = sum(e > bottom for e, _ in pairs)
+    over_count = sum(p > e for e, p in pairs)
+    under_count = sum(p < e for e, p in pairs)
+    return {
+        "n": len(pairs),
+        "over_count": over_count, "over_of": over_of, "over": _rate(over_count, over_of),
+        "under_count": under_count, "under_of": under_of, "under": _rate(under_count, under_of),
+        "signed": sum(p - e for e, p in pairs) / len(pairs) if pairs else None,
+    }
+
+
+def _dimension_cell(pairs: list[tuple[int, int]]) -> dict:
+    cell = _direction(pairs, bottom=1, top=3)
+    # GOOD for a story that has not earned it is the rubric's worst error;
+    # OK for a Poor story is its cheapest. Count the first apart from the pool.
+    cell["wrong_good"] = sum(p == 3 and e < 3 for e, p in pairs)
+    cell["wrong_good_rate"] = _rate(cell["wrong_good"], cell["over_of"])
+    return cell
+
+
+def compute_dimension_direction(results: list[StoryPrediction]) -> dict:
+    """Per dimension, how often the model graded higher or lower than the label.
+
+    Agreement metrics (MAE, exact match) cannot tell over-grading from
+    under-grading, and the rubric ranks over-grading as the costliest error
+    (docs/newsletter-rubric.md section 1). Keys are the dimensions plus "all",
+    which pools every dimension judgment. See ``_direction`` for the
+    denominators; ``wrong_good`` counts GOOD given where the label was lower.
+    """
+    out = {}
+    pooled: list[tuple[int, int]] = []
+    for dim in DIMENSIONS:
+        pairs = _dimension_pairs(results, dim)
+        pooled += pairs
+        out[dim] = _dimension_cell(pairs)
+    out["all"] = _dimension_cell(pooled)
+    return out
+
+
+_THEME_GRADE_NAME = {None: "absent", "present": "present", "emphasized": "emphasized"}
+# predicted_for_expected confusions worth naming: a wrong EMPHASIZED earns a
+# Gmail label the story did not deserve (D14); the rest are its mirror images.
+_THEME_CONFUSIONS = (
+    "emphasized_for_present", "emphasized_for_absent", "present_for_absent",
+    "present_for_emphasized", "absent_for_emphasized", "absent_for_present",
+)
+
+
+def _theme_rank(grade: str | None) -> int:
+    return THEME_GRADE_RANK.get(grade, 0)
+
+
+def _theme_cell(graded: list[tuple[str | None, str | None]]) -> dict:
+    """Direction of (expected, predicted) theme grades, with the named confusions
+    and how many stories carried each label (the confusions' denominators)."""
+    cell = _direction([(_theme_rank(e), _theme_rank(p)) for e, p in graded], bottom=0, top=2)
+    cell.update(dict.fromkeys(_THEME_CONFUSIONS, 0))
+    for expected, predicted in graded:
+        if expected != predicted:
+            cell[f"{_THEME_GRADE_NAME[predicted]}_for_{_THEME_GRADE_NAME[expected]}"] += 1
+    cell["absent_labeled"] = sum(e is None for e, _ in graded)
+    cell["present_labeled"] = sum(e == "present" for e, _ in graded)
+    cell["emphasized_labeled"] = sum(e == "emphasized" for e, _ in graded)
+    return cell
+
+
+def compute_theme_direction(results: list[StoryPrediction], themes: list[str]) -> dict:
+    """Per theme, how often the model's grade came out higher or lower than the
+    label on Absent < Present < Emphasized, and which confusions those were
+    (issue #55). Keys are the themes plus "all", which pools every theme
+    judgment and also carries ``unreadable``.
+
+    Only rows whose theme call succeeded count, and a row whose reply the parser
+    could not fully read (``theme_parse_anomalies``) is left out: a line the
+    parser skipped would otherwise be scored as the model grading that theme
+    Absent. ``unreadable`` says how many rows that was.
+    """
+    unreadable = {anomaly["story_id"] for anomaly in theme_parse_anomalies(results)}
+    scored = [r for r in results if _theme_scored(r) and r.story_id not in unreadable]
+    out = {}
+    pooled: list[tuple[str | None, str | None]] = []
+    for theme in themes:
+        graded = [
+            (_theme_grade(r.expected_themes, theme), _theme_grade(r.predicted_themes, theme))
+            for r in scored
+        ]
+        pooled += graded
+        out[theme] = _theme_cell(graded)
+    out["all"] = _theme_cell(pooled)
+    out["all"]["unreadable"] = len(unreadable)
+    return out
+
+
+def format_rate_delta(a: float | None, b: float | None) -> str:
+    """Delta for a lower-is-better rate (graded too high / too low), as a percent."""
+    if a is None or b is None:
+        return "N/A"
+    d = b - a
+    sign = "+" if d >= 0 else ""
+    label = " (improved)" if d < 0 else (" (worse)" if d > 0 else "")
+    return f"{sign}{d:.1%}{label}"
+
+
 # NB: a "within-1" dimension metric was dropped in the 3-value migration (#53):
 # on a 1-3 scale the only pair NOT within 1 is a Poor<->Good confusion, so it was
 # ~always 1.0 and added no signal beyond MAE (now 0-2) + exact-match.
@@ -122,6 +240,9 @@ def compute_all_metrics(
         "tier": compute_tier_metrics(story_results, mode),
         "dimension_mae": compute_dimension_mae(story_results),
         "dimension_exact": compute_dimension_exact_match(story_results),
+        # Which way the disagreements run: over-grading is the costly direction.
+        "dimension_direction": compute_dimension_direction(story_results),
+        "theme_direction": compute_theme_direction(story_results, THEMES),
         # Primary, production-aligned: only Emphasized earns a Gmail label (#53).
         "themes": compute_multilabel_metrics(story_results, THEMES, positive="emphasized"),
         # Secondary: whether the theme was detected at all (Present or Emphasized).
@@ -562,32 +683,48 @@ def load_results(
 
 
 def _text_excerpt(text: str) -> str:
-    """Whitespace-collapse *text* and truncate to a short label (~60 chars)."""
-    collapsed = re.sub(r"\s+", " ", text or "").strip()
+    """Whitespace-collapse *text* and truncate to a short label (~60 chars).
+
+    Control characters are removed first: excerpts are printed to a terminal and
+    the stored text is email content."""
+    collapsed = re.sub(r"\s+", " ", clean_for_display(text or "")).strip()
     return collapsed[:57] + "..." if len(collapsed) > 60 else collapsed
 
 
-def load_story_excerpts(golden_set_path: str) -> dict[str, str]:
-    """Best-effort story_id -> text-excerpt map from the run's golden set file.
-
-    Results rows carry only story_ids; the story text lives in the golden set,
-    so verbose output labels a story by the first words of its text. Any failure
-    (moved/deleted file, malformed line) degrades to {} so verbose output falls
-    back to bare story_ids.
-    """
+def _excerpts_from(path: str, records) -> dict[str, str]:
+    """story id -> excerpt from one JSONL file; {} if it cannot be read."""
     excerpts: dict[str, str] = {}
     try:
-        with open(golden_set_path) as f:
+        with open(path) as f:
             for line in f:
                 line = line.strip()
                 if not line:
                     continue
-                d = json.loads(line)
-                for s in d.get("stories", []):
-                    if s.get("story_id") and s.get("text"):
-                        excerpts[s["story_id"]] = _text_excerpt(s["text"])
-    except (OSError, json.JSONDecodeError):
+                for story_id, text in records(json.loads(line)):
+                    if story_id and text:
+                        excerpts[story_id] = _text_excerpt(text)
+    except (OSError, json.JSONDecodeError, AttributeError, TypeError):
         return {}
+    return excerpts
+
+
+def load_story_excerpts(golden_set_path: str, story_labels_path: str = "") -> dict[str, str]:
+    """Best-effort story_id -> text-excerpt map for a run's stories.
+
+    Results rows carry only story_ids; the story text lives in the curated
+    golden set and, for stories graded in newsletter_grade, in the story-label
+    log (keyed by ``story_key``). Verbose output labels a story by the first
+    words of its text. A file that is missing or malformed contributes nothing,
+    so verbose output falls back to bare story_ids for its stories.
+    """
+    excerpts = _excerpts_from(
+        golden_set_path,
+        lambda d: [(s.get("story_id"), s.get("text")) for s in d.get("stories", [])],
+    )
+    if story_labels_path:
+        excerpts.update(_excerpts_from(
+            story_labels_path, lambda d: [(d.get("story_key"), d.get("text"))],
+        ))
     return excerpts
 
 
@@ -608,6 +745,53 @@ def _format_dim_table(
             [dim, mae_s, format_pct(exact.get(dim))],
             widths,
         ))
+    return "\n".join(lines)
+
+
+def _format_signed(value: float | None) -> str:
+    return "N/A" if value is None else f"{value:+.2f}"
+
+
+def _format_share(count: int, of: int) -> str:
+    """'3/40 (7.5%)': a count beside what it is out of; N/A when nothing could count."""
+    return f"{count}/{of} ({count / of:.1%})" if of else "N/A"
+
+
+def _format_direction_tables(dimension: dict, theme: dict) -> str:
+    """Too-high / too-low shares per dimension and per theme.
+
+    Every figure is a count over the labels it could apply to, so a share over
+    three stories does not read like one over forty.
+    """
+    name_width = max(len("Dimension"), len("all"), *(len(t) for t in THEMES))
+    widths = [name_width, 4, 16, 16, 16, 7]
+    lines = ["  " + format_table_row(
+        ["Dimension", "n", "Too high", "Too low", "Wrong GOOD", "Signed"], widths),
+        "  " + "-" * sum(w + 2 for w in widths)]
+    for dim in [*DIMENSIONS, "all"]:
+        d = dimension[dim]
+        lines.append("  " + format_table_row(
+            [dim, str(d["n"]),
+             _format_share(d["over_count"], d["over_of"]),
+             _format_share(d["under_count"], d["under_of"]),
+             _format_share(d["wrong_good"], d["over_of"]),
+             _format_signed(d["signed"])], widths))
+    widths = [name_width, 4, 16, 16, 18, 18]
+    lines += ["", "  " + format_table_row(
+        ["Theme", "n", "Too high", "Too low", "Emph. for Present", "Emph. for Absent"], widths),
+        "  " + "-" * sum(w + 2 for w in widths)]
+    for name in [*THEMES, "all"]:
+        t = theme[name]
+        lines.append("  " + format_table_row(
+            [name, str(t["n"]),
+             _format_share(t["over_count"], t["over_of"]),
+             _format_share(t["under_count"], t["under_of"]),
+             _format_share(t["emphasized_for_present"], t["present_labeled"]),
+             _format_share(t["emphasized_for_absent"], t["absent_labeled"])], widths))
+    unreadable = theme["all"].get("unreadable", 0)
+    if unreadable:
+        lines += ["", f"  {plural(unreadable, 'story', 'stories')} left out of the theme rows: "
+                      "the theme reply could not be fully read (see Parse anomalies)."]
     return "\n".join(lines)
 
 
@@ -650,7 +834,13 @@ def print_report(
         print(f"  Tag:          {meta.tag}")
     print(f"  Golden set:   {meta.golden_set_path}")
     print(f"  Newsletters:  {meta.golden_set_count}")
-    print(f"  Stories:      {meta.story_count}")
+    stories_line = f"  Stories:      {meta.story_count}"
+    if meta.story_label_count:
+        curated = meta.story_count - meta.story_label_count
+        stories_line += (
+            f" ({curated} curated, {meta.story_label_count} from the story-label log)"
+        )
+    print(stories_line)
 
     # Sections with zero underlying predictions are omitted (mirroring the tier
     # section) instead of rendering as a fake 0.0%.
@@ -691,6 +881,11 @@ def print_report(
         print()
         print(_format_theme_table(themes))
 
+        if "dimension_direction" in metrics:
+            print("\n--- Grading direction (count / labels that could be graded that way) ---")
+            print(_format_direction_tables(
+                metrics["dimension_direction"], metrics["theme_direction"]))
+
     extraction = metrics["extraction"]
     if extraction["count"] or extraction.get("errors"):
         print("\n--- Extraction ---")
@@ -712,7 +907,7 @@ def print_report(
             story_results or [],
             extraction_results or [],
             match_threshold=match_threshold,
-            excerpts=load_story_excerpts(meta.golden_set_path),
+            excerpts=load_story_excerpts(meta.golden_set_path, meta.story_labels_path),
             anomalies=metrics.get("theme_anomalies", []),
         )
 
@@ -841,10 +1036,18 @@ def print_comparison(
     print(f"\n{'=' * 60}")
     print("Newsletter Comparison Report")
     print(f"{'=' * 60}")
-    print(f"  Run A: {meta1.run_id[:8]}  mode={meta1.mode}  "
-          f"prompt_hash={meta1.prompt_hash or 'n/a'}  tag={meta1.tag or '-'}")
-    print(f"  Run B: {meta2.run_id[:8]}  mode={meta2.mode}  "
-          f"prompt_hash={meta2.prompt_hash or 'n/a'}  tag={meta2.tag or '-'}")
+    for name, meta in (("A", meta1), ("B", meta2)):
+        stories = f"stories={meta.story_count}"
+        if meta.story_label_count:
+            stories += f" ({meta.story_label_count} from the story-label log)"
+        print(f"  Run {name}: {meta.run_id[:8]}  mode={meta.mode}  model={meta.newsletter_model}  "
+              f"prompt_hash={meta.prompt_hash or 'n/a'}  tag={meta.tag or '-'}  {stories}")
+    if story1 is not None and story2 is not None:
+        ids1, ids2 = {r.story_id for r in story1}, {r.story_id for r in story2}
+        if ids1 != ids2:
+            print(f"\n  WARNING: the two runs scored different stories ({len(ids1)} and "
+                  f"{len(ids2)}, {len(ids1 & ids2)} in common). Every delta below mixes the "
+                  "change being tested with the change in stories.")
     if meta1.mode != meta2.mode:
         print(f"\n  WARNING: run modes differ ({meta1.mode} vs {meta2.mode}); "
               "sections absent from one run show N/A and deltas are not comparable.")
@@ -878,6 +1081,39 @@ def print_comparison(
         a_s = "N/A" if a is None else f"{a:.2f}"
         b_s = "N/A" if b is None else f"{b:.2f}"
         print("  " + format_table_row([dim, a_s, b_s, format_mae_delta(a, b)], widths))
+
+    # Direction: is the model grading too high (the costly error) less often?
+    da, db = metrics1.get("dimension_direction"), metrics2.get("dimension_direction")
+    ta_dir, tb_dir = metrics1.get("theme_direction"), metrics2.get("theme_direction")
+    if da and db and ta_dir and tb_dir:
+        def rate_row(label: str, a: float | None, b: float | None) -> None:
+            print("  " + format_table_row(
+                [label, format_pct(a), format_pct(b), format_rate_delta(a, b)], widths))
+
+        def emphasized_rate(cell: dict, label: str) -> float | None:
+            return _rate(cell[f"emphasized_for_{label}"], cell[f"{label}_labeled"])
+
+        header("Graded too high (lower=better)")
+        for dim in DIMENSIONS:
+            rate_row(dim, da[dim]["over"], db[dim]["over"])
+        rate_row("all dimensions", da["all"]["over"], db["all"]["over"])
+        rate_row("  wrong GOOD", da["all"]["wrong_good_rate"], db["all"]["wrong_good_rate"])
+        rate_row("all themes", ta_dir["all"]["over"], tb_dir["all"]["over"])
+        for label in ("present", "absent"):
+            rate_row(f"  Emph. for {label.capitalize()}",
+                     emphasized_rate(ta_dir["all"], label), emphasized_rate(tb_dir["all"], label))
+        print(f"  (labels that could be graded higher: dimensions A {da['all']['over_of']}, "
+              f"B {db['all']['over_of']}; themes A {ta_dir['all']['over_of']}, "
+              f"B {tb_dir['all']['over_of']})")
+
+        header("Graded too low (lower=better)")
+        for dim in DIMENSIONS:
+            rate_row(dim, da[dim]["under"], db[dim]["under"])
+        rate_row("all dimensions", da["all"]["under"], db["all"]["under"])
+        rate_row("all themes", ta_dir["all"]["under"], tb_dir["all"]["under"])
+        print(f"  (labels that could be graded lower: dimensions A {da['all']['under_of']}, "
+              f"B {db['all']['under_of']}; themes A {ta_dir['all']['under_of']}, "
+              f"B {tb_dir['all']['under_of']})")
 
     # Themes — primary Emphasized rows, then the secondary detection (>=Present)
     # rows so a detection-level regression between runs is visible here too

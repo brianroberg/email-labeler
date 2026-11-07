@@ -258,11 +258,84 @@ TUI details:
 > extraction/quality/theme `prompt_hash`, so runs recorded before the change are
 > no longer prompt-comparable.
 
+### newsletter_grade
+
+| Flag | Description |
+|---|---|
+| `--assessments` | Production assessments JSONL to draw stories from (default: `[newsletter] output_file` in the config, relative to the CWD) |
+| `--labels` | Story-label log to append to (default: `evals/newsletter_story_labels.jsonl`) |
+| `--golden-set` | Hand-curated golden set; newsletters it has reviewed or excluded are left out of the queue (default: `evals/newsletter_golden_set.jsonl`; a missing file means none) |
+| `--config` | Path to config.toml (default: the repo-root `config.toml`, regardless of CWD); read for `[newsletter] output_file` and `[newsletter.rubric]` |
+| `--miscut` | List the stories set aside as miscut (by thread, with reason, opening words and note), then exit |
+
+Grades ready-made stories, one at a time, into an append-only label log. Needs
+no LLM endpoint and no proxy.
+
+**Queue.** Built in memory at launch from the assessments file (read with the
+review TUI's `load_assessments`, so the newest record per thread is used and
+pre-#53 records must be migrated first). Only each story's text, its thread id
+and the record's timestamp are read; grades, tiers, reasoning, model, sender and
+subject are not carried into the queue or onto the screen. Left out: threads the
+curated golden set has reviewed or excluded (a newsletter that was only
+harvested stays in), stories already labeled, blank texts, and a text already
+queued. Order is by story key (a hash of the text), so it is the same on every
+launch and does not group a newsletter's stories together.
+
+**Screen.** The story (scrollable with Up/Down, PgUp/PgDn and Home/End while
+grading; while a note is typed Up/Down and PgUp/PgDn still scroll it, and
+Home/End move within the note), the question being asked with the
+wording from `[newsletter.rubric]`, the answers so far, and the keys:
+
+| Key | Action |
+|---|---|
+| `1` `2` `3` | Answer the current question: low / middle / high |
+| `0` | Answer Absent for the remaining themes (ignored while a dimension is asked) |
+| `t` | Flag the current question as torn; a card with a torn flag asks why and is not saved until a reason is given (`Esc` returns to the question) |
+| `n` | Add or edit the story's note |
+| `backspace` | Take back the last answer; at a story's first question, reopen the story labeled just before |
+| `x` | Mark the story miscut, then `1`-`4` for the reason and an optional note |
+| `s` | Move the story to the end of the queue (answers given so far are dropped) |
+| `Esc` | Cancel the note or the miscut menu |
+| `q` | Quit (a half-answered story is not saved) |
+
+**Label log.** One JSON line per finished story (`StoryLabel` in
+`evals/newsletter_schemas.py`): `story_key`, `thread_id`, `text`, `status`
+(`graded` or `miscut`), `scores`, `themes`, `torn`, `note`, `miscut_reason`,
+`recut_of`, `labeled_at`, `seconds`, `source_timestamp`. Lines are appended and
+synced; earlier lines are not rewritten. The newest line per `story_key` is the
+one in force, by `labeled_at` (file order breaks ties), so re-grading a story
+appends a line and two machines' logs are combined by concatenating them. A
+label that cannot be written leaves the story on screen. The file holds story
+text and is gitignored.
+
+`newsletter_run` reads this log by default (`--story-labels`): graded stories
+become ground truth for the quality and theme metrics.
+
+**Miscut stories** stay in the log with their text, reason and note, and are left
+out of the queue under that key. Two rules bring later cuts of the same thread
+back, where "later" is by the assessment record's timestamp against the
+label's `source_timestamp` (stories from the same extraction as a labeled story
+are its neighbors and are queued plainly, even when a cut that ran long
+contains them):
+
+- A later story that contains a miscut story, or is contained in it, is queued
+  as its recut (`recut_of`).
+- A later story that is mostly the same text as an already graded story is not
+  queued again. One that only shares a passage with it (a sign-off, say), or is
+  a much longer cut of it, is queued.
+
+A miscut story leaves the `--miscut` list when it is graded itself, when a
+graded story names it in `recut_of`, or when a story graded from a later
+extraction contains it or is contained in it (so a chain of miscut recuts
+drains once one cut is graded). Texts marked "not a story" are final: they are
+counted in the listing, not listed as waiting.
+
 ### newsletter_run
 
 | Flag | Description |
 |---|---|
-| `--golden-set` | Path to newsletter golden set JSONL (default: `evals/newsletter_golden_set.jsonl`) |
+| `--golden-set` | Path to newsletter golden set JSONL (default: `evals/newsletter_golden_set.jsonl`), or `none` to score only the story-label log. A missing file is an error |
+| `--story-labels` | Story-label log written by `newsletter_grade` (default: `evals/newsletter_story_labels.jsonl`; a missing file means none). Its graded stories are scored in the `quality`, `themes` and `all` modes alongside the curated golden stories, and not in extraction: their boundaries came from the extractor. Miscut stories, and stories whose thread is in the curated golden set, are left out. Each result row records its `source` (`curated` or `story_labels`) and the run metadata records `story_label_count`. With graded stories in the log, the `quality` and `themes` modes run when the curated golden set has no reviewed newsletters, or with `--golden-set none`; `extraction` needs the curated set |
 | `--config` | Path to config.toml (default: the repo-root `config.toml`, regardless of CWD) |
 | `--output-dir` | Output directory for results (default: `evals/newsletter_results/`) |
 | `--mode` | Which outputs to evaluate: `extraction`, `quality`, `themes`, or `all` (default: `all`). `quality` and `themes` fire **only their own** LLM calls; the skipped side's fields are `null` in the results rows |
@@ -401,6 +474,29 @@ and exit code 1 (all three modes) — and when the offending path is a
 `.cot.jsonl`, a hint points at the main results file. Public helpers:
 `match_stories_detailed()`, `theme_parse_anomalies()`, `load_story_excerpts()`,
 `build_trend_rows()`, `comparison_as_json()`.
+
+
+**Grading direction.** Agreement metrics (MAE, exact match, F1) do not say which
+way the model disagrees with the labels, and the rubric ranks over-grading as
+the costliest error. The single-run report therefore prints, per dimension and
+per theme, how often the model graded **too high** and **too low**.
+
+- Each figure is a count over the labels it could apply to: a label already at
+  the top of its scale cannot be graded too high, nor one at the bottom too
+  low, so those are not in the denominator. `N/A` means nothing could count.
+- Dimensions also show **Wrong GOOD** (GOOD given where the label was lower,
+  the error the rubric ranks worst) and the signed mean error.
+- Themes also show wrong EMPHASIZED grades split by the label (Present or
+  Absent), each over the number of stories so labeled (issue #55).
+- A story whose theme reply the parser could not fully read is left out of the
+  theme rows and counted in a line beneath them; it is listed under Parse
+  anomalies, not scored as the model grading a theme Absent.
+
+`--compare` shows the too-high and too-low rates of both runs, lower being
+better, with the wrong-GOOD and wrong-EMPHASIZED rates and the denominators.
+Its header names each run's model and story count, and it warns when the two
+runs did not score the same stories, since `newsletter_run` picks up newly
+graded stories by default and a delta then mixes the two changes.
 
 ### Newsletter shared cache & prompt separation
 

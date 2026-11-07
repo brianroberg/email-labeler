@@ -197,10 +197,28 @@ newsletter_harvest → newsletter_label → newsletter_run → newsletter_report
   auto-derived from scores. `X` excludes a whole newsletter from the queue and
   eval runs (toggle; relaunch with `--include-excluded` to see and restore
   excluded ones). No LLM endpoint is needed.
+- **grade** — A second Textual tool, for growing the *grading* ground truth
+  without drawing any boundaries. It queues the story texts the daemon has
+  already extracted (from the production assessments file) and shows them one at
+  a time, with nothing the model said about them, beside the rubric's wording for
+  the question being asked. Nine single-key answers per story: `1`/`2`/`3` are
+  always low/middle/high (Poor/OK/Good for the four dimensions, then
+  Absent/Present/Emphasized for the five themes) and `0` answers Absent for the
+  remaining themes. `t` flags the current question as one you were torn on (the
+  tool then asks why before saving), `n` adds a note, `backspace` takes back an
+  answer and steps back into the previous story, `s` skips. `x` marks a story
+  **miscut** (cut short, runs past its end, several stories in one, not a story):
+  it is set aside for recutting, not graded and not thrown away. The story
+  scrolls while you grade and while you type a note. Each finished story is appended to
+  `evals/newsletter_story_labels.jsonl`; nothing else is saved or accepted. No
+  LLM endpoint is needed.
 - **run** — Replay the golden set through the real classifier (LLM-cached) and
-  write timestamped results.
+  write timestamped results. Stories graded with **grade** are scored too, in
+  the quality and theme metrics only; the report's header says how many stories
+  came from each source.
 - **report** — Compute tier/dimension/theme/extraction metrics, compare two runs,
-  or show a trend across runs.
+  or show a trend across runs. It also reports the *direction* of disagreement:
+  how often the model graded too high and too low, per dimension and per theme.
 
 **Environment.** `newsletter_run` calls the `[newsletter.llm]` endpoint resolved
 from `NEWSLETTER_LLM_URL` / `NEWSLETTER_LLM_API_KEY`, falling back to
@@ -238,6 +256,15 @@ uv run python -m evals.newsletter_report --results-dir evals/newsletter_results/
 ```bash
 uv run python -m evals.newsletter_harvest --proxy-url http://localhost:8000
 uv run python -m evals.newsletter_label --unreviewed-only
+```
+
+**Grade ready-made stories** (run where the daemon's assessments file is, or
+pass a copy with `--assessments`):
+
+```bash
+uv run python -m evals.newsletter_grade
+uv run python -m evals.newsletter_grade --assessments /path/to/newsletter_assessments.jsonl
+uv run python -m evals.newsletter_grade --miscut    # list stories set aside for recutting
 ```
 
 **Iterate a prompt variant:**

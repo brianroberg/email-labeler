@@ -13,13 +13,16 @@ from evals.newsletter_report import (
     cli,
     comparison_as_json,
     compute_all_metrics,
+    compute_dimension_direction,
     compute_dimension_exact_match,
     compute_dimension_mae,
     compute_extraction_metrics,
     compute_multilabel_metrics,
+    compute_theme_direction,
     compute_tier_metrics,
     format_mae_delta,
     format_metric_delta,
+    format_rate_delta,
     load_story_excerpts,
     match_stories,
     match_stories_detailed,
@@ -1213,3 +1216,318 @@ class TestComparisonDeltaSign:
         assert m["themes"]["micro_f1"] == 1.0
         assert m["dimension_mae"]["simple"] == 0.0
         assert m["extraction"]["micro_f1"] == 1.0
+
+
+class TestStoryLabelCountInHeader:
+    def test_header_splits_the_story_count_by_source(self, capsys):
+        metrics = compute_all_metrics([_pred()], [])
+        print_report(_meta(mode="quality", story_count=7, story_label_count=5), metrics,
+                     story_results=[_pred()])
+        assert "Stories:      7 (2 curated, 5 from the story-label log)" in capsys.readouterr().out
+
+    def test_header_is_unchanged_without_label_log_stories(self, capsys):
+        metrics = compute_all_metrics([_pred()], [])
+        print_report(_meta(mode="quality", story_count=7), metrics, story_results=[_pred()])
+        out = capsys.readouterr().out
+        assert "Stories:      7\n" in out
+        assert "story-label log" not in out
+
+    def test_meta_written_before_the_field_existed_loads_with_zero(self):
+        old = _meta().to_dict()
+        del old["story_label_count"]
+        del old["story_labels_path"]
+        restored = NewsletterRunMeta.from_dict(old)
+        assert (restored.story_label_count, restored.story_labels_path) == (0, "")
+
+
+def _scores(simple, concrete, personal, dynamic):
+    return {"simple": simple, "concrete": concrete, "personal": personal, "dynamic": dynamic}
+
+
+def _themed(story_id, expected, predicted):
+    """A row whose theme reply is the well-formed one that parses to *predicted*."""
+    row = _pred(story_id=story_id, expected_themes=expected, predicted_themes=predicted)
+    row.themes_raw = "\n".join(
+        f"{theme.upper()}: {predicted.get(theme, 'absent').upper()}" for theme in THEMES
+    )
+    return row
+
+
+class TestDimensionDirection:
+    """Over-grading is the rubric's costliest error (docs/newsletter-rubric.md §1);
+    agreement metrics alone cannot tell it from under-grading."""
+
+    def _rows(self):
+        return [
+            _pred("a", expected_scores=_scores(2, 2, 2, 2), predicted_scores=_scores(3, 2, 1, 2)),
+            _pred("b", expected_scores=_scores(1, 2, 3, 2), predicted_scores=_scores(3, 2, 3, 2)),
+            _pred("c", expected_scores=_scores(2, 2, 2, 2), predicted_scores=None),  # parse failure
+        ]
+
+    def test_too_high_is_measured_over_the_labels_that_could_be_graded_higher(self):
+        simple = compute_dimension_direction(self._rows())["simple"]
+        assert (simple["n"], simple["over_count"], simple["over_of"]) == (2, 2, 2)
+        assert simple["over"] == 1.0
+        assert simple["signed"] == 1.5
+
+    def test_too_low_is_measured_over_the_labels_that_could_be_graded_lower(self):
+        direction = compute_dimension_direction(self._rows())
+        # simple's labels are OK and Poor: only the OK can be graded lower.
+        assert (direction["simple"]["under_count"], direction["simple"]["under_of"]) == (0, 1)
+        personal = direction["personal"]
+        assert (personal["under_count"], personal["under_of"], personal["under"]) == (1, 2, 0.5)
+        # personal's labels are OK and Good: a Good cannot be over-graded.
+        assert (personal["over_count"], personal["over_of"]) == (0, 1)
+
+    def test_a_good_label_is_never_counted_as_a_chance_to_over_grade(self):
+        rows = [_pred("a", expected_scores=_scores(3, 3, 3, 3), predicted_scores=_scores(3, 3, 3, 3))]
+        simple = compute_dimension_direction(rows)["simple"]
+        assert (simple["over_of"], simple["over"]) == (0, None)
+        assert (simple["under_of"], simple["under"]) == (1, 0.0)
+
+    def test_a_wrong_good_is_counted_apart_from_other_over_grades(self):
+        # The rubric's worst error is GOOD for a story that has not earned it;
+        # OK for a Poor story is its cheapest. One pooled rate hides the difference.
+        rows = [
+            _pred("a", expected_scores=_scores(1, 2, 2, 2), predicted_scores=_scores(2, 3, 2, 2)),
+        ]
+        direction = compute_dimension_direction(rows)
+        assert direction["simple"]["over_count"] == 1
+        assert direction["simple"]["wrong_good"] == 0
+        assert direction["concrete"]["wrong_good"] == 1
+        assert direction["all"]["wrong_good"] == 1
+        assert direction["all"]["wrong_good_rate"] == pytest.approx(1 / 4)
+
+    def test_all_pools_every_dimension_judgment(self):
+        direction = compute_dimension_direction(self._rows())["all"]
+        assert direction["n"] == 8
+        assert (direction["over_count"], direction["over_of"]) == (2, 7)
+        assert (direction["under_count"], direction["under_of"]) == (1, 7)
+        assert direction["signed"] == pytest.approx((1 + 2 - 1) / 8)
+
+    def test_no_scored_stories_is_not_a_rate_of_zero(self):
+        direction = compute_dimension_direction([])
+        assert direction["simple"]["n"] == 0
+        assert direction["simple"]["over"] is None and direction["simple"]["under"] is None
+        assert direction["simple"]["signed"] is None
+        assert direction["all"]["wrong_good_rate"] is None
+
+
+class TestThemeDirection:
+    def _rows(self):
+        return [
+            _themed("a", {"scripture": "present"}, {"scripture": "emphasized"}),
+            _themed("b", {}, {"scripture": "emphasized", "church": "present"}),
+            _themed("c", {"scripture": "emphasized", "church": "emphasized"},
+                    {"scripture": "present"}),
+            _pred("d", expected_themes={"scripture": "present"}),  # theme call never ran
+        ]
+
+    def test_rates_are_over_the_labels_that_could_move_that_way(self):
+        direction = compute_theme_direction(self._rows(), THEMES)
+        scripture = direction["scripture"]
+        assert scripture["n"] == 3
+        assert (scripture["over_count"], scripture["over_of"], scripture["over"]) == (2, 2, 1.0)
+        assert (scripture["under_count"], scripture["under_of"], scripture["under"]) == (1, 2, 0.5)
+        church = direction["church"]
+        assert (church["over_count"], church["over_of"]) == (1, 2)
+        assert (church["under_count"], church["under_of"]) == (1, 1)
+
+    def test_missing_every_labeled_theme_reads_as_always_too_low(self):
+        # Ten stories, two labeled scripture=emphasized, the model finds no
+        # theme anywhere. Measured over all cells that would read as 4%.
+        rows = [_themed(f"s{i}", {"scripture": "emphasized"} if i < 2 else {}, {})
+                for i in range(10)]
+        direction = compute_theme_direction(rows, THEMES)
+        assert direction["scripture"]["under"] == 1.0
+        assert (direction["all"]["under_count"], direction["all"]["under_of"]) == (2, 2)
+        assert direction["all"]["under"] == 1.0
+
+    def test_wrong_emphasized_grades_come_with_how_many_stories_could_have_one(self):
+        # EMPHASIZED is what earns a Gmail label (D14), so a wrong one is split
+        # by the true grade, each against the number of stories so labeled.
+        scripture = compute_theme_direction(self._rows(), THEMES)["scripture"]
+        assert (scripture["emphasized_for_present"], scripture["present_labeled"]) == (1, 1)
+        assert (scripture["emphasized_for_absent"], scripture["absent_labeled"]) == (1, 1)
+        church = compute_theme_direction(self._rows(), THEMES)["church"]
+        assert (church["emphasized_for_absent"], church["absent_labeled"]) == (0, 2)
+
+    def test_all_pools_every_theme_judgment(self):
+        direction = compute_theme_direction(self._rows(), THEMES)["all"]
+        assert direction["n"] == 3 * len(THEMES)
+        assert (direction["over_count"], direction["over_of"]) == (3, 13)
+        assert (direction["under_count"], direction["under_of"]) == (2, 3)
+
+    def test_no_scored_stories_is_not_a_rate_of_zero(self):
+        direction = compute_theme_direction([], THEMES)
+        assert direction["scripture"]["n"] == 0
+        assert direction["scripture"]["over"] is None
+        assert direction["all"]["under"] is None
+
+
+class TestDirectionInReports:
+    def _rows(self):
+        rows = [
+            _pred("a", expected_scores=_scores(2, 2, 2, 2), predicted_scores=_scores(3, 2, 1, 2),
+                  expected_themes={"scripture": "present"},
+                  predicted_themes={"scripture": "emphasized"}),
+            _pred("b", expected_scores=_scores(1, 2, 3, 2), predicted_scores=_scores(3, 2, 3, 2)),
+        ]
+        for row in rows:
+            row.themes_raw = "SCRIPTURE: ABSENT"
+        return rows
+
+    def test_metrics_bundle_carries_both_directions(self):
+        metrics = compute_all_metrics(self._rows(), [])
+        assert metrics["dimension_direction"]["simple"]["over"] == 1.0
+        assert metrics["theme_direction"]["scripture"]["emphasized_for_present"] == 1
+
+    def test_single_run_report_shows_counts_with_their_denominators(self, capsys):
+        rows = self._rows()
+        print_report(_meta(mode="all", story_count=2), compute_all_metrics(rows, []),
+                     story_results=rows)
+        out = capsys.readouterr().out
+        direction = out[out.index("--- Grading direction"):]
+        assert "Too high" in direction and "Too low" in direction and "Wrong GOOD" in direction
+        simple = next(line for line in direction.splitlines()
+                      if line.strip().startswith("simple"))
+        assert "2/2 (100.0%)" in simple   # too high
+        assert "0/1 (0.0%)" in simple     # too low: only one label could be graded lower
+        scripture = next(line for line in direction.splitlines()
+                         if line.strip().startswith("scripture"))
+        assert "1/1" in scripture         # Emphasized given to the one Present-labeled story
+
+    def test_single_run_report_prints_na_when_nothing_was_scored(self, capsys):
+        rows = [_pred("a", expected_scores=_scores(2, 2, 2, 2), predicted_scores=None)]
+        print_report(_meta(mode="quality"), compute_all_metrics(rows, []), story_results=rows)
+        out = capsys.readouterr().out
+        direction = out[out.index("--- Grading direction"):]
+        simple = next(line for line in direction.splitlines()
+                      if line.strip().startswith("simple"))
+        assert "N/A" in simple and "%" not in simple
+
+    def _after(self):
+        after = [
+            _pred("a", expected_scores=_scores(2, 2, 2, 2), predicted_scores=_scores(2, 2, 1, 2),
+                  expected_themes={"scripture": "present"},
+                  predicted_themes={"scripture": "present"}),
+            _pred("b", expected_scores=_scores(1, 2, 3, 2), predicted_scores=_scores(2, 2, 3, 2)),
+        ]
+        for row in after:
+            row.themes_raw = "SCRIPTURE: PRESENT"
+        return after
+
+    def test_comparison_shows_whether_over_grading_fell(self, capsys):
+        before, after = self._rows(), self._after()
+        print_comparison(
+            _meta(tag="before", newsletter_model="model-a"), compute_all_metrics(before, []),
+            _meta(tag="after", newsletter_model="model-b"), compute_all_metrics(after, []),
+            story1=before, story2=after,
+        )
+        out = capsys.readouterr().out
+        too_high = out[out.index("Graded too high (lower=better)"):]
+        simple = next(line for line in too_high.splitlines() if line.strip().startswith("simple"))
+        assert "100.0%" in simple and "50.0%" in simple and "(improved)" in simple
+        assert "wrong GOOD" in too_high
+        assert "Emph. for Present" in too_high
+        assert "Graded too low (lower=better)" in out
+        assert "model=model-a" in out and "model=model-b" in out
+        assert "WARNING: the two runs scored different stories" not in out
+
+    def test_comparison_warns_when_the_runs_scored_different_stories(self, capsys):
+        # newsletter_run reads the story-label log by default, so a run taken
+        # after more labeling scores more stories than the one before it.
+        before = self._rows()
+        after = self._after() + [
+            _pred("new", expected_scores=_scores(2, 2, 2, 2), predicted_scores=_scores(2, 2, 2, 2)),
+        ]
+        print_comparison(
+            _meta(tag="before", story_count=2), compute_all_metrics(before, []),
+            _meta(tag="after", story_count=3, story_label_count=1), compute_all_metrics(after, []),
+            story1=before, story2=after,
+        )
+        out = capsys.readouterr().out
+        assert "WARNING: the two runs scored different stories" in out
+        assert "2 in common" in out
+        assert "stories=2" in out and "stories=3 (1 from the story-label log)" in out
+
+
+class TestThemeDirectionSkipsUnreadableReplies:
+    def test_a_reply_the_parser_could_not_read_is_not_counted_as_too_low(self):
+        # "DISCIPLE-MAKING: EMPHASIZED" is a near-miss line parse_themes skips.
+        # That is a parser gap, reported under Parse anomalies, not the model
+        # grading the theme Absent.
+        unreadable = _pred("a", expected_themes={"disciple_making": "emphasized"})
+        unreadable.themes_raw = "DISCIPLE-MAKING: EMPHASIZED"
+        read = _themed("b", {"disciple_making": "emphasized"}, {"disciple_making": "emphasized"})
+        read.themes_raw = "DISCIPLE_MAKING: EMPHASIZED"
+        direction = compute_theme_direction([unreadable, read], THEMES)
+        assert direction["disciple_making"]["n"] == 1
+        assert direction["disciple_making"]["under_count"] == 0
+        assert direction["all"]["unreadable"] == 1
+
+    def test_the_report_says_how_many_replies_were_left_out(self, capsys):
+        unreadable = _pred("a", expected_themes={"disciple_making": "emphasized"})
+        unreadable.themes_raw = "DISCIPLE-MAKING: EMPHASIZED"
+        print_report(_meta(mode="themes"), compute_all_metrics([unreadable], [], mode="themes"),
+                     story_results=[unreadable])
+        out = capsys.readouterr().out
+        assert "1 story left out of the theme rows" in out
+
+
+class TestFormatRateDelta:
+    def test_a_lower_rate_is_an_improvement(self):
+        assert format_rate_delta(0.5, 0.25) == "-25.0% (improved)"
+
+    def test_a_higher_rate_is_worse(self):
+        assert format_rate_delta(0.25, 0.5) == "+25.0% (worse)"
+
+    def test_no_change_and_missing_values(self):
+        assert format_rate_delta(0.25, 0.25) == "+0.0%"
+        assert format_rate_delta(None, 0.25) == "N/A"
+
+
+class TestExcerptsForLabelLogStories:
+    def _label_line(self, key, text):
+        return json.dumps({
+            "type": "story_label", "story_key": key, "thread_id": "t_900020", "text": text,
+            "status": "graded",
+            "scores": {"simple": 3, "concrete": 3, "personal": 3, "dynamic": 3},
+        }) + "\n"
+
+    def test_label_log_stories_are_excerpted_by_their_key(self, tmp_path):
+        labels = tmp_path / "labels.jsonl"
+        labels.write_text(self._label_line("0123456789abcdef", "Priya led the Tuesday study."))
+        excerpts = load_story_excerpts("/nope/absent.jsonl", str(labels))
+        assert excerpts == {"0123456789abcdef": "Priya led the Tuesday study."}
+
+    def test_verbose_report_names_a_label_log_story_by_its_text(self, tmp_path, capsys):
+        labels = tmp_path / "labels.jsonl"
+        labels.write_text(self._label_line("0123456789abcdef", "Priya led the Tuesday study."))
+        row = _pred(story_id="0123456789abcdef", predicted_scores={"simple": 3},
+                    expected_tier="good", predicted_tier="fair")
+        print_report(_meta(golden_set_path="/nope/absent.jsonl", story_labels_path=str(labels),
+                           story_label_count=1),
+                     compute_all_metrics([row]), verbose=True, story_results=[row])
+        assert "Priya led the Tuesday study" in capsys.readouterr().out
+
+    def test_excerpts_carry_no_control_characters(self, tmp_path):
+        # Excerpts are printed to a terminal by --verbose; the label log stores
+        # story text exactly as extracted from email.
+        labels = tmp_path / "labels.jsonl"
+        labels.write_text(self._label_line(
+            "0123456789abcdef", "\x1b[2J\x1b]0;owned\x07Priya led\xa0the study."))
+        (excerpt,) = load_story_excerpts("/nope/absent.jsonl", str(labels)).values()
+        assert "\x1b" not in excerpt and "\x07" not in excerpt
+        assert "Priya led the study." in excerpt
+
+    def test_an_unreadable_label_log_degrades_to_curated_excerpts_only(self, tmp_path):
+        golden = tmp_path / "golden.jsonl"
+        golden.write_text(json.dumps({
+            "type": "golden_newsletter", "thread_id": "t", "message_id": "m",
+            "sender": "s", "subject": "subj", "body": "b",
+            "stories": [{"story_id": "t:0", "text": "Marcus came to dinner"}],
+        }) + "\n")
+        labels = tmp_path / "labels.jsonl"
+        labels.write_text("{not json}\n")
+        assert load_story_excerpts(str(golden), str(labels)) == {"t:0": "Marcus came to dinner"}

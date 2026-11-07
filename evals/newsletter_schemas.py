@@ -5,7 +5,14 @@ from_dict is tolerant of missing optional keys (via d.get(...) defaults) so
 older golden sets and result files keep loading as the schema grows.
 """
 
+import hashlib
+import json
+import os
 from dataclasses import dataclass, field
+from datetime import datetime, timezone
+from pathlib import Path
+
+from newsletter import _DIMENSIONS, _VALID_THEMES, compute_tier
 
 # Grades that ever appear in a stored theme dict. Kept in lockstep with
 # newsletter.parse_themes (which only stores present/emphasized; absent is
@@ -124,6 +131,175 @@ class GoldenStory:
         )
 
 
+# A story-label line's status. "graded" carries ground truth; "miscut" sets the
+# story aside for recutting and carries none.
+STORY_LABEL_STATUSES = ("graded", "miscut")
+
+# What the operator said is wrong with a miscut story. "not_a_story" is the one
+# reason no recut can fix; the others describe a boundary to redraw.
+MISCUT_REASONS = ("cut_short", "runs_long", "several_stories", "not_a_story")
+
+_THEME_NAMES = frozenset(name.lower() for name in _VALID_THEMES)
+
+
+@dataclass
+class StoryLabel:
+    """One line of the append-only story-label log written by
+    ``evals.newsletter_grade``: the operator's judgment of one ready-made story.
+
+    Self-contained on purpose (it carries the story text), so the log is a
+    grading golden set by itself and two machines' logs merge by concatenation.
+    A later line for the same ``story_key`` supersedes an earlier one.
+    Validated on load, theme names included, because the file is written by a
+    tool and merged by hand.
+    """
+
+    story_key: str  # hash of the normalized story text
+    thread_id: str
+    text: str
+    status: str  # one of STORY_LABEL_STATUSES
+    scores: dict[str, int] | None = None  # all four dimensions, 1-3, when graded
+    themes: dict[str, str] = field(default_factory=dict)  # theme -> "present"/"emphasized"
+    torn: list[str] = field(default_factory=list)  # dimensions/themes the operator was torn on
+    note: str = ""
+    miscut_reason: str = ""  # one of MISCUT_REASONS when status == "miscut"
+    recut_of: str = ""  # story_key of the miscut story this one replaces
+    labeled_at: str = ""  # ISO-8601 UTC
+    seconds: float | None = None  # time the card was open
+    source_timestamp: str = ""  # the assessment record the text came from
+
+    def to_dict(self) -> dict:
+        return {
+            "type": "story_label",
+            "story_key": self.story_key,
+            "thread_id": self.thread_id,
+            "text": self.text,
+            "status": self.status,
+            "scores": self.scores,
+            "themes": self.themes,
+            "torn": self.torn,
+            "note": self.note,
+            "miscut_reason": self.miscut_reason,
+            "recut_of": self.recut_of,
+            "labeled_at": self.labeled_at,
+            "seconds": self.seconds,
+            "source_timestamp": self.source_timestamp,
+        }
+
+    @classmethod
+    def from_dict(cls, d: dict) -> "StoryLabel":
+        """Build a label from one decoded log line, validating all of it.
+
+        Every problem is a ValueError that names the field, so the reader can
+        report the file and line: the log is merged by hand, and a malformed
+        line must not surface later as a crash or as a silently wrong score.
+        """
+        if not isinstance(d, dict):
+            raise ValueError("a story-label line must be a JSON object")
+        missing = [name for name in ("story_key", "thread_id", "text", "status") if name not in d]
+        if missing:
+            raise ValueError(f"story label is missing {', '.join(missing)}")
+        key = d["story_key"]
+
+        def text_field(name: str, default: str = "", required: bool = False) -> str:
+            value = d.get(name, default)
+            if not isinstance(value, str) or (required and not value.strip()):
+                kind = "a non-empty string" if required else "a string"
+                raise ValueError(f"story label {key!r}: {name} must be {kind}, got {value!r}")
+            return value
+
+        text_field("story_key", required=True)
+        thread_id = text_field("thread_id")
+        text = text_field("text", required=True)
+        status = d["status"]
+        if status not in STORY_LABEL_STATUSES:
+            raise ValueError(
+                f"story label {key!r}: status {status!r} is not one of "
+                f"{', '.join(STORY_LABEL_STATUSES)}"
+            )
+        raw_scores = d.get("scores")
+        if raw_scores is not None and not isinstance(raw_scores, dict):
+            raise ValueError(f"scores for story {key!r} must be a mapping, got {raw_scores!r}")
+        scores = _coerce_scores(raw_scores, story_id=key, field_name="scores")
+        raw_themes = d.get("themes")
+        if raw_themes is not None and not isinstance(raw_themes, (dict, list)):
+            raise ValueError(f"themes for story {key!r} must be a mapping, got {raw_themes!r}")
+        themes = _coerce_themes(raw_themes, story_id=key, field_name="themes")
+        unknown = sorted(set(themes) - _THEME_NAMES)
+        if unknown:
+            raise ValueError(
+                f"themes for story {key!r}: unknown theme name(s) {', '.join(unknown)}; "
+                f"expected only {', '.join(sorted(_THEME_NAMES))}"
+            )
+        torn = d.get("torn") or []
+        if not isinstance(torn, list):
+            raise ValueError(f"torn for story {key!r} must be a list, got {torn!r}")
+        stray = sorted({str(name) for name in torn} - _THEME_NAMES - set(_DIMENSIONS))
+        if stray:
+            raise ValueError(
+                f"torn for story {key!r}: {', '.join(stray)} is not a dimension or a theme"
+            )
+        seconds = d.get("seconds")
+        if seconds is not None and (isinstance(seconds, bool) or not isinstance(seconds, (int, float))):
+            raise ValueError(f"story label {key!r}: seconds must be a number, got {seconds!r}")
+        reason = text_field("miscut_reason")
+        if status == "graded":
+            if scores is None:
+                raise ValueError(f"story label {key!r}: a graded label needs scores")
+            missing_dims = [dim for dim in _DIMENSIONS if dim not in scores]
+            if missing_dims:
+                raise ValueError(
+                    f"scores for story {key!r}: missing dimension(s) {', '.join(missing_dims)}"
+                )
+            extra = sorted(set(scores) - set(_DIMENSIONS))
+            if extra:
+                raise ValueError(
+                    f"scores for story {key!r}: {', '.join(extra)} is not a dimension"
+                )
+        else:
+            if reason not in MISCUT_REASONS:
+                raise ValueError(
+                    f"story label {key!r}: miscut_reason {reason!r} is not one of "
+                    f"{', '.join(MISCUT_REASONS)}"
+                )
+            if scores is not None or themes:
+                raise ValueError(
+                    f"story label {key!r}: a miscut story carries no scores or themes"
+                )
+        return cls(
+            story_key=key,
+            thread_id=thread_id,
+            text=text,
+            status=status,
+            scores=scores,
+            themes=themes,
+            torn=list(torn),
+            note=text_field("note"),
+            miscut_reason=reason,
+            recut_of=text_field("recut_of"),
+            labeled_at=text_field("labeled_at"),
+            seconds=seconds,
+            source_timestamp=text_field("source_timestamp"),
+        )
+
+    def to_golden_story(self) -> "GoldenStory":
+        """This label as grading ground truth, in the shape the eval runs on."""
+        if self.status != "graded":
+            raise ValueError(
+                f"story label {self.story_key!r} is {self.status}, not graded: "
+                "a miscut story has no ground truth"
+            )
+        return GoldenStory(
+            story_id=self.story_key,
+            text=self.text,
+            expected_scores=dict(self.scores),
+            expected_tier=compute_tier(self.scores).value,
+            expected_themes=dict(self.themes),
+            reviewed=True,
+            notes=self.note,
+        )
+
+
 @dataclass
 class GoldenNewsletter:
     """One newsletter in the golden set; owns its list of GoldenStory."""
@@ -189,6 +365,9 @@ class StoryPrediction:
     themes_raw: str | None = None
     duration_seconds: float = 0.0
     error: str | None = None
+    # Where the ground truth came from: "curated" (the hand-curated golden set)
+    # or "story_labels" (the story-label log written by newsletter_grade).
+    source: str = "curated"
 
     def to_dict(self) -> dict:
         return {
@@ -205,6 +384,7 @@ class StoryPrediction:
             "themes_raw": self.themes_raw,
             "duration_seconds": self.duration_seconds,
             "error": self.error,
+            "source": self.source,
         }
 
     @classmethod
@@ -231,6 +411,7 @@ class StoryPrediction:
             themes_raw=d.get("themes_raw"),
             duration_seconds=d.get("duration_seconds", 0.0),
             error=d.get("error"),
+            source=d.get("source", "curated"),
         )
 
 
@@ -327,6 +508,10 @@ class NewsletterRunMeta:
     extraction_system_prompt: str = ""
     quality_system_prompt: str = ""
     theme_system_prompt: str = ""
+    # Stories taken from the story-label log (newsletter_grade); they are part
+    # of story_count. Zero and "" for runs that used none.
+    story_labels_path: str = ""
+    story_label_count: int = 0
 
     def to_dict(self) -> dict:
         return {
@@ -349,6 +534,8 @@ class NewsletterRunMeta:
             "extraction_system_prompt": self.extraction_system_prompt,
             "quality_system_prompt": self.quality_system_prompt,
             "theme_system_prompt": self.theme_system_prompt,
+            "story_labels_path": self.story_labels_path,
+            "story_label_count": self.story_label_count,
         }
 
     @classmethod
@@ -372,4 +559,90 @@ class NewsletterRunMeta:
             extraction_system_prompt=d.get("extraction_system_prompt", ""),
             quality_system_prompt=d.get("quality_system_prompt", ""),
             theme_system_prompt=d.get("theme_system_prompt", ""),
+            story_labels_path=d.get("story_labels_path", ""),
+            story_label_count=d.get("story_label_count", 0),
         )
+
+
+# --- The story-label log -----------------------------------------------------
+# File handling for the log lives here, beside StoryLabel, so the headless eval
+# runner can read it without loading the grading screen.
+
+
+def story_key(text: str) -> str:
+    """A story's identity: a hash of its text with whitespace normalized.
+
+    Text-only on purpose. A recut of the same newsletter is different text and
+    so a different story; the same text arriving in two threads is one story.
+    """
+    normalized = " ".join(text.split())
+    return hashlib.sha256(normalized.encode()).hexdigest()[:16]
+
+
+def read_label_log(path: Path) -> list[StoryLabel]:
+    """Every label line in *path*, in file order. A missing file is an empty log.
+
+    Blank lines are skipped. A line that is not JSON, or not a valid label,
+    raises ValueError naming the file and line, so a bad hand-merge is located
+    rather than silently dropped.
+    """
+    path = Path(path)
+    if not path.exists():
+        return []
+    labels = []
+    with open(path) as f:
+        for lineno, line in enumerate(f, 1):
+            if not line.strip():
+                continue
+            try:
+                labels.append(StoryLabel.from_dict(json.loads(line)))
+            except (ValueError, KeyError, TypeError, AttributeError) as exc:
+                raise ValueError(f"{path}:{lineno}: {exc}") from exc
+    return labels
+
+
+def append_label(path: Path, label: StoryLabel) -> None:
+    """Append one label line to *path* and sync it to disk.
+
+    Earlier lines are never rewritten. If the file does not end in a newline
+    (a hand-merge, an interrupted write), one is added first so the new label
+    lands on its own line.
+    """
+    line = (json.dumps(label.to_dict()) + "\n").encode()
+    with open(path, "a+b") as f:
+        f.seek(0, os.SEEK_END)
+        if f.tell() > 0:
+            f.seek(-1, os.SEEK_END)
+            if f.read(1) != b"\n":
+                f.write(b"\n")
+        f.write(line)
+        f.flush()
+        os.fsync(f.fileno())
+
+
+def parse_time(value) -> datetime | None:
+    """An ISO-8601 time as an aware datetime (naive is read as UTC), or None
+    when *value* is missing or unreadable."""
+    try:
+        stamp = datetime.fromisoformat(value or "")
+    except (TypeError, ValueError):
+        return None
+    return stamp if stamp.tzinfo else stamp.replace(tzinfo=timezone.utc)
+
+
+def latest_labels(labels: list[StoryLabel]) -> dict[str, StoryLabel]:
+    """The label in force for each story: the newest by ``labeled_at``.
+
+    File order is only the tie-break (a later line wins) when two lines carry
+    equal or unreadable times, because two machines' logs are merged by
+    concatenation and file order is then not time order.
+    """
+    latest: dict[str, StoryLabel] = {}
+    for label in labels:
+        kept = latest.get(label.story_key)
+        if kept is not None:
+            new_at, kept_at = parse_time(label.labeled_at), parse_time(kept.labeled_at)
+            if new_at is not None and kept_at is not None and new_at < kept_at:
+                continue
+        latest[label.story_key] = label
+    return latest

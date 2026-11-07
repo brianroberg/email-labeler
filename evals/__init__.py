@@ -4,6 +4,7 @@ import json
 import os
 import stat
 import tempfile
+import unicodedata
 from pathlib import Path
 
 import httpx
@@ -56,6 +57,44 @@ def _target_mode(path: Path) -> int:
         current_umask = os.umask(0)
         os.umask(current_umask)
         return 0o666 & ~current_umask
+
+
+# Format characters that legitimate text needs: the zero-width joiner and
+# non-joiner (emoji sequences, Persian and Indic scripts).
+_KEPT_FORMAT_CHARACTERS = frozenset("\u200c\u200d")
+
+
+def clean_for_display(text: str, keep_newlines: bool = False) -> str:
+    """*text* made safe and faithful to show on a terminal.
+
+    Story text comes from email. Dropped: every character in a Unicode "other"
+    category (control, format, surrogate, private use, unassigned), which covers
+    escape sequences, the bidirectional overrides and isolates that reorder what
+    is displayed, tag characters, and lone surrogates that cannot be encoded.
+    The zero-width joiner and non-joiner are the one exception, because emoji
+    sequences and some scripts need them.
+
+    Kept as a plain space: non-breaking, thin and every other Unicode space.
+    They are not control characters, and deleting them glues words together, so
+    the reader would see text that differs from what is stored. Line breaks
+    (including U+2028/U+2029) are kept only with *keep_newlines*, otherwise
+    they become spaces; a tab becomes spaces either way.
+    """
+    out = []
+    for ch in text:
+        if ch == "\n":
+            out.append("\n" if keep_newlines else " ")
+        elif ch == "\t":
+            out.append("    " if keep_newlines else " ")
+        else:
+            category = unicodedata.category(ch)
+            if category in ("Zl", "Zp"):
+                out.append("\n" if keep_newlines else " ")
+            elif category == "Zs":
+                out.append(" ")
+            elif category[0] != "C" or ch in _KEPT_FORMAT_CHARACTERS:
+                out.append(ch)
+    return "".join(out)
 
 
 def plural(n: int, singular: str, plural_form: str | None = None) -> str:
