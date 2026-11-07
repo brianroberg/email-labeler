@@ -45,8 +45,10 @@ the same change:
 ## What reviews here tend to miss
 
 - **A prompt edit is a behaviour change.** It alters grades or labels on real
-  mail and changes `prompt_hash`, so eval runs from before and after stop being
-  prompt-comparable. Check it against the rubric it implements (D21, D23).
+  mail, and eval runs from before and after stop being prompt-comparable: the
+  newsletter eval records `prompt_hash` over the prompt block, the email eval
+  only `config_hash` over the whole file. Check it against the rubric it
+  implements (D21, D23).
 - **The tests mock the external services** (`CLAUDE.md`, Testing). Green tests
   say nothing about a live provider: request shapes, error bodies and timeouts
   are assumptions until probed.
