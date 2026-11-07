@@ -63,7 +63,10 @@ the same change:
 - **Eval comparisons that cannot carry the claim.** Check the size of the
   golden set against the difference being claimed, whether the two runs differ
   in more than one thing, and whether the response cache could have served one
-  run's answers to the other (its key includes the model but not the endpoint).
+  run's answers to the other. Its key is the model name, temperature,
+  max_tokens, `extra_body` and the prompt text (`evals/llm_cache.py`), so two
+  runs that differ only in endpoint or in a server-side setting share answers;
+  one cache file serves both evals.
 - **Restated values.** A number or a rule copied into prose instead of pointed
   at will drift; the authority map in `CLAUDE.md` says where each fact lives.
 - **Absolute wording in docs** ("never", "always", "only") without a test that
