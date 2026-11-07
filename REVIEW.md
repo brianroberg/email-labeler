@@ -23,7 +23,7 @@ break, what counts as an interface, and what reviews of this repo tend to miss.
 | Function independence | A newsletter fault stopping email triage, or the reverse | D1, D5 scope |
 | Newsletter grades | A grade whose meaning drifts from the rubric, or a record the review TUI cannot read | D23 and `docs/newsletter-rubric.md`; D12, D18 |
 | Eval validity | A comparison that looks like a result but is not one (see below) | D21, D23; `evals/README-technical.md` |
-| Real content in git | Email or newsletter text, names or ids in a tracked file or fixture | `.gitignore`; fixtures are written from scratch with synthetic values |
+| Real content in git | Email or newsletter text, names or ids in a tracked file or fixture | `.gitignore` (the newsletter eval paths are guarded by `tests/test_gitignore_eval_data.py`); fixtures are written from scratch with synthetic values |
 
 ## What counts as an interface
 
