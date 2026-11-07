@@ -37,8 +37,11 @@ the same change:
 - **Eval CLI flags and modules**: `tests/test_eval_cli_docs.py`,
   `tests/test_eval_newsletter_cli_docs.py`, `tests/test_newsletter_eval_docs.py`.
 - **TUI hotkeys and usage**: `tests/test_tui_docs.py`.
-- **The assessments JSONL schema** (`schema_version`, D12) and the golden-set
-  JSONL schemas in `evals/schemas.py` and `evals/newsletter_schemas.py`.
+- **The assessments JSONL schema** (`schema_version`, D12): documented under
+  "Assessment record schema" in `README-technical.md`; `tests/test_newsletter.py`
+  and `tests/test_migrate_assessments.py`. **The golden-set JSONL schemas** in
+  `evals/schemas.py` and `evals/newsletter_schemas.py`: `tests/test_eval_schemas.py`
+  and `tests/test_eval_newsletter_schemas.py`.
 - **Gmail label names**: the daemon verifies them at startup and exits if one
   is missing, so a renamed label is a deployment step, not only a code change.
 
