@@ -31,7 +31,10 @@ A change to any of these needs its documentation and its guard test updated in
 the same change:
 
 - **`config.toml` keys and prompt sections**: real-config tests in
-  `tests/test_daemon.py`. Comments there are the design record for sizing (D7).
+  `tests/test_daemon.py` check that keys and prompt sections exist and carry
+  specific rules; what a prompt says is checked against the rubric it
+  implements (D21, D23) and by an eval run, not by a unit test. Comments in
+  `config.toml` are the design record for sizing (D7).
 - **Environment variables**: `tests/test_env_var_docs.py`,
   `tests/test_env_example_docs.py`, the table in `README-technical.md`.
 - **Eval CLI flags and modules**: `tests/test_eval_cli_docs.py`,
