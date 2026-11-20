@@ -3822,6 +3822,28 @@ class TestLoadConfig:
             assert "system" in prompts[key]
             assert "user_template" in prompts[key]
 
+    @pytest.mark.parametrize("prompt, rule", [
+        ("quality_assessment",
+         "When torn between two grades, give the lower grade"
+         " and say why inside your <think> reasoning, not in the answer lines."),
+        ("theme_classification",
+         "When torn between PRESENT and EMPHASIZED, give PRESENT"
+         " and say why inside your <think> reasoning, not in the answer lines."),
+    ])
+    def test_config_grading_prompts_carry_the_grade_down_rule(self, prompt, rule):
+        # The rubric's grade-down rule: docs/newsletter-rubric.md §1, and its §8
+        # entry of 2026-11-05 for why each prompt words it the way it does.
+        config = load_config()
+        system = config["newsletter"]["prompts"][prompt]["system"]
+        assert rule in system
+        # Stated once, before the format instruction. A second "torn" sentence
+        # (a wider rule, or a request to explain after the answers) changes the
+        # rule rather than rewording it, and must come with a rubric change.
+        assert system.lower().count("torn") == 1
+        assert system.index(rule) < system.index("exact format")
+        # The rubric's rationale sentence is for its human readers.
+        assert "coachable" not in system
+
 
 class TestResolveIntEnv:
     def test_returns_default_when_unset(self, monkeypatch):
