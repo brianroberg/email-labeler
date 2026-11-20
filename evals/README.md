@@ -161,6 +161,71 @@ uv run python -m evals.report --compare evals/results/run_a.jsonl evals/results/
 uv run python -m evals.report --results-dir evals/results/
 ```
 
+## Claude comparison (issue #92)
+
+Runs the current local model and a Claude model side by side on the golden
+set's person threads (the local model's traffic) and writes one report. The
+Anthropic SDK it needs is an optional extra, `compare`, which the daemon's
+Docker image does not install.
+
+**Where it runs:** on docker-3's host, outside Docker, like the other eval tools
+(see Setup): the golden set is mounted there, and the local model is reachable
+from there through `MLX_URL`.
+
+**The key:** the script asks for the Anthropic API key at a hidden prompt. To
+avoid typing it, put it in a root-only file (`chmod 600`), pass
+`--anthropic-key-file PATH`, and delete the file afterwards. The key is not
+taken from the command line or the environment
+(`test_no_flag_takes_the_key_itself`,
+`test_without_a_key_file_the_key_is_typed_not_taken_from_the_environment`,
+`test_uses_only_the_given_key_whatever_the_environment_holds`), so it does not
+go into agent-stack's `.env` or the assistant's container. The run does not
+print the key or write it to its output files
+(`test_key_is_never_printed_or_written`). Without a terminal (for example
+`ssh host 'cmd'` without `-t`) the prompt cannot hide what is typed, so the
+run stops before reading the key and asks for `--anthropic-key-file`
+(`test_getpass_fallback_leaves_the_key_unread`).
+
+```bash
+uv run --extra compare python -m evals.compare --dry-run   # the plan only
+uv run --extra compare python -m evals.compare             # the plan, one typed "yes", then both arms
+```
+
+The plan names the golden set and its counts, both models, whether the local
+model answered, the number of API calls, and the estimated tokens and cost.
+It also gives each arm's request settings as sent (arm A's from `[llm.local]`
+in `config.toml`, arm B's from `evals/compare.py`), because the arms differ in
+more than the model, and says this is one run with no repeat. The report
+repeats both above its table.
+It says plainly that the golden sets are real mail and arm B sends them to
+Anthropic, and names the host arm A sends them to (the `MLX_URL` host), as an
+API stand-in (decision D4) when `MLX_API_KEY` is set. If the local model does not answer (the MacBook asleep), the run
+stops at the plan, before the yes, the key, or anything sent to Anthropic
+(`test_unreachable_local_model_refuses_before_anything_is_sent`). After "yes"
+and the key, it runs the local arm, then the Claude arm, and writes
+`evals/results/<timestamp>_compare_<local>_vs_<model>.md` (git-ignored). A
+thread the local model could not be reached for (the endpoint unreachable or
+the connection dropped) is not sent to Anthropic; a thread it answered
+unusably is
+(`test_a_thread_arm_a_lost_to_an_outage_is_not_sent_but_a_content_failure_is`).
+A request already in flight when the MacBook sleeps usually ends as a read
+timeout and is sent, counted as arm A's error. If arm A answered no thread
+usably, arm B is not run (`test_arm_b_is_not_run_when_arm_a_produced_nothing`).
+A thread either arm lost to an outage (the local model, or Anthropic,
+unreachable or overloaded after retries) is scored for neither arm and counted
+in that arm's "Lost to an outage" row
+(`test_a_thread_either_arm_lost_to_an_outage_is_scored_for_neither`).
+
+The classifier prompt asks the model to write its reasoning in its reply,
+which current Claude models may decline as `reasoning_extraction`. The report
+counts each arm's errors by kind, refusals by category, and says above the
+table when refusals are more than half of arm B's replies. Arm B stops sending
+once at least 5 replies are in and more than half are refusals, and reports
+the rest as not sent; the one yes still covers the run. Details:
+[README-technical.md](README-technical.md#compare).
+`--model` picks another Claude model; flags and details are in
+[README-technical.md](README-technical.md#compare).
+
 ## Newsletter evaluation
 
 The daemon's newsletter pipeline (active under `NEWSLETTER_ONLY=1`) grades

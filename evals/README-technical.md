@@ -120,6 +120,141 @@ the dialect it accepts via `--extra-body`/`--local-extra-body`.
 
 **Assistant-field metrics** (issue #78). Reported separately from the three-way label accuracy, as binary precision/recall/F1 over the threads whose expected label is `needs_response` AND which carry a non-null `expected_assistant`; that n is printed alongside every figure. Within that set a thread counts as a positive prediction only when `predicted_assistant` is `True`, so an absent prediction counts as a negative — which is what the absence of the marker label means in practice. A positive prediction on a thread outside the set (wrong label, or not yet annotated) is reported on its own line as `out_of_scope_positives` instead of entering precision. While a run contains no `predicted_assistant` values at all, the block prints annotation progress — `assistant: no predictions in this run (N of M needs_response threads annotated)` — rather than a 0% that would read as a measured failure. `print_trend` carries an `Assistant` column (the F1, `N/A` with no predictions); `--compare` prints a precision/recall/F1 block when both runs have predictions; `--format json` carries the whole `assistant` section.
 
+### compare
+
+The Claude comparison (issue #92); usage and where it runs are in
+[README.md](README.md#claude-comparison-issue-92).
+
+| Flag | Description |
+|---|---|
+| `--golden-set` | Path to golden set JSONL (default: `evals/golden_set.jsonl`). Its reviewed, non-excluded **person** threads are used |
+| `--config` | Path to config.toml (default: the repo-root `config.toml`) |
+| `--output-dir` | Where the report and the two per-arm results files are written (default: `evals/results/`, git-ignored) |
+| `--model` | Claude model for arm B, one of the priced models in `PRICES_PER_MTOK` (`evals/compare.py`); default `claude-opus-5-5`. Any other value is an argparse error, so each run can be costed (`test_model_defaults_to_opus_and_accepts_only_priced_models`) |
+| `--anthropic-key-file` | Read the API key from this file instead of the hidden prompt. The file must be owner-only (`chmod 600`); a wider mode, an empty file or an unreadable path stops the run with a one-line reason |
+| `--dry-run` | Print the plan and stop. Exits 1 when the local model did not answer its probe, as a real run would |
+| `--max-threads` | Use at most this many person threads (a cheap first run) |
+
+**Population and arms.** Both arms run Stage 2 on the same person threads, the
+`--local-only` population, through the real `EmailClassifier`, so the prompt is
+the one in `config.toml`, unchanged. Arm B is not sent the threads arm A lost to
+an outage of the local model, nor any once refusals dominate (see "Order of a
+run" and "Refusals"); the report's header gives how many it was sent. Arm A is the `[llm.local]` client built as
+`run_eval` builds it (`MLX_URL`, so where `MLX_URL` points decides where arm A's
+mail goes — decision D4). Arm B puts `AnthropicLLMClient` in the local slot. The
+cloud slot holds a stand-in that fails the row if it is called
+(`test_full_run_compares_both_arms_on_person_threads` sees no such error).
+Arm A runs at the daemon's local concurrency, `LOCAL_PARALLEL` or else
+`[daemon] local_parallel`, read as `daemon.py` reads it
+(`test_arm_a_runs_at_the_daemons_local_concurrency_env_override_included`),
+not at `run_eval`'s `cloud_parallel`. Its latency is still not production's:
+the eval queues every thread at once, while production sees person mail a
+few at a time. Neither arm uses the response
+cache: a hit has no latency and no usage, and arm A may already be cached from
+earlier runs.
+
+**Arm B's request.** Model, effort, `max_tokens`, retry budget, per-request
+timeout and concurrency are module constants in `evals/compare.py`, each with
+its reason. No `temperature` is sent and thinking is left at its adaptive
+default: the claude-api skill's model notes (2026-11) list a temperature as
+rejected by the current models and disabled thinking as rejected by Opus 5.5.
+No `fallbacks` model is set: a fallback would change which model answered. A reply
+stopped at `max_tokens` or by a refusal, or one with no answer outside its
+reasoning, raises `LLMContentError` and counts as that arm's error. Where the
+cause is known by type, the row's error starts with a bracketed kind:
+`[refusal: <category>]` (the reply's `stop_details.category`, or
+`uncategorised`; the free-text explanation is not recorded), `[max_tokens]`,
+`[timeout]` (a read timeout, the SDK's `APITimeoutError` after its retries), or
+`[unavailable]`: an outage, that is, a 429 or a 5xx (529 "overloaded"
+included) left after the SDK's retries, a connection failure, or a connect
+timeout. A rejected request (another 4xx) and anything else are "other" in
+the report (`test_an_unusable_reply_records_its_kind`,
+`test_a_timeout_records_its_kind`,
+`test_an_api_outage_after_retries_records_its_kind`,
+`test_a_connection_failure_records_its_kind`,
+`test_a_rejected_request_is_not_an_outage`).
+
+**Refusals.** The classifier prompt asks the model to reason step by step in
+`<think>` tags in its reply. The claude-api skill documents that kind of
+instruction as a trigger for declines with category `reasoning_extraction` on
+current models; whether it fires on this prompt is not known until a run. The
+prompt is unchanged here, so both arms see the same one. Arm B stops sending
+once `REFUSAL_STOP_MIN_REPLIES` replies are in and more than half of them are
+refusals; threads not sent after that are recorded as `[not sent] stopped after
+refusals` (`test_arm_b_stops_once_five_replies_are_in_and_most_are_refusals`,
+`test_arm_b_sends_nothing_more_once_refusals_dominate`). Requests already in
+flight when the rule trips still land; if they are answers and bring the ratio
+back to half, arm B stays stopped
+(`test_once_stopped_arm_b_stays_stopped_when_answers_in_flight_land`). The one typed yes covers the run; the
+stop asks nothing (`test_arm_b_sends_nothing_more_once_refusals_dominate`). The SDK
+client is built from the given key and the fixed base URL with the
+`ANTHROPIC_*` variables hidden, because `daemon.py` loads `.env` at import
+(`test_uses_only_the_given_key_whatever_the_environment_holds`). One SDK
+variable acts earlier, at import: `ANTHROPIC_LOG=debug` in the shell makes the
+SDK log each request body, the mail included, so the entry point holds the
+`anthropic` logger at INFO (`test_sdk_debug_logging_does_not_write_the_mail`).
+
+**Order of a run.** Plan → stop if the local model did not answer → typed
+`yes` → key → a model lookup that sends no mail (checks the key and the model
+id) → arm A → stop if arm A produced no result → arm B on the threads arm A
+did not lose to an outage of the local model → report. Arm A's client is
+wrapped so an `LLMUnavailableError` is tagged in its row; arm B is not sent
+those threads, and its results file records them as `[not sent] local model
+unavailable`. A thread arm A failed on content is sent, unless arm A answered
+no thread usably: then arm B is not run
+(`test_arm_b_is_not_run_when_arm_a_produced_nothing`). The report counts the
+threads not sent in their own row and scores them for neither arm, and arm
+B's cost per message is over the threads it sent
+(`test_a_thread_arm_a_lost_to_an_outage_is_not_sent_but_a_content_failure_is`,
+`test_threads_not_sent_are_neither_errors_nor_billed_messages`).
+
+**Estimate.** `capture_prompts()` runs the threads through the classifier with
+a recorder in the local slot, so the estimate counts the exact Stage 2 prompts.
+Input tokens are prompt characters over `CHARS_PER_TOKEN`; output is
+`ASSUMED_OUTPUT_TOKENS_PER_CALL` per reply (adaptive thinking bills as output
+and is not known in advance). The plan also prints the cost if every reply ran
+to `max_tokens`. That is an estimate too, not a ceiling: its input tokens are
+estimated, and it prices one attempt per thread, so retried attempts are not
+counted. Prices and their date are `PRICES_PER_MTOK` / `PRICES_AS_OF`.
+The API's token counter is itself an API call, so it is not used.
+
+**Outputs.** `<timestamp>_compare_<local>_vs_<model>.md`: one Markdown table,
+scored on the threads both arms were sent and neither lost to an outage. A
+thread either arm lost to an outage (`[unavailable]`: the local model or the
+Anthropic API unreachable, or overloaded after retries) is scored for neither
+arm, alike for both, and counted in that arm's "Lost to an outage" row
+(`test_a_thread_either_arm_lost_to_an_outage_is_scored_for_neither`,
+`test_a_thread_arm_b_lost_to_an_outage_is_scored_for_neither_arm`). An arm's
+other errors stay in its figures as a miss for the thread's expected label,
+so they lower that arm's recall
+(`test_an_arms_error_counts_as_a_miss_for_its_expected_label`). It leads with
+needs_response recall, then the error classes in the cost order of
+`docs/labeling-rubric.md` §3 (D21), then per-category precision/recall, errors
+per arm by expected label and by kind, threads not sent, median and p90
+latency per answered message, and cost. When refusals are more than half of
+arm B's replies, a line above the table says the comparison is not meaningful
+(`test_a_refusal_dominated_arm_b_is_marked_not_meaningful_above_the_table`),
+and another says when arm B stopped early and how many threads it did not
+send; that line does not itself mark the comparison as not meaningful. Above
+the table, one line per
+arm gives its request settings as sent: arm A's from `[llm.local]`
+(temperature, `max_tokens`, timeout, `extra_body` verbatim), arm B's from the
+module constants (default sampling, adaptive thinking, effort, `max_tokens`,
+timeout and retries). A further line says this is one run with no repeat and
+that arm B's sampling is not fixed. The plan states the same
+(`test_the_plan_states_each_arms_settings_and_one_run`,
+`test_the_report_states_each_arms_settings_above_the_table`). They are
+disclosed rather than aligned because the claude-api skill (2026-11) lists a
+temperature as rejected by the current Claude models and disabled thinking as
+rejected by Opus 5.5. The report holds counts only, no subject, sender, body or
+thread id (`test_report_holds_no_message_content`,
+`test_holds_counts_only_no_thread_ids`). Next to it are two ordinary results
+files, `*_stage2_only_compare-A-*.jsonl` and `*_stage2_only_compare-B-*.jsonl`,
+which `evals.report --compare` reads like any other run, by its own rules: it
+leaves errors out of its figures and prints no error count, so its figures
+differ from the comparison report's. Read the comparison report for errors
+and threads not sent.
+
 ## Newsletter Evaluation CLI Reference
 
 The newsletter eval harness mirrors the email eval's 4-stage shape
